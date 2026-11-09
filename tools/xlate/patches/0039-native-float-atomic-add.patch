@@ -1,0 +1,247 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -29,6 +29,9 @@
+         public Dictionary<int, Instruction> ConstantBuffers { get; } = new();
+         public Dictionary<int, Instruction> StorageBuffers { get; } = new();
+ 
++        // NX2NAVI: storage buffers seen as 32-bit floats, for the atomic float add (Declarations.GetFloatStorageBuffer)
++        public Dictionary<int, Instruction> FloatStorageBuffers { get; } = new();
++
+         public Dictionary<int, Instruction> LocalMemories { get; } = new();
+         public Dictionary<int, Instruction> SharedMemories { get; } = new();
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -160,6 +160,50 @@
+             }
+         }
+ 
++        // NX2NAVI: storage buffer binding seen as 32-bit floats: a second variable at the buffer's set and binding, for the
++        // atomic float add (Instructions.cs GenerateAtomicFloatAdd), which needs a pointer to the float it adds; SPIR-V
++        // cannot reinterpret the word pointers of the buffer's own variable. Both variables are marked Aliased. It is
++        // declared where the first atomic needs it, so only the shaders that add floats carry one.
++        public static SpvInstruction GetFloatStorageBuffer(CodeGenContext context, int binding)
++        {
++            if (context.FloatStorageBuffers.TryGetValue(binding, out SpvInstruction existing))
++            {
++                return existing;
++            }
++
++            BufferDefinition buffer = context.Properties.StorageBuffers[binding];
++
++            SpvInstruction arrayType = context.GetType(AggregateType.Array | AggregateType.FP32, 0);
++            SpvInstruction structType = context.TypeStruct(false, arrayType);
++
++            if (context.FloatStorageBuffers.Count == 0)
++            {
++                // The types are shared by every float view of the shader and decorated once, and so are the capability
++                // and the extension.
++                context.Decorate(arrayType, Decoration.ArrayStride, (LiteralInteger)4);
++                context.Decorate(structType, Decoration.BufferBlock);
++                context.MemberDecorate(structType, 0, Decoration.Offset, (LiteralInteger)0);
++
++                context.AddCapability(Capability.AtomicFloat32AddEXT);
++                context.AddExtension("SPV_EXT_shader_atomic_float_add");
++            }
++
++            SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
++            SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
++            int setIndex = context.TargetApi == TargetApi.Vulkan ? buffer.Set : 0;
++
++            context.Name(variable, buffer.Name + "_f32");
++            context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
++            context.Decorate(variable, Decoration.Binding, (LiteralInteger)buffer.Binding);
++            context.Decorate(variable, Decoration.Aliased);
++            context.Decorate(context.StorageBuffers[binding], Decoration.Aliased);
++            context.AddGlobalVariable(variable);
++
++            context.FloatStorageBuffers.Add(binding, variable);
++
++            return variable;
++        }
++
+         private static void DeclareSamplers(CodeGenContext context, IEnumerable<TextureDefinition> samplers)
+         {
+             foreach (TextureDefinition sampler in samplers)
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -176,9 +176,40 @@
+ 
+         private static OperationResult GenerateAtomicAdd(CodeGenContext context, AstOperation operation)
+         {
++            // NX2NAVI: GlobalToStorage leaves a float add (RED/ATOM .F32.FTZ.RN) marked FP32 when the host adds floats atomically
++            if ((operation.Inst & Instruction.FP32) != 0)
++            {
++                return GenerateAtomicFloatAdd(context, operation);
++            }
++
+             return GenerateAtomicMemoryBinary(context, operation, context.Delegates.AtomicIAdd);
+         }
+ 
++        // NX2NAVI: an atomic float add on a word of a storage buffer: sources are the buffer's binding, its field index (0),
++        // the word index and the value. The word is addressed through the buffer's float variable
++        // (Declarations.GetFloatStorageBuffer) and the old value comes back, as float.
++        private static OperationResult GenerateAtomicFloatAdd(CodeGenContext context, AstOperation operation)
++        {
++            if (operation.StorageKind != StorageKind.StorageBuffer ||
++                operation.SourcesCount != 4 ||
++                operation.GetSource(0) is not AstOperand { Type: OperandType.Constant } binding)
++            {
++                throw new InvalidOperationException($"A float atomic add needs a storage buffer binding, a field and a word index, and a value, not {operation.StorageKind}.");
++            }
++
++            SpvInstruction fp32 = context.TypeFP32();
++            SpvInstruction variable = Declarations.GetFloatStorageBuffer(context, binding.Value);
++            SpvInstruction field = context.Get(AggregateType.S32, operation.GetSource(1));
++            SpvInstruction word = context.Get(AggregateType.S32, operation.GetSource(2));
++            SpvInstruction pointer = context.AccessChain(context.TypePointer(StorageClass.Uniform, fp32), variable, field, word);
++            SpvInstruction value = context.GetFP32(operation.GetSource(3));
++
++            SpvInstruction one = context.Constant(context.TypeU32(), 1);
++            SpvInstruction zero = context.Constant(context.TypeU32(), 0);
++
++            return new OperationResult(AggregateType.FP32, context.AtomicFAddEXT(fp32, pointer, one, zero, value));
++        }
++
+         private static OperationResult GenerateAtomicAnd(CodeGenContext context, AstOperation operation)
+         {
+             return GenerateAtomicMemoryBinary(context, operation, context.Delegates.AtomicAnd);
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -356,6 +356,18 @@
+         {
+             return false;
+         }
++
++        /// <summary>
++        /// NX2NAVI: queries whether the host adds 32-bit floats in storage buffers atomically (VK_EXT_shader_atomic_float,
++        /// shaderBufferFloat32AtomicAdd). The float atomic add (RED/ATOM .F32.FTZ.RN) then stays one instruction
++        /// (CodeGen/Spirv/Instructions.cs GenerateAtomicFloatAdd); otherwise it becomes a compare-and-swap loop
++        /// (Translation/Optimizations/GlobalToStorage.cs TryGenerateStorageOp).
++        /// </summary>
++        bool QueryHostSupportsFloat32AtomicAdd()
++        {
++            return false;
++        }
++
+         bool QueryHostSupportsShaderNonUniformIndexing()
+         {
+             return false;
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -75,11 +75,15 @@
+             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
+             private readonly HelperFunctionManager _hfm;
+ 
+-            public GtsContext(HelperFunctionManager hfm)
++            // NX2NAVI: the host adds floats in storage buffers atomically (IGpuAccessor.QueryHostSupportsFloat32AtomicAdd)
++            public readonly bool NativeFloatAtomicAdd;
++
++            public GtsContext(HelperFunctionManager hfm, bool nativeFloatAtomicAdd)
+             {
+                 _entries = [];
+                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
+                 _hfm = hfm;
++                NativeFloatAtomicAdd = nativeFloatAtomicAdd;
+             }
+ 
+             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
+@@ -247,7 +251,7 @@
+             IGpuAccessor gpuAccessor,
+             TargetLanguage targetLanguage)
+         {
+-            GtsContext gtsContext = new(hfm);
++            GtsContext gtsContext = new(hfm, gpuAccessor.QueryHostSupportsFloat32AtomicAdd());
+ 
+             foreach (BasicBlock block in blocks)
+             {
+@@ -456,7 +460,7 @@
+                     offset = newOffset;
+                 }
+ 
+-                if (CanUseInlineStorageOp(operation, targetLanguage))
++                if (CanUseInlineStorageOp(operation, targetLanguage, gtsContext.NativeFloatAtomicAdd))
+                 {
+                     return GenerateInlineStorageOp(resourceManager, node, operation, offset, result);
+                 }
+@@ -499,18 +503,19 @@
+             }
+         }
+ 
+-        private static bool CanUseInlineStorageOp(Operation operation, TargetLanguage targetLanguage)
++        private static bool CanUseInlineStorageOp(Operation operation, TargetLanguage targetLanguage, bool nativeFloatAtomicAdd)
+         {
+             if (operation.StorageKind != StorageKind.GlobalMemory)
+             {
+                 return false;
+             }
+ 
+-            // NX2NAVI: a float atomic add has no inline form (the SPIR-V backend only adds integers): it takes the
+-            // helper path, whose TryGenerateStorageOp writes a compare-and-swap loop
++            // NX2NAVI: a float atomic add is inline where the host adds floats atomically; elsewhere it has no inline form
++            // (the SPIR-V backend only adds integers) and takes the helper path, whose TryGenerateStorageOp writes a
++            // compare-and-swap loop
+             if (operation.Inst == (Instruction.AtomicAdd | Instruction.FP32))
+             {
+-                return false;
++                return nativeFloatAtomicAdd;
+             }
+ 
+             return (operation.Inst != Instruction.AtomicMaxS32 &&
+@@ -660,6 +665,7 @@
+             if (!TryGenerateStorageOp(
+                 resourceManager,
+                 targetLanguage,
++                gtsContext.NativeFloatAtomicAdd,
+                 context,
+                 operation.Inst,
+                 operation.StorageKind,
+@@ -862,6 +868,7 @@
+                 if (!TryGenerateStorageOp(
+                     resourceManager,
+                     targetLanguage,
++                    gtsContext.NativeFloatAtomicAdd,
+                     context,
+                     operation.Inst,
+                     operation.StorageKind,
+@@ -1084,6 +1091,7 @@
+         private static bool TryGenerateStorageOp(
+             ResourceManager resourceManager,
+             TargetLanguage targetLanguage,
++            bool nativeFloatAtomicAdd,
+             EmitterContext context,
+             Instruction inst,
+             StorageKind storageKind,
+@@ -1116,12 +1124,27 @@
+                         resultValue = context.AtomicAdd(StorageKind.StorageBuffer, binding, Const(0), wordOffset, value);
+                         break;
+                     case Instruction.AtomicAdd | Instruction.FP32:
+-                        // NX2NAVI: the word is read, the float sum swapped in if the word is still the one read,
+-                        // and the loop repeats otherwise (InstEmitMemory EmitAtomicOp marks these)
+-                        resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                        if (nativeFloatAtomicAdd)
+                         {
+-                            return context.FPAdd(memValue, value);
+-                        });
++                            // NX2NAVI: one atomic float add on the word (CodeGen/Spirv/Instructions.cs GenerateAtomicFloatAdd)
++                            resultValue = context.Add(
++                                Instruction.AtomicAdd | Instruction.FP32,
++                                StorageKind.StorageBuffer,
++                                Local(),
++                                Const(binding),
++                                Const(0),
++                                wordOffset,
++                                value);
++                        }
++                        else
++                        {
++                            // NX2NAVI: the word is read, the float sum swapped in if the word is still the one read,
++                            // and the loop repeats otherwise (InstEmitMemory EmitAtomicOp marks these)
++                            resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                            {
++                                return context.FPAdd(memValue, value);
++                            });
++                        }
+ 
+                         break;
+                     case Instruction.AtomicAnd:

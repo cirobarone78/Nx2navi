@@ -12,7 +12,7 @@
 //          "topo", "payload", "task"} (stage "ts" / "ms": an NVN2 task or mesh program, AmpereLowering.MeshInfo),
 //          "tex": {slot: type}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool, "zero_locals": bool,
-//          "sbuf_align": int, "subgroup": int }
+//          "float_atomic_add": bool, "sbuf_align": int, "subgroup": int }
 //   Output: <out>/<key>.spv and <out>/<key>.res.json (bindings, queried slots, notes).
 using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
@@ -132,6 +132,10 @@ static class SwshXlate
         // The runtime binds the device address table (runtime/vk_gpa.c) when the device has buffer device addresses:
         // global accesses the translator finds no storage buffer for go through it (patch 0030).
         public bool QueryHostSupportsBufferDeviceAddress() => _job["bda"] is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
+        // "float_atomic_add": true: the device adds floats in storage buffers atomically (VK_EXT_shader_atomic_float,
+        // runtime/vk_device.c): a float atomic add (RED/ATOM .F32.FTZ.RN) stays one OpAtomicFAddEXT (patch 0039) instead of
+        // the compare-and-swap loop of patches 0023 and 0033.
+        public bool QueryHostSupportsFloat32AtomicAdd() => _job["float_atomic_add"] is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
         public bool QueryHostSupportsTextureShadowLod() => true;
         // Sub-texel precision bits of a host whose gathers round differently from Maxwell (AMD, Intel): the translator then
         // biases gather coordinates so the same texels are picked (TexturePass.InsertCoordGatherBias). 0: no bias.

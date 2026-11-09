@@ -63,6 +63,7 @@ typedef struct {
     int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
     int amd_llpc;                      // AMD's own driver for RDNA 3 and newer (its driverInfo names LLPC)
     int mesa;                          // a Mesa driver the game runs on: RADV, ANV or NVK
+    int float_atomic_add;              // shaderBufferFloat32AtomicAdd enabled: shaders add floats in storage buffers atomically
 } VkCaps;
 extern VkCaps vk_caps;
 void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, amd_llpc, mesa
@@ -71,6 +72,10 @@ void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (
 // 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
 int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
                 const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p);
+// Before vkCreateDevice, with the driver's VK_EXT_shader_atomic_float features (NULL: the extension is absent or
+// NX2NAVI_VK_FLOAT_ATOMICS=0 leaves it off): sets vk_caps.float_atomic_add and leaves enabled only the storage buffer
+// add feature.
+void vk_caps_float_atomics(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT *f);
 void vk_caps_init(VkCtx *c);                          // after it: pretend limits, fallbacks, the boot report
 
 VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded

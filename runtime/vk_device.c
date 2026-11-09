@@ -299,6 +299,7 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT saf;
 } FeatureChain;
 
 static int create_device(void) {
@@ -362,6 +363,14 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
+    // Float adds in storage buffers as one atomic (translator patch 0039, vk_caps.c vk_caps_float_atomics).
+    // NX2NAVI_VK_FLOAT_ATOMICS=0 leaves the extension off, not only its feature.
+    int has_saf = 0;
+    if (cfg_bool("NX2NAVI_VK_FLOAT_ATOMICS") && has_ext(ep, ne, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+        has_saf = 1;
+        ext[n_ext++] = VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME;
+        CHAIN(saf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT);
+    }
     vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the eight below
     // FSR 3.1 (vk_ffx.cpp): its Vulkan back end looks vkGetBufferMemoryRequirements2KHR up by that name, which resolves
     // only with the extension enabled (the core function has no suffix); without it the back end called address 0.
@@ -410,6 +419,7 @@ static int create_device(void) {
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
+    vk_caps_float_atomics(has_saf ? &c->saf : NULL);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};

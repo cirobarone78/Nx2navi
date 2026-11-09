@@ -63,7 +63,7 @@ static const char *const known[] = {
     "SHOTS_FULL", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_IDLE", "SPLIT_IN_PASS", "SPLIT_US", "SPV_MARK_TEST", "SPV_OVERRIDE", "STICK_DEADZONE", "STICK_SENS",
     "SWKBD_ANSWER",
     "SET_AT", "SWKBD_TEST", "TAA", "TEST_PAD", "TEST_PAD_AT", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_DISUSE", "TEX_GEN_UNDO", "TEX_MEMO", "TEX_VRAM_PRESSURE", "TEX_RELEASED_MB", "TEX_REUSE", "TEX_COMMIT_FREE_MB", "TEX_PROC_COMMIT_MB", "TEX_EVICT", "TEX_COMMIT_EVICT", "MIRROR_EVICT", "VRAM_BUDGET_MB", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "EVO_TRACE", "EVENT_AT_SYNC", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NAN_PRESERVE", "VK_NOOPT", "VK_NO_FLOAT64",
-    "VK_PRESENT", "VK_RECONVERGE", "VK_NAN_BITS", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
+    "VK_FLOAT_ATOMICS", "VK_PRESENT", "VK_RECONVERGE", "VK_NAN_BITS", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
     "WALK_KEY", "WALK_SCALE", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WB_NO_REUP", "WB_MERGE_MAX", "WB_PROBE", "WB_SPLIT", "WB_LAZY", "WB_LAZY_TOUCH", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
     "ZSTD_CHECK", "ZSTD_NATIVE",
     "BIND_REUSE", "DYN_DELTA", "STG_ARENA", "SUBMIT_BATCH", "ASTC_GPU_DESWIZZLE", "ASTC_SCRATCH_KEEP", "ASTC_ARENA",
@@ -122,7 +122,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"BIND_SKIP", "performance"}, {"SHADER_CACHE_FLUSH", "performance"}, {"SHADER_CARRY", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
     {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_IDLE", "performance"}, {"SPLIT_IN_PASS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
     {"VK_DYN_VERTEX", "performance"}, {"VK_DYN_A2C", "performance"}, {"VK_SUBGROUP_PIN", "performance"}, {"VK_RECONVERGE", "performance"},
-    {"VK_NAN_PRESERVE", "performance"}, {"VK_NAN_BITS", "performance"},
+    {"VK_FLOAT_ATOMICS", "performance"}, {"VK_NAN_PRESERVE", "performance"}, {"VK_NAN_BITS", "performance"},
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"PASS_CRUMBS", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
     {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"MEM_CENSUS", "diagnostics"}, {"WB_NO_REUP", "diagnostics"}, {"WB_PROBE", "diagnostics"}, {"WB_SPLIT", "performance"}, {"SHADOW_BULK_WRITE", "performance"}, {"WB_LAZY", "performance"}, {"WB_LAZY_TOUCH", "diagnostics"}, {"FLUSH_UPLOAD", "diagnostics"}, {"GPA_TWIN_MAX_KB", "diagnostics"},
     {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"},
@@ -259,6 +259,7 @@ static const CfgMeta metas[] = {
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
     {"VK_DYN_A2C", "", "0|1", RESTART}, {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
     {"VK_RECONVERGE", "1", "0|1", RESTART},   // vk_pipeline.c spirv_reconverge
+    {"VK_FLOAT_ATOMICS", "1", "0|1", RESTART},   // vk_caps.c vk_caps_float_atomics: shaders add floats in storage buffers atomically
     {"VK_NAN_PRESERVE", "", "0|1", RESTART},   // vk_pipeline.c spirv_nan_preserve; unset: every driver but NVIDIA's
     {"VK_NAN_BITS", "", "0|1", RESTART},   // vk_pipeline.c spirv_nan_bits; unset: AMD's driver for RDNA 1 and 2
     {"VK_NOOPT", "0", "0|1", RESTART},   // vk_pipeline.c noopt_flag

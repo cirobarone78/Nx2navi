@@ -271,6 +271,9 @@
 # Keep a shader's threads together after divergent code where the game's shaders expect it (maximal reconvergence,
 # when the driver supports it). 0 turns it off; leaves then go missing from the foliage's colour pass.
 # vk_reconverge = 1
+# Add floats in the game's shader accumulators with one atomic instruction where the GPU has VK_EXT_shader_atomic_float.
+# 0 keeps the compare-and-swap loop that GPUs without it use. The first start after a change translates the shaders again.
+# vk_float_atomics = 1
 # Ask the GPU driver to keep NaN, infinity and signed zero in the game's shader maths as the Switch does, 0 or 1.
 # Without it a driver may assume they never occur. The AMD symptoms it is for: Navi drawn without her orb (only her
 # sparkles), black and white blocks on her and on Link, shadows blown up. Default: on, except on NVIDIA's driver,

@@ -10,7 +10,11 @@
 //   - no 32-lane pin (no subgroupSizeControl, 32 outside min..max, or NX2NAVI_VK_SUBGROUP_PIN=0): stages run at the
 //     device's subgroupSize (SPIR-V 1.3 without a required size) and the translator is told that size.
 //     NX2NAVI_VK_SUBGROUP=<n> pins n instead of 32 where the driver allows it.
-// The defaults (Float64, no storage rounding, 32 everywhere) leave the shader cache keys as they were (gfx_shader.c).
+//   - no shaderBufferFloat32AtomicAdd (VK_EXT_shader_atomic_float; NX2NAVI_VK_FLOAT_ATOMICS=0 turns it off): the
+//     translator adds floats in storage buffers (the guest's RED/ATOM .F32 adds) with a compare-and-swap loop instead of
+//     one OpAtomicFAddEXT.
+// The defaults (Float64, atomic float add, no storage rounding, 32 everywhere) leave the shader cache keys as they were
+// (gfx_shader.c).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +28,7 @@
 VkCaps vk_caps = {.float64 = 1, .sg_size = 32};
 static int f64_supported;
 static VkBool32 gpl_lib, gpl_fast;   // the driver's graphicsPipelineLibrary (feature), ...FastLinking (property)
+static VkBool32 fa_buffer;   // the driver's shaderBufferFloat32AtomicAdd; asked for only while the setting is on
 
 static uint32_t env_u32(const char *name, uint32_t def) {
     const char *e = cfg_get(name);
@@ -62,6 +67,19 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
     const char *e = cfg_get("NX2NAVI_GPL");
     vk_caps.gpl = gpl_lib && gpl_fast && !(e && !strcmp(e, "0"));
     return vk_caps.gpl;
+}
+
+// The guest adds floats in storage buffers with RED/ATOM .F32 (tools/xlate/patches/0039): one OpAtomicFAddEXT where the
+// device has shaderBufferFloat32AtomicAdd, else the compare-and-swap loop of patches 0023 and 0033. Of the extension's
+// features only that one stays on: it is the one the translator uses. vk_device.c asks for the extension only while
+// NX2NAVI_VK_FLOAT_ATOMICS is on, so 0 keeps the loop and leaves the extension off as well.
+void vk_caps_float_atomics(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT *f) {
+    if (!f) return;
+    fa_buffer = f->shaderBufferFloat32AtomicAdd;
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT use = {.sType = f->sType, .pNext = f->pNext,
+                                                        .shaderBufferFloat32AtomicAdd = fa_buffer};
+    *f = use;
+    vk_caps.float_atomic_add = fa_buffer;
 }
 
 static int has_ext(const VkExtensionProperties *ep, uint32_t n, const char *name) {
@@ -127,7 +145,8 @@ void vk_caps_init(VkCtx *c) {
     // with one setting serve the other. NX2NAVI_ZERO_LOCALS=0 turns it off.
     uint32_t zero_locals = env_u32("NX2NAVI_ZERO_LOCALS", 1);
     // bda: global accesses the translator finds no storage buffer for go through the device address table (vk_gpa.c)
-    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, zero_locals != 0, vk_gpa_wanted_ctx(c));
+    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, zero_locals != 0, vk_gpa_wanted_ctx(c),
+                        vk_caps.float_atomic_add);
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (NX2NAVI_GATHER_BIAS)", gather);
 
     char dv[32];
@@ -152,6 +171,10 @@ void vk_caps_init(VkCtx *c) {
            has_ext(ep, ne, "VK_EXT_graphics_pipeline_library"), depth_ok(p, VK_FORMAT_D16_UNORM),
            depth_ok(p, VK_FORMAT_D24_UNORM_S8_UINT), depth_ok(p, VK_FORMAT_X8_D24_UNORM_PACK32), depth_ok(p, VK_FORMAT_D32_SFLOAT),
            depth_ok(p, VK_FORMAT_D32_SFLOAT_S8_UINT));
+    rt_log("vk caps: float atomic add: storage buffers %s (VK_EXT_shader_atomic_float %d, %s)",
+           vk_caps.float_atomic_add ? "native" : "compare-and-swap loop", has_ext(ep, ne, "VK_EXT_shader_atomic_float"),
+           !cfg_bool("NX2NAVI_VK_FLOAT_ATOMICS") ? "left off by NX2NAVI_VK_FLOAT_ATOMICS=0"
+           : fa_buffer ? "shaderBufferFloat32AtomicAdd 1" : "shaderBufferFloat32AtomicAdd 0");
     rt_log("vk caps: gpl %s fast-link %s (graphicsPipelineLibrary %u%s)", vk_caps.gpl ? "yes" : "no",
            gpl_fast ? "yes" : "no", (unsigned)gpl_lib, !gpl_lib || !gpl_fast || vk_caps.gpl ? "" : ", off by NX2NAVI_GPL=0");
     rt_log("vk caps: fallbacks: float64 %s, storage buffers %s %u, subgroup pin %u on stages %#x, translator subgroup vs/fs/cs %u/%u/%u",
