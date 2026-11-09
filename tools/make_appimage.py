@@ -2,12 +2,15 @@
 player's PC from their own dump with tools/make_game.py, as NX2navi-Setup.exe does on Windows.
 
     python3 tools/make_appimage.py --python <standalone CPython 3.14> --appimagetool <appimagetool> [--out dist]
+                                   [--dlss libnvidia-ngx-dlss.so.<version> | --no-dlss]
 
 The AppImage holds no game files: the kit's tools/, recomp/, runtime/ and docs, the shader translator built by
-tools/build_xlate.py (bin/nx2navi_xlate), the pinned Vulkan Memory Allocator header, and a relocatable CPython 3.14
-(python-build-standalone, as `uv python install 3.14` puts in ~/.local/share/uv/python) with numpy, lz4, zstandard and
-fonttools. zbic, the GPL package that unpacks the game's program files, is not bundled: the AppImage installs it with
-pip into ~/.local/share/nx2navi/pydeps the first time it runs, as the Windows launcher downloads it.
+tools/build_xlate.py (bin/nx2navi_xlate), NVIDIA's DLSS library with its notice (bin/, tools/dlss_pin.py: downloaded
+from NVIDIA's DLSS SDK repository and checked, or --dlss; not with --no-dlss), the pinned Vulkan Memory Allocator
+header, and a relocatable CPython 3.14 (python-build-standalone, as `uv python install 3.14` puts in
+~/.local/share/uv/python) with numpy, lz4, zstandard and fonttools. zbic, the GPL package that unpacks the game's
+program files, is not bundled: the AppImage installs it with pip into ~/.local/share/nx2navi/pydeps the first time it
+runs, as the Windows launcher downloads it.
 
 The compiler and the libraries come from the system (README-BuildKit.md, "Linux"): the AppImage checks for clang,
 clang++, lld and the headers before it starts, and names the packages for Arch, Fedora and Debian/Ubuntu.
@@ -131,6 +134,9 @@ def main():
     ap.add_argument('--python', type=Path, required=True,
                     help='a relocatable CPython 3.14 folder (python-build-standalone, ~/.local/share/uv/python/cpython-3.14*)')
     ap.add_argument('--appimagetool', type=Path, required=True, help='appimagetool-x86_64.AppImage')
+    ap.add_argument('--dlss', type=Path, help="NVIDIA's libnvidia-ngx-dlss.so.<version> from disk instead of "
+                                               "downloading it from NVIDIA's DLSS SDK repository")
+    ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the AppImage')
     ap.add_argument('--out', type=Path, default=ROOT / 'dist', help='where the AppImage goes (default dist/)')
     a = ap.parse_args()
 
@@ -140,12 +146,14 @@ def main():
                  a.python / 'bin' / 'python3'):
         if not need.exists():
             sys.exit(f'{need} is missing (tools/build_xlate.py builds the translator; tools/build_game.py fetches VMA)')
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import dlss_pin
+    dlss = None if a.no_dlss else dlss_pin.resolve(a.dlss, ROOT / 'build' / 'dl', linux=True)
 
     app = ROOT / 'build' / 'appimage' / 'NX2navi.AppDir'
     shutil.rmtree(app, ignore_errors=True)
     kit = app / 'usr' / 'kit'
     kit.mkdir(parents=True)
-    sys.path.insert(0, str(ROOT / 'tools'))
     import build_shaders
     build_shaders.build(ROOT / 'runtime')   # the image carries the runtime's shaders compiled (runtime/*_spv.h)
     for d in KIT_DIRS:
@@ -158,6 +166,8 @@ def main():
     (kit / 'bin').mkdir()
     for f in ('nx2navi_xlate', 'nx2navi_xlate.id'):
         shutil.copy2(xlate / f, kit / 'bin' / f)
+    if dlss:   # DLSS: NGX loads it from beside the game (runtime/vk_dlaa.c); make_game.py copies it there
+        dlss_pin.place(dlss, kit / 'bin', linux=True)
     (kit / 'toolchain' / 'vma').mkdir(parents=True)
     shutil.copy2(ROOT / 'toolchain' / 'vma' / 'vk_mem_alloc.h', kit / 'toolchain' / 'vma' / 'vk_mem_alloc.h')
 

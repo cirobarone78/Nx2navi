@@ -554,6 +554,9 @@ def copy_if_changed(src, dst):
 
 
 DLSS_DLL, DLSS_NOTICE = 'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt'   # tools/dlss_pin.py, in the kit's bin/
+# The Linux library's name ends in the DLSS version (tools/dlss_pin.py): it is found by its prefix, as the runtime
+# finds it beside the game (runtime/resolution.c dlss_dll).
+DLSS_SO_PREFIX, DLSS_SO_NOTICE = 'libnvidia-ngx-dlss.so.', 'libnvidia-ngx-dlss-NOTICE.txt'
 # DLSS Frame Generation (runtime/vk_dlssg.c) loads these from beside the game: nx2navi_dlssg.dll (runtime/dlssg/,
 # tools/build_dlssg.py), NVIDIA Streamline's interposer and the plugins it uses, and NGX's frame generation library.
 # A release carries them with their licence texts in bin/dlssg/ (tools/make_launcher.py --dlssg); without the whole set
@@ -564,7 +567,7 @@ DLSSG_FILES = ('nx2navi_dlssg.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dl
 
 
 def notice_sha256(path):
-    """The sha256 line of a DLSS notice: the DLL a kit placed beside the game."""
+    """The sha256 line of a DLSS notice: the library a kit placed beside the game."""
     try:
         for line in path.read_text(encoding='utf-8').splitlines():
             if line.startswith('sha256 '):
@@ -574,22 +577,35 @@ def notice_sha256(path):
     return None
 
 
-def place_dlss(out):
+def dlss_files(folder, linux):
+    """The DLSS libraries in folder, by name: nvngx_dlss.dll, or on Linux every libnvidia-ngx-dlss.so.<version>."""
+    return sorted(p for p in folder.glob(DLSS_SO_PREFIX + '*' if linux else DLSS_DLL) if p.is_file())
+
+
+def place_dlss(out, linux=False):
     """NVIDIA's DLSS library from the kit's bin/ beside the game, where NGX loads it (runtime/vk_dlaa.c), with its
-    notice. A different nvngx_dlss.dll the player put there (another DLSS version) is kept; the one an earlier build
-    placed, named by the notice beside it, is replaced. Returns a line for the build's log when it kept the player's."""
-    src, dst, note = KIT / 'bin' / DLSS_DLL, out / DLSS_DLL, KIT / 'bin' / DLSS_NOTICE
-    if not src.is_file():
+    notice. A different library the player put there (another DLSS version) is kept; the one an earlier build placed,
+    named by the notice beside it, is replaced. linux: the Linux library, whose name carries the DLSS version, so a
+    kit with another version replaces the earlier build's file under its old name. Returns a line for the build's
+    log when it kept the player's."""
+    note_name = DLSS_SO_NOTICE if linux else DLSS_NOTICE
+    srcs, note = dlss_files(KIT / 'bin', linux), KIT / 'bin' / note_name
+    if not srcs:
         return None
-    if dst.is_file():
+    src = srcs[-1]
+    beside = dlss_files(out, linux)
+    for dst in beside:
         s, d = os.stat(src), os.stat(dst)
-        if d.st_size != s.st_size or int(d.st_mtime) != int(s.st_mtime):
+        if dst.name != src.name or d.st_size != s.st_size or int(d.st_mtime) != int(s.st_mtime):
             have = sha256_file(dst)
-            if have != notice_sha256(out / DLSS_NOTICE) and have != sha256_file(src):
-                return f"{DLSS_DLL} kept: the one already beside the game is not the kit's (another DLSS version)"
-    copy_if_changed(src, dst)
-    if note.is_file() and (not (out / DLSS_NOTICE).is_file() or (out / DLSS_NOTICE).read_bytes() != note.read_bytes()):
-        shutil.copy2(note, out / DLSS_NOTICE)   # by content: two versions' notices can share size and second
+            if have != notice_sha256(out / note_name) and have != sha256_file(src):
+                return f"{dst.name} kept: the one already beside the game is not the kit's (another DLSS version)"
+    copy_if_changed(src, out / src.name)
+    for dst in beside:
+        if not dst.samefile(out / src.name):   # another version's library, placed by an earlier build: replaced
+            dst.unlink()
+    if note.is_file() and (not (out / note_name).is_file() or (out / note_name).read_bytes() != note.read_bytes()):
+        shutil.copy2(note, out / note_name)   # by content: two versions' notices can share size and second
     return None
 
 
@@ -1323,7 +1339,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         copy_if_changed(xlate / name, out / name)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
-    kept = place_dlss(out) if WIN else None   # NVIDIA DLSS (runtime/vk_dlaa.c): its library is a Windows DLL
+    kept = place_dlss(out, linux=not WIN)   # NVIDIA DLSS (runtime/vk_dlaa.c): this platform's library from the kit
     if kept:
         say(f'  {kept}')
     if WIN and place_dlssg(out):   # DLSS Frame Generation (runtime/vk_dlssg.c): Windows DLLs too
