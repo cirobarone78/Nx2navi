@@ -552,6 +552,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
+                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
+    [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
+    [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
+    [UI_MENU_FRAMEGEN_NEEDS_DLSS] = "choose a DLSS mode under Upscaling first",
+    [UI_MENU_FRAMEGEN_DESC_NONE] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1, and neither runs "
+                                   "here.",
+    [UI_MENU_FRAMEGEN_NEEDS_NONE] = "needs DLSS or FSR 3.1, which do not run here",
     [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "

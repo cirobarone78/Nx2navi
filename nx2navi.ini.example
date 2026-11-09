@@ -371,12 +371,12 @@
 # The game's own FXAA after the post effects; with DLAA on it is not needed. Changes while the game runs take effect at
 # once.
 # fxaa = 1
-# Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU: one generated frame between every two the game draws, the HUD
-# kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX 40 and 50 GPUs, paced with Reflex; it needs
-# nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable, which the setup puts there). Both need DLSS or
-# FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit counts the frames on screen, generated ones
-# included: the game draws the limit divided by the multiplier (2 for fsr3). With fps_limit unset it is the display's
-# rate.
+# Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU where amd_fidelityfx_vk.dll loads, so not on Linux: one generated
+# frame between every two the game draws, the HUD kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX
+# 40 and 50 GPUs, paced with Reflex; it needs nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable,
+# which the setup puts there). Both need DLSS or FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit
+# counts the frames on screen, generated ones included: the game draws the limit divided by the multiplier (2 for fsr3).
+# With fps_limit unset it is the display's rate.
 # fsr3 takes effect at once, dlss (on or off) at the next start.
 # framegen = off
 # DLSS frame generation's multiplier: the frames on screen for each frame the game draws, 2, 3 or 4 (one, two or three

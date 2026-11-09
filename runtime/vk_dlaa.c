@@ -138,7 +138,9 @@ int vk_dlaa_wanted(void) {
 // inputs. The DLSS mode setting (NX2NAVI_DLSS) is the render scale for both.
 static int fsr3(void) { return !N.ngx_up && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3"); }
 static int fsr_frame;   // fsr3() as vk_dlaa_init and then vk_dlaa_frame read it: the upscaler this frame runs with
-int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3(); }
+// FSR 3.1 is the upscaler and its library loads (vk_ffx_available): widescreen.c shrinks the scene only for an upscaler
+// that runs.
+int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3() && vk_ffx_available(); }
 
 // The upscaler the menu has set cannot start in this run: DLSS when NGX was never tried (a device made without its
 // extensions), FSR 3.1 while NGX is up and serves the run. A DLSS this PC could not bring up is not waiting for a restart.
@@ -306,7 +308,7 @@ void vk_dlaa_init(void) {
     if (vk_dlaa_wanted() && fsr3()) {
         fsr_frame = 1;
         N.available = vk_ffx_load();
-        rt_log("dlaa: the temporal upscaler is AMD FSR 3.1%s", N.available ? "" : ", which is missing: the game's own scaling");
+        rt_log("dlaa: the temporal upscaler is AMD FSR 3.1%s", N.available ? "" : ", which is not available: the game's own scaling");
         return;
     }
     if (!vk_dlaa_wanted() || !core_load()) return;

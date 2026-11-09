@@ -67,6 +67,8 @@ int vk_hdr_wanted(void);
 int vk_hdr_active(void);
 int vk_hdr_needs_restart(void);
 int vk_dlaa_needs_restart(void);
+int vk_ffx_available(void);             // vk_ffx.cpp: FSR 3.1 upscaling can run (asked without loading the library)
+int vk_ffx_framegen_available(void);    // ... and FSR 3.1 frame generation
 double frame_step_limit_hz(void);
 int frame_limit_follows_display(void);
 int frame_limit_adjustable(void);
@@ -798,14 +800,15 @@ static bool dlss_offered(void) {
 // (DLSS or FSR 3.1 on) with NX2NAVI_TAA (which of them) and NX2NAVI_DLSS (the mode, the render scale: widescreen.c
 // wide_present). A temporal mode fits the picture with bilinear, the upscaler having made it; DLSS's model is NVIDIA's own
 // for the mode (vk_dlaa.c evaluate, dlss_preset at its default). The list: bilinear, FSR 1, the DLSS modes where DLSS
-// runs (dlss_offered), the FSR 3.1 modes; a DLSS mode still set where DLSS does not run stays listed last until another
-// choice replaces it, so the row shows what is set.
+// runs (dlss_offered), the FSR 3.1 modes where FSR 3.1 loads (vk_ffx_available); a DLSS or FSR 3.1 mode still set where
+// it does not run stays listed last until another choice replaces it, so the row shows what is set.
 // The Upscaling row's name of what is set now, for the performance overlay.
 static void upscaling_name(char *out, size_t size) {
     static const char *const modes[] = {"dlaa", "quality", "balanced", "performance", "ultra_performance"};
     static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     static const UiTextId fsr3[] = {UI_MENU_FSR3_NATIVE, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
-    if (!cfg_bool("NX2NAVI_DLAA")) {
+    // FSR 3.1 set where it cannot load runs nothing (vk_dlaa.c vk_dlaa_fsr3): the game scales the picture as the rest says
+    if (!cfg_bool("NX2NAVI_DLAA") || (!strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") && !vk_ffx_available())) {
         if (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr")) snprintf(out, size, "%s", menu_text(UI_MENU_UPSCALER_BILINEAR));
         else snprintf(out, size, menu_text(UI_MENU_OV_FMT_FSR), cfg_int("NX2NAVI_SHARPNESS"));
         return;
@@ -849,18 +852,23 @@ static void row_upscaling(void) {
         for (int i = 0; i < 5; i++)
             if (!strcmp(cfg_value("NX2NAVI_DLSS"), modes[i])) now.mode = i;
     }
-    const bool dlss = dlss_offered();
+    const bool dlss = dlss_offered(), fsr = vk_ffx_available();
     add(BILINEAR, 0);
     add(FSR1, 0);
     for (int i = 0; dlss && i < 5; i++) add(DLSS, i);
-    for (int i = 0; i < 5; i++) add(FSR3, i);
+    for (int i = 0; fsr && i < 5; i++) add(FSR3, i);
     if (!dlss && now.kind == DLSS) add(DLSS, now.mode);
+    if (!fsr && now.kind == FSR3) add(FSR3, now.mode);
     int cur = 0;
     for (int i = 0; i < n; i++)
         if (list[i].kind == now.kind && list[i].mode == now.mode) cur = i;
+    // FSR 3.1 still set where it cannot load: nothing upscales, so the row says so under its value
+    const char *note = nullptr;
+    if (!fsr && now.kind == FSR3) note = menu_text(UI_MENU_FSR3_OFF);
+    else if (dlss && vk_dlaa_needs_restart()) note = menu_text(UI_MENU_AFTER_RESTART);
     int nv = opt_choice_index("NX2NAVI_UPSCALER", UI_MENU_UPSCALING, names, n, cur, 1,
-                              dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
-                              dlss && vk_dlaa_needs_restart() ? menu_text(UI_MENU_AFTER_RESTART) : nullptr);
+                              !fsr ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
+                              note);
     if (nv < 0 || nv >= n) return;
     const Entry e = list[nv];
     opt_apply("NX2NAVI_UPSCALER", e.kind == FSR1 ? "fsr" : "bilinear");
@@ -935,25 +943,41 @@ static void row_framegen_mult(bool restart) {
 
 // Frame generation (vk_fg.cpp, at once; NVIDIA's after a restart); it needs a temporal upscaler's motion vectors
 static void row_framegen(void) {
-    // the generated frames are made from DLSS's or FSR 3.1's motion vectors: without one of them it would do nothing
-    const bool dlss = dlss_offered(), upscaled = cfg_bool("NX2NAVI_DLAA");
-    if (!upscaled) opt_disable_next(dlss ? UI_MENU_FRAMEGEN_NEEDS : UI_MENU_FRAMEGEN_NEEDS_FSR);
-    static const char *const values[] = {"off", "fsr3", "dlss"};
-    const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "AMD FSR 3.1", "NVIDIA DLSS"};
+    // the generated frames are made from DLSS's or FSR 3.1's motion vectors: without one of them it would do nothing,
+    // and FSR 3.1 set where it cannot load (vk_ffx_available) is none
+    const bool dlss = dlss_offered(), fsr = vk_ffx_framegen_available();
+    const bool upscaled = cfg_bool("NX2NAVI_DLAA") && (strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") || vk_ffx_available());
     const char *v = cfg_value("NX2NAVI_FRAMEGEN");
     int cur = !strcmp(v, "fsr3") ? 1 : !strcmp(v, "dlss") ? 2 : 0;
-    // NVIDIA DLSS (vk_dlssg.c, through Streamline and nx2navi_dlssg.dll) is listed on NVIDIA GPUs now that Reflex paces it
-    // from the frame's start and generated frames are presented; elsewhere only while it is set
-    int n = dlss || cur == 2 ? 3 : 2;
+    // what the texts promise follows what runs here: DLSS's frame generation, AMD's, both or neither
+    const UiTextId desc = dlss ? (fsr ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_DLSS)
+                               : (fsr ? UI_MENU_FRAMEGEN_DESC_FSR : UI_MENU_FRAMEGEN_DESC_NONE);
+    UiTextId note = dlss ? (fsr ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_DLSS)
+                         : (fsr ? UI_MENU_FRAMEGEN_NOTE_FSR : UI_MENU_FRAMEGEN_NOTE);   // neither: the general note
+    if (!dlss && !fsr && cur == 0) opt_disable_next(UI_MENU_FRAMEGEN_NEEDS_NONE);
+    else if (!upscaled) opt_disable_next(dlss ? (fsr ? UI_MENU_FRAMEGEN_NEEDS : UI_MENU_FRAMEGEN_NEEDS_DLSS)
+                                              : (fsr ? UI_MENU_FRAMEGEN_NEEDS_FSR : UI_MENU_FRAMEGEN_NEEDS_NONE));
+    // Off, AMD's where FSR 3.1 loads and NVIDIA DLSS (vk_dlssg.c, through Streamline and nx2navi_dlssg.dll) on NVIDIA GPUs,
+    // now that Reflex paces it from the frame's start and generated frames are presented; elsewhere one stays listed
+    // while it is set
+    static const char *const all_values[] = {"off", "fsr3", "dlss"};
+    const char *all_names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "AMD FSR 3.1", "NVIDIA DLSS"};
+    const char *values[3], *names[3];
+    int n = 0, at = 0;
+    for (int i = 0; i < 3; i++) {
+        if ((i == 1 && !fsr && cur != 1) || (i == 2 && !dlss && cur != 2)) continue;
+        if (i == cur) at = n;
+        values[n] = all_values[i], names[n++] = all_names[i];
+    }
     // AMD's follows the setting; NVIDIA's is set up with the device, so only a change to or from it waits for a restart
     const bool restart = dlss && (cur == 2) != (vk_dlssg_wanted() != 0);
-    UiTextId note = restart ? UI_MENU_AFTER_RESTART : dlss ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_FSR;
+    if (restart) note = UI_MENU_AFTER_RESTART;
+    else if (cur == 1 && !fsr) note = UI_MENU_FSR3_OFF;   // set where it cannot load: "in use: off" and why
     // NVIDIA's set since the start but not running: "in use: off" and why (vk_dlssg_status; the log has the details)
     const int st = cur == 2 && !restart ? vk_dlssg_status() : DLSSG_RUNS;
     if (st == DLSSG_NO_GPU) note = UI_MENU_FRAMEGEN_OFF_GPU;
     else if (st == DLSSG_NO_FILES) note = UI_MENU_FRAMEGEN_OFF_FILES;
-    int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, cur, 0,
-                              dlss ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_FSR, menu_text(note));
+    int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, at, 0, desc, menu_text(note));
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN", values[nv]);
     else if (cur == 2 && upscaled && dlss) row_framegen_mult(restart);
 }
@@ -989,7 +1013,7 @@ static void tab_screen(float scale) {
     row_hdr();
     // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS) and FSR 3.1 (vk_ffx.cpp, its own RCAS); with
     // bilinear or DLSS the slider would do nothing
-    int dl = cfg_bool("NX2NAVI_DLAA"), fsr3 = dl && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
+    int dl = cfg_bool("NX2NAVI_DLAA"), fsr3 = dl && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") && vk_ffx_available();
     if (!fsr3 && (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || dl)) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
     opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     // Anisotropic filtering of the surface textures that tile (vk_texture.c aniso_raised), at once (vk_sampler_aniso_live)
@@ -1540,7 +1564,8 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
     const char *hdr = cfg_value("NX2NAVI_HDR");
     snprintf(v[8], sizeof v[8], "%s", menu_text(!strcmp(hdr, "native") ? UI_MENU_HDR_NATIVE : cfg_bool("NX2NAVI_HDR") ? UI_MENU_HDR_TONEMAPPED : UI_MENU_FRAMEGEN_OFF));
     const char *fg = cfg_value("NX2NAVI_FRAMEGEN");
-    snprintf(v[9], sizeof v[9], "%s", !strcmp(fg, "fsr3") ? "AMD FSR 3.1" : !strcmp(fg, "dlss") ? "NVIDIA DLSS" : menu_text(UI_MENU_FRAMEGEN_OFF));
+    const bool fsr_fg = !strcmp(fg, "fsr3") && vk_ffx_framegen_available();   // set but not loadable: off
+    snprintf(v[9], sizeof v[9], "%s", fsr_fg ? "AMD FSR 3.1" : !strcmp(fg, "dlss") ? "NVIDIA DLSS" : menu_text(UI_MENU_FRAMEGEN_OFF));
     if (!strcmp(fg, "dlss") && vk_dlssg_active())   // its multiplier as set, clamped to what this GPU allows
         snprintf(v[9], sizeof v[9], "NVIDIA DLSS %dx",
                  vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), vk_dlssg_multiplier_max(nullptr), nullptr));

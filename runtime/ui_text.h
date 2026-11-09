@@ -275,6 +275,11 @@ typedef enum {
     // the same rows' texts on a GPU DLSS does not run on (not NVIDIA): the menu leaves DLSS out there
     UI_MENU_UPSCALING_DESC_FSR, UI_MENU_FRAMEGEN_DESC_FSR, UI_MENU_FRAMEGEN_NOTE_FSR,
     UI_MENU_FRAMEGEN_NEEDS_FSR,
+    // and on a build where FSR 3.1 does not load (vk_ffx_available): the menu leaves it out there, and these texts say so
+    UI_MENU_UPSCALING_DESC_NO_FSR,
+    UI_MENU_FSR3_OFF,   // FSR 3.1 is still set but not loadable: "in use: off" and why
+    UI_MENU_FRAMEGEN_DESC_DLSS, UI_MENU_FRAMEGEN_NOTE_DLSS, UI_MENU_FRAMEGEN_NEEDS_DLSS,   // DLSS only
+    UI_MENU_FRAMEGEN_DESC_NONE, UI_MENU_FRAMEGEN_NEEDS_NONE,                               // neither runs
     // DLSS frame generation (ui/menu.cpp row_framegen, row_framegen_mult): the multiplier row, its notes when this GPU
     // and driver allow less than 4x, and the frame generation row's notes when DLSS's does not run
     UI_MENU_FRAMEGEN_MULT, UI_MENU_FRAMEGEN_MULT_DESC,
