@@ -1050,7 +1050,10 @@ static void shadow_sync_pool(PoolRec *r) {
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
             int dirty = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since;
             if (dirty && !run) run = x;
-            else if (!dirty && run) shadow_copy(r, run, x, 0), run = 0;
+            else if (!dirty && run) {
+                shadow_copy(r, run, x, 0);
+                run = 0;
+            }
         }
     }
     if (run) shadow_copy(r, run, hi, 0);

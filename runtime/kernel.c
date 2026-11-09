@@ -318,7 +318,13 @@ static int cores_enabled(void) {
     if (g_cores_on < 0) {
         g_cores_on = !cfg_bool("NX2NAVI_FREE_CORES");   // "0" keeps the gate, like unset
         const char *n = cfg_get("NX2NAVI_CORES");
-        if (n && atoi(n) >= 1 && atoi(n) <= NCORE) {
+        if (!n || !*n) {
+            int pcores = plat_cpu_cores(NULL, NULL);
+            if (pcores > 0 && pcores < NCORE) {
+                g_active_cores = pcores;
+                rt_log("kernel: auto-detected %d physical cores; folding %d virtual cores onto them", g_active_cores, NCORE);
+            }
+        } else if (atoi(n) >= 1 && atoi(n) <= NCORE) {
             g_active_cores = atoi(n);
             rt_log("kernel: %d virtual cores run threads (NX2NAVI_CORES); higher cores fold onto them", g_active_cores);
         }
