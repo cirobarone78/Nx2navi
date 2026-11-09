@@ -18,6 +18,8 @@ Run: python tests/launcher_test.py   (Python 3.14 for the zstd tests; the window
   a source checkout's build/xlate/), the prompts step with a stand-in prompt tool, the object cache of the compile
   step with the system's C compiler, and its windres call under folders with spaces (a script in windres's place)
 - jobs: an install driven by a fake make_game.py, with and without the prompts row
+- tools/run_game.py: the profile copy a scripted run plays on and the save imported into it as Import Saves imports
+  one, and the copy gone after the run or a failed import (a shell script stands in for the game)
 - the look: the colour schemes, the background picture's fitting and kept copy, the sound effects (low by default,
   only the game's own select and back sounds, decoded from a made-up .bwav)
 - the window: --selftest draws every screen (skipped without a display)
@@ -50,6 +52,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
 from launcher.context import Context  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
+import run_game  # noqa: E402
 
 try:
     from compression import zstd as ZSTD
@@ -2449,6 +2452,153 @@ class SaveShareTest(unittest.TestCase):
         d = saves.default_export_dir()
         self.assertTrue(d.is_dir())
         self.assertIn(d, (winsys.known_folder('downloads'), winsys.known_folder('desktop'), Path.home()))
+
+
+class RunGameTest(unittest.TestCase):
+    """tools/run_game.py: the copy of the profile a scripted run plays on, with the save --save names imported into it
+    as the launcher's Import Saves imports one, and nothing of it left after the run."""
+
+    SAVE = {'account.sav': b'acct', 'option.sav': b'opt', 'slot_00/progress.sav': b'p0', 'slot_01/progress.sav': b'p1'}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='nx2navi-run-'))
+        self.game = self.tmp / 'game'
+        self.profile = self.game / 'profile'
+        self.files(saves.account_dir(self.game), self.SAVE)
+        self.run = self.game / 'prof-t'
+        mock.patch.object(run_game, 'SAVES', self.tmp / 'build' / 'save-backup').start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def files(self, folder, names):
+        for n, data in names.items():
+            (folder / n).parent.mkdir(parents=True, exist_ok=True)
+            (folder / n).write_bytes(data)
+        return folder
+
+    def zip_of(self, members, name='report.zip'):
+        path = self.tmp / name
+        with zipfile.ZipFile(path, 'w') as z:
+            for n, data in members.items():
+                z.writestr(n, data)
+        return path
+
+    def prepare(self, save=None):
+        """The account folder of the run's copy, with save imported."""
+        run_game.prepare_run(self.run, self.profile, save and str(save), log=lambda m: None)
+        return saves.account_dir(self.run)
+
+    def names(self, folder):
+        return sorted(p.relative_to(folder).as_posix() for p in folder.rglob('*') if p.is_file())
+
+    def test_a_zip_is_unpacked_into_an_empty_folder(self):
+        # an earlier run with this tag stopped after unpacking a crash report's profile folder; this run's zip holds one
+        # slot, and the search found the earlier account folder first
+        self.files(self.run / 'zip', {'profile/save/' + 'a' * 32 + '/account.sav': b'earlier'})
+        acct = self.prepare(self.zip_of({'slot_02/progress.sav': b'mine'}))
+        self.assertEqual((acct / 'account.sav').read_bytes(), b'acct')
+        self.assertEqual((acct / 'slot_02' / 'progress.sav').read_bytes(), b'mine')
+        scratch = self.files(self.tmp / 'scratch', {'old/account.sav': b'earlier'})
+        run_game.save_source(str(self.zip_of({'slot_03/progress.sav': b'x'})), self.profile, scratch)
+        self.assertEqual(self.names(scratch), ['slot_03/progress.sav'])
+
+    @unittest.skipIf(os.name == 'nt', 'a shell script stands in for the game')
+    def test_the_run_folder_goes_after_a_run_and_after_a_failed_import(self):
+        exe = self.game / 'ocarina'
+        exe.write_text('#!/bin/sh\ncat "$2"/save/*/slot_02/progress.sav\n')
+        exe.chmod(0o755)
+        argv = ['run_game.py', str(self.game), '--tag', 't', '--seconds', '1', '--wall', '60', '--save']
+        good = self.zip_of({'slot_02/progress.sav': b'mine'})
+        bad = self.zip_of({'profile/notes.txt': b'no save'}, 'bad.zip')
+        for save, code in ((good, 0), (bad, 'no save of the game')):
+            with mock.patch.object(run_game, 'take_slot', lambda: None), \
+                    mock.patch.object(sys, 'argv', argv + [str(save)]), contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaises(SystemExit) as e:
+                run_game.main()
+            if code == 0:
+                self.assertEqual(e.exception.code, 0)
+                self.assertIn('mine', (self.game / 'logs' / 't.log').read_text())
+            else:
+                self.assertIn(code, str(e.exception.code))
+            self.assertEqual(sorted(p.name for p in self.game.iterdir()), ['logs', 'ocarina', 'profile'])
+
+    def test_an_exported_zip_imports_its_save_without_the_report(self):
+        other = self.tmp / 'reporter'
+        self.files(saves.account_dir(other), {'account.sav': b'theirs', 'option.sav': b'o', 'slot_00/progress.sav': b'q0'})
+        self.files(other, {'logs/nx2navi.log': b'log', 'nx2navi.ini': b'[graphics]'})
+        exported = saves.export_save(other, self.tmp, bug_report=True, log=lambda m: None)['path']
+        acct = self.prepare(exported)
+        self.assertEqual(self.names(acct), ['account.sav', 'option.sav', 'slot_00/progress.sav'])
+        self.assertEqual((acct / 'account.sav').read_bytes(), b'theirs')
+        # one of another game, and that zip unpacked into a folder (its save one level down), stop the run
+        bad = self.zip_of({saves.MANIFEST: json.dumps({'format': saves.FORMAT, 'format_version': 1,
+                                                       'title_id': '0100000000010000'}),
+                           'save/account.sav': b'x'}, 'other-game.zip')
+        with self.assertRaises(SystemExit) as e:
+            self.prepare(bad)
+        self.assertIn('another game', str(e.exception.code))
+        unpacked = self.tmp / 'unpacked'
+        with zipfile.ZipFile(exported) as z:
+            z.extractall(unpacked)
+        with self.assertRaises(SystemExit) as e:
+            self.prepare(unpacked)
+        self.assertIn('no save of the game', str(e.exception.code))
+
+    def test_a_save_import_waiting_for_the_next_start_stays_out(self):
+        self.files(self.profile, {'save-import/account.sav': b'pending', 'save-import.part/account.sav': b'half'})
+        for save in (None, self.files(self.tmp / 'slot_03', {'progress.sav': b'p3'})):
+            acct = self.prepare(save)
+            self.assertFalse((self.run / 'profile' / 'save-import').exists())
+            self.assertFalse((self.run / 'profile' / 'save-import.part').exists())
+            self.assertEqual((acct / 'account.sav').read_bytes(), b'acct')
+        self.assertTrue((self.profile / 'save-import').is_dir())   # the player's profile is not written
+
+    def test_dot_and_dotdot_are_paths_not_backup_names(self):
+        run_game.SAVES.mkdir(parents=True)   # build/save-backup/.. is build/
+        backup = self.files(self.profile / 'save-backup' / '2026-11-09 17.30.05', {'account.sav': b'backup'})
+        self.assertEqual(run_game.save_source(backup.name, self.profile, self.tmp / 'zip'), backup)
+        for name in ('.', '..'):
+            self.assertEqual(run_game.save_source(name, self.profile, self.tmp / 'zip'), Path(name))
+        (self.tmp / 'here').mkdir()
+        with contextlib.chdir(self.tmp / 'here'), self.assertRaises(SystemExit) as e:   # '..' holds the game folder
+            self.prepare('..')
+        self.assertIn('holds the folder of this run', str(e.exception.code))
+        self.assertEqual(self.names(saves.account_dir(self.run)), sorted(self.SAVE))
+
+    def test_a_folder_save_has_the_imports_limits_and_no_links(self):
+        big = self.files(self.tmp / 'big', {f'slot_0{i}/progress.sav': b'xx' for i in range(6)})
+        for limit, value in (('MAX_FILES', 5), ('MAX_BYTES', 5)):
+            with mock.patch.object(saves, limit, value), self.assertRaises(SystemExit) as e:
+                self.prepare(big)
+            self.assertIn('holds more than a save', str(e.exception.code))
+        outside = self.files(self.tmp / 'outside', {'secret.txt': b'not a save'})
+        for kind in ('file', 'folder'):
+            src = self.files(self.tmp / f'linked-{kind}', {'account.sav': b'a', 'option.sav': b'o'})
+            try:
+                if kind == 'file':
+                    os.symlink(outside / 'secret.txt', src / 'slot_00.sav')
+                else:
+                    os.symlink(outside, src / 'slot_00', target_is_directory=True)
+            except OSError:
+                self.skipTest('links cannot be made here')
+            with self.assertRaises(SystemExit) as e:
+                self.prepare(src)
+            self.assertIn('is a link', str(e.exception.code))
+            self.assertEqual(self.names(saves.account_dir(self.run)), sorted(self.SAVE))
+
+    def test_a_single_slot_goes_over_the_newest_save(self):
+        # a finished commit the game has not swapped in yet is newer than the account folder (fs_host.c save_recover)
+        self.files(self.profile / 'save-tx' / 'ready-0000000003',
+                   {'account.sav': b'acct new', 'option.sav': b'opt', 'slot_00/progress.sav': b'p0 new'})
+        acct = self.prepare(self.files(self.tmp / 'slot_02', {'progress.sav': b'mine', 'caption.sav': b'c'}))
+        self.assertEqual(self.names(acct), ['account.sav', 'option.sav', 'slot_00/progress.sav',
+                                            'slot_02/caption.sav', 'slot_02/progress.sav'])
+        self.assertEqual((acct / 'account.sav').read_bytes(), b'acct new')
+        self.assertEqual((acct / 'slot_00' / 'progress.sav').read_bytes(), b'p0 new')
+        self.assertEqual((acct / 'slot_02' / 'progress.sav').read_bytes(), b'mine')
+        self.assertEqual(list((self.run / 'profile' / 'save-tx').iterdir()), [])
 
 
 class IconTest(unittest.TestCase):
