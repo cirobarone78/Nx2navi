@@ -850,6 +850,35 @@ class RelayTest(unittest.TestCase):
         self.assertEqual((passed, [dg.type for to, dg in out]), (sent, [cr.T_CHALLENGE]))
         self.assertLessEqual(challenged, 8 + 2 * 11)
 
+    def test_the_rejoins_of_rooms_someone_made_to_flood_with_leave_other_rooms_their_share(self):
+        """Someone makes four rooms of eight members and, every half second for four seconds, sends a CONNECT with each of
+        the 32 tokens from the member's own network and one from another, in new sessions: 64 at once, as many as each
+        member's own challenges allow, against a relay that sets 40 a second aside for rejoins. A member of another room
+        who comes back from a new port right after the last of them still gets its challenge: each room has its own share
+        of those set aside."""
+        relay = cr.Relay(rejoin_challenge_rate=40)
+        (a, b), secret = self.room_of(2, relay=relay)
+        flooders = []
+        for r in range(4):
+            maker = Client(f'M{r}', ip=f'10.66.{r}.1')
+            maker.join(relay, 0, cr.INTENT_CREATE)
+            flooders.append(maker)
+            for i in range(1, 8):
+                c = Client(f'M{r}{i}', ip=f'10.66.{r}.{i + 1}', secret=maker.secret)
+                c.join(relay, 0, cr.INTENT_JOIN)
+                flooders.append(c)
+        challenged = 0
+        for step in range(9):
+            now = 1 + step / 2
+            for m in flooders:
+                for addr in (m.addr, ('10.77.0.9', m.addr[1])):   # its own network, and another
+                    m.seq, m.nonce, m.session = m.seq + 1, random.getrandbits(64), random.getrandbits(64)
+                    challenged += len(relay.handle(m.connect(cr.INTENT_JOIN), addr, now))
+        a.addr = (a.addr[0], a.addr[1] + 1000)   # back from a new port (a new NAT mapping): a cookie first
+        a.seq, a.nonce = a.seq + 1, 99
+        out = parsed(relay.handle(a.connect(cr.INTENT_JOIN), a.addr, 5))
+        self.assertEqual(([dg.type for to, dg in out], challenged >= 9 * 8), ([cr.T_CHALLENGE], True))
+
     def test_challenges_are_limited_per_network_so_one_cannot_lock_out_the_rest(self):
         relay = cr.Relay(challenge_rate=100, prefix_challenge_rate=10, prefix_challenge_burst=10)
         flood = sum(len(relay.handle(Client(ip=f'10.1.0.{i}').connect(cr.INTENT_CREATE), (f'10.1.0.{i}', 5), 0)) for i in range(200))

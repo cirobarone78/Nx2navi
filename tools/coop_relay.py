@@ -316,7 +316,7 @@ class Member:
 
 class Room:
     __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared', 'egress',
-                 'sessions', 'forwarded_at')
+                 'sessions', 'forwarded_at', 'rejoins')
 
     def __init__(self, rid, locator, prefix, now):
         self.id, self.locator, self.prefix = rid, locator, prefix
@@ -329,6 +329,7 @@ class Room:
         self.egress = None   # its share of the bytes the relay forwards (Relay.share_egress)
         self.sessions = {}   # sessions its members used (insertion order: the oldest first), never taken again
         self.forwarded_at = None   # when it last forwarded: a room that did recently shares the budget
+        self.rejoins = None  # its share of the challenges set aside for its members' rejoins (Relay.take_rejoin)
 
     def use_session(self, session):
         self.sessions[session] = True
@@ -376,9 +377,8 @@ class Relay:
         self.prefix_rooms = {}       # network prefix -> rooms it made that are open
         self.failed = {}       # (client id, address, CONNECT seq, locator) -> (reason, when): refusals of an attempt (oldest first)
         self.challenges = None
-        self.rejoin_challenges = None   # the share of challenges set aside for CONNECTs with a member's valid token
-        self.egress = None
         self.next_prune = 0
+        self.egress = None
         self.rate_said = -10.0   # when the log last told of a join refused for the network's budget
         self.seq = 0
         self.stats = {k: 0 for k in ('rx', 'malformed', 'bad_tag', 'no_member', 'wrong_addr', 'rate_limited',
@@ -461,16 +461,14 @@ class Relay:
             b = table[key] = Bucket(rate, burst, now)
         return b
 
-    def take_challenge(self, addr, now, member=None):
+    def take_challenge(self, addr, now, member=None, room=None):
         """A challenge (or an answer to another protocol version) for addr: the relay's budget first (a flood it refuses
         leaves no state behind), then its network's. A CONNECT that carries a member's valid token (a rejoin) takes from
-        a share set aside for those, which a flood without a token never reaches, and from that member's own challenges
-        for its network or for the others (MEMBER_CHALLENGES), never from its packets."""
+        its room's share of those set aside for rejoins, which a flood without a token never reaches, and from that
+        member's own challenges for its network or for the others (MEMBER_CHALLENGES), never from its packets."""
         if member is not None:
-            if self.rejoin_challenges is None:
-                self.rejoin_challenges = Bucket(self.rejoin_challenge_rate, self.rejoin_challenge_rate, now)
             mine = member.home_challenges if prefix_of(addr) == prefix_of(member.addr) else member.away_challenges
-            return mine.take(1, now) and self.rejoin_challenges.take(1, now)
+            return mine.take(1, now) and self.take_rejoin(room, now)
         if self.challenges is None:
             self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
         self.challenges.refill(now)
@@ -478,6 +476,20 @@ class Relay:
             return False
         mine = self.bucket(self.challenge_buckets, prefix_of(addr), *self.prefix_challenge, now)
         return mine is not None and mine.take(1, now) and self.challenges.take(1, now)
+
+    def take_rejoin(self, room, now):
+        """A challenge from room's share of those set aside for rejoins: rejoin_challenge_rate a second split equally
+        among the open rooms, with MAX_MEMBERS at once at least, so that the members' tokens of rooms someone made to
+        flood with take those rooms' shares and never another room's."""
+        share = self.rejoin_challenge_rate / max(1, len(self.rooms))
+        burst = max(share, MAX_MEMBERS)
+        if room.rejoins is None:
+            room.rejoins = Bucket(share, burst, now)
+        else:
+            room.rejoins.refill(now)
+            room.rejoins.rate, room.rejoins.burst = share, burst
+            room.rejoins.tokens = min(room.rejoins.tokens, burst)
+        return room.rejoins.take(1, now)
 
     def share_egress(self, now):
         """Each room's share of the forwarding budget: equal among the rooms that forwarded to someone in the last ACTIVE
@@ -613,7 +625,7 @@ class Relay:
         # someone who saw the member's CONNECT on the way would take its place
         if (rejoin is None or rejoin.addr != addr or rejoin.session != session) and not self.cookie_ok(addr, cookie, now):
             # not yet proven to receive at its address: only a challenge, and only if that is no larger than the request
-            if len(data) < CONNECT_MIN or not self.take_challenge(addr, now, rejoin):
+            if len(data) < CONNECT_MIN or not self.take_challenge(addr, now, rejoin, room):
                 return []
             self.stats['challenges'] += 1
             return [(addr, pack(T_CHALLENGE, 0, 0, 0, self.next_seq(), pack_challenge(nonce, self.cookie(addr, int(now // 60))), key))]
