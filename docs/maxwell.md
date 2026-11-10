@@ -115,8 +115,11 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    `provokingVertexLast` and chains `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT{LAST_VERTEX}` in
    `create_graphics`; without the feature it logs that flat outputs come from the first vertex. **Fixed.**
 2. **Unwritten vertex outputs.** `spirv_add_outputs` (`vk_pipeline.c`) adds outputs initialised to (0, 0, 0, 1) for
-   FS inputs the VS lacks. Our translator never links stages, so its `InitializeVertexOutputs` would initialise
-   no user output; translator patch 0006 initialises the unlinked outputs. **Fixed.**
+   FS inputs the VS lacks. `gfx_shader.c` reflects the full declared location span of VS output and FS input arrays,
+   not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.
+   The same reflected mask feeds recorded-pipeline prewarm, independent stage-library unions and direct pipeline builds.
+   Our translator never links stages, so its `InitializeVertexOutputs` would initialise no user output;
+   translator patch 0006 initialises the unlinked outputs. **Implemented; array-span runtime validation pending.**
 3. **Masked clears.** `vk_exec.c` skips colour clears with a partial channel mask (`W_CLEAR_MASK`); `clear_ds` skips stencil
    clears with a partial mask (`W_STENCIL_MASK`). NX2navi issues such clears. Check the log for
    `colour clear with channel mask` and `stencil clear with mask`. The hardware recipe (1.3) shows what the replay must do: colour clear = scissor 0 + channel mask, stencil clear = `value & mask` merged under the front write mask; so a draw with `colorWriteMask` / `stencilWriteMask` set to the clear mask is the exact equivalent. **Missing.**
