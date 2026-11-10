@@ -105,8 +105,13 @@ static void pass_marks_init(VkCtx *c) {
     set_checkpoint = c->has_nv_checkpoints
                          ? (PFN_vkCmdSetCheckpointNV)vk_dpa(c->device, "vkCmdSetCheckpointNV") : NULL;
     pm_amd = !off && write_marker && words;
-    vk_pass_marks_on = pm_amd || set_checkpoint;
-    if (vk_pass_marks_on)
+    // Timestamp profiling needs pass labels, but no vendor breadcrumb extension.
+    const char *timing = cfg_get("NX2NAVI_GPU_PASSES");
+    int timestamps = timing && *timing && strcmp(timing, "0");
+    vk_pass_marks_on = pm_amd || set_checkpoint || timestamps;
+    if (timestamps && !pm_amd && !set_checkpoint)
+        rt_log("vk: pass labels on for timestamp profiling; vendor breadcrumbs unavailable");
+    else if (vk_pass_marks_on)
         rt_log("vk: pass marks on (%s%s%s; NX2NAVI_PASS_CRUMBS=0 turns them off%s)", pm_amd ? "VK_AMD_buffer_marker" : "",
                pm_amd && set_checkpoint ? " and " : "", set_checkpoint ? "VK_NV_device_diagnostic_checkpoints" : "",
                set_checkpoint ? "" : ", =1 adds NVIDIA checkpoints where the driver has them");
