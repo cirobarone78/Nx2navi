@@ -1074,6 +1074,12 @@ int plat_file_set_readonly(const char *path, int on) {
     return chmod(path, m & 07777) == 0;
 }
 
+int plat_file_private(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return 0;
+    return chmod(path, S_ISDIR(st.st_mode) ? 0700 : 0600) == 0;
+}
+
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
     DIR *d = opendir(dir);
     if (!d) return 0;

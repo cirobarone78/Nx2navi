@@ -756,6 +756,13 @@ int plat_file_set_readonly(const char *path, int on) {
     return SetFileAttributesW(w, on ? a | FILE_ATTRIBUTE_READONLY : a & ~(DWORD)FILE_ATTRIBUTE_READONLY) != 0;
 }
 
+// The profile folder lies in the user's own folder, whose permissions already keep other accounts out (not checked here
+// for ACLs a user changed).
+int plat_file_private(const char *path) {
+    wchar_t w[WPATH];
+    return widen(path, w, WPATH) && GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES;
+}
+
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
     wchar_t wd[WPATH], we[64], pat[WPATH + 64];
     if (!widen(dir, wd, WPATH) || !widen(ext, we, 64)) return 0;

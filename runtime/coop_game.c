@@ -172,10 +172,14 @@ static struct {
     uint8_t room_key[32];
     int has_room_key, said_random;
     // the maker's remedies by setting (coop_remove = a key's fingerprint, coop_reset_pools): the values last acted on
+    // (the first ones only noted: a value left from before acts on nothing)
     char remove_seen[32], reset_seen[32];
+    int cfg_primed;
     uint64_t spent_seen, spent_at;  // the contributors' spends last logged for the maker, and when
-    // nx2navi.ini as it is now (cfg reads it at start only), once a second: coop_accept, and the maker's coop_remove and
-    // coop_reset_pools as last seen there (the first reading is only noted: a value left from before acts on nothing)
+    unsigned own_key_seen;          // digests carrying this game's own key, as last logged
+    uint64_t own_key_said;
+    // nx2navi.ini as it is now (cfg reads it at start only), once a second in a room: coop_accept, and the maker's
+    // coop_remove and coop_reset_pools as last acted on (the first reading is only noted)
     uint64_t ini_at;
     int ini_primed;
     char ini_accept[32], ini_remove[32], ini_reset[32];
@@ -483,8 +487,8 @@ static void on_message(int from, const uint8_t *bytes, size_t n, void *user) {
 // The maker's key for the room of code (32 random bytes) in <profile>/coop-keys, so that a maker whose game started
 // again signs the room's rules and removals with the same key. The file is named by a hash of the room's secret, and
 // the key is mixed with the secret before use (coop_state.c), so the file alone signs nothing; with the secret, whoever
-// can read the profile folder can act as the room's maker, as whoever can write it can change the save. make: a room
-// this session made gets one when it has none. 1 and the key in key when there is one.
+// can read it acts as the room's maker, so the folder is this account's alone (0700, the file 0600). make: a room this
+// session made gets one when it has none. 1 and the key in key when there is one.
 static int room_key(const char *code, int make, uint8_t key[32]) {
     uint8_t h[8];
     coop_blake2b(h, sizeof h, NULL, 0, code, strlen(code));
@@ -493,16 +497,26 @@ static int room_key(const char *code, int make, uint8_t key[32]) {
     if (!fs_profile_path(rel, path, sizeof path) || !fs_profile_path("coop-keys", dir, sizeof dir)) return 0;
     uint64_t n = 0;
     uint8_t *b = plat_file_read(path, &n);
-    int ok = b && n == 32;
+    int ok = b && n == 32, read = b != NULL;
     if (ok) memcpy(key, b, 32);
     free(b);
-    if (ok || !make || !plat_random(key, 32)) return ok;
+    if (ok) {
+        plat_file_private(dir), plat_file_private(path);   // a folder an earlier release made readable to others
+        return 1;
+    }
+    if (plat_file_exists(path))
+        rt_log("coop: sync: the room's key file in %s %s; %s", dir, read ? "is damaged (not 32 bytes)" : "cannot be read",
+               make ? "a new key replaces it, so this game no longer signs the rules the room accepted from it" : "this game does not sign the room's rules");
+    if (!make || !plat_random(key, 32)) return 0;
     plat_file_mkdir_p(dir);
+    plat_file_private(dir);
     if (!plat_file_write_atomic(path, key, 32)) {
         rt_log("coop: sync: the room's key could not be kept in %s; a restart of this game ends its say over the room's rules", dir);
         return 1;
     }
-    rt_log("coop: sync: the key this game signs the room's rules with is kept in %s (with the room's secret it acts as the room's maker)", dir);
+    plat_file_private(path);
+    rt_log("coop: sync: the key this game signs the room's rules with is kept in %s (with the room's secret it acts as the room's maker: "
+           "never hand out a copy of this folder or of the profile)", dir);
     return 1;
 }
 
@@ -537,20 +551,22 @@ static void on_view(const CoopView *v, void *user) {
 
 // coop_accept: "always" accepts every offer, but only from the environment, so an nx2navi.ini someone hands a player
 // cannot make their game take a room without asking. A number (hex) accepts that offer from any source: it is keyed
-// with a random value of this start of the game, so no file can hold it in advance; nx2navi.ini's line counts as the
-// file is now (poll_ini), so the player puts the number the log shows there while the game runs. 1 for always, else 0
-// and the number (0 none) in *number.
+// with a random value of this start of the game, so no file can hold it in advance. nx2navi.ini's line counts as the
+// file is now (poll_ini), before the line read at start (which may say always, and that counts for nothing), so the
+// player puts the number the log shows there while the game runs. 1 for always, else 0 and the number (0 none) in
+// *number.
 static int accept_setting(uint32_t *number) {
     const char *v = cfg_value("NX2NAVI_COOP_ACCEPT");
+    int env = cfg_from_env("NX2NAVI_COOP_ACCEPT");
     *number = 0;
+    if (env && !strcmp(v, "always")) return 1;
+    if (!env && G.ini_accept[0]) v = G.ini_accept;
     if (!strcmp(v, "always")) {
-        if (cfg_from_env("NX2NAVI_COOP_ACCEPT")) return 1;
         if (!G.said_always)
             rt_log("coop: sync: coop_accept = always is taken from the environment only (NX2NAVI_COOP_ACCEPT); the nx2navi.ini line is ignored");
         G.said_always = 1;
         return 0;
     }
-    if (G.ini_accept[0] && !cfg_from_env("NX2NAVI_COOP_ACCEPT")) v = G.ini_accept;
     char *end;
     unsigned long n = strtoul(v, &end, 16);
     if (*v && !*end) *number = (uint32_t)n;
@@ -606,7 +622,8 @@ static void offer_update(uint64_t now) {
         else
             rt_log("coop: sync: nothing from the room is applied to this game until you accept it: put coop_accept = %08x into nx2navi.ini "
                    "[coop] while the game runs (the number is new at each start of the game and changes with the room); the save is copied "
-                   "to coop-backup in the profile folder first", o.token);
+                   "to coop-backup in the profile folder first. Your key pools count only the players you accept, among those the maker lets "
+                   "use the pools at all; your story flags take what the players you accept took from the players they accepted", o.token);
     }
     if (!o.token && o.disagree && !G.said_disagree)
         rt_log("coop: sync: the members carry rules signed by different keys, so this game takes no rules and applies nothing; ask the "
@@ -666,24 +683,52 @@ int coop_game_contributors(CoopContributor *out, int max) {
     return n;
 }
 
-// The maker's coop_remove (a member's id, or a key's fingerprint) and coop_reset_pools, from nx2navi.ini as it is now,
-// once a second (on the coop thread, without G.lock: a removal by id goes through coop_remove_member's hook).
+// The maker's coop_remove (a key's fingerprint, which the log shows beside each member) and coop_reset_pools, and
+// coop_accept, from nx2navi.ini as it is now, once a second while in a room (on the coop thread, without G.lock: a
+// removal of a member in the room goes through coop_remove_member's hook). A reading that fails (an editor saving the
+// file, a lock) is skipped, not read as empty. A value acts once: when it comes back after a missed reading, or stays
+// in the file, it acts on nothing again (coop_reset_pools = 0 lets the next value act). A member number is not taken
+// from the file: numbers pass to other players as members come and go.
+static void remove_by_fingerprint(const char *fp) {
+    uint64_t kid = 0, k;
+    int member = 0;
+    CoopOffer o;
+    plat_mutex_lock(&G.lock);
+    if (G.eng && coop_sync_key_parse(fp, &kid)) coop_sync_offer(G.eng, &o, plat_now_ms());
+    else o.n = 0;
+    for (int i = 0; i < o.n; i++)
+        if (o.member[i].heard && coop_sync_key_parse(o.member[i].key, &k) && k == kid) member = o.member[i].id;
+    plat_mutex_unlock(&G.lock);
+    if (member && coop_remove_member(member)) return;   // in the room: the relay removes it too
+    coop_game_remove_key(fp);
+}
+
 static void poll_ini(uint64_t now) {
+    if (G.view.state != COOP_JOINED && G.view.state != COOP_RECONNECTING) return;   // no room: nothing to act on, nothing read
     if (G.ini_at && now - G.ini_at < 1000) return;
     G.ini_at = now;
-    char rm[32], rp[32];
-    if (!cfg_ini_now("coop_accept", G.ini_accept, sizeof G.ini_accept)) G.ini_accept[0] = 0;
-    if (!cfg_ini_now("coop_remove", rm, sizeof rm)) rm[0] = 0;
-    if (!cfg_ini_now("coop_reset_pools", rp, sizeof rp)) rp[0] = 0;
+    char acc[32], rm[32], rp[32];
+    if (cfg_ini_now("coop_accept", acc, sizeof acc) < 0 || cfg_ini_now("coop_remove", rm, sizeof rm) < 0 ||
+        cfg_ini_now("coop_reset_pools", rp, sizeof rp) < 0)
+        return;
+    snprintf(G.ini_accept, sizeof G.ini_accept, "%s", acc);
     int primed = G.ini_primed;
     G.ini_primed = 1;
-    if (primed && strcmp(rm, G.ini_remove) && rm[0]) {
-        if (strspn(rm, "0123456789") == strlen(rm)) coop_remove_member(atoi(rm));
-        else coop_game_remove_key(rm);
+    if (rm[0] && strcmp(rm, G.ini_remove)) {
+        snprintf(G.ini_remove, sizeof G.ini_remove, "%s", rm);
+        if (!primed) {
+        } else if (strspn(rm, "0123456789") == strlen(rm)) {
+            rt_log("coop: sync: coop_remove = %s in nx2navi.ini names a member number, which another player may have by now: put the "
+                   "member's key fingerprint there (the log shows it beside each member)", rm);
+        } else {
+            remove_by_fingerprint(rm);
+        }
     }
-    if (primed && strcmp(rp, G.ini_reset) && rp[0] && strcmp(rp, "0")) coop_game_reset_pools();
-    snprintf(G.ini_remove, sizeof G.ini_remove, "%s", rm);
-    snprintf(G.ini_reset, sizeof G.ini_reset, "%s", rp);
+    if (!strcmp(rp, "0")) snprintf(G.ini_reset, sizeof G.ini_reset, "0");
+    else if (rp[0] && strcmp(rp, G.ini_reset)) {
+        snprintf(G.ini_reset, sizeof G.ini_reset, "%s", rp);
+        if (primed) coop_game_reset_pools();
+    }
 }
 
 // coop_remove_member's hook (coop.h): the maker's removal, signed, so that every game drops that identity.
@@ -696,22 +741,28 @@ static int on_remove(int member, void *user) {
     return ok;
 }
 
-// For the maker: the pool contributors that are not in the room and spent more than they brought, when that changed
-// (at most every 10 s), with the setting that removes each (G.lock held).
+// For the maker: the pool contributors that took more from the pools than they brought (per pool:
+// coop_sync_contributors), in the room or not, when that changed (at most every 10 s), with the setting that removes
+// each (G.lock held). A player who used keys others found is among them too; a drainer is the one nobody expected.
 static void say_spenders(uint64_t now) {
     if (now - G.spent_at < 10000 || !coop_sync_is_maker(G.eng)) return;
     CoopContributor c[24];
     int n = coop_sync_contributors(G.eng, c, 24);
     uint64_t h = 0;
     for (int i = 0; i < n; i++)
-        if (!c[i].member && !c[i].removed && (c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0))
-            for (int k = 0; k < 3; k++) h = (h ^ (uint64_t)c[i].spent[k] ^ (uint64_t)c[i].key[k * 5]) * 0x100000001b3ull;
+        if (!c[i].self && !c[i].removed && (c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0))
+            for (int k = 0; k < 3; k++) h = (h ^ (uint64_t)c[i].spent[k] ^ (uint64_t)c[i].key[k * 5] ^ (uint64_t)c[i].member << 40) * 0x100000001b3ull;
     if (h == G.spent_seen) return;
     G.spent_seen = h, G.spent_at = now;
-    for (int i = 0; h && i < n; i++)
-        if (!c[i].member && !c[i].removed && (c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0))
-            rt_log("coop: sync: key %s, not in the room, spent %lld keys, %lld rupees and %lld ammunition beyond what it brought; "
-                   "coop_remove = %s gives them back", c[i].key, (long long)c[i].spent[0], (long long)c[i].spent[1], (long long)c[i].spent[2], c[i].key);
+    for (int i = 0; h && i < n; i++) {
+        if (c[i].self || c[i].removed || !(c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0)) continue;
+        char who[COOP_NAME_MAX + 40];
+        if (c[i].member) snprintf(who, sizeof who, "member %d, %s", c[i].member, c[i].name);
+        else snprintf(who, sizeof who, "not in the room");
+        rt_log("coop: sync: key %s (%s) took %lld keys, %lld rupees and %lld ammunition from the pools beyond what it brought; "
+               "coop_remove = %s removes it and gives back what it took", c[i].key, who, (long long)c[i].spent[0], (long long)c[i].spent[1],
+               (long long)c[i].spent[2], c[i].key);
+    }
 }
 
 // The copy of the save an accepted room waits for, on the coop thread without G.lock (it takes a while). The first
@@ -756,12 +807,15 @@ static void on_tick(uint64_t now, void *user) {
         read_rules(&mine);
         coop_sync_settings(G.eng, &mine, (G.view.state == COOP_JOINED || G.view.state == COOP_RECONNECTING) && G.view.made);
         // coop_remove = a key's fingerprint (a member id is coop.c's), coop_reset_pools = any new value: until the menu
-        // has rows for them, the maker reaches both from nx2navi.ini while the game runs
+        // has rows for them, the maker reaches both from nx2navi.ini while the game runs. The values at start are only
+        // noted: one left from an earlier session acts on nothing
         const char *rm = cfg_value("NX2NAVI_COOP_REMOVE"), *rp = cfg_value("NX2NAVI_COOP_RESET_POOLS");
         uint64_t kid;
-        if (strcmp(rm, G.remove_seen) && coop_sync_key_parse(rm, &kid)) remove_key(rm);
+        int primed = G.cfg_primed;
+        G.cfg_primed = 1;
+        if (primed && strcmp(rm, G.remove_seen) && coop_sync_key_parse(rm, &kid)) remove_key(rm);
         snprintf(G.remove_seen, sizeof G.remove_seen, "%s", rm);
-        if (strcmp(rp, G.reset_seen) && *rp && strcmp(rp, "0")) {
+        if (primed && strcmp(rp, G.reset_seen) && *rp && strcmp(rp, "0")) {
             if (coop_sync_reset_pools(G.eng)) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
             else rt_log("coop: sync: coop_reset_pools: only the room's maker resets the pools");
         }
@@ -791,6 +845,12 @@ static void on_tick(uint64_t now, void *user) {
             if (ign >> id & 1 && !(G.ignored_seen >> id & 1))
                 rt_log("coop: sync: member %d sent values this game does not take; nothing more is taken from it while it stays in the room", id);
         G.rejected_seen = st.rejected, G.ignored_seen = ign;
+        if (st.own_key != G.own_key_seen && (!G.own_key_said || now - G.own_key_said >= 60000)) {
+            G.own_key_said = now, G.own_key_seen = st.own_key;
+            rt_log("coop: sync: member %d presents this game's own key for the room: another game holds a copy of this profile's coop-keys "
+                   "folder (or of the whole profile) and can act as the room's maker; it stays not identified, so nobody can accept the "
+                   "room while it is in it", st.own_key_member);
+        }
         say_spenders(now);
     }
     plat_mutex_unlock(&G.lock);

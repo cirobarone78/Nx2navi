@@ -359,6 +359,7 @@ void plat_file_delete(const char *path);
 int plat_file_truncate(const char *path, uint64_t size);  // 1 on success
 int64_t plat_file_size(const char *path);                 // bytes of a file, -1 when missing or unreadable
 int plat_file_set_readonly(const char *path, int on);     // sets or clears the read-only attribute; 1 on success
+int plat_file_private(const char *path);                  // only this account may read it (0600, a folder 0700); 1 on success
 // A file that only grows and other processes may read meanwhile: each write lands whole at its end, from any thread,
 // and reaches the file even if the process dies right after (no user-space buffer, no flush to the disk).
 typedef struct PlatAppend PlatAppend;

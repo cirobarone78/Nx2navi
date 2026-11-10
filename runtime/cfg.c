@@ -949,14 +949,18 @@ static void load_ini(void) {
     }
 }
 
-int cfg_ini_now(const char *key, char *out, size_t cap) {
+int cfg_ini_read(const char *path, const char *key, char *out, size_t cap) {
     if (cap) out[0] = 0;
-    if (!find_ini()) return 0;
     uint64_t size = 0;
-    uint8_t *data = plat_file_read(ini_path, &size);
-    if (!data) return 0;
+    uint8_t *data = plat_file_read(path, &size);
+    if (!data || !size) {   // gone or empty for a moment (an editor saving it), or locked: no reading, not "no value"
+        free(data);
+        return -1;
+    }
     int found = 0;
-    for (char *p = (char *)data; *p && !found;) {
+    char *p = (char *)data;
+    if (size >= 3 && !memcmp(p, "\xEF\xBB\xBF", 3)) p += 3;   // as cfg_load: editors add a BOM
+    for (;;) {
         char *eol = strchr(p, '\n');
         if (eol) *eol = 0;
         char *s = trim(p), *eq = strchr(s, '=');
@@ -965,7 +969,13 @@ int cfg_ini_now(const char *key, char *out, size_t cap) {
             const char *k = trim(s);
             size_t i = 0;
             while (k[i] && key[i] && tolower((unsigned char)k[i]) == tolower((unsigned char)key[i])) i++;
-            if (!k[i] && !key[i]) found = 1, snprintf(out, cap, "%s", trim(eq + 1));
+            if (!k[i] && !key[i]) {   // as cfg_load: a repeated key's later line wins, quotes go, "key =" sets nothing
+                char *v = trim(eq + 1);
+                size_t vl = strlen(v);
+                if (vl >= 2 && v[0] == '"' && v[vl - 1] == '"') v[vl - 1] = 0, v++;
+                snprintf(out, cap, "%s", v);
+                found = *v != 0;
+            }
         }
         if (!eol) break;
         p = eol + 1;
@@ -973,6 +983,8 @@ int cfg_ini_now(const char *key, char *out, size_t cap) {
     free(data);
     return found;
 }
+
+int cfg_ini_now(const char *key, char *out, size_t cap) { return find_ini() ? cfg_ini_read(ini_path, key, out, cap) : 0; }
 
 void cfg_init(void) {
     load_ini();
