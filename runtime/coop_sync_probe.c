@@ -89,6 +89,7 @@ static Game *by_id[COOP_MAX_MEMBERS + 1];
 struct Adv;
 static void adv_led_report(struct Adv *a, Game *g, const Flag *f, int was_bound, int after);
 static void adv_led_applied(struct Adv *a, Game *g, const Flag *f);
+static void adv_led_snap(struct Adv *a, const Game *g);
 
 static Flag *flag_of(Game *g, uint32_t hash) {
     for (int i = 0; i < g->n; i++)
@@ -243,6 +244,7 @@ static void deliver_one(Net *net, const Packet *p, uint64_t now) {
             net->lost++;
             continue;
         }
+        if (g->ledger && p->kind == COOP_K_DIGEST) adv_led_snap(g->ledger, g);   // a digest may bring a pool reset
         coop_sync_receive(g->eng, p->from, p->kind, p->b, p->n, now);
         if (rnd() % 100 < net->dup) coop_sync_receive(g->eng, p->from, p->kind, p->b, p->n, now);
     }
@@ -2056,11 +2058,12 @@ typedef struct {   // an honest game's joins, pickups and uses in one pools' epo
 } AdvEpoch;
 
 typedef struct {
-    AdvEpoch cur, prev;            // the pools' epoch its game is in, and the one before (for a game a reset has not reached)
+    AdvEpoch cur, past[4];         // the pools' epoch its game is in and the ones before, latest first: a game a reset
+                                   // has not reached yet counts what the others did in its epoch, also after they moved on
     int32_t last;                  // its count at its last report (after what the pool handed it)
     AdvJoin pre;                   // the view before a report
-    int has_carry, carry_set;      // a reset's carry until the game joins; carry_set: one waits for the next epoch
-    int64_t carry, carry_next;
+    int has_carry, snap_ok;        // a reset's carry until the game joins; snap_ok: the game had the room's rules
+    int64_t carry, snap;           // snap: its pools by the ledger just before a message that may bring a reset
 } AdvLed;
 
 typedef struct Adv {
@@ -2167,7 +2170,8 @@ static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
     uint32_t ep = a->led[g][p].cur.ep;
     for (int h = 0; h < ADV_H; h++) {
         const AdvLed *L = &a->led[h][p];
-        const AdvEpoch *e = L->cur.ep == ep ? &L->cur : L->prev.valid && L->prev.ep == ep ? &L->prev : NULL;
+        const AdvEpoch *e = L->cur.ep == ep ? &L->cur : NULL;
+        for (int i = 0; i < 4 && !e; i++) e = L->past[i].valid && L->past[i].ep == ep ? &L->past[i] : NULL;
         if (!e || !adv_counts(a, g, h) || !adv_claim(a, h, p, e, &c, &debt)) continue;
         int32_t rb;
         uint32_t rg, rs;
@@ -2179,17 +2183,23 @@ static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
     return n != 0;
 }
 
-// Game k's pools' epoch as its engine has it: a reset that reached it starts a new record, with the ledger's carry
-// when the reset found the game in the room.
+// Game k's pools' epoch as its engine has it: a reset that reached it starts a new record, with the carry the ledger
+// took just before the message that brought it (when the game had the room's rules then); one that waits keeps the
+// larger. And the game's own record of its epoch as its engine holds it now: the engine signs it again in a report,
+// and a claim made again at its next tick, also while the game reports nothing. The ledger looks before every message
+// that may bring a reset, so a record that a reset ends is kept as the game last signed it.
 static void adv_led_epoch(Adv *a, int k, int p) {
     AdvLed *L = &a->led[k][p];
     uint32_t ep = coop_sync_pool_epoch(a->h[k].eng);
-    if (ep == L->cur.ep) return;
-    L->prev = L->cur;
-    memset(&L->cur, 0, sizeof L->cur);
-    L->cur.ep = ep, L->cur.valid = 1, L->cur.floor = -(1 << 20);
-    if (L->carry_set && (!L->has_carry || L->carry_next > L->carry)) L->carry = L->carry_next;
-    L->has_carry |= L->carry_set, L->carry_set = 0;
+    if (ep != L->cur.ep) {
+        memmove(&L->past[1], &L->past[0], 3 * sizeof L->past[0]);
+        L->past[0] = L->cur;
+        memset(&L->cur, 0, sizeof L->cur);
+        L->cur.ep = ep, L->cur.valid = 1, L->cur.floor = -(1 << 20);
+        if (L->snap_ok && (!L->has_carry || L->snap > L->carry)) L->carry = L->snap;
+        L->has_carry |= L->snap_ok;
+    }
+    L->cur.own = coop_sync_own_record(a->h[k].eng, adv_pool_hash[p], &L->cur.ob, &L->cur.og, &L->cur.os);
 }
 
 // game_frame's report of pool counter f of honest game g, before (after 0) and after the engine took it: was its pool
@@ -2234,22 +2244,27 @@ static void adv_led_applied(Adv *a, Game *g, const Flag *f) {
     if (k >= 0 && p >= 0) a->led[k][p].last = f->value;
 }
 
-// Before the maker resets the pools: the ledger's carry for every honest game that has the room's rules (what its pools
-// hold by the ledger now), which the game takes when the reset reaches it; one that waits keeps the larger.
-static void adv_carry(Adv *a) {
-    for (int g = 0; g < ADV_H; g++) {
-        CoopRules r;
-        coop_sync_rules(a->h[g].eng, &r);
-        if (!a->net.present[g] || !r.epoch) continue;
-        for (int p = 0; p < ADV_POOLS; p++) {
-            for (int h = 0; h < ADV_H; h++) adv_led_epoch(a, h, p);
-            AdvLed *L = &a->led[g][p];
-            int64_t v = 0;
-            adv_ledger(a, g, p, 1, &v);
-            if (!L->carry_set || v > L->carry_next) L->carry_next = v;
-            L->carry_set = 1;
-        }
+// Before a message that may bring a pool reset reaches honest game g (a digest carries the room's charter), and before
+// the maker's own reset: what g's pools hold by the ledger over the records g holds, which is g's carry if the reset
+// takes effect there now. A game carries what it holds when the reset reaches it, not when the maker made it: a key it
+// used in between is gone from its carry.
+static void adv_led_snap(Adv *a, const Game *g) {
+    int k = adv_game(a, g);
+    if (k < 0) return;
+    CoopRules r;
+    coop_sync_rules(g->eng, &r);
+    for (int p = 0; p < ADV_POOLS; p++) {
+        for (int h = 0; h < ADV_H; h++) adv_led_epoch(a, h, p);
+        AdvLed *L = &a->led[k][p];
+        L->snap = 0, L->snap_ok = r.epoch != 0;
+        if (L->snap_ok) adv_ledger(a, k, p, 1, &L->snap);
     }
+}
+
+// The maker resets the pools: for its own game the reset takes effect at once.
+static void adv_reset_pools(Adv *a) {
+    adv_led_snap(a, &a->h[0]);
+    a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng);
 }
 
 // ---- the room
@@ -2370,7 +2385,7 @@ static void adv_charter(Adv *a, int i) {
     size_t n = digest_signed(d, a->code, sk, pk, m->id, m->session, 0, name, modes, (uint32_t)adv_rnd(a),
                              adv_below(a, 2) ? a->pool_epoch + 1 : (uint32_t)adv_rnd(a), admit, 1 + (int)adv_below(a, 4), gone, (int)adv_below(a, 3));
     for (int k = 0; k < ADV_H; k++)
-        if (a->net.present[k]) coop_sync_receive(a->h[k].eng, m->id, COOP_K_DIGEST, d, n, a->now);
+        if (a->net.present[k]) adv_led_snap(a, &a->h[k]), coop_sync_receive(a->h[k].eng, m->id, COOP_K_DIGEST, d, n, a->now);
 }
 
 // Hostile member i comes (a new start of its game: a new key, sometimes), or goes.
@@ -2483,6 +2498,7 @@ static void adv_replay(Adv *a) {
         if (ids[i] == q->from) found = 1, forged = sess[i] != q->sess, sess[i] = q->sess;
     if (!found) ids[n] = q->from, sess[n++] = q->sess, forged = 1;
     if (forged) coop_sync_room(a->h[k].eng, a->code, a->h[k].id, ids, sess, n, maker, a->now);
+    if (q->kind == COOP_K_DIGEST) adv_led_snap(a, &a->h[k]);
     coop_sync_receive(a->h[k].eng, q->from, q->kind, q->b, q->n, a->now);
     adv_replays++;
     if (forged) a->now = run_by(&a->net, a->now, 100 + adv_below(a, 1500), 16), adv_roster(a);
@@ -2492,7 +2508,7 @@ static void adv_replay(Adv *a) {
 
 // A pool reset as docs/coop.md says to make one: the maker removes the hostile keys it admitted first; then, after a
 // quiet moment in which the players who ask accept the room as it is now (a carry counts the keys a game counts when
-// the reset reaches it), the ledger takes its carry and the maker resets (sometimes twice).
+// the reset reaches it), the maker resets (sometimes twice).
 static void adv_reset(Adv *a) {
     for (int j = 0; j < a->nmkid; j++)
         if (coop_sync_accepted_key(a->h[0].eng, a->mkid[j])) adv_remove(a, j);
@@ -2500,12 +2516,10 @@ static void adv_reset(Adv *a) {
     adv_ask_all(a);
     a->now = run_by(&a->net, a->now, 500, 16);
     adv_ask_all(a);
-    adv_carry(a);
-    a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng);
+    adv_reset_pools(a);
     if (adv_below(a, 3) == 0) {
         a->now = run_by(&a->net, a->now, 300, 16);
-        adv_carry(a);
-        a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng);
+        adv_reset_pools(a);
     }
 }
 
@@ -2642,10 +2656,9 @@ static int adv_run(uint64_t seed) {
         for (int j = 0; j < a->nmkid; j++) adv_remove(a, j);
     } else {
         for (int k = 0; k < ADV_H && twice; k++) a->h[k].hold_pools = 1;
-        adv_carry(a);
-        a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng);
+        adv_reset_pools(a);
         a->now = run_by(&a->net, a->now, 1200, 16);
-        if (twice) adv_carry(a), a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng), a->now = run_by(&a->net, a->now, 1200, 16);
+        if (twice) adv_reset_pools(a), a->now = run_by(&a->net, a->now, 1200, 16);
         for (int k = 0; k < ADV_H; k++) a->h[k].hold_pools = 0;
     }
     for (int t = 0; t < 8; t++) a->now = run_by(&a->net, a->now, 3000, 16), adv_ask_all(a);
