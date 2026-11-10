@@ -239,15 +239,16 @@ typedef struct {
     unsigned sent_msgs, recv_msgs, sent_bytes;
     unsigned merged;                // registers a message raised
     unsigned pools_bound;
-    unsigned rejected;              // values refused (not shared here, out of range, the state full, failed signatures)
+    unsigned rejected;              // values refused (not shared here, out of range, the state full, failed record signatures)
     unsigned unaccepted;            // flags dropped because their sender's key is not one this player accepted
     unsigned sig_checks;            // signatures checked
     unsigned sig_skipped;           // messages dropped because their sender's budget of checks was spent
-    unsigned forged;                // sections whose sender's signature did not check out (made in its name by someone else)
+    unsigned forged;                // sections, and identities or charters in digests, whose signature did not check out (made
+                                    // in a member's name by someone else); never held against that member
     unsigned replayed;              // sections whose counter was taken before (sealed again by someone with the secret)
     unsigned rate_dropped;          // messages over a member's rate
     unsigned probe_max;             // the longest run of index slots an insert walked
-    unsigned own_key;               // digests of another member that carried this game's own key (a copy of its key file)
+    unsigned own_key;               // identities of another member signed with this game's own key (a copy of its key file)
     int own_key_member;             // the member that sent the last of them
 } CoopSyncStats;
 void coop_sync_stats(const CoopSync *s, CoopSyncStats *out);

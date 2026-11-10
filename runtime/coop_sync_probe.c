@@ -1585,8 +1585,9 @@ static void probe_h3_mark(void) {
     printf("coop-probe: sync mark: the relay's maker mark gives no rules the members' charters contradict\n");
 }
 
-// Findings 6 and 8: a signed name is shown cleaned; identities and charters that fail their check count against the
-// sender, are not checked twice and are capped.
+// Findings 6 and 8: a signed name is shown cleaned; identities and charters that fail their check are not checked twice
+// for the same bytes and are capped. From the sixth review on they do not count against the member a digest names: a
+// digest is not signed by its sender, so anyone with the room's secret can send one in that member's name.
 static void probe_h3_signatures(void) {
     Net net = {0};
     Game a, b;
@@ -1612,9 +1613,16 @@ static void probe_h3_signatures(void) {
     // member 5: an identity that never checks out, the same bytes again and again, then new ones
     size_t bn = make_digest(d, "H3F6", seed5, 5, 0x5555, "Mal", 3, 1, NULL, 0);
     uint64_t t0 = now;
+    CoopSyncStats st1, st5;
+    coop_sync_stats(b.eng, &st5);
     for (int i = 0; i < 300; i++) coop_sync_receive(b.eng, 5, COOP_K_DIGEST, d, bn, now += 3);
+    coop_sync_stats(b.eng, &st1);
     for (int i = 0; i < 300; i++) bn = make_digest(d, "H3F6", seed5, 5, 0x5555, "Mal", 3, 2 + i, NULL, 0), coop_sync_receive(b.eng, 5, COOP_K_DIGEST, d, bn, now += 3);
-    CHECK(coop_sync_ignored(b.eng) >> 5 & 1, "F8: a member whose identity fails its check again and again is ignored");
+    coop_sync_offer(b.eng, &o, now);
+    x = offer_member(&o, 5);
+    CHECK(!(coop_sync_ignored(b.eng) >> 5 & 1) && x && !x->heard && st1.sig_checks - st5.sig_checks <= 1,
+          "F8: an identity that fails its check again and again is not taken, its same bytes are checked once (%u checks), and it does not "
+          "count against the member it names (ignored %u)", st1.sig_checks - st5.sig_checks, coop_sync_ignored(b.eng) >> 5 & 1);
     // member 4, identified: charters claiming A's key with a later epoch and no valid signature
     uint8_t apk[COOP_PK_LEN] = {0};
     Net cap = {0};
@@ -1625,17 +1633,16 @@ static void probe_h3_signatures(void) {
     free(cap.q);
     for (int i = 0; i < 300; i++)
         dn = make_digest(d, "H3F6", seed4, 4, 0x4444, evil, sizeof evil - 1, 0, apk, 1000 + (uint32_t)i), coop_sync_receive(b.eng, 4, COOP_K_DIGEST, d, dn, now += 3);
-    CHECK(coop_sync_ignored(b.eng) >> 4 & 1, "F8: a member that sends charters in the maker's name that fail their check is ignored");
-#ifndef COOP_BEFORE
     CoopSyncStats st;
     coop_sync_stats(b.eng, &st);
-    CHECK(st.sig_checks - st0.sig_checks <= 2 * 33 + 4, "F8: at most what the refusal limit allows was checked (%u checks in %llu ms)",
-          st.sig_checks - st0.sig_checks, (unsigned long long)(now - t0));
-#endif
-    (void)t0, (void)st0;
+    unsigned most = 2 * (256 + 128 * (unsigned)((now - t0) / 1000 + 1));
+    CHECK(!(coop_sync_ignored(b.eng) >> 4 & 1) && st.forged - st0.forged >= 2 && st.sig_checks - st0.sig_checks <= most,
+          "F8: charters in the maker's name that fail their check count against nobody (ignored %u), are counted as forged (%u), and the "
+          "checks stay within the two members' budgets (%u checks in %llu ms, at most %u)", coop_sync_ignored(b.eng) >> 4 & 1,
+          st.forged - st0.forged, st.sig_checks - st0.sig_checks, (unsigned long long)(now - t0), most);
     game_free(&a), game_free(&b);
     free(net.q);
-    printf("coop-probe: sync signatures: signed names are shown cleaned; failed checks count against the sender and are capped\n");
+    printf("coop-probe: sync signatures: signed names are shown cleaned; failed checks are made once for the same bytes, capped, and held against nobody\n");
 }
 
 // Finding 10: a game's own pool record is not rolled back after the room came back.
@@ -2970,6 +2977,203 @@ static void probe_h5_claim_at_title(void) {
     printf("coop-probe: sync claim at the title screen: a removal makes the claim again also while the game plays no save\n");
 }
 
+// ---- 12. the sixth review's findings
+
+// Where the charter of digest d begins (after its identity and the byte that says it carries one); 0 when it has none.
+static size_t charter_at(const Packet *d) {
+    size_t at = 5 + COOP_PK_LEN + 8, nl = d->b[at];
+    at += 1 + nl + COOP_SIG_LEN;
+    return at < d->n && d->b[at] ? at + 1 : 0;
+}
+
+// Finding 2: a digest is not signed by its sender, so what fails in one is held against nobody, and a changed copy of
+// a genuine signature does not make the genuine one fail. (a) 40 digests in B's name, each with B's identity and the
+// maker's charter one epoch later, its signature as it was; (b) two rosters that make A meet B again, then B's own
+// digest with one byte of its name changed; (c) the maker's new charter (a removal) with one mode changed and its
+// signature as it was, in the maker's name before the genuine one arrives. A keeps taking B's values and identifies B,
+// and B takes the genuine removal.
+static void probe_h6_digests(void) {
+    {
+        Net net = {0};
+        Game a, b;
+        game_init(&a, 1, 0x6101), game_init(&b, 2, 0x6102);
+        defaults(&a, 1), defaults(&b, 0);
+        net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+        uint64_t now = run(&net, (net_roster(&net, "H6F2A", 1000), 1000), 3000);
+        Packet d = digest_of(&b, now + 3000);
+        size_t c = charter_at(&d);
+        if (c) d.b[c] ^= 0x80;   // the epoch, 128 later
+        for (int i = 0; i < 40 && c; i++) coop_sync_receive(a.eng, 2, COOP_K_DIGEST, d.b, d.n, now += 20);
+        b.f[99].value = 1;
+        now = run(&net, now, 3000);
+        CHECK(c && !(coop_sync_ignored(a.eng) >> 2 & 1) && value_of(&a, 100) == 1,
+              "H6 F2a: 40 digests in B's name carrying the maker's charter with a later epoch and a signature that does not check out leave B "
+              "counted at A (ignored %u) and B's flag reaches A (%d)", coop_sync_ignored(a.eng) >> 2 & 1, value_of(&a, 100));
+        game_free(&a), game_free(&b);
+        free(net.q);
+    }
+    {
+        Net net = {0};
+        Game a, b;
+        game_init(&a, 1, 0x6111), game_init(&b, 2, 0x6112);
+        defaults(&a, 1), defaults(&b, 0);
+        net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+        uint64_t now = run(&net, (net_roster(&net, "H6F2B", 1000), 1000), 3000);
+        Packet d = digest_of(&b, now + 3000);
+        d.b[5 + COOP_PK_LEN + 8 + 1] ^= 1;   // one byte of B's name; its signature as it was
+        int ids[2] = {1, 2};
+        uint64_t made_up[2] = {a.session, 0xBAD5E55}, real[2] = {a.session, b.session};
+        coop_sync_room(a.eng, "H6F2B", 1, ids, made_up, 2, 1, now += 8);
+        coop_sync_room(a.eng, "H6F2B", 1, ids, real, 2, 1, now += 8);
+        coop_sync_receive(a.eng, 2, COOP_K_DIGEST, d.b, d.n, now += 8);
+        b.f[100].value = 1;
+        now = run(&net, now, 6000);
+        CHECK(heard_at(&a, 2, now) && value_of(&a, 101) == 1 && !(coop_sync_ignored(a.eng) >> 2 & 1),
+              "H6 F2b: after two rosters and B's digest with one byte of its name changed, A identifies B by B's own digests (%d), takes B's "
+              "flag (%d) and does not ignore B (%u)", heard_at(&a, 2, now), value_of(&a, 101), coop_sync_ignored(a.eng) >> 2 & 1);
+        game_free(&a), game_free(&b);
+        free(net.q);
+    }
+    {
+        Net net = {0};
+        Game a, b, m;
+        game_init(&a, 1, 0x6121), game_init(&b, 2, 0x6122), game_init(&m, 3, 0x6123);
+        defaults(&a, 1), defaults(&b, 0), defaults(&m, 0);
+        net.games[0] = &a, net.games[1] = &b, net.games[2] = &m, net.present[0] = net.present[1] = net.present[2] = 1;
+        uint64_t now = run(&net, (net_roster(&net, "H6F2C", 1000), 1000), 5000);
+        flag_of(&m, KEYS_FOREST)->value = 2;   // M picks up 2
+        now = run(&net, now, 3000);
+        int64_t before;
+        coop_sync_pool(b.eng, KEYS_FOREST, &before);
+        int acted = coop_sync_remove(a.eng, 3);
+        net.present[2] = 0;
+        net_roster(&net, "H6F2C", now);
+        Packet d = digest_of(&a, now += 8);   // the maker's digest with the removal, caught before it reached B
+        size_t c = charter_at(&d);
+        if (c) d.b[c + 5] ^= 1;               // one mode of the charter changed, its signature as it was
+        coop_sync_receive(b.eng, 1, COOP_K_DIGEST, d.b, d.n, now += 8);
+        now = run(&net, now, 6000);
+        CoopRules ra, rb;
+        coop_sync_rules(a.eng, &ra), coop_sync_rules(b.eng, &rb);
+        int64_t vb;
+        coop_sync_pool(b.eng, KEYS_FOREST, &vb);
+        CHECK(c && acted && before == 2 && rb.epoch == ra.epoch && vb == 0 && !(coop_sync_ignored(b.eng) >> 1 & 1),
+              "H6 F2c: a changed copy of the maker's removal, sent first, keeps neither the genuine one from B (epochs %u %u, B's pool %lld, "
+              "before %lld) nor counts against the maker (ignored %u)", ra.epoch, rb.epoch, (long long)vb, (long long)before,
+              coop_sync_ignored(b.eng) >> 1 & 1);
+        game_free(&a), game_free(&b), game_free(&m);
+        free(net.q);
+    }
+    printf("coop-probe: sync digests: what fails in a digest counts against nobody, and a changed copy does not make the genuine one fail\n");
+}
+
+// Finding 1's root cause in the sync layer: an identity is bound to a member's session, but not to one key. Someone
+// with the room's secret who is first with an identity of its own key for B's new session at A held B's place at A for
+// the whole session. Now the two keys are disputed (A takes B as neither) while both are presented, and once the other
+// key stops, B's own takes the place.
+static void probe_h6_identity_race(void) {
+    Net net = {0};
+    Game a, b;
+    game_init(&a, 1, 0x6201), game_init(&b, 2, 0x6202);
+    defaults(&a, 1), defaults(&b, 0);
+    net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H6R", 1000), 1000), 3000);
+    b.session ^= 0x6EED;   // B joins again: a new session
+    net_roster(&net, "H6R", now);
+    uint8_t seed_x[32] = {0x58, 6}, d[COOP_MAX_PAYLOAD];
+    size_t dn = make_digest(d, "H6R", seed_x, 2, b.session, "P2", 2, 0, NULL, 0);
+    coop_sync_receive(a.eng, 2, COOP_K_DIGEST, d, dn, now += 8);   // before B's own identity reaches A
+    now = run(&net, now, 4000);
+    int during = heard_at(&a, 2, now);
+    now = run(&net, now, 12000);   // the other key is not presented again
+    CoopOffer o;
+    coop_sync_offer(a.eng, &o, now);
+    const CoopOfferMember *x = offer_member(&o, 2);
+    uint64_t kid = 0;
+    int own = x && x->heard && coop_sync_key_parse(x->key, &kid) && kid == game_kid(&b, "H6R");
+    b.f[101].value = 1;
+    now = run(&net, now, 3000);
+    CHECK(!during && own && value_of(&a, 102) == 1,
+          "H6 F1: another key's identity for B's new session, at A before B's own: A takes B as neither while both are presented (%d), as "
+          "B by B's key once the other stops (%d), and takes B's flag (%d)", during, own, value_of(&a, 102));
+    game_free(&a), game_free(&b);
+    free(net.q);
+    printf("coop-probe: sync identity race: another key first for a member's session disputes it only while it keeps coming\n");
+}
+
+// Finding 3: a reset's carry is a claim from the reset on. (a) The maker, at its title screen with a claim of 2, resets;
+// B arrives after the reset, joins with nothing and picks up a key; the maker loads its save with 2: the pools hold 3.
+// (b) P accepted M and joined with 3 while M's 10 gains counted; G declined M; the maker removes M and resets in one
+// charter (one save of nx2navi.ini), P at its title screen; G picks up a key; P loads its save with 3: the pools hold 4.
+static void probe_h6_carry(void) {
+    {
+        Net net = {0};
+        Game a, b;
+        game_init(&a, 1, 0x6301), game_init(&b, 2, 0x6302);
+        defaults(&a, 1), defaults(&b, 0);
+        flag_of(&a, KEYS_FOREST)->value = 2;
+        net.games[0] = &a, net.games[1] = &b, net.present[0] = 1;
+        uint64_t now = run(&net, (net_roster(&net, "H6F3A", 1000), 1000), 5000);
+        a.hold_pools = 1;   // the maker at its title screen
+        int reset = coop_sync_reset_pools(a.eng);
+        now = run(&net, now, 2000);
+        net.present[1] = 1;   // B arrives, with no key
+        now = run(&net, (net_roster(&net, "H6F3A", now), now), 5000);
+        flag_of(&b, KEYS_FOREST)->value += 1;   // and picks one up
+        now = run(&net, now, 3000);
+        a.hold_pools = 0;   // the maker loads its save with 2
+        now = run(&net, now, 5000);
+        int64_t va, vb;
+        coop_sync_pool(a.eng, KEYS_FOREST, &va), coop_sync_pool(b.eng, KEYS_FOREST, &vb);
+        CHECK(reset && va == 3 && vb == 3 && value_of(&a, KEYS_FOREST) == 3 && value_of(&b, KEYS_FOREST) == 3,
+              "H6 F3a: the maker's carry of 2 and B's pickup after the reset, B arriving after it: the pools hold 3 (pools %lld %lld, shown %d %d)",
+              (long long)va, (long long)vb, value_of(&a, KEYS_FOREST), value_of(&b, KEYS_FOREST));
+        game_free(&a), game_free(&b);
+        free(net.q);
+    }
+    {
+        Net net = {0};
+        Game a, p, g, m;
+        game_init(&a, 1, 0x6311), game_init(&p, 2, 0x6312), game_init(&g, 3, 0x6313), game_init(&m, 4, 0x6314);
+        defaults(&a, 1), defaults(&p, 0), defaults(&g, 0), defaults(&m, 0);
+        g.ask = 1, p.hold_pools = 1, a.hold_pools = 1;   // the maker at its title screen throughout: its counter holds no gift of M's
+        net.games[0] = &a, net.games[1] = &p, net.games[2] = &g, net.games[3] = &m;
+        net.present[0] = net.present[1] = net.present[2] = 1;
+        uint64_t now = run(&net, (net_roster(&net, "H6F3B", 1000), 1000), 5000);
+        CoopOffer o;
+        int g_ok = coop_sync_offer(g.eng, &o, now) && coop_sync_accept(g.eng, o.token);   // G accepts A and P
+        net.present[3] = 1;   // M comes; A and P accept it, G does not
+        now = run(&net, (net_roster(&net, "H6F3B", now), now), 4000);
+        flag_of(&m, KEYS_FOREST)->value = 10;   // M picks up 10
+        now = run(&net, now, 3000);
+        flag_of(&p, KEYS_FOREST)->value = 3, p.hold_pools = 0;   // P loads a save with 3: its claim counts M's 10
+        now = run(&net, now, 3000);
+        int32_t pb = 0;
+        uint32_t pg, ps;
+        int64_t g_saw = -1, g_after = -1;
+        coop_sync_own_record(p.eng, KEYS_FOREST, &pb, &pg, &ps);   // P's claim absorbed into M's gains
+        coop_sync_pool(g.eng, KEYS_FOREST, &g_saw);                // and G, who does not count M, counts none of P's 3
+        p.hold_pools = 1;   // P at its title screen
+        int acted = coop_sync_remove(a.eng, 4) && coop_sync_reset_pools(a.eng);   // one save of nx2navi.ini: one charter
+        net.present[3] = 0;
+        now = run(&net, (net_roster(&net, "H6F3B", now), now), 5000);
+        coop_sync_pool(g.eng, KEYS_FOREST, &g_after);
+        flag_of(&g, KEYS_FOREST)->value += 1;   // G picks up one
+        now = run(&net, now, 3000);
+        flag_of(&p, KEYS_FOREST)->value = 3, p.hold_pools = 0, a.hold_pools = 0;   // P plays its save with 3 again; the maker one with none
+        now = run(&net, now, 5000);
+        int64_t v[3];
+        coop_sync_pool(a.eng, KEYS_FOREST, &v[0]), coop_sync_pool(p.eng, KEYS_FOREST, &v[1]), coop_sync_pool(g.eng, KEYS_FOREST, &v[2]);
+        CHECK(g_ok && acted && pb < 3 && g_saw == 0 && v[0] == 4 && v[1] == 4 && v[2] == 4 && value_of(&g, KEYS_FOREST) == 4 && value_of(&p, KEYS_FOREST) == 4,
+              "H6 F3b: the removal and the reset in one charter while P is at its title screen, then G's pickup: P's 3 and G's 1 stay (pools "
+              "%lld %lld %lld, shown P %d G %d; P's base %d and G's pool %lld before, G's pool %lld after the reset)", (long long)v[0], (long long)v[1],
+              (long long)v[2], value_of(&p, KEYS_FOREST), value_of(&g, KEYS_FOREST), pb, (long long)g_saw, (long long)g_after);
+        game_free(&a), game_free(&p), game_free(&g), game_free(&m);
+        free(net.q);
+    }
+    printf("coop-probe: sync carry: a reset's carry is a claim from the reset on, also when the removal comes in the same charter\n");
+}
+
 int probe_coop_sync(void) {
     fails = 0;
     if (getenv("NX2NAVI_COOP_ADVERSARY")) {
@@ -3011,6 +3215,9 @@ int probe_coop_sync(void) {
     probe_h5_join();
     probe_h5_rebind();
     probe_h5_claim_at_title();
+    probe_h6_digests();
+    probe_h6_identity_race();
+    probe_h6_carry();
     probe_adversary();
     return fails;
 }

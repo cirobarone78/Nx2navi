@@ -51,6 +51,8 @@ enum {
     RATE_BYTES = 32768,          // section and push bytes per second, under the relay's 64 KB/s per member
     BURST_BYTES = 8192,
     IDENT_WAIT_MS = 5000,        // a member that appeared this recently and is not identified holds the offer back
+    IDENT_HOLD_MS = 10000,       // another key's identity for a member's session takes its place only after this long
+                                 // without the one held (and the two are disputed while both are heard within it)
     CATCHUP_MS = 20000,          // after this long in the room, the state of one member is enough to join the pools
     ORIGINATE_MS = 1000,         // the maker signs a new charter at most this often (a removal at once)
     MSG_CAP = COOP_MAX_MESSAGE,
@@ -86,7 +88,7 @@ typedef struct { uint64_t kid; int32_t base; uint32_t gain, spend; } Seen;   // 
 // its claim can be made again when the records this game counts change.
 typedef struct {
     int fresh;                      // the join made this game's record of the epoch
-    int64_t want;                   // the game's count, or the carry of a reset when larger
+    int64_t want;                   // the game's count (a reset's carry is the joins' floor instead: Joins.floor)
     Seen seen[MAX_ADMIT];
     int nseen;
 } Join;
@@ -126,6 +128,8 @@ typedef struct {
     int present, have_digest;
     uint64_t session, seen_at;
     int ident;                      // its identity was checked for this session
+    uint64_t ident_at;              // when its identity was last presented
+    uint64_t rival_at;              // when another key's identity for its session last checked out (a dispute), 0 none
     uint8_t pk[COOP_PK_LEN];
     uint64_t kid;
     char name[NAME_CAP];            // the name its identity signed, cleaned for showing
@@ -369,8 +373,14 @@ static void gone_add(CoopSync *s, uint64_t kid) {
     s->gone[s->ngone++] = kid;
 }
 
-// A peer whose messages count: identified, not removed, not ignored.
-static int peer_counts(const CoopSync *s, const Peer *p) { return p->present && p->ident && !p->ignored && !removed(s, p->kid); }
+// Another key's identity for this member's session checked out recently, as well as the one held: only one of them is
+// the member's, and a game cannot tell which, so neither counts until one of them is no longer heard.
+static int disputed(const CoopSync *s, const Peer *p) { return p->rival_at && s->now - p->rival_at < IDENT_HOLD_MS; }
+
+// A peer whose messages count: identified and not disputed, not removed, not ignored.
+static int peer_counts(const CoopSync *s, const Peer *p) {
+    return p->present && p->ident && !disputed(s, p) && !p->ignored && !removed(s, p->kid);
+}
 
 // The slot of a flag in the index: keyed with a key of this process, so a peer cannot pile registers onto one run.
 static unsigned slot_of(const CoopSync *s, uint32_t hash) {
@@ -887,6 +897,22 @@ static void adopt_charter(CoopSync *s, const Charter *c) {
     }
     if (dropped) drop_pushes_of_records(s);
     recompute_sums(s);
+    // a pool reset: what this game carries is its claim in the new epoch from now on, signed at once as its record, so
+    // that every game counts it from the reset on and adds what anyone picks up after it, also while this game is at its
+    // title screen or never plays again. A game the reset does not admit claims its carry when it joins
+    // (coop_sync_pool_local)
+    if (had && c->pool_epoch != old_pool_epoch && admitted(s, s->kid))
+        for (int k = 0; k < s->npools; k++) {
+            Pool *p = &s->pools[k];
+            if (!p->has_carry || p->carry <= 0 || s->room.mode[p->cat] != COOP_MODE_POOL || rec_of(p, s->kid)) continue;
+            Rec r;
+            memset(&r, 0, sizeof r);
+            r.kid = s->kid, r.epoch = c->pool_epoch, r.base = (int32_t)clamp_reg(p->carry);
+            memcpy(r.pk, s->pk, COOP_PK_LEN);
+            p->joins = (Joins){.epoch = c->pool_epoch, .floor = r.base};
+            p->has_carry = 0;
+            own_record(s, p, &r, s->now);
+        }
     if (!had || memcmp(old.mode, s->room.mode, COOP_CAT_N) || c->pool_epoch != old_pool_epoch) s->caught_up = 0;
     for (int i = 0; i < s->nregs; i++) flag_check(s, i);
     for (int k = 0; k < s->npools; k++) pool_check(s, &s->pools[k]);
@@ -936,12 +962,14 @@ static uint64_t trusted_signer(const CoopSync *s) {
     return s->have_room ? s->ch.kid : one;
 }
 
-static void refuse(CoopSync *s, int from, const char *why, uint32_t hash);
-
 // A signature check on behalf of peer p: 1 valid, 0 not, -1 not checked (p's budget of checks is spent: the message
-// is dropped, a digest brings it again). The signature that failed last is not checked again.
+// is dropped, a digest brings it again). The check that failed last is not made again for the same signature, key and
+// bytes; the tag covers all three (keyed with this process's own key), so that a changed copy of a genuine message,
+// which anyone with the room's secret can send first, does not make the genuine one fail.
 static int sig_check(CoopSync *s, Peer *p, const uint8_t sig[COOP_SIG_LEN], const uint8_t pk[COOP_PK_LEN], const uint8_t *m, size_t n) {
-    uint64_t tag = (get64(sig) ^ get64(sig + 32) ^ get64(pk)) | 1;
+    uint8_t sp[COOP_SIG_LEN + COOP_PK_LEN];
+    memcpy(sp, sig, COOP_SIG_LEN), memcpy(sp + COOP_SIG_LEN, pk, COOP_PK_LEN);
+    uint64_t tag = coop_siphash24(s->ik0 ^ coop_siphash24(s->ik0, s->ik1, sp, sizeof sp), s->ik1, m, n) | 1;
     if (p->bad_sig == tag) return 0;
     if (!p->sig_at) p->sig_at = s->now, p->sig_tokens = SIG_BURST;
     if (s->now > p->sig_at) p->sig_tokens += (int64_t)(s->now - p->sig_at) * SIG_RATE / 1000, p->sig_at = s->now;
@@ -957,12 +985,14 @@ static int sig_check(CoopSync *s, Peer *p, const uint8_t sig[COOP_SIG_LEN], cons
     return 0;
 }
 
+// A charter a digest carries. A digest is not signed by its sender (anyone with the room's secret can send one in a
+// member's name), so a charter that does not check out is dropped and counted, never held against that member.
 static void consider_charter(CoopSync *s, int from, const Charter *c) {
     if (s->have_room && c->kid == s->ch.kid && c->epoch <= s->ch.epoch) return;   // nothing newer
     if (c->kid != trusted_signer(s)) return;
     uint8_t m[640];
     int ok = sig_check(s, &s->peer[from], c->sig, c->pk, m, charter_message(s, c, m));
-    if (!ok) refuse(s, from, "rules in the name of the key that signs them, which do not check out", 0);
+    if (!ok) s->st.forged++;
     if (ok == 1) adopt_charter(s, c);
 }
 
@@ -1133,13 +1163,14 @@ int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
         const Peer *p = &s->peer[id];
         if (!p->present) continue;
         CoopOfferMember *m = &o->member[o->n++];
-        m->id = id, m->heard = p->ident, m->removed = p->ident && removed(s, p->kid);
-        m->maker = p->ident && s->have_room && p->kid == s->ch.kid;
-        if (p->ident) {
+        int ident = p->ident && !disputed(s, p);   // two keys for its session: identified as neither
+        m->id = id, m->heard = ident, m->removed = ident && removed(s, p->kid);
+        m->maker = ident && s->have_room && p->kid == s->ch.kid;
+        if (ident) {
             snprintf(m->name, sizeof m->name, "%s", p->name);
             fingerprint(p->kid, m->key);
             if (!m->removed) kids[nk++] = p->kid;
-        } else if (s->now - p->seen_at < IDENT_WAIT_MS) {
+        } else if (!p->ident && s->now - p->seen_at < IDENT_WAIT_MS) {
             waiting = 1;
         } else {
             o->unidentified++;   // present and silent about who it is: the room cannot be accepted while it is there
@@ -1454,22 +1485,45 @@ static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_
     coop_name_clean(name, sizeof name, b + at, nl);
     const uint8_t *name_raw = b + at, *sig = b + at + nl;
     at += nl + COOP_SIG_LEN;
-    if (!p->ident || memcmp(p->pk, pk, COOP_PK_LEN) || memcmp(p->raw, name_raw, nl) || p->raw[nl]) {
-        // an identity is bound to one session: another key in the same session, a session of that key that ended, or a
-        // key another member holds is not taken
-        if (p->ident && memcmp(p->pk, pk, COOP_PK_LEN)) return;
-        uint64_t kid = kid_of(pk);
-        if (kid == s->kid) s->st.own_key++, s->st.own_key_member = from;   // another game holds this game's key: a copied key file
-        if (session_ended(s, kid, p->session) || kid == s->kid || member_of_kid(s, kid)) return;
+    uint64_t kid = kid_of(pk);
+    if (p->ident && kid == p->kid && !memcmp(p->raw, name_raw, nl) && !p->raw[nl]) {
+        p->ident_at = now;   // the identity held, presented again
+    } else {
+        // an identity is bound to one session: a session of that key that ended, a key another member holds, or the key
+        // held under another name is not taken. Another key for the same session is one of two that cannot both be
+        // the member's: it takes the place only once the one held was not presented for IDENT_HOLD_MS, and until then
+        // the two are disputed (neither counts) while both keep coming. So whoever holds the room's secret and is first
+        // with an identity of its own key for a member's session cuts that member off only while it keeps sending
+        int rival = p->ident && kid != p->kid;
+        if (p->ident && !rival) return;
+        if (session_ended(s, kid, p->session) || (kid != s->kid && member_of_kid(s, kid))) return;
         char raw[NAME_CAP];
         memcpy(raw, name_raw, nl), raw[nl] = 0;
         if (strlen(raw) != nl) return;
-        // checked over the bytes as signed; shown cleaned, as the relay's names are
+        // checked over the bytes as signed; shown cleaned, as the relay's names are. A digest is not signed by its sender:
+        // an identity that does not check out is dropped and counted, never held against the member
         uint8_t m[128];
         int ok = sig_check(s, p, sig, pk, m, identity_message(s, from, p->session, prev, pk, raw, m));
-        if (!ok) refuse(s, from, "an identity that does not check out", 0);
+        if (!ok) s->st.forged++;
         if (ok != 1) return;
-        p->ident = 1, p->kid = kid;
+        if (kid == s->kid) {   // signed with this game's own key: another game holds a copy of its key file
+            s->st.own_key++, s->st.own_key_member = from;
+            return;
+        }
+        if (rival && now - p->ident_at < IDENT_HOLD_MS) {
+            if (!disputed(s, p)) tracef(s, "member %d: another key's identity for its session; neither counts while both are presented", from);
+            p->rival_at = now;
+            return;
+        }
+        if (rival) {   // the key held was not presented for a while: what came with it is forgotten, its budgets stay
+            Peer q = *p;
+            memset(p, 0, sizeof *p);
+            p->present = q.present, p->session = q.session, p->seen_at = q.seen_at, p->tokens = q.tokens, p->tok_at = q.tok_at;
+            p->sig_tokens = q.sig_tokens, p->sig_at = q.sig_at, p->bad_sig = q.bad_sig;
+            tracef(s, "member %d: the key held for its session was not presented for %d s; another key's identity takes its place", from,
+                   IDENT_HOLD_MS / 1000);
+        }
+        p->ident = 1, p->kid = kid, p->ident_at = now;
         memcpy(p->pk, pk, COOP_PK_LEN);
         memcpy(p->raw, raw, nl + 1);
         memcpy(p->name, name, sizeof name);
@@ -1866,8 +1920,11 @@ void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, in
         Joins *js = &p->joins;
         if (fresh || js->epoch != s->ch.pool_epoch || !js->n) {
             // the first join of the epoch, or a record of it this game does not remember joining with (the room kept
-            // it while this game started again): what it holds stays the least it claims
-            js->epoch = s->ch.pool_epoch, js->n = 0, js->debt = 0, js->floor = fresh ? -POOL_REG_MAX : mine->base;
+            // it while this game started again, or a reset's carry signed at once): what it holds stays the least it
+            // claims. A reset's carry that was not signed then (this game was not admitted yet) is a claim made at the
+            // reset, so what anyone picked up since comes on top of it
+            int32_t carry = p->has_carry && p->carry > 0 ? (int32_t)clamp_reg(p->carry) : -POOL_REG_MAX;
+            js->epoch = s->ch.pool_epoch, js->n = 0, js->debt = 0, js->floor = fresh ? carry : mine->base;
         }
         if (js->n == POOL_JOINS) {   // the second oldest keeps what it claims now; the first holds the debt gain
             int32_t c;
@@ -1881,7 +1938,6 @@ void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, in
         Join *j = &js->j[js->n++];
         memset(j, 0, sizeof *j);
         j->fresh = fresh, j->want = value;
-        if (p->has_carry && p->carry > j->want) j->want = p->carry;
         for (int i = 0; i < p->nrec; i++)
             if (p->rec[i].epoch == s->ch.pool_epoch) j->seen[j->nseen++] = (Seen){p->rec[i].kid, p->rec[i].base, p->rec[i].gain, p->rec[i].spend};
         int32_t base;
