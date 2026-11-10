@@ -85,8 +85,8 @@ static void mesa_cache_beside_exe(void) {
 // beside the exe, which nothing else writes, with a limit of NV_CACHE_BYTES. The driver makes GLCache inside that
 // folder but not the folder, so it is made here; pointed at a folder that is missing or not writable it caches nothing
 // at all, so when that folder cannot be made or written neither variable is set and the driver keeps its own folder
-// and limit. Without NVIDIA's kernel driver (no /proc/driver/nvidia/version, the test play.sh makes) the variables do
-// nothing and the folder would stay empty, so nothing is done.
+// and limit. Without NVIDIA's kernel driver (no /proc/driver/nvidia/version, the test the AppImage's build makes for
+// DLSS) the variables do nothing and the folder would stay empty, so nothing is done.
 #define NV_CACHE_BYTES "8589934592"   // 8 GiB
 static void nvidia_cache_beside_exe(void) {
     if (plat_fs_kind("/proc/driver/nvidia/version") != PLAT_FS_FILE) return;
@@ -270,6 +270,7 @@ retry:
         }
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -408,7 +409,6 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
-    vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {

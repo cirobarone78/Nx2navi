@@ -992,7 +992,8 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 //   GPU's when the fence does. Whole-range copies both ways lost the CPU's bytes: Ocarina writes a lighting parameter
 //   into a buffer whose binding its compute passes write every frame, the GPU only ever read zero there, the lighting
 //   coefficients and then the volumetric fog came out NaN, and the fog pass drew the 3D scene black.
-// NX2NAVI_SHADOW=1/0 forces the mode on or off; the default is on for Linux and Wine.
+// NX2NAVI_SHADOW=1/0 forces the mode on or off; the default is on for Linux and Wine, except for NVIDIA's own driver on
+// Linux, where imports are about twice as fast (mirror_mode).
 #define SB_PAGE 4096ull
 static PlatMutex shadow_lock = PLAT_MUTEX_INIT;   // after pool_lock; before gen_lock
 static PoolRec **stouch;                          // shadow_lock: pools resolved since the last sync
@@ -1585,7 +1586,7 @@ static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
 static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
-static void mirror_mode(int discrete) {
+static void mirror_mode(int discrete, uint32_t vendor) {
     const char *e = cfg_value("NX2NAVI_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
     const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
@@ -1615,7 +1616,13 @@ static void mirror_mode(int discrete) {
 #ifdef _WIN32
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
 #else
-    shadow_on = !sh || !*sh || strcmp(sh, "0");
+    // NVIDIA's own driver imports guest memory without the cost shadow storage avoids on amdgpu (re-protecting imported
+    // pages), and there the copies are the slower path and draw a wrong picture: in Kokiri Forest on 0.7.1 (RTX 4090,
+    // driver 615.78) imports with VRAM mirrors ran at 51.9 frames a second with no frame flagged by the flicker scanner
+    // in 6,627, the copies at 27.4 with 2,668 of 4,227 flagged (brighter, a white haze, alternating frame by frame).
+    // The pools stay imports unless NX2NAVI_SHADOW asks for the copies. The open driver for the same cards (a Mesa
+    // driver, vendor 0 here) keeps the copies: it is not measured.
+    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : vendor != 0x10de;
 #endif
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
                           sh && *sh ? " (NX2NAVI_SHADOW)" : "");
@@ -3358,7 +3365,7 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
                               f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " LAZY" : "");
     }
     rt_log("%s", line);
-    mirror_mode(discrete);
+    mirror_mode(discrete, vk_caps.mesa ? 0 : p->vendorID);
 }
 
 // ---------------------------------------------------------------- upload batches and deferred destruction

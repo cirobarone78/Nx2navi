@@ -149,14 +149,11 @@ else
     ev step dlss '"state":"skip"'
 fi
 
-# play.sh: the environment the game wants on this machine, then the game
+# play.sh: starts the game from its own folder. It sets no storage mode: the game leaves shadow storage off for
+# NVIDIA's own driver itself (runtime/vk_memory.c mirror_mode), by the driver of the device it runs on.
 {
     echo '#!/bin/bash'
     echo 'cd "$(dirname "$(readlink -f "$0")")"'
-    if [ -e /proc/driver/nvidia/version ]; then
-        echo '# NVIDIA: the default shadow storage leaves the 3D world black (issue #72)'
-        echo 'export NX2NAVI_SHADOW="${NX2NAVI_SHADOW:-0}"'
-    fi
     echo 'exec ./ocarina "$@"'
 } > "$OUT/play.sh"
 chmod +x "$OUT/play.sh"

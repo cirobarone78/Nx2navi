@@ -250,7 +250,11 @@ a VRAM mirror's write-back merge marks the pages it changed, and only those are 
 reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
 Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
-well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+well: the shadow copies are chosen for the measured cost above, not for a missing extension. NVIDIA's own driver on Linux
+imports instead (`NX2NAVI_SHADOW=1` brings the copies back): it imports guest memory without that cost, and there the
+copies are the slower path and draw a wrong picture. In Kokiri Forest on 0.7.1 (RTX 4090, driver 615.78), imports with
+VRAM mirrors ran at 51.9 frames a second with no frame flagged by the flicker scanner in 6,627; the copies ran at 27.4,
+and 2,668 of 4,227 frames were flagged (brighter, with a white haze, alternating frame by frame).
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
