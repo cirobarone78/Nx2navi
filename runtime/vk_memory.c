@@ -968,7 +968,7 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 //   reports it at the fence (vk_gpu_written), which copies those bytes back into guest memory. Until then the CPU
 //   copies skip them: a page the CPU and the GPU both write keeps the GPU's bytes.
 // NX2NAVI_SHADOW=1/0 forces the mode on or off; the default is on for Linux and Wine.
-typedef struct { uint64_t lo, hi; } SRange;
+typedef struct { uint64_t lo, hi; int submitted; } SRange;
 static PlatMutex shadow_lock = PLAT_MUTEX_INIT;   // after pool_lock; before gen_lock
 static PoolRec **stouch;                          // shadow_lock: pools resolved since the last sync
 static int nstouch, cstouch;
@@ -976,6 +976,15 @@ static SRange *spend;                             // shadow_lock: GPU writes rec
 static int nspend, cspend;
 static int64_t s_live_n, s_live_bytes;            // shadow_lock
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
+
+static int shadow_pending_inputs(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("SHADOW_PENDING_INPUTS", "1");
+        if (mode) rt_log("vk: shadow CPU inputs precede writes of the part being submitted");
+    }
+    return mode;
+}
 
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_lo = addr & ~0xfffull;
@@ -1026,15 +1035,16 @@ static void shadow_forget(PoolRec *r) {
     plat_mutex_unlock(&shadow_lock);
 }
 
-// shadow_lock held: copies guest [a, b) into the shadow, leaving out the bytes of GPU writes not copied back yet
-// (spend from index i on).
+// shadow_lock held: copies guest [a, b) into the shadow, protecting writes of earlier submitted parts
+// that are not copied back yet (spend from index i on).
 static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b, int i) {
     for (; i < nspend; i++)
-        if (spend[i].lo < b && spend[i].hi > a) {
+        if ((!shadow_pending_inputs() || spend[i].submitted) && spend[i].lo < b && spend[i].hi > a) {
             if (spend[i].lo > a) shadow_copy(r, a, spend[i].lo, i + 1);
             if (spend[i].hi < b) shadow_copy(r, spend[i].hi, b, i + 1);
             return;
         }
+    if (b <= a) return;
     memcpy(r->smap + (a - r->import_lo), (const void *)(uintptr_t)a, b - a);
     s_copied += b - a;
 }
@@ -1090,6 +1100,10 @@ void vk_mem_shadow_sync(void) {
         s_syncs += (uint64_t)nstouch;
         nstouch = 0;
     }
+    // Pending writes recorded for this part have not run yet. Their CPU inputs must be uploaded first; only
+    // writes of earlier parts need protection from stale CPU bytes. The next sync sees these writes as submitted.
+    if (shadow_pending_inputs())
+        for (int i = 0; i < nspend; i++) spend[i].submitted = 1;
     s_ticks += qpc() - t0;
     plat_mutex_unlock(&shadow_lock);
 }
