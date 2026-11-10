@@ -1199,6 +1199,14 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
+    # The runtime's own shaders are in the repository as source only: from a source checkout their headers are not
+    # there until they are built, and every runtime file that includes one would fail to compile. A kit carries them
+    # built, so nothing is stale there and no shader compiler is looked for.
+    import build_shaders
+    stale = build_shaders.stale(rt)
+    if stale:
+        say(f'  compiling {len(stale)} of the runtime\'s own shaders (runtime/*_spv.h)')
+        build_shaders.build(rt, stale)
     clang, clangxx, env, vma = toolchain(msys)
     if not romfs_job:
         romfs_index(out, gen)

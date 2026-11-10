@@ -80,7 +80,9 @@ RADV). It takes clang, clang++ and lld from `PATH` and links against the system'
    pinned 3.4.0 into `toolchain/vma/` and checks its hash.
 
 2. The shader translator: a kit with `bin/nx2navi_xlate` has it; from a source checkout, build it once with
-   `python tools/build_xlate.py` (needs the .NET 10 SDK). The build copies it beside the game.
+   `python tools/build_xlate.py` (needs the .NET 10 SDK). The build copies it beside the game. A kit also carries the
+   runtime's own shaders compiled; from a source checkout the build compiles them first, with `glslc`, `spirv-as` and
+   `spirv-val` (on Arch the packages `shaderc` and `spirv-tools`).
 
 3. Build, then play:
 
