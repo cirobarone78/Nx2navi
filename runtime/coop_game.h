@@ -35,3 +35,6 @@ int coop_game_remove_key(const char *fingerprint);
 // The identities the pools admit and what each spent beyond what it brought (coop_state.h): whom the maker would remove
 // after a drain. Their count (at most max).
 int coop_game_contributors(CoopContributor *out, int max);
+// fs_host.c, at every RomFS file open on any thread: notes the start of the title screen, after which sync waits for a
+// save to be loaded. With COOP off it reads one value and returns.
+void coop_game_rom_open(const char *path);

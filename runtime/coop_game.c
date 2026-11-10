@@ -29,6 +29,7 @@
 //   (a highest-count merge would hand back what the game took away); heart pieces and gold skulltula tokens, and the 11
 //   heart reward flags (their pickups are mostly per-object flags this layer does not write, so a shared count would pay a
 //   piece twice); life, the magic in the meter, bottle contents, equipment worn, the time of day, Link's place.
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,8 +69,9 @@ enum {
 #define S_CAPACITY 0xf80f8077u   // wallet, bomb bag, quiver, seed bag, stick and nut capacities
 #define F_RUPEES 0xa77921d7u
 #define F_MAGIC_SIZE 0x12d63a97u
-#define F_PLAY_CLOCK 0xe53eb6d1u // UInt: seconds played, advanced while the game runs
+#define F_PLAY_CLOCK 0xe53eb6d1u // UInt: seconds played, advanced while the game runs (on the title screen too)
 #define F_LOADING 0xf5deef0au    // Bool: a save is being loaded
+#define PLAYER_PTR 0x7004e371d0ull   // [main+0x4e371d0] + 0x480: the Player actor, none before the first load
 
 // Scene changes in progress (Bool, not saved): nothing is read or written while one is set.
 static const uint32_t transition_flags[] = {0x9a9506e7, 0xf8633c7f, 0xf96989b6, 0xe19dfdd6};
@@ -145,7 +147,9 @@ static struct {
     int nflags, npools, cap;
     unsigned count[COOP_CAT_N];
     int bound, gate, slice;
-    int loaded;             // a save was loaded since the start (the title screen's clock runs too)
+    int loaded;             // a save was loaded since the title screen last started (its clock runs too)
+    int titles;             // title_starts when last seen
+    int player;             // the Player actor stands in the world (player_in_world)
     uint32_t clock;
     uint64_t clock_at, clock_entry, loading_entry, transition_entry[4];
     uint32_t frames;        // frames played since the save was bound
@@ -900,7 +904,29 @@ static void bind(uint64_t mgr) {
            G.count[COOP_CAT_KEYS], G.count[COOP_CAT_AMMO]);
 }
 
-// The game is being played: the clock runs, no save is loading, no scene is changing. Notes a save change (unbind).
+// Link stands in the world: the Player actor, [[main+0x4e371d0] + 0x480], exists (its name, [+0x20], reads "Player")
+// away from the origin (its position in metres at +0x31c). There is none on the title screen at the start, so this holds
+// sync back while the first load builds the world; after a return to the title screen the actor stays (title_starts
+// marks that).
+static int player_in_world(void) {
+    uint64_t m = rd_ok(PLAYER_PTR, 8) ? LD64(PLAYER_PTR) : 0, a = rd_ok(m + 0x480, 8) ? LD64(m + 0x480) : 0;
+    uint64_t name = rd_ok(a + 0x20, 8) ? LD64(a + 0x20) : 0;
+    if (!rd_ok(name, 7) || memcmp((const void *)(uintptr_t)name, "Player", 7) || !rd_ok(a + 0x31c, 12)) return 0;
+    float p[3];
+    memcpy(p, (const void *)(uintptr_t)(a + 0x31c), sizeof p);
+    return isfinite(p[0]) && isfinite(p[2]) && fabsf(p[0]) + fabsf(p[2]) >= 1.0f;
+}
+
+// The title screen's event flow is opened each time the title screen starts: at boot and after the pause menu's Title
+// Screen. From then until a save is loaded the flags are the title's, and the play clock runs on from the save's value.
+static volatile int32_t title_starts;
+void coop_game_rom_open(const char *path) {
+    if (__atomic_load_n(&G.on, __ATOMIC_RELAXED) && strstr(path, "/Event/EventFlow/TitleEvent.bfevfl"))
+        plat_inc32(&title_starts);
+}
+
+// The game is being played: a save was loaded since the title screen, Link stands in the world, the clock runs, no save
+// is loading, no scene is changing. Notes a save change (unbind).
 static int gate(uint64_t mgr) {
     if (mgr != G.mgr || !G.clock_entry) {   // the addresses of the few flags read every frame
         G.clock_entry = entry_of(mgr, C_UINT, INT_SIZE, F_PLAY_CLOCK);
@@ -909,21 +935,30 @@ static int gate(uint64_t mgr) {
         if (!G.clock_entry || !rd_ok(G.clock_entry, INT_SIZE)) return 0;
     }
     uint64_t now = plat_now_ms();
+    int titles = plat_cas32(&title_starts, 0, 0);
+    if (titles != G.titles) {
+        G.titles = titles;
+        unbind("the title screen came back");
+        G.loaded = 0;
+    }
     uint32_t clock = LD32(G.clock_entry + I_CURRENT);
     int loading = G.loading_entry && LD8(G.loading_entry + B_CURRENT);
     unsigned moving = 0;
     for (int i = 0; i < 4; i++) moving |= (unsigned)(G.transition_entry[i] && LD8(G.transition_entry[i] + B_CURRENT)) << i;
     if (clock != G.clock) {
-        // the clock counts seconds one by one, on the title screen too (from 0); any other change is a save being loaded
-        // (a load, a new game, the same save again from where it was saved), which also sets the flags: play starts at
-        // the next tick after one
+        // the clock counts seconds one by one, on the title screen too; any other change is a save being loaded (a load,
+        // a new game, the same save again from where it was saved), which also sets the flags: play starts at the next
+        // tick after one
         int tick = clock > G.clock && clock - G.clock <= 5;
         if (!tick) unbind("another save was loaded"), G.loaded = 1;
         G.clock = clock;
         G.clock_at = tick ? now : 0;
     }
     if (loading) unbind("a save is loading"), G.loaded = 1;
-    int open = G.loaded && !loading && !moving && G.clock_at && now - G.clock_at < CLOCK_MS;
+    int player = player_in_world();
+    if (player != G.player && TRACE_ON) rt_log("coop: sync: Link %s the world", player ? "stands in" : "is not in");
+    G.player = player;
+    int open = G.loaded && player && !loading && !moving && G.clock_at && now - G.clock_at < CLOCK_MS;
     if (open != G.gate && TRACE_ON)
         rt_log("coop: sync: game %s (play clock %u, loading %d, scene change %#x)", open ? "running" : "paused", clock, loading, moving);
     G.gate = open;
