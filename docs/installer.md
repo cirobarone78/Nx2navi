@@ -177,7 +177,7 @@ nn::pl shared fonts). The game does not ship them. Without them it exits before 
 type-2 runtime: no libfuse2 needed on the host). This setup reads the game files of the base tree's game (base and update
 with a keys file, `installer/layout.py` SUPPORTED) and needs one of its versions lifted to build (generated/v121 or
 v143), so it cannot build Ocarina of Time from a `.nup`; players get `tools/make_appimage.py`'s AppImage
-(README-BuildKit.md, "Linux"), which carries this setup's compiler and sysroot through `tools/linux_toolchain.py`. The player makes it executable and starts it; on a Steam Deck, from
+(README-BuildKit.md, "Linux"), which with `--toolchain` carries this setup's compiler and sysroot through `tools/linux_toolchain.py`. The player makes it executable and starts it; on a Steam Deck, from
 Desktop Mode. The command-line setup needs the desktop session's display (`DISPLAY` or `WAYLAND_DISPLAY`) because preparing the
 shaders opens a window; the check step fails at once without it. Building the release also needs `make` and `pkg-config`. The bundled Tcl/Tk 9.0.4 is rebuilt with
 Xft against the sniper sysroot so Russian text uses system TrueType fonts. The setup builds the game into the folder they pick, as on Windows, and the game is `nx2navi` there with

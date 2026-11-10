@@ -132,14 +132,21 @@ switches at once, with a *DLSS multiplier* of 2x to 6x (above 2x on RTX 50 cards
 frames needed to reach the display's refresh rate (`framegen = dlss` and `fg_mult` in `nx2navi.ini`). The log says
 `ngxfg: DLSS Frame Generation available` when NGX found the library.
 
-`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python and
-its own compiler, for players without a source checkout: clang and lld of LLVM 23 with the headers and libraries the
-build reads (`tools/linux_toolchain.py`: the Steam Runtime 3 SDK's glibc 2.31 and C++ library, and SDL3, Opus, libvpx,
-dav1d and zstd, which the game links in), so it needs none of the packages above, not on a Steam Deck either. The game it
-builds needs glibc 2.31 and the graphics driver's Vulkan loader; the compiler needs glibc 2.34 (SteamOS 3, Ubuntu
-22.04, Debian 12). It installs zbic with pip on its first run, picks `--jobs` from the memory, builds into
-`~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh` beside the game. An AppImage made with
-`--no-toolchain` is about 150 MB smaller and checks for the packages above instead.
+`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
+players without a source checkout. It installs zbic with pip on its first run, picks `--jobs` from the memory, builds
+into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh` beside the game. Made as it is, it
+checks for the packages above and names the missing ones. Made with `--toolchain` (about 150 MB larger) it carries its
+own compiler and needs none of them: clang and lld of LLVM 23 with the headers and libraries the build reads
+(`tools/linux_toolchain.py`: the Steam Runtime 3 SDK's glibc 2.31 and C++ library, and SDL3, Opus, libvpx, dav1d and
+zstd, which the game links in). What such an AppImage still needs of the system:
+
+- the compiler (the official LLVM release's binaries): glibc 2.34, the `libstdc++.so.6` of GCC 12 or newer
+  (GLIBCXX_3.4.30) and zlib (`libz.so.1`). Ubuntu 22.04, Debian 12 and SteamOS 3.8 (glibc 2.41) have them; SteamOS 3.2
+  and 3.3 (glibc 2.33, GCC 11) do not.
+- the game folder: `ocarina` needs glibc 2.29 or newer, `libgcc_s.so.1` and the graphics driver's Vulkan loader; the
+  shader translator beside it (`nx2navi_xlate`, built on the release machine) needs glibc 2.34.
+- without FUSE (or with `APPIMAGE_EXTRACT_AND_RUN=1`) every run unpacks the AppImage into `$TMPDIR` first, about 1 GB
+  with the toolchain; on a `/tmp` held in memory that is memory.
 
 ## Playing
 

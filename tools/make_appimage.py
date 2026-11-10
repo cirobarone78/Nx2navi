@@ -4,7 +4,7 @@ arguments on a desktop it opens a window to install, update and play (tools/appi
 with --events and reads its progress lines).
 
     python3 tools/make_appimage.py --python <standalone CPython 3.14> --appimagetool <appimagetool> [--out dist]
-                                   [--dlss libnvidia-ngx-dlss.so.<version> | --no-dlss] [--no-toolchain]
+                                   [--dlss libnvidia-ngx-dlss.so.<version> | --no-dlss] [--toolchain]
 
 The AppImage holds no game files: the kit's tools/, recomp/, runtime/ and docs, the shader translator built by
 tools/build_xlate.py (bin/nx2navi_xlate), NVIDIA's DLSS library with its notice (bin/, tools/dlss_pin.py: downloaded
@@ -17,12 +17,12 @@ into the kit's prompt-art folder; without it that step is skipped and the game k
 package that unpacks the game's program files, is not bundled: the AppImage installs it with pip into
 ~/.local/share/nx2navi/pydeps the first time it runs, as the Windows launcher downloads it.
 
-It also carries the compiler, the linker and the headers and libraries the game build reads (tools/linux_toolchain.py,
-in the kit's llvm/: LLVM 23's clang and lld with the Steam Runtime 3 SDK's glibc 2.31 and C++ library, and SDL3, Opus,
-libvpx, dav1d and zstd built in statically), so it builds the game on a PC with no compiler or development packages, a
-Steam Deck among them. With --no-toolchain it is about 150 MB smaller and takes them from the system instead
-(README-BuildKit.md, "Linux"): it then checks for clang, clang++, lld and the headers before it starts, and names the
-packages for Arch, Fedora and Debian/Ubuntu.
+The compiler and the libraries come from the system (README-BuildKit.md, "Linux"): the AppImage checks for clang,
+clang++, lld and the headers before it starts, and names the packages for Arch, Fedora and Debian/Ubuntu. With
+--toolchain it carries them instead (tools/linux_toolchain.py, in the kit's llvm/: LLVM 23's clang and lld with the
+Steam Runtime 3 SDK's glibc 2.31 and C++ library, and SDL3, Opus, libvpx, dav1d and zstd built in statically), so it
+builds the game on a PC with no compiler or development packages, such as SteamOS; it is then about 150 MB larger, and
+making it downloads about 3.3 GB the first time (toolchain/release-dl keeps them).
 """
 import argparse
 import os
@@ -74,11 +74,14 @@ ev() { [ ${#EVENTS[@]} -gt 0 ] && printf '@@{"ev":"%s","step":"%s"%s}\n' "$1" "$
 if [ "$1" = --events ]; then EVENTS=(--events); shift; fi
 ev step deps '"state":"start"'
 
-# A kit with its own toolchain (tools/linux_toolchain.py) builds with it and needs nothing of the system's: its clang
-# reads the clang.cfg beside it, which points it at the sysroot there.
+# A kit with its own toolchain (tools/linux_toolchain.py) builds with it and needs no compiler, headers or libraries of
+# the system's (README-BuildKit.md says what the compiler itself needs): its clang reads the clang.cfg beside it, which
+# points it at the sysroot there. These variables would turn that file off or add the system's headers, libraries or
+# programs to a compile or link.
 missing=()
 if [ -x "$KIT/llvm/bin/clang" ]; then
     export PATH="$KIT/llvm/bin:$PATH" VMA_INCLUDE="$KIT/toolchain/vma"
+    unset CLANG_NO_DEFAULT_CONFIG CCC_OVERRIDE_OPTIONS COMPILER_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
 else
     for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
     for h in SDL3/SDL.h vulkan/vulkan.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
@@ -197,8 +200,9 @@ def main():
     ap.add_argument('--dlss', type=Path, help="NVIDIA's libnvidia-ngx-dlss.so.<version> from disk instead of "
                                                "downloading it from NVIDIA's DLSS SDK repository")
     ap.add_argument('--no-dlss', action='store_true', help='leave NVIDIA DLSS out of the AppImage')
-    ap.add_argument('--no-toolchain', action='store_true',
-                    help='leave the compiler, linker and libraries out: the AppImage then needs the system\'s')
+    ap.add_argument('--toolchain', action='store_true',
+                    help='carry the compiler, linker and libraries (tools/linux_toolchain.py), so the AppImage needs '
+                         'none of the system\'s')
     ap.add_argument('--out', type=Path, default=ROOT / 'dist', help='where the AppImage goes (default dist/)')
     ap.add_argument('--prompt-art', type=Path, nargs='+', metavar='FOLDER',
                     help='folders holding XGamepad, P5Gamepad and Keyboard_Mouse (or those folders): the button art, as '
@@ -238,7 +242,7 @@ def main():
         dlss_pin.place(dlss, kit / 'bin', linux=True)
     (kit / 'toolchain' / 'vma').mkdir(parents=True)
     shutil.copy2(ROOT / 'toolchain' / 'vma' / 'vk_mem_alloc.h', kit / 'toolchain' / 'vma' / 'vk_mem_alloc.h')
-    if not a.no_toolchain:
+    if a.toolchain:
         import linux_toolchain
         linux_toolchain.assemble(kit / 'llvm')
     if a.prompt_art:

@@ -1,6 +1,7 @@
 # The Linux AppImage of each release (tools/make_appimage.py), built on a Linux runner and attached to the release
 # itself: the release is assembled on Windows (tools/make_release.py), and the AppImage needs Linux (the translator's
-# NativeAOT build for linux-x64, appimagetool). It holds the build kit only, no game files, as the setup does.
+# NativeAOT build for linux-x64, appimagetool). It holds the build kit only, no game files, as the setup does, and with
+# --toolchain the compiler and libraries a build reads (tools/linux_toolchain.py), so players need no packages.
 name: Linux AppImage
 
 on:
@@ -21,7 +22,7 @@ concurrency:
 jobs:
   appimage:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90   # the toolchain's first downloads (3.3 GB) and its SDL, dav1d and runtime compiles
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -33,9 +34,13 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - uses: astral-sh/setup-uv@v6
-      - name: Shader compilers
-        # make_appimage.py compiles the runtime's own shaders (tools/build_shaders.py: glslc, spirv-as, spirv-val)
-        run: sudo apt-get update && sudo apt-get install -y glslc spirv-tools
+      - name: Shader compilers and the toolchain's build tools
+        # make_appimage.py compiles the runtime's own shaders (tools/build_shaders.py: glslc, spirv-as, spirv-val);
+        # tools/linux_toolchain.py runs make, tar with xz, pkg-config, wayland-scanner (without it SDL leaves Wayland
+        # out) and readelf, and its end check runs a program linked with the Vulkan loader
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc spirv-tools make xz-utils pkg-config libwayland-bin binutils libvulkan1
       - name: Shader translator and VMA
         run: |
           uv venv -q --python 3.12 .venv
@@ -51,6 +56,13 @@ jobs:
           done
           unzip -q "$RUNNER_TEMP"/app/NX2navi-app-*.zip 'prompt-art/*' -d "$RUNNER_TEMP/app" || true
           ls -d "$RUNNER_TEMP/app/prompt-art" 2>/dev/null || echo "::warning::no prompt-art in the app zip: the AppImage's builds keep the Switch prompts"
+      - name: Toolchain downloads
+        # LLVM, the Steam Runtime SDK, CMake and the sources tools/linux_toolchain.py builds (about 3.3 GB), each
+        # checked against its sha256 when used; the pins live in these three files
+        uses: actions/cache@v4
+        with:
+          path: toolchain/release-dl
+          key: toolchain-dl-${{ hashFiles('tools/linux_toolchain.py', 'tools/make_release_linux.py', 'tools/make_release.py') }}
       - name: AppImage
         run: |
           uv python install -q 3.14
@@ -60,7 +72,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/appimagetool"
           art=(); [ -d "$RUNNER_TEMP/app/prompt-art" ] && art=(--prompt-art "$RUNNER_TEMP/app/prompt-art")
           APPIMAGE_EXTRACT_AND_RUN=1 .venv/bin/python tools/make_appimage.py --python "$py" \
-            --appimagetool "$RUNNER_TEMP/appimagetool" --out dist "${art[@]}"
+            --appimagetool "$RUNNER_TEMP/appimagetool" --out dist --toolchain "${art[@]}"
           appimage=$(ls dist/NX2navi-Linux-*-x86_64.AppImage)
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help | head -3
           (cd dist && sha256sum NX2navi-Linux-*-x86_64.AppImage > SHA256SUMS-linux.txt && cat SHA256SUMS-linux.txt)
