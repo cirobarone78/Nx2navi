@@ -154,6 +154,7 @@ void mem_init(void);                                       // reserve every regi
                                                            // (up to 20 times, NX2NAVI_REEXEC), then fatal
 const RtGuestLayout *mem_layout(void);
 void mem_guest_census(uint64_t frame);   // NX2NAVI_TRACE=perf: committed bytes per guest region
+void mem_lazy_heap_report(uint64_t frame);   // NX2NAVI_TRACE=perf: the lazy heap's faults since the last line
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);                      // 0x01
 uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm);             // 0x02
 uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at); // 0x03

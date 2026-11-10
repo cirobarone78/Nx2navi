@@ -24,6 +24,7 @@ __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
 __attribute__((weak)) void prof_commit_census(uint64_t frame) { (void)frame; }
 __attribute__((weak)) void mem_guest_census(uint64_t frame) { (void)frame; }
+__attribute__((weak)) void mem_lazy_heap_report(uint64_t frame) { (void)frame; }
 
 // NX2NAVI_TRACE=perf, NX2NAVI_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
 // (frame-time summary). perf_base: the part fixed at start.
@@ -451,6 +452,7 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
     if (census_on && (frame % 3600 == 0 || prv >= census_prv + (1ull << 30)))
         prof_commit_census(frame), mem_guest_census(frame), census_prv = prv;
+    mem_lazy_heap_report(frame);
     if (g.have_gpu && g.have_idle)
         rt_log("perf: frame %llu: gpu idle per frame %.2f ms between timed parts: %.2f ms waiting for the next submission, "
                "%.2f ms with it queued (untimed work or waits); %.1f gaps over 0.5 ms, longest %.2f ms; submit to start avg %.2f ms",

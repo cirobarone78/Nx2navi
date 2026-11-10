@@ -51,6 +51,7 @@ static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint64_t heap_size, alias_bytes;
 static int heap_lazy;               // NX2NAVI_HEAP_LAZY, Windows: the heap is committed page run by page run on first use
 static uint64_t heap_lazy_faults, heap_lazy_bytes;   // accesses that committed heap pages, and the bytes they committed
+static uint64_t heap_lazy_ns, heap_lazy_max_ns;      // time in those faults, lock wait included, since the last report
 static uint8_t *alias_pages;        // 1 per mapped 4 KiB page of the alias region
 typedef struct { uint64_t dst, src, size; } StackMap;
 static StackMap stack_maps[MAX_STACK_MAPS];
@@ -464,9 +465,14 @@ int mem_host_readable(uint64_t a, uint64_t n) {
 static int heap_lazy_fault(uint64_t a) {
     uint64_t heap = L.heap.base;
     if (a < heap || a - heap >= __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE)) return 0;
+    uint64_t t0 = plat_now_ns();
     plat_mutex_lock(&frz_lock);
     uint64_t got = heap_lazy_commit_locked(a & ~0xFFFFull, 0x10000);
-    if (got) heap_lazy_faults++;
+    if (got) {
+        uint64_t ns = plat_now_ns() - t0;
+        heap_lazy_faults++, heap_lazy_ns += ns;
+        if (ns > heap_lazy_max_ns) heap_lazy_max_ns = ns;
+    }
     plat_mutex_unlock(&frz_lock);
     return got != 0;
 }
@@ -1194,6 +1200,23 @@ void mem_kernel_free(void *p, uint64_t size) {
 // NX2NAVI_TRACE=perf: how many bytes of each guest region are committed, so a process that has grown says which region
 // holds the memory. A region is reserved whole at start-up and committed page by page, so the walk reads each run of
 // pages of the same state; the alias window is the largest and costs the most steps when it is full.
+// NX2NAVI_TRACE=perf: what the lazy heap's first-use faults cost since the last line (perf.c, every perf window that had
+// some), so that a hitch can be told from them: the time includes the wait for frz_lock.
+void mem_lazy_heap_report(uint64_t frame) {
+    static uint64_t faults_prv, bytes_prv;
+    if (!heap_lazy) return;
+    plat_mutex_lock(&frz_lock);
+    uint64_t faults = heap_lazy_faults, bytes = heap_lazy_bytes, ns = heap_lazy_ns, max = heap_lazy_max_ns;
+    heap_lazy_ns = heap_lazy_max_ns = 0;
+    plat_mutex_unlock(&frz_lock);
+    if (faults == faults_prv && bytes == bytes_prv) return;
+    rt_log("mem: lazy heap at frame %llu: %llu faults and %.1f MiB committed since the last line, %.2f ms in the faults "
+           "(longest %.3f ms); %.0f of %.0f MiB committed", (unsigned long long)frame,
+           (unsigned long long)(faults - faults_prv), (bytes - bytes_prv) / 1048576.0, ns / 1e6, max / 1e6,
+           bytes / 1048576.0, __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE) / 1048576.0);
+    faults_prv = faults, bytes_prv = bytes;
+}
+
 void mem_guest_census(uint64_t frame) {
     const RtGuestLayout *g = mem_layout();
     const struct { const char *name; RtRange r; } reg[] = {
