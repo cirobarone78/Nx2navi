@@ -19,7 +19,12 @@
 
 enum {
     MAX_REGS = 1 << 16,          // a hostile peer cannot grow the state past this; the game has about 12000 flags
-    MAX_POOLS = 128,             // the game has 22 counters; room for what a confused peer adds
+    MAX_POOLS = 128,             // the game has 22 counters; an entry for a counter it does not have is refused
+    MAX_CONTRIB = 256,           // gain and spend registers of one pool: each binding of a save that gains or spends adds one
+    POOL_REG_MAX = 1 << 20,      // a contributor's gains or spends at most, and the lowest base
+    PEER_RATE = 49152,           // message bytes per second taken from one peer (it sends at most 32 KB/s)
+    PEER_BURST = 65536,
+    BAD_MAX = 32,                // values a member sent that this game refuses: past this many it is ignored
     PUSH_SLOTS = 4096,           // local changes waiting for their three sends
     DIGEST_MS = 2000,            // every digest_ms plus up to 400 ms
     ANSWER_MS = 500,             // a section goes to the same peer at most this often
@@ -41,7 +46,8 @@ typedef struct {
 typedef struct {
     uint32_t hash;
     uint8_t cat, bound, queued, have_local;
-    int32_t local, expected, cap;
+    int32_t local, expected, cap, max;   // max: the highest value the game takes for this counter
+    int contrib;                    // gain and spend registers
     uint64_t me;                    // this binding's contributor id
     int64_t gains, spends;          // over every contributor
     int base;                       // the base register's index, -1 none
@@ -53,6 +59,10 @@ typedef struct {
     uint64_t want;                  // sections to send it, a bit each
     uint64_t answered_at[COOP_SYNC_SECTIONS];
     uint64_t digest_at;             // the last digest sent to it alone
+    int64_t tokens;                 // its message bytes' budget (PEER_RATE)
+    uint64_t tok_at;
+    unsigned bad;                   // values it sent that this game refuses
+    int ignored;                    // past BAD_MAX of them: nothing more is taken from it while it is in the room
 } Peer;
 
 typedef struct { int idx; uint8_t round; uint64_t due, first; } Push;
@@ -60,6 +70,9 @@ typedef struct { int idx; uint8_t round; uint64_t due, first; } Push;
 struct CoopSync {
     uint64_t self_id;
     uint32_t schema;
+    CoopSyncLimitFn limit;          // the local game's table: what it shares and up to which value
+    void *limit_user;
+    uint64_t ik0, ik1;              // the index's key
     Reg *regs;
     int nregs, cap;
     int *index;                     // reg index + 1, 0 empty
@@ -105,6 +118,36 @@ static uint64_t mix64(uint64_t x) {
 static uint64_t key_of(uint8_t kind, uint32_t hash, uint64_t who) { return mix64(((uint64_t)kind << 56) ^ hash ^ mix64(who)); }
 static int sec_of(const Reg *r) { return (int)(key_of(r->kind, r->hash, r->who) % COOP_SYNC_SECTIONS); }
 static uint32_t share_of(const Reg *r, uint32_t v) { return v ? (uint32_t)mix64(key_of(r->kind, r->hash, r->who) ^ v) : 0; }
+
+// SipHash-2-4 (Aumasson and Bernstein): a keyed hash for the index, so that slots cannot be chosen from outside.
+#define SIP_ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define SIP_ROUND                                                                                                      \
+    do {                                                                                                               \
+        v0 += v1, v1 = SIP_ROTL(v1, 13), v1 ^= v0, v0 = SIP_ROTL(v0, 32), v2 += v3, v3 = SIP_ROTL(v3, 16), v3 ^= v2;  \
+        v0 += v3, v3 = SIP_ROTL(v3, 21), v3 ^= v0, v2 += v1, v1 = SIP_ROTL(v1, 17), v1 ^= v2, v2 = SIP_ROTL(v2, 32);  \
+    } while (0)
+uint64_t coop_siphash24(uint64_t k0, uint64_t k1, const uint8_t *m, size_t n) {
+    uint64_t v0 = 0x736f6d6570736575ull ^ k0, v1 = 0x646f72616e646f6dull ^ k1;
+    uint64_t v2 = 0x6c7967656e657261ull ^ k0, v3 = 0x7465646279746573ull ^ k1;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w = 0;
+        for (int k = 0; k < 8; k++) w |= (uint64_t)m[i + k] << 8 * k;
+        v3 ^= w;
+        SIP_ROUND;
+        SIP_ROUND;
+        v0 ^= w;
+    }
+    uint64_t b = (uint64_t)n << 56;
+    for (size_t k = 0; i + k < n; k++) b |= (uint64_t)m[i + k] << 8 * k;
+    v3 ^= b;
+    SIP_ROUND;
+    SIP_ROUND;
+    v0 ^= b;
+    v2 ^= 0xff;
+    for (int r = 0; r < 4; r++) SIP_ROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
 
 static void put8(uint8_t **p, uint8_t v) { *(*p)++ = v; }
 static void put32(uint8_t **p, uint32_t v) { for (int i = 0; i < 4; i++) *(*p)++ = (uint8_t)(v >> 8 * i); }
@@ -186,9 +229,18 @@ static int reg_synced(const CoopSync *s, const Reg *r) {
     return r->kind == COOP_R_FLAG ? m == COOP_MODE_SHARED : m == COOP_MODE_POOL;
 }
 
+// The slot of a register in the index: keyed with a key of this process, so that a peer that chooses contributor ids
+// cannot pile its registers onto one run of slots.
+static unsigned slot_of(const CoopSync *s, uint8_t kind, uint32_t hash, uint64_t who) {
+    uint8_t m[13] = {kind};
+    for (int i = 0; i < 4; i++) m[1 + i] = (uint8_t)(hash >> 8 * i);
+    for (int i = 0; i < 8; i++) m[5 + i] = (uint8_t)(who >> 8 * i);
+    return (unsigned)coop_siphash24(s->ik0, s->ik1, m, sizeof m);
+}
+
 static int find_reg(const CoopSync *s, uint8_t kind, uint32_t hash, uint64_t who) {
     if (!s->index_cap) return -1;
-    unsigned mask = (unsigned)s->index_cap - 1, i = (unsigned)key_of(kind, hash, who) & mask;
+    unsigned mask = (unsigned)s->index_cap - 1, i = slot_of(s, kind, hash, who) & mask;
     for (;;) {
         int k = s->index[i];
         if (!k) return -1;
@@ -200,10 +252,14 @@ static int find_reg(const CoopSync *s, uint8_t kind, uint32_t hash, uint64_t who
 
 static void index_insert(CoopSync *s, int idx) {
     const Reg *r = &s->regs[idx];
-    unsigned mask = (unsigned)s->index_cap - 1, i = (unsigned)key_of(r->kind, r->hash, r->who) & mask;
-    while (s->index[i]) i = (i + 1) & mask;
+    unsigned mask = (unsigned)s->index_cap - 1, i = slot_of(s, r->kind, r->hash, r->who) & mask, steps = 1;
+    while (s->index[i]) i = (i + 1) & mask, steps++;
     s->index[i] = idx + 1;
+    if (steps > s->st.probe_max) s->st.probe_max = steps;
 }
+
+// The highest value of (cat, hash) the local game takes (CoopSyncLimitFn); 0: none, or no limits yet.
+static uint32_t limit_of(const CoopSync *s, int cat, uint32_t hash) { return s->limit ? s->limit(cat, hash, s->limit_user) : 0; }
 
 static Pool *pool_get(CoopSync *s, uint32_t hash, int cat, int create) {
     for (int i = 0; i < s->npools; i++)
@@ -212,6 +268,8 @@ static Pool *pool_get(CoopSync *s, uint32_t hash, int cat, int create) {
     Pool *p = &s->pools[s->npools++];
     memset(p, 0, sizeof *p);
     p->hash = hash, p->cat = (uint8_t)cat, p->cap = -1, p->base = -1;
+    uint32_t max = limit_of(s, cat, hash);
+    p->max = max && max < INT32_MAX ? (int32_t)max : INT32_MAX;
     return p;
 }
 
@@ -219,7 +277,9 @@ static int reg_get(CoopSync *s, uint8_t kind, int cat, uint32_t hash, uint64_t w
     int idx = find_reg(s, kind, hash, who);
     if (idx >= 0) return idx;
     if (s->nregs >= MAX_REGS) return -1;
-    if (kind != COOP_R_FLAG && !pool_get(s, hash, cat, 1)) return -1;
+    Pool *pool = kind == COOP_R_FLAG ? NULL : pool_get(s, hash, cat, 1);
+    if (kind != COOP_R_FLAG && !pool) return -1;
+    if ((kind == COOP_R_POOL_GAIN || kind == COOP_R_POOL_SPEND) && pool->contrib >= MAX_CONTRIB) return -1;
     if (s->nregs == s->cap) {
         int nc = s->cap ? s->cap * 2 : 1024;
         Reg *nr = realloc(s->regs, (size_t)nc * sizeof *nr);
@@ -239,7 +299,8 @@ static int reg_get(CoopSync *s, uint8_t kind, int cat, uint32_t hash, uint64_t w
     memset(r, 0, sizeof *r);
     r->kind = kind, r->cat = (uint8_t)cat, r->hash = hash, r->who = who;
     index_insert(s, idx);
-    if (kind == COOP_R_POOL_BASE) pool_get(s, hash, cat, 0)->base = idx;
+    if (kind == COOP_R_POOL_BASE) pool->base = idx;
+    else if (kind != COOP_R_FLAG) pool->contrib++;
     return idx;
 }
 
@@ -265,6 +326,7 @@ static int32_t pool_target(const CoopSync *s, const Pool *p) {
     int64_t v = pool_value(s, p);
     if (v < 0) v = 0;
     if (p->cap >= 0 && v > p->cap) v = p->cap;
+    if (v > p->max) v = p->max;
     if (v > INT32_MAX) v = INT32_MAX;
     return (int32_t)v;
 }
@@ -324,6 +386,29 @@ static void drop_state(CoopSync *s) {
     s->push_head = s->push_tail = 0;
     s->apply_head = s->apply_tail = 0;
     memset(s->sums, 0, sizeof s->sums);
+}
+
+void coop_sync_limits(CoopSync *s, CoopSyncLimitFn fn, void *user) { s->limit = fn, s->limit_user = user; }
+
+void coop_sync_index_key(CoopSync *s, const uint8_t key[16]) {
+    s->ik0 = s->ik1 = 0;
+    for (int i = 0; i < 8; i++) s->ik0 |= (uint64_t)key[i] << 8 * i, s->ik1 |= (uint64_t)key[8 + i] << 8 * i;
+    if (s->index) memset(s->index, 0, (size_t)s->index_cap * sizeof *s->index);
+    for (int i = 0; i < s->nregs; i++) index_insert(s, i);
+}
+
+void coop_sync_schema(CoopSync *s, uint32_t schema) {
+    if (schema == s->schema) return;
+    s->schema = schema;
+    drop_state(s);   // what was merged under another classification means nothing under this one
+    s->caught_up = 0;
+    s->digest_to |= 1;
+}
+
+unsigned coop_sync_ignored(const CoopSync *s) {
+    unsigned mask = 0;
+    for (int id = 1; id <= COOP_MAX_MEMBERS; id++) mask |= (unsigned)(s->peer[id].present && s->peer[id].ignored) << id;
+    return mask;
 }
 
 // ---- lifetime
@@ -532,10 +617,24 @@ static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_
     update_caught_up(s);
 }
 
+// A value this game refuses: counted, and against its sender when no honest member sends it (an honest one with the
+// same schema refuses it too and never passes it on).
+static void refuse(CoopSync *s, int from, int hostile, const char *why, uint32_t hash) {
+    Peer *p = &s->peer[from];
+    s->st.rejected++;
+    if (!hostile) return;
+    p->bad++;
+    tracef(s, "refused from member %d: %s %08x (%u so far)", from, why, hash, p->bad);
+    if (p->bad >= BAD_MAX && !p->ignored) {
+        p->ignored = 1;
+        tracef(s, "member %d is ignored while it stays in the room", from);
+    }
+}
+
 static void on_section(CoopSync *s, int from, const uint8_t *b, size_t n) {
     if (n < SYNC_HDR || b[0] != COOP_K_DIGEST_VER || get32(b + 1) != s->schema) return;
     size_t count = b[5], at = SYNC_HDR;
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count && !s->peer[from].ignored; i++) {
         if (at + 2 > n) return;
         uint8_t kind = b[at], cat = b[at + 1];
         if (kind < COOP_R_FLAG || kind > COOP_R_POOL_SPEND || cat >= COOP_CAT_N) return;
@@ -545,14 +644,32 @@ static void on_section(CoopSync *s, int from, const uint8_t *b, size_t n) {
         uint64_t who = sz == 18 ? get64(b + at + 6) : 0;
         uint32_t v = get32(b + at + sz - 4);
         at += sz;
-        if ((kind == COOP_R_FLAG) == coop_cat_is_pool(cat)) continue;   // a flag in a pool category, or the reverse
-        if ((kind == COOP_R_POOL_GAIN || kind == COOP_R_POOL_SPEND) == !who) continue;
         if (!s->have_room || s->room.mode[cat] != (kind == COOP_R_FLAG ? COOP_MODE_SHARED : COOP_MODE_POOL)) continue;
+        if (!s->limit) continue;   // the game's table is not known yet
+        // checked before anything is stored or passed on: a hash this game shares in that category, a value it takes
+        uint32_t max = limit_of(s, cat, hash);
+        int isflag = kind == COOP_R_FLAG, contrib = kind == COOP_R_POOL_GAIN || kind == COOP_R_POOL_SPEND;
+        if (isflag == coop_cat_is_pool(cat) || contrib == !who || !max) {
+            refuse(s, from, 1, "not a value this game shares", hash);
+            continue;
+        }
+        if (isflag ? v > max : kind == COOP_R_POOL_BASE ? v && (base_decode(v) < -POOL_REG_MAX || base_decode(v) > (int64_t)max) : v > POOL_REG_MAX) {
+            refuse(s, from, 1, "a value out of range for", hash);
+            continue;
+        }
         int idx = find_reg(s, kind, hash, who);
         if (idx >= 0 && s->regs[idx].cat != cat) continue;   // classified differently here: this game's view wins
+        if (idx >= 0 && v <= s->regs[idx].s) continue;
+        Pool *p = contrib ? pool_get(s, hash, cat, 0) : NULL;
+        if (p && p->bound && who == p->me) {   // only this game counts its own gains and spends
+            refuse(s, from, 0, "a raise of this game's own contributor", hash);
+            continue;
+        }
         if (idx < 0 && !v) continue;
-        if (idx < 0 && (idx = reg_get(s, kind, cat, hash, who)) < 0) continue;
-        if (v <= s->regs[idx].s) continue;
+        if (idx < 0 && (idx = reg_get(s, kind, cat, hash, who)) < 0) {
+            s->st.rejected++;   // the state is full (or the pool has its most contributors)
+            continue;
+        }
         trace_entry(s, "received", &s->regs[idx], v, from);
         reg_raise(s, idx, v);
         s->st.merged++;
@@ -562,6 +679,16 @@ static void on_section(CoopSync *s, int from, const uint8_t *b, size_t n) {
 
 void coop_sync_receive(CoopSync *s, int from, uint8_t kind, const uint8_t *bytes, size_t n, uint64_t now) {
     if (from < 1 || from > COOP_MAX_MEMBERS || from == s->self || !s->in_room) return;
+    Peer *p = &s->peer[from];
+    if (!p->present || p->ignored) return;
+    if (!p->tok_at) p->tok_at = now, p->tokens = PEER_BURST;   // a member's messages are taken at PEER_RATE
+    if (now > p->tok_at) p->tokens += (int64_t)(now - p->tok_at) * PEER_RATE / 1000, p->tok_at = now;
+    if (p->tokens > PEER_BURST) p->tokens = PEER_BURST;
+    if (p->tokens < (int64_t)n) {
+        s->st.rate_dropped++;
+        return;
+    }
+    p->tokens -= (int64_t)n;
     s->st.recv_msgs++;
     if (kind == COOP_K_DIGEST) on_digest(s, from, bytes, n, now);
     else if (kind == COOP_K_SECTION) on_section(s, from, bytes, n);
@@ -683,7 +810,10 @@ void coop_sync_local(CoopSync *s, int cat, uint32_t hash, uint32_t value, uint64
 static void contribute(CoopSync *s, Pool *p, uint8_t kind, uint32_t add, uint64_t now) {
     int idx = reg_get(s, kind, p->cat, p->hash, p->me);
     if (idx < 0) return;
-    reg_raise(s, idx, s->regs[idx].s + add);
+    uint64_t v = (uint64_t)s->regs[idx].s + add;   // saturates: never wraps to a small value
+    if (v > POOL_REG_MAX) v = POOL_REG_MAX;
+    if (v <= s->regs[idx].s) return;
+    reg_raise(s, idx, (uint32_t)v);
     push_local(s, idx, now);
 }
 

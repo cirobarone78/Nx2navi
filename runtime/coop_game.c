@@ -53,7 +53,8 @@ enum {
     RESET_NEW_GAME = 8 | 16 | 32, RESET_TEMPORARY = 1 | 2 | 4 | 256,
     SLICES = 4,             // a quarter of the flags is read each frame: every flag every 4 frames
     APPLY_PER_FRAME = 16,
-    INT_MAX_ITEM = 999,     // an item count above this from the network is not taken
+    INT_MAX_ITEM = 999,     // the highest item count or counter the room may set: the game's counters show three digits
+    KEY_MAX = 15,           // the most small keys of one dungeon the room may set (the most any dungeon has is 9)
     CLOCK_MS = 2500,        // the game clock advanced this recently: the game is being played
 };
 
@@ -99,6 +100,7 @@ static int in_list(const uint32_t *list, size_t n, uint32_t h) {
 typedef struct {
     uint32_t hash;
     uint8_t is_int, cat, inv;
+    uint32_t max;           // the highest register value the room may set: 1 for a Bool, KEY_MAX or INT_MAX_ITEM for an Int
     int32_t last;           // the raw value last reported
     uint64_t addr;          // the entry
     uint64_t cap_addr;      // a pool counter's capacity entry (Int), 0 none
@@ -149,6 +151,9 @@ static struct {
     unsigned applied[COOP_CAT_N], applied_total;
     uint64_t applied_log_at;
     unsigned rules_seen;
+    uint32_t schema;        // of the table: games merge only with the same
+    unsigned rejected_seen, ignored_seen;
+    uint64_t checked_at;
 } G;
 
 #define TRACE_ON (rt_trace & RT_TRACE_COOP)
@@ -306,6 +311,7 @@ static int build_table(uint64_t mgr) {
             GFlag *f = add_flag();
             if (!f) break;
             f->hash = h, f->is_int = (uint8_t)type, f->cat = (uint8_t)cat, f->inv = inv, f->addr = a, f->cap_addr = cap_addr;
+            f->max = !type ? 1 : cat == COOP_CAT_KEYS ? KEY_MAX : INT_MAX_ITEM;
             G.count[cat]++;
         }
     }
@@ -317,6 +323,17 @@ static int build_table(uint64_t mgr) {
     if (!G.by_hash) return 0;
     for (int i = 0; i < G.nflags; i++) G.by_hash[i] = i;
     qsort(G.by_hash, (size_t)G.nflags, sizeof *G.by_hash, cmp_by_hash);
+    // the schema: this layer's version, the game's, and the table (every hash with its category, type and limit), so
+    // that two builds that classify or limit differently do not merge
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char *p = "nx2navi-coop-sync/2"; *p; p++) h = (h ^ (uint8_t)*p) * 0x100000001b3ull;
+    h = (h ^ (uint64_t)rt_game_version) * 0x100000001b3ull;
+    for (int i = 0; i < G.nflags; i++) {
+        const GFlag *f = &G.flags[G.by_hash[i]];
+        uint64_t row[2] = {f->hash | (uint64_t)f->cat << 32 | (uint64_t)f->is_int << 40, f->max};
+        for (int k = 0; k < 16; k++) h = (h ^ (uint8_t)(row[k / 8] >> 8 * (k % 8))) * 0x100000001b3ull;
+    }
+    G.schema = (uint32_t)(h ^ h >> 32);
     return G.nflags > 0;
 }
 
@@ -392,15 +409,25 @@ static void read_test_aid(void) {
 
 static void trace_line(void *user, const char *line) { (void)user, rt_log("coop: sync: %s", line); }
 
+// The engine's limits (coop_sync_limits), with G.lock held: a flag or counter of the table in that category.
+static uint32_t limit_fn(int cat, uint32_t hash, void *user) {
+    (void)user;
+    GFlag *f = flag_by_hash(hash);
+    return f && f->cat == cat ? f->max : 0;
+}
+
 static int ensure_engine(void) {
     if (G.eng) return 1;
-    uint64_t h = 0xcbf29ce484222325ull;   // the schema: game version and this file's classification
-    const char *tag = "nx2navi-coop-sync/1";
-    for (const char *p = tag; *p; p++) h = (h ^ (uint8_t)*p) * 0x100000001b3ull;
-    h = (h ^ (uint64_t)rt_game_version) * 0x100000001b3ull;
     G.self_id = coop_client_id();
-    CoopSync *e = coop_sync_new(G.self_id, (uint32_t)(h ^ h >> 32));
+    CoopSync *e = coop_sync_new(G.self_id, 0);   // the schema is the table's, once a save is played (bind)
     if (!e) return 0;
+    uint8_t key[16] = {0};
+    if (!plat_random(key, sizeof key)) {
+        uint64_t t = plat_now_ns();
+        memcpy(key, &t, sizeof t);
+    }
+    coop_sync_index_key(e, key);
+    coop_sync_limits(e, limit_fn, NULL);
     if (TRACE_ON) coop_sync_trace(e, trace_line, NULL);
     plat_mutex_lock(&G.lock);
     G.eng = e;
@@ -462,6 +489,19 @@ static void on_tick(uint64_t now, void *user) {
             rt_log("coop: sync: the room's rules: %s%s", text, r.owner == G.self_id ? " (this player's settings)" : "");
         }
     }
+    if (now - G.checked_at >= 1000) {   // what the engine refused, once a second
+        G.checked_at = now;
+        CoopSyncStats st;
+        coop_sync_stats(G.eng, &st);
+        unsigned ign = coop_sync_ignored(G.eng);
+        if (st.rejected != G.rejected_seen)
+            rt_log("coop: sync: %u values from the room were refused (flags this game does not share or values it does not "
+                   "take); %u in this session", st.rejected - G.rejected_seen, st.rejected);
+        for (int id = 1; id <= COOP_MAX_MEMBERS; id++)
+            if (ign >> id & 1 && !(G.ignored_seen >> id & 1))
+                rt_log("coop: sync: member %d sent values this game does not take; nothing more is taken from it while it stays in the room", id);
+        G.rejected_seen = st.rejected, G.ignored_seen = ign;
+    }
     plat_mutex_unlock(&G.lock);
 }
 
@@ -484,12 +524,16 @@ static void unbind(const char *why) {
 
 static void bind(uint64_t mgr) {
     uint64_t be = LD64(mgr + C_BOOL + CN_ENTRIES), ie = LD64(mgr + C_INT + CN_ENTRIES);
+    if (!plat_mutex_trylock(&G.lock)) return;   // the coop thread has the engine: the next frame
     if (mgr != G.mgr || be != G.bool_entries || ie != G.int_entries || !G.nflags) {
-        if (!build_table(mgr)) return;
+        if (!build_table(mgr)) {   // under the lock: the engine's limits read the table on the coop thread
+            plat_mutex_unlock(&G.lock);
+            return;
+        }
         G.mgr = mgr, G.bool_entries = be, G.int_entries = ie;
     }
     uint64_t now = plat_now_ms();
-    plat_mutex_lock(&G.lock);
+    coop_sync_schema(G.eng, G.schema);
     coop_sync_rebind(G.eng);
     for (int i = 0; i < G.nflags; i++) {
         GFlag *f = &G.flags[i];
@@ -556,7 +600,7 @@ static void run_test_aid(Cpu *c, uint64_t mgr) {
 
 static void apply(Cpu *c, uint64_t mgr) {
     CoopApply a[APPLY_PER_FRAME];
-    plat_mutex_lock(&G.lock);
+    if (!plat_mutex_trylock(&G.lock)) return;   // the coop thread has the engine: nothing is applied this frame
     int n = coop_sync_take(G.eng, a, APPLY_PER_FRAME);
     plat_mutex_unlock(&G.lock);
     for (int i = 0; i < n; i++) {
@@ -573,7 +617,7 @@ static void apply(Cpu *c, uint64_t mgr) {
         } else if (!f->is_int) {
             if (v != 1) continue;
             v = !f->inv;
-        } else if (v > INT_MAX_ITEM) {
+        } else if (v > (int32_t)f->max) {   // the engine took none above it: a check of last resort
             continue;
         }
         set_flag(c, mgr, f->is_int, f->hash, v);
@@ -602,8 +646,8 @@ static void apply(Cpu *c, uint64_t mgr) {
 static void scan(uint64_t now) {
     int nflat = G.nflags - G.npools;
     int from = nflat * G.slice / SLICES, to = nflat * (G.slice + 1) / SLICES;
+    if (!plat_mutex_trylock(&G.lock)) return;   // the coop thread has the engine: this frame reads nothing
     G.slice = (G.slice + 1) % SLICES;
-    plat_mutex_lock(&G.lock);
     for (int i = from; i < to; i++) {
         GFlag *f = &G.flags[i];
         int32_t raw = raw_of(f);

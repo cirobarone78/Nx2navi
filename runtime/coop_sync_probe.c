@@ -15,7 +15,10 @@
 //    in the middle of a session (to shared: merges from then on; to per player: stops, keeps what it has).
 // 5. Nothing merged survives a change of room or of save: a save loaded after leaving a room, the next room, and another
 //    save loaded in a room of one get none of what the last room and the last save had.
-// 6. Random bytes into the receiver.
+// 6. A hostile member: hashes the game does not share, values out of range (a flag set to 2 to freeze it, an item of
+//    1000, pool registers of 2^31), contributor ids chosen to collide in the index, a flood; none of it is stored,
+//    passed on or applied, the honest values still merge, and the member is ignored after a few dozen.
+// 7. Random bytes into the receiver.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,11 +73,22 @@ static Flag *flag_add(Game *g, int cat, uint32_t hash, int32_t value, int32_t ca
     return f;
 }
 
+// The game's table as the engine sees it (coop_game.c's limits): every flag of the fake game in its own category, a
+// Bool, song or quest item up to 1, an item up to 4, small keys up to 15 and the other counters up to 999.
+static uint32_t fake_limit(int cat, uint32_t hash, void *user) {
+    Flag *f = flag_of(user, hash);
+    if (!f || f->cat != cat) return 0;
+    return cat == COOP_CAT_ITEMS ? 4 : cat == COOP_CAT_KEYS ? 15 : coop_cat_is_pool(cat) ? 999 : 1;
+}
+
 // The flag set of the fake game: hashes 1..P are progress flags, 0x1000+ items, 0x2000+ songs, 0x3000+ quest items.
 static void game_init(Game *g, int id, uint64_t client) {
     memset(g, 0, sizeof *g);
     g->id = id;
+    static const uint8_t index_key[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     g->eng = coop_sync_new(client, 0xC0FFEE);
+    coop_sync_limits(g->eng, fake_limit, g);
+    coop_sync_index_key(g->eng, index_key);
     for (uint32_t h = 1; h <= 300; h++) flag_add(g, COOP_CAT_PROGRESS, h, 0, -1);
     for (uint32_t h = 0x1000; h < 0x1040; h++) flag_add(g, COOP_CAT_ITEMS, h, 0, -1);
     for (uint32_t h = 0x2000; h < 0x200D; h++) flag_add(g, COOP_CAT_SONGS, h, 0, -1);
@@ -302,8 +316,10 @@ static void probe_algebra(void) {
         for (int k = 0; k < 3; k++) {
             const int si = orders[o][k];
             for (int m = 0; m < counts[si]; m++)
-                for (int rep = 0; rep < (k == 0 ? 2 : 1); rep++)
-                    coop_sync_receive(g.eng, 8, COOP_K_SECTION, streams[si][m].b, streams[si][m].n, 1100);
+                for (int rep = 0; rep < (k == 0 ? 2 : 1); rep++) {   // one message every 100 ms: under a member's rate
+                    static uint64_t t = 1100;
+                    coop_sync_receive(g.eng, 8, COOP_K_SECTION, streams[si][m].b, streams[si][m].n, t += 100);
+                }
         }
         // nothing shrinks: every flag a message carried is in the state, at least at the value it carried
         for (int si = 0; si < 3; si++)
@@ -592,10 +608,140 @@ static void probe_carry_over(void) {
     printf("coop-probe: sync carry-over: a new room and a new save start with nothing of the last ones\n");
 }
 
-// ---- 6. hostile bytes
+// ---- 6. a hostile member
+
+static uint8_t *entry_flag(uint8_t *p, int cat, uint32_t hash, uint32_t v) {
+    *p++ = COOP_R_FLAG, *p++ = (uint8_t)cat;
+    for (int i = 0; i < 4; i++) *p++ = (uint8_t)(hash >> 8 * i);
+    for (int i = 0; i < 4; i++) *p++ = (uint8_t)(v >> 8 * i);
+    return p;
+}
+
+static uint8_t *entry_pool(uint8_t *p, int kind, int cat, uint32_t hash, uint64_t who, uint32_t v) {
+    *p++ = (uint8_t)kind, *p++ = (uint8_t)cat;
+    for (int i = 0; i < 4; i++) *p++ = (uint8_t)(hash >> 8 * i);
+    if (kind != COOP_R_POOL_BASE)
+        for (int i = 0; i < 8; i++) *p++ = (uint8_t)(who >> 8 * i);
+    for (int i = 0; i < 4; i++) *p++ = (uint8_t)(v >> 8 * i);
+    return p;
+}
+
+// A SECTION message of the entries in [b + 6, end) (count of them) from member from to games a and b.
+static void inject(Game *a, Game *b, int from, uint8_t *buf, uint8_t *end, int count, uint64_t now) {
+    buf[0] = COOP_K_DIGEST_VER, buf[1] = 0xEE, buf[2] = 0xFF, buf[3] = 0xC0, buf[4] = 0, buf[5] = (uint8_t)count;
+    coop_sync_receive(a->eng, from, COOP_K_SECTION, buf, (size_t)(end - buf), now);
+    if (b) coop_sync_receive(b->eng, from, COOP_K_SECTION, buf, (size_t)(end - buf), now);
+}
+
+static uint64_t old_slot_mix(uint64_t x) {   // the unkeyed index hash the engine used before: an attacker can invert it
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static void probe_hostile(void) {
+    uint8_t msg[15];
+    for (int i = 0; i < 15; i++) msg[i] = (uint8_t)i;
+    uint64_t k0 = 0x0706050403020100ull, k1 = 0x0f0e0d0c0b0a0908ull;   // the paper's key 00..0f and message 00..0e
+    CHECK(coop_siphash24(k0, k1, msg, 15) == 0xa129ca6149be45e5ull && coop_siphash24(k0, k1, msg, 0) == 0x726fdb47dd0e0e31ull,
+          "SipHash-2-4 reference vectors");
+
+    Net net = {0};
+    Game a, b, h;
+    game_init(&a, 1, 0x61);
+    game_init(&b, 2, 0x62);
+    game_init(&h, 3, 0x63);
+    defaults(&a, 1), defaults(&b, 0), defaults(&h, 0);
+    flag_of(&a, KEYS_FOREST)->value = 2;
+    net.games[0] = &a, net.games[1] = &b, net.games[2] = &h, net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "HOST01", 1000), 1000), 4000);
+    uint8_t buf[COOP_MAX_PAYLOAD], *p = buf + 6;
+    for (uint32_t k = 0; k < 10; k++) p = entry_flag(p, COOP_CAT_PROGRESS, 0xDEAD0000 + k, 1);   // not flags of the game
+    p = entry_flag(p, COOP_CAT_PROGRESS, 5, 2);                                                    // a flag at 2: frozen
+    p = entry_flag(p, COOP_CAT_ITEMS, 0x1000, 1000);                                               // an item out of range
+    p = entry_pool(p, COOP_R_POOL_SPEND, COOP_CAT_KEYS, KEYS_FOREST, 0x1234, 0xFFFFFFFFu);        // keys to 0 for good
+    p = entry_pool(p, COOP_R_POOL_GAIN, COOP_CAT_KEYS, KEYS_FOREST, 0x5678, 0x7FFFFFFFu);         // or to 2^31
+    p = entry_pool(p, COOP_R_POOL_BASE, COOP_CAT_KEYS, KEYS_FOREST, 0, 0xFFFFFFFFu);
+    inject(&a, &b, 3, buf, p, 15, now);
+    now = run(&net, now, 2000);
+    a.f[4].value = 1;   // the honest value of flag 5
+    now = run(&net, now, 3000);
+    int64_t ka = -1, kb = -1;
+    coop_sync_pool(a.eng, KEYS_FOREST, &ka);
+    coop_sync_pool(b.eng, KEYS_FOREST, &kb);
+    CHECK(!coop_sync_flag(a.eng, COOP_CAT_PROGRESS, 0xDEAD0001) && !coop_sync_flag(b.eng, COOP_CAT_PROGRESS, 0xDEAD0009),
+          "hostile: hashes the game does not share are not stored");
+    CHECK(value_of(&b, 5) == 1 && value_of(&a, 5) == 1, "hostile: a flag sent as 2 does not freeze it: the honest 1 reaches B (%d)", value_of(&b, 5));
+    CHECK(value_of(&a, 0x1000) == 0 && value_of(&b, 0x1000) == 0, "hostile: an item of 1000 is not applied (%d)", value_of(&b, 0x1000));
+    CHECK(ka == 2 && kb == 2 && value_of(&a, KEYS_FOREST) == 2 && value_of(&b, KEYS_FOREST) == 2,
+          "hostile: pool registers of 2^32 leave the key pool at 2 (%lld %lld, shown %d %d)", (long long)ka, (long long)kb,
+          value_of(&a, KEYS_FOREST), value_of(&b, KEYS_FOREST));
+    CoopSyncStats st;
+    coop_sync_stats(b.eng, &st);
+    CHECK(st.rejected >= 15 && !(coop_sync_ignored(b.eng) >> 3 & 1), "hostile: 15 refused values counted (%u), member 3 not yet ignored", st.rejected);
+    // more of them: member 3 is ignored, even for a value the game would take
+    p = buf + 6;
+    for (uint32_t k = 0; k < 20; k++) p = entry_flag(p, COOP_CAT_SONGS, 0xBAD00000 + k, 1);
+    inject(&a, &b, 3, buf, p, 20, now);
+    p = entry_flag(buf + 6, COOP_CAT_PROGRESS, 7, 1);
+    inject(&a, &b, 3, buf, p, 1, now + 10);
+    CHECK((coop_sync_ignored(a.eng) >> 3 & 1) && (coop_sync_ignored(b.eng) >> 3 & 1) && !coop_sync_flag(b.eng, COOP_CAT_PROGRESS, 7),
+          "hostile: after 35 refused values member 3 is ignored (%x)", coop_sync_ignored(b.eng));
+    // a flood from member 2 at one instant: past its rate the messages are dropped
+    coop_sync_stats(a.eng, &st);
+    unsigned dropped = st.rate_dropped;
+    p = buf + 6;
+    for (int k = 0; k < 100; k++) p = entry_flag(p, COOP_CAT_PROGRESS, 1 + (uint32_t)k, 0);
+    for (int k = 0; k < 200; k++) inject(&a, NULL, 2, buf, p, 100, now + 20);
+    coop_sync_stats(a.eng, &st);
+    CHECK(st.rate_dropped > dropped + 100, "hostile: a flood of 200 KB at once from one member is rate limited (%u dropped)", st.rate_dropped - dropped);
+    CHECK(!a.lowered && !b.lowered, "hostile: no apply lowered a value");
+    game_free(&a), game_free(&b), game_free(&h);
+    free(net.q);
+
+    // contributor ids that the unkeyed hash put in one run of slots, as many as a member likes
+    Game c, d;
+    Net n2 = {0};
+    game_init(&c, 1, 0x71);
+    game_init(&d, 2, 0x72);
+    defaults(&c, 1), defaults(&d, 0);
+    n2.games[0] = &c, n2.games[1] = &d, n2.present[0] = n2.present[1] = 1;
+    now = run(&n2, (net_roster(&n2, "HOST02", now), now), 3000);
+    CoopSyncStats before;
+    coop_sync_stats(c.eng, &before);
+    int sent = 0;
+    p = buf + 6;
+    int count = 0;
+    for (uint64_t who = 1; sent < 600; who++) {
+        uint64_t key = old_slot_mix(((uint64_t)COOP_R_POOL_GAIN << 56) ^ KEYS_FOREST ^ old_slot_mix(who));
+        if (key & 0xFFFF) continue;
+        p = entry_pool(p, COOP_R_POOL_GAIN, COOP_CAT_KEYS, KEYS_FOREST, who, 1);
+        sent++, count++;
+        if (count == 60) {
+            inject(&c, NULL, 2, buf, p, count, now += 100);
+            p = buf + 6, count = 0;
+        }
+    }
+    coop_sync_stats(c.eng, &st);
+    CHECK(st.regs - before.regs <= 256 && st.probe_max < 40, "index: 600 chosen contributor ids make %u registers, the longest probe %u",
+          st.regs - before.regs, st.probe_max);
+    game_free(&c), game_free(&d);
+    free(n2.q);
+    printf("coop-probe: sync hostile member: refused values are not stored, passed on or applied, a frozen flag still merges, the "
+           "member is ignored, a flood is limited, the index stays short (%u)\n", st.probe_max);
+}
+
+// ---- 7. hostile bytes
+
+static uint32_t fuzz_limit(int cat, uint32_t hash, void *user) {
+    (void)user;
+    return hash & 1 ? 0 : coop_cat_is_pool(cat) ? 999 : 1;
+}
 
 static void probe_sync_fuzz(void) {
     CoopSync *s = coop_sync_new(1, 0xC0FFEE);
+    coop_sync_limits(s, fuzz_limit, NULL);
     CoopRules r;
     coop_rules_default(&r);
     coop_sync_settings(s, &r, 1);
@@ -633,6 +779,7 @@ int probe_coop_sync(void) {
     probe_rules();
     probe_keys();
     probe_carry_over();
+    probe_hostile();
     probe_sync_fuzz();
     return fails;
 }

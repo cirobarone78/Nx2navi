@@ -69,6 +69,20 @@ CoopSync *coop_sync_new(uint64_t self_id, uint32_t schema);
 void coop_sync_free(CoopSync *s);
 // Trace lines (sent, received, by hash and value) go to fn when set.
 void coop_sync_trace(CoopSync *s, void (*fn)(void *user, const char *line), void *user);
+// What the local game takes from the room: the highest value of flag or counter (cat, hash), 0 when this game does not
+// share that hash in that category (a flag: 1 for a Bool; a pool counter: what the game can show). Every value a
+// member sends is checked against it before it is stored or passed on; one that fails is dropped and counted, and a
+// member that sends many is ignored while it stays in the room. Called with the engine's lock held; no limits, nothing
+// is taken.
+typedef uint32_t (*CoopSyncLimitFn)(int cat, uint32_t hash, void *user);
+void coop_sync_limits(CoopSync *s, CoopSyncLimitFn fn, void *user);
+// A random key of this process for the register index (SipHash-2-4), so a peer cannot choose where its registers go.
+void coop_sync_index_key(CoopSync *s, const uint8_t key[16]);
+uint64_t coop_siphash24(uint64_t k0, uint64_t k1, const uint8_t *m, size_t n);
+// The schema, once the local game's table is known: a new one forgets everything merged.
+void coop_sync_schema(CoopSync *s, uint32_t schema);
+// Members (a bit per id) whose messages are ignored for sending values this game refuses.
+unsigned coop_sync_ignored(const CoopSync *s);
 
 // ---- the room (the coop thread)
 // The room and who is in it: code "" when in none. A new code (or none) forgets the rules, the peers and everything
@@ -118,6 +132,9 @@ typedef struct {
     unsigned sent_msgs, recv_msgs, sent_bytes;
     unsigned merged;                // registers a message raised
     unsigned pools_bound;
+    unsigned rejected;              // values refused (not shared here, out of range, the state full)
+    unsigned rate_dropped;          // messages over a member's rate
+    unsigned probe_max;             // the longest run of index slots an insert walked
 } CoopSyncStats;
 void coop_sync_stats(const CoopSync *s, CoopSyncStats *out);
 // The merged value of a flag (0 when absent), and a pool's value (base + gains - spends) and whether it is bound.
