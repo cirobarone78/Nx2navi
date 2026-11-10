@@ -708,6 +708,8 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                           .usage = aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                                        ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        // DLSS (vk_dlaa.c) and contact shadows (vk_contact.c) also sample and store through these views: they keep the
+        // image's sampled and storage usage where the view's format supports it (an sRGB view has no storage).
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, format, &fp);
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
