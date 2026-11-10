@@ -63,6 +63,9 @@ typedef struct PoolRec {
     VkBuffer mbuf;                     // MS_ON: device-local copy of [import_lo, import_hi), same offsets as buf
     VmaAllocation malloc_;
     uint32_t acc_sub;                  // replay: the last submission that synced the mirror (mirror_sync)
+    uint32_t pm_frame;                 // replay: the frame (pframe) of pm_cur
+    uint8_t pm_cur, pm_prev;           // replay: the places in their frame (vk_sub_in_frame, 7 the rest) of the submissions
+                                       // that synced it, in frame pm_frame and in the one before (NX2NAVI_PRESNAP_PLACE)
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
     uint32_t retry_sub;                // replay: a mirror refused for the VRAM budget is asked again from here, 0 never
     uint8_t asked_room;                // replay: its refusal already asked the textures for room (once until it gets one)
@@ -1328,6 +1331,34 @@ enum { MR_BUDGET, MR_UNTRACKED, MR_OVERLAP, MR_ALLOC, MR_N };
 int vk_mirror_on;
 static int mirror_verify;
 static int mirror_gap = 2;             // pre-snap: hot pools at most this many 2 MiB regions apart share one query
+static uint32_t pframe;                // replay: frames begun (vk_mem_mirror_begin: a place not after the last one's)
+static int pplace = 99;                // replay: the place of the last submission vk_mem_mirror_begin saw
+
+// NX2NAVI_PRESNAP_PLACE=1 (default), 0, ab: a submission's pre-snap (vk_mem_mirror_begin) takes the write-watch
+// snapshots of the pools the submission at its place in the last frame synced, not those the submission before it
+// synced. In Kokiri Forest the frame's first submission (#0) and its fourth (#3) use no pool, and their pre-snaps
+// covered the pools of the submission before them, #5's and #2's: 36.8 queries over 282 MiB a frame, 0.23-0.31 ms; then
+// #2 and #5, whose submissions before them use no pool either, queried their pools one at a time at their first use,
+// 63.5 queries over 254 MiB.
+static int presnap_place(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("PRESNAP_PLACE", "1");
+    return RT_KNOB_ON(mode);
+}
+
+static int sub_place(void) { return vk_sub_in_frame >= 0 && vk_sub_in_frame < 7 ? vk_sub_in_frame : 7; }
+
+static void pm_note(PoolRec *r) {   // replay: r synced in the submission being recorded
+    if (r->pm_frame != pframe) {
+        r->pm_prev = r->pm_frame + 1 == pframe ? r->pm_cur : 0;
+        r->pm_cur = 0, r->pm_frame = pframe;
+    }
+    r->pm_cur |= (uint8_t)(1u << sub_place());
+}
+
+static uint8_t pm_last(const PoolRec *r) {   // the places that synced r in the last frame
+    return r->pm_frame == pframe ? r->pm_prev : r->pm_frame + 1 == pframe ? r->pm_cur : 0;
+}
 static PoolRec **mlist;                // pool_lock: mirrored pools by import_lo
 static int nm, mcap;
 static uint32_t msub;                  // replay: number of the submission being recorded
@@ -1709,6 +1740,7 @@ static void mirror_retire(void *arg) {
 static void mirror_sync(PoolRec *r) {
     uint64_t t0 = qpc();
     r->acc_sub = msub;
+    pm_note(r);
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     int excl = 0;
@@ -2191,9 +2223,12 @@ void vk_mem_mirror_begin(void) {
     plat_mutex_lock(&gen_lock);
     ww_ep++;
     uint64_t b0 = ww_bytes;
+    int pl = sub_place(), pp = presnap_place();
+    if (pl <= pplace) pframe++;   // a new frame, though its first submissions may have had nothing to record
+    pplace = pl;
     for (int i = 0; i < nm; i++) {
         const PoolRec *r = mlist[i];
-        if (r->acc_sub != prev) continue;
+        if (pp ? !(pm_last(r) >> pl & 1) : r->acc_sub != prev) continue;
         uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
         if (have && a <= run1 + 1 + (uint64_t)mirror_gap) {
             if (b > run1) run1 = b;

@@ -267,8 +267,11 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     return f;
 }
 
+int vk_sub_in_frame;
+
 static void replay_main(void *arg) {
     (void)arg;
+    int sub_idx = 0;   // submissions since the last present, in queue order
     perf_replay_thread();
     plat_mutex_lock(&rl);
     for (;;) {
@@ -280,6 +283,7 @@ static void replay_main(void *arg) {
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
+            vk_sub_in_frame = sub_idx++;
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -293,6 +297,7 @@ static void replay_main(void *arg) {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -475,7 +480,10 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
-    if (!gfx_replay_async()) return submit_sync(handles, n);
+    if (!gfx_replay_async()) {
+        vk_sub_in_frame = nvn_submits_in_frame;   // the front end counts it up after the submit returns
+        return submit_sync(handles, n);
+    }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
