@@ -531,16 +531,21 @@
 # your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
 # offer with a number (eight hex digits, new at each start of the game); accept it on the menu's Co-op tab, or put that
 # number here while the game runs to accept that offer (this line as the file is now counts, before the one read at
-# start). A new member, other rules or another save loaded make a new offer with a new number. A member who never says
-# who it is keeps the room from being accepted. Your key pools count only you and the players you accepted, among those
-# the room's maker lets use them. Accepting every room (always) is taken from the environment only
-# (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a room for you.
+# start). A new member, other rules or another save loaded make a new offer with a new number (another save joins the
+# pools only once you accept it). A member who never says who it is keeps the room from being accepted. Your key pools
+# count only you and the players you accepted, among those the room's maker lets use them. Every message that can
+# change your save is signed by the player who sent it, so someone who knows the room's secret and runs the relay (or
+# sends from its address on your network) can read and disturb the room but not set flags in a player's name.
+# Accepting every room (always) is taken from the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file,
+# so an ini someone hands you cannot accept a room for you.
 # coop_accept = ask
 # The room's maker (the Co-op tab's Remove and Reset the pools do the same): coop_remove = a player's key fingerprint
-# (xxxx-xxxx-xxxx-xxxx, as the log and the tab show it beside each member), in the room or after it left; every game
-# drops that key and what it took from the pools. A member
-# number here is not taken: numbers pass to other players as members come and go. coop_reset_pools = a new value (1,
-# then 2, or 0 and then 1 again): every game joins the pools again with what they held for the players in the room.
+# (xxxx-xxxx-xxxx-xxxx, as the log and the tab show it beside each member; without dashes it may be all digits), in the
+# room or after it left; every game drops that key and what it took from the pools, and keys others brought while it
+# was in a pool stay theirs. A member number here is not taken: numbers pass to other players as members come and go.
+# coop_reset_pools = a new value (1, then 2, or 0 and then 1 again): every game joins the pools again with what they
+# held for the players in the room. A player who drained a pool and is still in the room when you reset keeps what it
+# took: remove it first, then reset.
 # Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs
 # the rules of a room you made with is kept in the profile folder (coop-keys, readable by your account only), so a
 # restart keeps you the room's maker; never hand out a copy of the profile folder.

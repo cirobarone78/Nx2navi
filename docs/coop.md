@@ -24,12 +24,17 @@ Read this before you join a room.
   can put the right one into a file in advance. Accepting every room without asking (`NX2NAVI_COOP_ACCEPT=always`)
   works only from the environment, never from `nx2navi.ini`.
 - **Your game takes values only from players you accepted.** What a player you did not accept sends is not kept, not
-  passed on and never applied, also after that player leaves or is removed. For story flags and items acceptance is
-  passed along: a player you accepted hands on what they took from the players *they* accepted, so a stranger someone
-  else let in reaches you through them. Pools are not passed along: your game counts in a pool only what you and the
-  players you accepted brought, picked up and spent, and joins the pools only once you accepted the room. What remains
-  with the maker: a player uses the pools at all only once the maker's game admitted them, which it does for every
-  player the maker accepted; and a player who left before you accepted is not counted in your pools.
+  passed on and never applied, also after that player leaves or is removed. Every message that can change your save is
+  signed by the player who sent it, so this holds also against someone who knows the room's secret and runs the relay,
+  or sends from its address on your network: they can make no message in another player's name that your game acts on.
+  For story flags and items acceptance is passed along: a player you accepted hands on what they took from the players
+  *they* accepted, so a stranger someone else let in reaches you through them. Pools are not passed along: your game
+  counts in a pool only what you and the players you accepted brought, picked up and spent, and joins the pools only
+  once you accepted the room (another save loaded in it joins only once you accepted that one too). What remains with
+  the maker: a player uses the pools at all only once the maker's game admitted them, which it does for every player
+  the maker accepted; a player who left before you accepted is not counted in your pools; and while a player you
+  accepted counts a stranger in their pools, what they claimed when they joined a pool counts that stranger too, until
+  the maker removes the stranger.
 - **Your save is copied first.** The moment you accept a room, the game copies your whole save (every slot) to
   `coop-backup/` in the profile folder, and takes nothing from the room until the copy is made. The first copy for a
   room in each start of the game is `first-<date-time>` and is kept until you delete it; later copies (another save
@@ -46,26 +51,32 @@ Read this before you join a room.
   their spends count at most up to what entered the pool (what the players brought and picked up), so they can empty a
   dungeon's pool, and the keys picked up after that, but no more than the dungeon has, and a record that claims less
   than nothing counts as nothing. The maker's removal of that player, also after they left, or a pool reset after they
-  left, gives back what they took, in every game. It does not give back keys of yours that the pool already seemed to
-  hold when your game joined it (a pool joined while that player's gains were in it counts your keys as part of
-  them). With rupees or ammunition in a pool (off by default) the same holds for them. Flags stay set when a player is
-  removed. None of this can be undone inside the game otherwise: go back to the copy of your save. Invite only people
-  you trust with your save, as you would hand them your controller.
+  left, gives back what they took, in every game, and each game makes its claim to the pool again as if that player
+  had never been in it, so keys you brought while their gains were in the pool stay yours, and a claim made while
+  their spends were in it does not leave the pool fuller than what the others brought. A pool reset while that player
+  is still in the room carries what they took into the new pools, and removing them afterwards does not give it back:
+  remove first, then reset (the reset's log line and the maker's hint say so). Keys a removed player's gains handed out
+  stay only as doors already opened. With rupees or ammunition in a pool (off by default) the same holds for them.
+  Flags stay set when a player is removed. None of this can be undone inside the game otherwise: go back to the copy
+  of your save. Invite only people you trust with your save, as you would hand them your controller.
 - **Who can get in.** Only someone who knows the room's secret: 18 characters (85 bits) that the game makes when a room
   is made and that the maker passes on to the others (by voice, a chat message). The relay never learns it. Someone who
   sees your traffic on the network, or who runs the relay, cannot read the messages, change them, make new ones or
-  guess the secret from them.
+  guess the secret from them. Someone who also knows the secret can read the room's messages, but can still make none
+  in a player's name: each player signs what they send with their own key.
 - **Removing a player.** The room's maker can remove a player by their key's fingerprint, which the log and the Co-op
   tab show beside each member (Remove on the player's row of the tab, or `coop_remove = <fingerprint>` in `nx2navi.ini`
   while the game runs; while they are in the room or after they left): the maker's game signs the removal, every game drops that player's key and keeps it
   dropped (their messages are ignored, their pool records dropped, so what they took from a pool comes back), and the
-  relay drops them and refuses them again. A member number in the file is not taken, since numbers pass to other
+  relay drops them and refuses them again (the session the maker's game listed for them at that moment, so a player
+  given the number since is not the one dropped). A member number in the file is not taken, since numbers pass to other
   players as members come and go, and each value acts once, so a line left in the file or read again after a moment in
   which the file could not be read removes nobody else. Someone who knows the secret can still come back under a new
   key (everyone then gets a new offer to accept or not); to be sure, make a new room, which has a new secret. The maker
   can also reset the pools (`coop_reset_pools = 1`, then 2 the next time, or 0 and then 1 again): every game joins them
   again with what they held for the players in the room, which recovers a pool that a player who left had emptied,
-  also when the maker resets twice before the games joined again. The key the maker's game signs the room's rules and
+  also when the maker resets twice before the games joined again; a player who emptied a pool and is still in the room
+  is removed first. The key the maker's game signs the room's rules and
   removals with is kept in the profile folder (`coop-keys/`, readable by your account only: the folder 0700, the file
   0600 on Linux), so a maker whose game restarted is still the room's maker. That file, together with the room's
   secret, lets whoever has both act as the room's maker: never hand out a copy of your profile folder. A game that sees
@@ -78,6 +89,7 @@ Read this before you join a room.
 | Who | Sees | Cannot |
 |---|---|---|
 | The relay's operator, and anyone on the network path | that a room exists (a random id and the locator, a value derived from the secret that does not give the secret back), the players' names, their IP addresses, when and how much they send | read, change or make any message between the players; learn the secret; change anyone's save or the room's rules (moving the relay's maker mark changes nothing for a player who accepted) |
+| Someone who knows the secret and runs the relay, or sends from its address on your network | all of the above, and every message of the room | make a message in another player's name that a game acts on (each is signed by its sender); change your save other than through a player you accepted. It can drop or delay messages, send one again within the last 64 of its sender, and send rosters that keep players from being identified or the room from being accepted for as long as it keeps sending; none of that lasts once it stops |
 | The other players in the room | your name, your progress (what the rules share), your messages, and with `NX2NAVI_COOP_PUPPETS=1` where your Link is (area, position, animation) | your IP address (the relay forwards everything), your account or profile (the id the relay knows you by is random for each start of the game and never shown to them) |
 | Your log and "Copy system info" | the room's first three characters and the offer's number; system info shows that `coop_room`, `coop_server`, `coop_name` and `coop_accept` are set, not their values | the secret, the relay's address (it appears only with `NX2NAVI_TRACE=coop`) |
 
@@ -158,9 +170,11 @@ where each network's joins went.
   budget that is full again, and checks its own challenge budget first, so a flood from spoofed addresses leaves no
   state behind. A member that rejoins with its token from its own address and in its own session needs no challenge;
   from another address, or with a new session (every rejoin draws one), it answers one first, so someone who saw its
-  CONNECT cannot take its place, and the challenges for a CONNECT with a member's valid token come from a share of
-  1000 a second set aside for them (and from that member's own budget), so a flood of challenges without a token does
-  not keep the players of a room out of it. A game whose roster shows another session for it joins again, at most once
+  CONNECT cannot take its place. The challenges for a CONNECT with a member's valid token come from a share of 1000 a
+  second set aside for them and from that member's own challenges (2 a second, 8 at once, kept apart for its own
+  network and for the others), never from its packets: a flood of them, with or without a token someone saw, neither
+  drops the member's messages nor keeps its rejoin from its own network out of the room. A game whose roster shows
+  another session for it joins again, at most once
   every 15 s. A session that was in the room before is refused (the last 4096 of each room are kept). A flood from many
   networks can still use up the relay's 5000 challenges a second for newcomers: a relay has finite capacity, and its
   operator's firewall is the place for more.
@@ -334,10 +348,11 @@ name. KICK (maker to relay) names a member and its session. These datagrams are 
 do not know `L` only; the relay and an observer of a CONNECT can make them, which lets them disturb the session
 (drop, reorder, invent members that cannot speak), not change a save. So a roster is taken only up to 2^20 ahead of
 the last one's number (the relay's counter moves with its own datagrams), and after the silence time and 4 s without
-a roster taken, the next one counts whatever its number, so one forged far ahead does not cut a player off; a session
-a roster no longer lists ends for progress sync only once its member is heard in the next one, or leaves, so a forged
-roster ends no identity; and a roster that lists another session for this player makes it join again at most once
-per 15 s. A relay or observer can still change the roster for that long, as it can drop datagrams.
+a roster taken, the next one counts whatever its number, so one forged far ahead does not cut a player off; no roster
+ends a session for progress sync (a session ends only when its member's identity in a later one names it, below), and
+neither does a relay that says the room is gone; a roster that lists another session for this player makes it join
+again at most once per 15 s, and its game keeps signing for the session it joined with. A relay or observer that keeps
+sending rosters changes the roster for as long as it sends, as it can drop datagrams for as long as it likes.
 
 **The player message envelope** (the payload of DATA, version byte 1):
 
@@ -358,29 +373,43 @@ the last 64 of that session (older ones are refused, not taken as a restart), th
 and destination; only then is the counter recorded and the message delivered.
 
 **Replay.** A message recorded before a player joined again carries the old session, which the roster no longer
-lists: refused. A message sent again within a session is refused by the window. A relay that lists an old session in
-a forged roster could replay that session's messages to a player; they are messages the sender really sent, and sync
-messages only raise values, so this brings nothing new into a save.
+lists: refused. A message sent again within a session is refused by the window. Someone who knows the secret can seal
+a recorded message again under a new counter, and a sync section carries its sender's own counter inside its
+signature for that: a section is taken once, and only within the last 64 of its sender's session. A relay that lists
+an old session in a forged roster could replay that session's messages to a player whose game never saw the session
+end; they are messages the sender really signed, and sync messages only raise values, so this brings nothing new into
+a save.
 
-**The sync messages (version 3).** `runtime/coop_state.c` has the byte layout. Each game makes a signing key for each
+**The sync messages (version 4).** `runtime/coop_state.c` has the byte layout. Each game makes a signing key for each
 room and start of the game (EdDSA, from a random value of the start and the room's secret, so nothing ties a player
 across rooms; the maker's from 32 random bytes kept in the profile for that room, mixed with the secret, so that it
-outlives a restart) and sends in every DIGEST its identity: the key, its name and a signature over the room's context
-(BLAKE2b-128 keyed with the secret), its member id and the session the relay lists for it. A game takes values only
-from a member whose identity checks out; an identity belongs to one session, a session of a key that ended (once its
-member was heard in the next session or left, and every session of a room the relay lost) is never taken again (the
-latest 1024 of each key the player accepted are kept apart, where no other member's churn removes them; the others
-share the last 65536), and a
-key another member holds is refused, so an identity cannot be copied to another member or slot; the relay also
-refuses a session that was in the room before. A name is checked as signed and shown cleaned (control and reordering
-characters replaced). Flags are taken only from a member whose key the player accepted. The DIGEST also carries the
+outlives a restart) and sends in every DIGEST its identity: the key, its name, the session it held in the room before
+this one (0 none) and a signature over the room's context (BLAKE2b-128 keyed with the secret), its member id, the
+session it joined with and that session before. A game takes values only from a member whose identity checks out; an
+identity belongs to one session, a session a member's later identity names as the one before is never taken again
+(the latest 1024 of each key the player accepted are kept apart, where no other member's churn removes them; the
+others share the last 65536), and a key another member holds is refused, so an identity cannot be copied to another
+member or slot; the relay also refuses a session that was in the room before. Only the key's holder ends its sessions
+that way: a forged roster, a relay that says the room is gone, or a replayed message or identity ends none. A game
+announces its identity at once when its session changes. A name is checked as signed and shown cleaned (control and
+reordering characters replaced). Every SECTION (a push of a change or an answer to a digest) ends with its sender's
+counter (8 bytes) and its signature (64 bytes) over "nx2navi-coop/4 section", the room's context, the sender's
+member id and session and the section's bytes, checked against the identified key before anything of the section is
+stored, applied or passed on: 72 bytes and one signature per section whatever it carries, about 35 µs to sign and
+100 µs to check one (measured on the runtime's -O2 build of Monocypher on an x64 desktop). Flags are taken only from a
+member whose key the player accepted. The DIGEST also carries the
 maker's charter: the rules, the keys admitted to the pools (8-byte key ids), the last 16 keys removed and the pools'
 epoch, with an epoch the maker raises at each change (saturating at 2^32−1), signed by the maker's key; each game
 keeps every removal it saw in the room. A pool record (one per contributor and pool) carries the contributor's key,
 the pools' epoch, a sequence number, its base, gains and spends, and its signature; a game keeps the record with the
 highest sequence of each key (its own too: a room that comes back hands it its own newest record) and stores only
 records of admitted keys of the current pools' epoch, checking the signature before it stores or passes one on; its
-pools count only the records of keys its player accepted, and its own.
+pools count only the records of keys its player accepted, and its own. A game remembers (in memory) its last 8 joins
+of each pool in the epoch, each with what it joined with and the records it saw then; its base is the highest of
+their claims, each made as if the game had counted then the keys it counts now, and made again whenever that changes
+(a removal, or its player accepting more). A reset carries this game's own claim as it would be with only the
+players the reset admits. A digest's sums are not signed: a forged one can make a game send its sections or join a
+pool before it heard every record, as dropping messages can.
 
 **Rules and the maker.** A game takes a charter signed by the key its player accepted; before any acceptance, its own
 for a room this session made; else by the key of the member the relay marks as the maker while no identified member
@@ -389,10 +418,12 @@ carries (each member's first digest is waited for, up to 5 s, so the quickest do
 counts only with a later epoch.
 
 **Per-member limits in each game.** Every value is checked against the local table before it is stored, passed on or
-applied; at most 48 KB/s is taken from one member; 32 refused flags or failed signatures (an identity, a charter in
-the maker's name, a pool record) and the member is ignored while it stays (a pool record this game cannot count is
-dropped without counting against its sender, since an honest member may hold a newer charter for a moment); a
-signature that failed is not checked again, and each member gets at most 128 signature checks a second (256 at once);
+applied; at most 48 KB/s is taken from one member; 32 refused flags or failed signatures of what only that member can
+make (an identity, a charter in the maker's name, a pool record) and the member is ignored while it stays (a pool
+record this game cannot count is dropped without counting against its sender, since an honest member may hold a newer
+charter for a moment, and a section whose signature fails is dropped without counting either, since someone else can
+make one in its name); a signature that failed is not checked again, and each member gets at most 128 signature checks
+a second (256 at once), sections' included;
 the register index is keyed (SipHash-2-4 with a random key of the process); a pool stores at most 24 records (the
 admitted keys), a record's base, gains and spends are at most 2^20 either way, and nobody but a record's key holder
 can make or change it. Without the system's random source (no client id, session, nonce or key a stranger cannot
@@ -403,12 +434,14 @@ guess) co-op stays off.
 1. **Keep a save you can go back to.** Join only with a save you are ready to restore from
    `coop-backup/first-<date-time>`. Anyone you accept can set story flags in your save, and so can anyone a player you
    accepted let in. A player in your pools can empty a dungeon's small keys while they play; the maker's removal of
-   that player, or a pool reset after they left, gives back what they took, but no removal takes a flag back, and keys
-   of yours that a pool counted as already there when you joined it can go with them.
-2. **Your acceptance is yours, the room is not.** A player you did not accept reaches neither your flags nor your
-   pools. But the players you accept pass on the flags of the players they accepted, and the maker alone decides who
-   may use the pools at all. If anyone you do not know is in the room, even one you declined, do not accept: leave,
-   and ask the maker for a new room (a new secret) for the people you know.
+   that player, or a pool reset after they were removed or left, gives back what they took, but no removal takes a
+   flag back, and a reset while they are still in the room keeps their drain: remove first, then reset.
+2. **Your acceptance is yours, the room is not.** A player you did not accept reaches neither your flags nor, by
+   themselves, your pools, also when they know the secret and run the relay. But the players you accept pass on the
+   flags of the players they accepted, a player you accepted who counts a stranger in their pools claims against a
+   pool with that stranger in it until the maker removes them, and the maker alone decides who may use the pools at
+   all. If anyone you do not know is in the room, even one you declined, do not accept: leave, and ask the maker for a
+   new room (a new secret) for the people you know.
 3. **Check the maker's key, and keep yours to yourself.** Before you accept, compare the fingerprint of the key that
    signs the room's rules with the maker's, by voice or chat. Never start the game with `NX2NAVI_COOP_ACCEPT=always`,
    or with a script or `nx2navi.ini` someone hands you. Never hand out a copy of your profile folder: its `coop-keys`
@@ -416,9 +449,10 @@ guess) co-op stays off.
    key).
 
 What nothing can prevent: everyone who knows the secret can join and read the room; a member or the relay can disturb
-it (leave messages out, flood within its limits, keep the rules from being agreed, change the offer so that nothing
-is applied until you accept again, or keep the room unaccepted by never saying who it is); and the relay sees who
-plays with whom and when, with names and addresses. None of that changes a save.
+it (leave messages out, delay them, send one again within the last 64 of its sender, flood within its limits, keep
+the rules from being agreed, change the offer so that nothing is applied until you accept again, keep the room
+unaccepted by never saying who it is, or send rosters that keep a player unidentified for as long as it keeps
+sending); and the relay sees who plays with whom and when, with names and addresses. None of that changes a save.
 
 ## Other players in the world (in progress, game 1.1.1)
 
@@ -507,11 +541,17 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   room the relay lost, the relay's maker mark against the members' rules, signed names, failed signatures, a game's own
   pool record after the room came back, and a removal 17 removals ago; and the fourth review's: a record with the
   lowest base, pools that follow the player's own acceptance, two resets in a row, a forged roster's sessions, what a
-  contributor took per pool, an accepted key's ended session after 65600 others, and a randomised run (a few seeds by
-  default; `NX2NAVI_COOP_ADVERSARY=first:count` runs those seeds alone) of hostile members who hold the secret and are
-  admitted, against invariants of flags, acceptance and pools. The session part adds rosters forged far and a little
-  ahead, rosters that list another session again and again, a refusal for the network's joins, and a room that is not
-  there. `ocarina --probe-fs` checks that the first copy
+  contributor took per pool, an accepted key's ended session after 65600 others; and the fifth review's: sections in
+  another member's name made with the secret alone (and a flood of them), a member's session after a forged roster
+  with a replayed message, a roster without it, a relay that says the room is gone, and a replayed identity of a
+  session the game never saw end, claims made again after a removal (keys brought while a removed player's gains
+  counted, a claim made while its spends counted, honest games that agree), another save that joins only once
+  accepted; and a randomised run (a few seeds by default; `NX2NAVI_COOP_ADVERSARY=first:count` runs those seeds
+  alone) of hostile members who hold the secret, admitted or not, and of an attacker with the secret and no accepted
+  key who forges senders and rosters and replays messages and identities, against invariants of flags, acceptance,
+  identification and a ledger of the honest players' joins, pickups and uses. The session part adds rosters forged
+  far and a little ahead, rosters that list another session again and again, a refusal for the network's joins, and a
+  room that is not there. `ocarina --probe-fs` checks that the first copy
   of a save outlasts the rotation.
 - `python tests/coop_page_check.py`: the menu's Co-op tab without the game, driven with the keyboard's and the pad's
   events: typing a name, a relay and a secret (Q and E are letters there, not tab keys), Make, Join with a wrong secret
