@@ -85,19 +85,17 @@
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 5                                      // in every cache key; bump when the key layout or the use of the
-                                                           // output changes here (4: translator identity, input ids; 5: the
-                                                           // NVN2 compute shared memory size in the request);
+#define KEY_VERSION 6                                      // in every cache key; bump when the key layout or use of the
+                                                           // output changes here (6: sampled texture format answers);
                                                            // translator changes are covered by its identity
-#define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
-                                                           // or the program hash changes (drops every stored input)
+#define IN_VERSION 2                                       // 2: tex_format in answers; invalidates every old input id
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
 #define USE_VERSION 1
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
 #define MAX_SVC 32                                         // translator processes
 
 typedef struct {                                           // which answers a shader's translation depends on
-    uint32_t slots;                                        // tex_type, img_type, img_format of these c2 slots
+    uint32_t slots;                                        // tex_type, tex_format, img_type, img_format of these c2 slots
     uint32_t attrs;                                        // attr_type (VS input Locations)
     uint32_t fouts;                                        // frag_out_type (FS output Locations)
 } UseMask;
@@ -847,7 +845,7 @@ static int entry_present(const uint8_t key[32]) {
 
 static const char *const tex_names[] = {NULL, "1d", "1darray", "buffer", "2d", "2darray", "2dms", "2dmsarray", "3d",
                                         "cube", "cubearray"};   // GfxShaderAnswers tex_type / img_type codes
-static const char *const fmt_names[] = {   // img_format codes: the translator's TextureFormat enum order
+static const char *const fmt_names[] = {   // tex_format / img_format codes: translator TextureFormat enum order
     NULL, "R8Unorm", "R8Snorm", "R8Uint", "R8Sint", "R16Float", "R16Unorm", "R16Snorm", "R16Uint", "R16Sint", "R32Float",
     "R32Uint", "R32Sint", "R8G8Unorm", "R8G8Snorm", "R8G8Uint", "R8G8Sint", "R16G16Float", "R16G16Unorm", "R16G16Snorm",
     "R16G16Uint", "R16G16Sint", "R32G32Float", "R32G32Uint", "R32G32Sint", "R8G8B8A8Unorm", "R8G8B8A8Snorm",
@@ -1298,6 +1296,7 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     GfxShaderAnswers zero = {0};
     if (!a) a = &zero;
     memcpy(p, a->tex_type, 32), p += 32;
+    memcpy(p, a->tex_format, 32), p += 32;
     memcpy(p, a->img_type, 32), p += 32;
     memcpy(p, a->img_format, 32), p += 32;
     memcpy(p, a->attr_type, 32), p += 32;
@@ -1329,7 +1328,10 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     memset(o, 0, sizeof *o);
     if (!a) return;
     for (int i = 0; i < 32; i++) {
-        if (m->slots >> i & 1) o->tex_type[i] = a->tex_type[i], o->img_type[i] = a->img_type[i], o->img_format[i] = a->img_format[i];
+        if (m->slots >> i & 1) {
+            o->tex_type[i] = a->tex_type[i], o->tex_format[i] = a->tex_format[i];
+            o->img_type[i] = a->img_type[i], o->img_format[i] = a->img_format[i];
+        }
         if (m->attrs >> i & 1) o->attr_type[i] = a->attr_type[i];
     }
     for (int i = 0; i < 8; i++)
@@ -1395,7 +1397,10 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         const char *sep = "";
         o += sprintf(o, ",\"tex\":{");
         for (int i = 0; i < 32; i++)
-            if (a->tex_type[i] && a->tex_type[i] < COUNT(tex_names)) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, tex_names[a->tex_type[i]]), sep = ",";
+            if (a->tex_type[i] && a->tex_type[i] < COUNT(tex_names)) {
+                const char *f = a->tex_format[i] && a->tex_format[i] < COUNT(fmt_names) ? fmt_names[a->tex_format[i]] : "R8G8B8A8Unorm";
+                o += sprintf(o, "%s\"%d\":{\"type\":\"%s\",\"fmt\":\"%s\"}", sep, i, tex_names[a->tex_type[i]], f), sep = ",";
+            }
         sep = "";
         o += sprintf(o, "},\"img\":{");
         for (int i = 0; i < 32; i++)
@@ -2373,8 +2378,8 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 //                       code[length], c1. One per code hash; written before the answers that name it. Game content:
 //                       it stays in the ignored pipeline cache directory.
 // A file with another header is rewritten; a torn tail (killed process) is cut off at open.
-#define ANS_VERSION 1
-#define ANS_PACKED 147                                     // pack_answers' size
+#define ANS_VERSION 2                                     // 2: separate sampled texture formats; old records are rewritten
+#define ANS_PACKED 179                                     // pack_answers' size
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
 #define PRG_VERSION 1
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
@@ -2434,6 +2439,7 @@ static uint64_t hash8(const uint8_t *sha) {
 static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
     memcpy(a->tex_type, p, 32), p += 32;
+    memcpy(a->tex_format, p, 32), p += 32;
     memcpy(a->img_type, p, 32), p += 32;
     memcpy(a->img_format, p, 32), p += 32;
     memcpy(a->attr_type, p, 32), p += 32;
@@ -2705,7 +2711,7 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 // ---- prepared variants (shader-prepared.bin next to pipeline-keys.bin)
 // "NX2NSPRP", version, record size; records: stage, priority, 2 zero bytes, input id. gfx_shader_prepare_seed writes
 // them in priority order, one per input id; gfx_shader_warm_list reads them at boot.
-#define PRP_VERSION 1
+#define PRP_VERSION 2                                     // 2: input ids use sampled texture format answers
 #define PRP_REC 36
 
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {

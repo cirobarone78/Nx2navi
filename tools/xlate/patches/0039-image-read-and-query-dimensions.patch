@@ -1,0 +1,53 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+index 258972c..020b9d8 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -237,6 +237,21 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             {
+                 int setIndex = context.TargetApi == TargetApi.Vulkan ? image.Set : 0;
+ 
++                ImageFormat format = GetImageFormat(image.Format);
++                // These ImageFormat enumerants require StorageImageExtendedFormats, even without an image access.
++                if (format is ImageFormat.Rg32f or ImageFormat.Rg16f or ImageFormat.R11fG11fB10f
++                    or ImageFormat.R16f or ImageFormat.Rgba16 or ImageFormat.Rgb10A2
++                    or ImageFormat.Rg16 or ImageFormat.Rg8 or ImageFormat.R16 or ImageFormat.R8
++                    or ImageFormat.Rgba16Snorm or ImageFormat.Rg16Snorm or ImageFormat.Rg8Snorm
++                    or ImageFormat.R16Snorm or ImageFormat.R8Snorm
++                    or ImageFormat.Rg32i or ImageFormat.Rg16i or ImageFormat.Rg8i
++                    or ImageFormat.R16i or ImageFormat.R8i or ImageFormat.Rgb10a2ui
++                    or ImageFormat.Rg32ui or ImageFormat.Rg16ui or ImageFormat.Rg8ui
++                    or ImageFormat.R16ui or ImageFormat.R8ui)
++                {
++                    context.AddCapability(Capability.StorageImageExtendedFormats);
++                }
++
+                 Dim dim = GetDim(image.Type);
+ 
+                 SpvInstruction imageType = context.TypeImage(
+@@ -246,7 +261,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     image.Type.HasFlag(SamplerType.Array),
+                     image.Type.HasFlag(SamplerType.Multisample),
+                     AccessQualifier.ReadWrite,
+-                    GetImageFormat(image.Format));
++                    format);
+ 
+                 // NX2NAVI (2026-10-20): an image declared without a format (QueryHostSupportsImageLoadFormatted) that the
+                 // shader stores to needs StorageImageWriteWithoutFormat; upstream never declares it, so spirv-val rejects
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+index 210f938..a1837c2 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -688,6 +688,13 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         {
+             AstTextureOperation texOp = (AstTextureOperation)operation;
+ 
++            // An Unknown image format still requires this SPIR-V capability under Vulkan 1.3.
++            // Use the declaration's format, including when multiple operations share a binding.
++            if (context.Properties.Images[texOp.GetTextureSetAndBinding()].Format == TextureFormat.Unknown)
++            {
++                context.AddCapability(Capability.StorageImageReadWithoutFormat);
++            }
++
+             AggregateType componentType = texOp.Format.GetComponentType();
+ 
+             bool isArray = (texOp.Type & SamplerType.Array) != 0;

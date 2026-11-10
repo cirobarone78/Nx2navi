@@ -33,8 +33,8 @@ enum { GFX_TEX_1D = 1, GFX_TEX_1D_ARRAY, GFX_TEX_BUFFER, GFX_TEX_2D, GFX_TEX_2D_
        GFX_TEX_2D_MS_ARRAY, GFX_TEX_3D, GFX_TEX_CUBE, GFX_TEX_CUBE_ARRAY };   // gfx_shader.c tex_names order
 enum { GFX_TYPE_FLOAT, GFX_TYPE_SINT, GFX_TYPE_UINT };
 typedef struct {                                           // the translator's answers (Program.cs Accessor)
-    uint8_t tex_type[32], img_type[32], img_format[32];    // per c2 slot; 0 = not asked; types are GFX_TEX_*,
-                                                           // img_format is the translator's TextureFormat
+    uint8_t tex_type[32], tex_format[32], img_type[32], img_format[32];   // separate sampled texture and image c2 slots;
+                                                           // 0 = not asked; GFX_TEX_* types, TextureFormat formats
     uint8_t attr_type[32], frag_out_type[8];               // GFX_TYPE_*
     uint16_t local[3]; uint32_t shared_bytes;
     uint8_t depth_minus_w;
@@ -112,7 +112,7 @@ typedef struct {
                                 // or, separate, texture slot (0x168 + 8 slot); IMG: image slot (0x120 + 8 slot); -1: other
     uint16_t type;              // TEX/IMG: the translator's SamplerType: 1 1D, 2 buffer, 3 2D, 4 3D, 5 cube | 0x100 array,
                                 // 0x200 multisample, 0x400 shadow
-    uint8_t format;             // IMG: declared format as a GfxShaderAnswers.img_format code, 0 unknown
+    uint8_t format;             // TEX/IMG: declared TextureFormat (tex_format / img_format answer code), 0 unknown
     uint8_t flags;              // SSBO: 1 written; TEX/IMG: the translator's TextureUsageFlags (4 image store, 8 coherent)
     int8_t cbuf_slot;           // TEX/IMG: constant buffer of the handle (-1: bound texture buffer); SSBO: of its address
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset

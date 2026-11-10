@@ -99,8 +99,8 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 37:
-        sys.exit(f"expected 37 patches, found {len(patches)}")
+    if len(patches) != 39:
+        sys.exit(f"expected 39 patches, found {len(patches)}")
     # build/xlate is inside this checkout, and git inside a repository reads a "diff --git" patch's paths from the
     # repository's top: those hunks fall outside the directory handed to --directory, git skips every file of the patch
     # and still exits 0. 0021-prmt-byte-permute.patch is the only one written in that form, so it used to be skipped in

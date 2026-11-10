@@ -526,7 +526,7 @@ static VkComponentSwizzle swz_of(uint8_t s) {
 }
 
 // A view in STENCIL mode samples the stencil plane (TextureViewSetDepthStencilMode); otherwise depth wins. The
-// translator declares every sampled image float and the shader takes the raw bits, as for integer formats.
+// shader's format answer also selects an unsigned sampled type for the stencil plane.
 VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, int hv) {
     if (hv && v->set_dsmode && v->dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL && (img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
         return VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -836,7 +836,7 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
 // was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
 // otherwise (slot_still).
-static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32], ifmt[32]; } AC[8];
+static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32], tfmt[32], ifmt[32]; } AC[8];
 
 // vk_texture_slot_token of the slot a texture or image handle names; an empty handle always resolves to nothing.
 static uint64_t token_of(uint64_t h) { return h ? vk_texture_slot_token((int)(h & 0xfffff)) : 1; }
@@ -878,20 +878,17 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
     return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
 }
 
-// The img_format answer of an image handle: the integer format its view gives it (int_view_format, as get_view binds
-// it), else 0 (the translator's default, a float format). Texture lock held.
-static uint8_t format_of_handle(uint64_t h) {
+// Match the descriptor's actual VkFormat, not only an explicit integer view override: native RG16UI is integer too.
+static uint8_t format_of_handle(uint64_t h, int storage) {
     view_t v;
     int hv;
     const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-    VkFormat f = VK_FORMAT_UNDEFINED;
-    static int logged;
-    if (img && hv && v.set_format && int_view_format(v.format, NULL) && logged < 8)
-        logged++, rt_log("vk: image view format: handle %#llx view nvn format %#x on vk format %d -> %d",
-                         (unsigned long long)h, v.format, img->format, int_view_format(v.format, NULL));
-    if (!img || !hv || !v.set_format || !int_view_format(v.format, &f) || texel_bytes(f) != texel_bytes(img->format) || !texel_bytes(f))
-        return 0;
-    return (uint8_t)int_view_format(v.format, NULL);
+    if (!img) return 0;
+    VkFormat f = storage ? storage_view_format(img, &v, hv) : img->format;
+    if (vk_exec_view_aspect(img, &v, hv) == VK_IMAGE_ASPECT_STENCIL_BIT) return 3;   // stencil is unsigned
+    for (uint8_t i = 1; i < sizeof tex_format / sizeof *tex_format; i++)
+        if (tex_format[i] == f) return i;
+    return 0;
 }
 
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
@@ -918,13 +915,16 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         int imiss = c->img[slot] != hi || !c->itok[slot] || !slot_still(&c->igen[slot], c->itok[slot], hi, gen);
         uint64_t tt = tmiss ? token_of(h) : 0, it = imiss ? token_of(hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
-        if (tmiss) c->tt[slot] = type_of_handle(h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
+        if (tmiss)
+            c->tt[slot] = type_of_handle(h), c->tfmt[slot] = format_of_handle(h, 0), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
         if (imiss)
-            c->it[slot] = type_of_handle(hi), c->ifmt[slot] = format_of_handle(hi), c->img[slot] = hi, c->itok[slot] = it,
+            c->it[slot] = type_of_handle(hi), c->ifmt[slot] = format_of_handle(hi, 1), c->img[slot] = hi, c->itok[slot] = it,
             c->igen[slot] = gen;
-        if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot]))   // NX2NAVI_SHADER_MEMO=check
+        if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot] ||
+                      format_of_handle(h, 0) != c->tfmt[slot] || format_of_handle(hi, 1) != c->ifmt[slot]))   // NX2NAVI_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
-        a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot], a->img_format[slot] = c->ifmt[slot];
+        a->tex_type[slot] = c->tt[slot], a->tex_format[slot] = c->tfmt[slot],
+        a->img_type[slot] = c->it[slot], a->img_format[slot] = c->ifmt[slot];
     }
     if (locked) vk_texture_unlock();
 }

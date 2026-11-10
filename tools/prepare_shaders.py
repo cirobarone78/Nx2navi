@@ -11,6 +11,7 @@ build's nx2navi.exe in the record layouts of runtime/gfx_shader.c ("answers met 
 
     seed-programs.bin  "NX2NSPRG": stage, length, c1 length, runtime code hash, control section, code, c1
     seed-answers.bin   "NX2NSANS": stage, code hash, input id (zero: the runtime computes it), answers, priority
+    Answers use version 2: 179 packed bytes, with sampled texture formats separate from image formats (248-byte records).
 
 Priority (the pad byte): 0 shaders the list's warm rows flag as title/menu (t), 1 other warm rows (S, C, R), 2 the
 rest; a default variant takes its shader's priority and sets DEFAULT_FLAG (bit 7). The runtime reads a flagged
@@ -61,7 +62,9 @@ FMT = [None, 'R8Unorm', 'R8Snorm', 'R8Uint', 'R8Sint', 'R16Float', 'R16Unorm', '
 TYPES = {'float': 0, 'sint': 1, 'uint': 2}
 DEFAULT = {'tex': {str(slot): '2d' for slot in range(32)}}   # answers outside a shader's use mask are dropped
 CONTROL = 0x880
-ANS_REC = 4 + 32 + 32 + 147 + 1
+ANS_VERSION = 2
+ANS_PACKED = 179
+ANS_REC = 4 + 32 + 32 + ANS_PACKED + 1
 DEFAULT_FLAG = 0x80   # pad byte: a default variant, its answers refined from its first translation (gfx_shader_guess.c)
 # Default variants left out unless --all-shaders: the larger compute programs of two of Ocarina's three NDSR upscaler
 # packages. The translator turns their 20-47 KB of code into 3-12.6 MB of SPIR-V, which the GPU driver took 34 s to
@@ -124,14 +127,17 @@ def parse_list(text):
 
 
 def answers(deps, stage, control):
-    """GfxShaderAnswers in gfx_shader.c pack_answers layout (147 bytes) from the list's deps JSON."""
-    tex, img, fmt, attr, fout = bytearray(32), bytearray(32), bytearray(32), bytearray(32), bytearray(8)
-    for slot, t in deps.get('tex', {}).items():
-        t = t.removesuffix('_depth')
+    """GfxShaderAnswers in gfx_shader.c pack_answers layout (179 bytes) from the list's deps JSON."""
+    tex, tex_fmt, img, img_fmt, attr = (bytearray(32) for _ in range(5))
+    fout = bytearray(8)
+    for slot, o in deps.get('tex', {}).items():
+        t = (o['type'] if isinstance(o, dict) else o).removesuffix('_depth')
         tex[int(slot)] = TEX.index('2d' if t == '*' else t)   # "*": any kind, translated as the plain 2D it stands for
+        if isinstance(o, dict):
+            tex_fmt[int(slot)] = FMT.index(o['fmt']) if o.get('fmt') in FMT else 0
     for slot, o in deps.get('img', {}).items():
         img[int(slot)] = TEX.index(o['type'])
-        fmt[int(slot)] = FMT.index(o['fmt']) if o.get('fmt') in FMT else 0
+        img_fmt[int(slot)] = FMT.index(o['fmt']) if o.get('fmt') in FMT else 0
     for loc, t in deps.get('attr', {}).items():
         attr[int(loc)] = TYPES[t]
     for idx, t in deps.get('fout', {}).items():
@@ -142,8 +148,8 @@ def answers(deps, stage, control):
         # each cut to 16 bits as answers_for stores them (task and mesh programs keep other fields there)
         local = struct.unpack_from('<III', control, 0x58 if nvn2(control) else 0x748)
         local = [(v or 1) & 0xffff for v in local]
-    packed = bytes(tex + img + fmt + attr + fout) + struct.pack('<HHHIB', *local, 0, 0)
-    assert len(packed) == 147
+    packed = bytes(tex + tex_fmt + img + img_fmt + attr + fout) + struct.pack('<HHHIB', *local, 0, 0)
+    assert len(packed) == ANS_PACKED
     return packed
 
 
@@ -242,7 +248,7 @@ def main():
         for _, body in progs.values():
             f.write(body)
     with open(out / 'seed-answers.bin', 'wb') as f:
-        f.write(b'NX2NSANS' + struct.pack('<II', 1, ANS_REC))
+        f.write(b'NX2NSANS' + struct.pack('<II', ANS_VERSION, ANS_REC))
         for _, rec in recs:
             f.write(rec)
     by = [sum(1 for p, _ in recs if p == i) for i in range(3)]

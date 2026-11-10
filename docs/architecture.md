@@ -93,6 +93,12 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   that meets one before it is built gets a fast-linked pipeline (`vk_pipeline.c` `PREWARM_PIPE_MS`).
   `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
   the whole wait, after which the rest finishes in the background.
+  Sampled textures and storage images have independent type and format answers (`GfxShaderAnswers`), selected from
+  the bound descriptor's format, including native integer textures and storage image reinterpretations.
+  Shader keys and recorded inputs
+  include both format arrays. Adding sampled formats changes shader input ids: `.in` files, `shader-answers.bin`,
+  seed answers and prepared shader lists use version 2, and `pipeline-keys.bin` uses version 5. Older inputs and
+  warm-up records are rejected rather than guessing their missing formats; prepare shaders again to rebuild them.
 - Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
   previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
   lists the translators it holds translations of, and a shader the new translator has not translated yet uses the

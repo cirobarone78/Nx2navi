@@ -10,7 +10,7 @@
 //   in play, all were uint and all were bitcast, against 36 of 3,339 float ones.
 // - Compute textures and images. Translated without texture answers (the seed gives a compute default variant none),
 //   the translator declares each texture and image with the type its instructions name; those types become the
-//   answers, image formats included, and a slot it queries without declaring one keeps the 2D default. Compute misses
+//   answers, texture and image formats included, and a slot it queries without declaring one keeps the 2D default. Compute misses
 //   dropped from 43 to 13. A compute shader play meets untranslated is translated and its pipeline built on the replay
 //   thread (vk_exec_draw.c, the dispatch's shader_for call), so each miss is a stall; the prepare step's driver builds
 //   of compute pipelines averaged 0.96 s each, 16 at a time, on an RTX 5090.
@@ -87,7 +87,10 @@ int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswer
         const GfxShaderRes *r;
         int n = gfx_shader_resources(s, GFX_RES_TEX, &r);
         for (int i = 0; i < n; i++)
-            if (r[i].slot >= 0 && r[i].slot < 32 && answer_type(r[i].type)) out->tex_type[r[i].slot] = answer_type(r[i].type);
+            if (r[i].slot >= 0 && r[i].slot < 32 && answer_type(r[i].type)) {
+                out->tex_type[r[i].slot] = answer_type(r[i].type);
+                if (r[i].format) out->tex_format[r[i].slot] = r[i].format;
+            }
         n = gfx_shader_resources(s, GFX_RES_IMG, &r);
         for (int i = 0; i < n; i++)
             if (r[i].slot >= 0 && r[i].slot < 32 && answer_type(r[i].type)) {

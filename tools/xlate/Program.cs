@@ -10,7 +10,7 @@
 //          "sm86": bool + "size": bytes (an NVN2 program, lowered by AmpereLowering.cs), "nvn2_table": [start, textures,
 //          images] (NVN2 compute binding table), "lowered_out": path, "mesh": {"stage": 6|7, "threads", "maxv", "maxp",
 //          "topo", "payload", "task"} (stage "ts" / "ms": an NVN2 task or mesh program, AmpereLowering.MeshInfo),
-//          "tex": {slot: type}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
+//          "tex": {slot: {type, fmt}}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool, "zero_locals": bool,
 //          "sbuf_align": int, "subgroup": int }
 //   Output: <out>/<key>.spv and <out>/<key>.res.json (bindings, queried slots, notes).
@@ -64,7 +64,9 @@ static class SwshXlate
         {
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
             int bytes = off0 * 4;
-            return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+            if (cbufSlot >= 0 && (cbufSlot & 0xffff) != 2) return -1;
+            if (bytes >= 0x20 && bytes < 0x120 && (bytes - 0x20) % 8 == 0) return (bytes - 0x20) / 8;
+            return bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
@@ -82,9 +84,8 @@ static class SwshXlate
                 _ => SamplerType.Texture2D,
             };
         }
-        // Image handles: NVN1 c[2] 0x120 + 8 * slot (NVN2 compute handles are renumbered there by AmpereLowering.Handle);
-        // TexSlot knows only the separate texture range, so image formats were never answered (an R32UI view of an
-        // R11G11B10F target was declared float, and the raw words the shader packs were converted on store).
+        // Image handles: NVN1 c[2] 0x120 + 8 * slot; NVN2 compute handles are renumbered there by AmpereLowering.Handle.
+        // Texture and image slots have separate format answers even when they share a slot number.
         int ImgSlot(int handle, int cbufSlot)
         {
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
@@ -94,9 +95,10 @@ static class SwshXlate
         public TextureFormat QueryTextureFormat(int handle, int cbufSlot = -1)
         {
             int slot = ImgSlot(handle, cbufSlot);
+            string table = slot >= 0 ? "img" : "tex";
             if (slot < 0) slot = TexSlot(handle, cbufSlot);
-            if (slot >= 0) ImgQueried.Add(slot);
-            string f = _job["img"] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
+            if (slot >= 0) (table == "img" ? ImgQueried : TexQueried).Add(slot);
+            string f = _job[table] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
             if (f == null) { Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
             return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
         }

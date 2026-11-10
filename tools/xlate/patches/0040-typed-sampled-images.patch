@@ -1,0 +1,75 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -272,7 +272,11 @@
+ 
+             if (!isImage)
+             {
+-                format = TextureFormat.Unknown;
++                // A fixed texture binding has one known numeric format. A dynamically indexed
++                // handle array can span different formats; do not infer its type from element zero.
++                format = type != SamplerType.None && arrayLength == 1
++                    ? _gpuAccessor.QueryTextureFormat(handle, cbufSlot)
++                    : TextureFormat.Unknown;
+             }
+ 
+             SetBindingPair setAndBinding = GetTextureOrImageBinding(
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -181,8 +181,11 @@
+                         _ => throw new InvalidOperationException($"Invalid sampler type \"{sampler.Type & SamplerType.Mask}\"."),
+                     };
+ 
++                    // Sampled images keep ImageFormat.Unknown; only their sampled numeric type varies.
++                    AggregateType componentType = sampler.Type.HasFlag(SamplerType.Shadow)
++                        ? AggregateType.FP32 : sampler.Format.GetComponentType();
+                     imageType = context.TypeImage(
+-                        context.TypeFP32(),
++                        context.GetType(componentType),
+                         dim,
+                         sampler.Type.HasFlag(SamplerType.Shadow),
+                         sampler.Type.HasFlag(SamplerType.Array),
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1245,6 +1245,10 @@
+             SamplerDeclaration declaration = context.Samplers[texOp.GetTextureSetAndBinding()];
+             SpvInstruction image = GenerateSampledImageLoad(context, texOp, declaration, ref srcIndex);
+ 
++            // Match the binding's declaration, not the untyped texture operation in the IR.
++            AggregateType componentType = isShadow ? AggregateType.FP32
++                : context.Properties.Textures[texOp.GetTextureSetAndBinding()].Format.GetComponentType();
++
+             int coordsCount = texOp.Type.Dimensions;
+ 
+             int pCount = coordsCount;
+@@ -1479,7 +1483,8 @@
+ 
+             bool colorIsVector = isGather || !isShadow;
+ 
+-            SpvInstruction resultType = colorIsVector ? context.TypeVector(context.TypeFP32(), 4) : context.TypeFP32();
++            SpvInstruction componentSpvType = context.GetType(componentType);
++            SpvInstruction resultType = colorIsVector ? context.TypeVector(componentSpvType, 4) : componentSpvType;
+ 
+             if (intCoords)
+             {
+@@ -1529,7 +1534,7 @@
+                 result = context.ImageSampleImplicitLod(resultType, image, pCoords, operandsMask, operands);
+             }
+ 
+-            AggregateType swizzledResultType = AggregateType.FP32;
++            AggregateType swizzledResultType = componentType;
+ 
+             if (colorIsVector)
+             {
+@@ -1538,7 +1543,11 @@
+                 result = GetSwizzledResult(context, result, swizzledResultType, texOp.Index);
+             }
+ 
+-            return new OperationResult(swizzledResultType, result);
++            // Texture IR uses FP32 register carriers, including vectors. Reinterpret integer
++            // samples without a numeric conversion so every Maxwell destination bit survives.
++            AggregateType registerType = AggregateType.FP32 | (swizzledResultType & AggregateType.ElementCountMask);
++            result = context.BitcastIfNeeded(registerType, swizzledResultType, result);
++            return new OperationResult(registerType, result);
+         }
+ 
+         // NX2NAVI: percentage-closer soft shadows for the sun. The deferred lighting shaders take the shadow as four

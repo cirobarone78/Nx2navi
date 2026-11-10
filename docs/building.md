@@ -265,7 +265,14 @@ exe's own version first, then of the other one.
 
 Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader
 to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; failure groups go to `failures.txt`.
-`tools\xlate_smoke.py` checks the translator alone, without game files.
+`tools\xlate_smoke.py` checks the translator alone, without game files: service recovery, constant output,
+every supported integer storage-image format, formatted float loads, typed texture fetch/sample/gather and masks,
+depth comparison, dimension queries, and signed/unsigned SM86 integer conversion. It checks that extended
+storage-image formats declare `StorageImageExtendedFormats`, while core formats do not acquire that requirement;
+unformatted reads declare their separate capability. All modules pass through `spirv-val` against Vulkan 1.3
+with relaxed block, standard uniform-buffer and scalar layouts plus `LocalSizeId` enabled. Rebuild the translator
+before running it, or select an existing executable with `--translator PATH`; a translator patch changes its identity
+and automatically selects fresh runtime shader cache entries.
 
 A change to the SM86 tensor lowering (`tools/xlate/AmpereLowering.cs` Hmma, Ldsm, Movm, Half) passes
 `python tests\tensor_lowering_check.py`: it lowers GPU-captured vectors with `nx2navi_xlate --lower` and runs them on

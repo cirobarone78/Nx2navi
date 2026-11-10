@@ -2692,15 +2692,10 @@ static struct {
 // enters each Pipe as building under the key a draw would compute, queues it to the low queue and builds the queue on
 // every core. Records are deduplicated by a hash of their bytes; they are collected under P.lock by the worker that
 // built the pipeline and appended by the present thread (vk_pipeline_autosave) or at exit (vk_pipeline_save). A file
-// with another magic, version or record size is ignored and rewritten; a version 3 file (no task stage) is converted
-// and rewritten. Bump KEYS_VERSION when VkPipeState or the record changes meaning without changing size.
-#define KEYS_VERSION 4                 // 3: shaders named by input id (gfx_shader.c); 4: mesh pipelines, with their task stage
+// with another magic, version or record size is ignored and rewritten. Bump KEYS_VERSION when VkPipeState, the record
+// or the shader input-id layout changes meaning without changing size.
+#define KEYS_VERSION 5                 // 5: shader input ids include sampled texture formats (gfx_shader.c IN_VERSION 2)
 typedef struct { char magic[8]; uint32_t version, rec_size; } KeysHeader;
-typedef struct {
-    uint8_t vs[32], fs[32];
-    uint32_t has_fs, pad;
-    VkPipeState s;
-} KeyRecV3;
 typedef struct {
     uint8_t vs[32], fs[32], ts[32];    // gfx_shader_input_id of each stage (vs: the mesh stage of a mesh pipeline); fs all
                                        // zero with has_fs 0, ts with has_ts 0
@@ -2833,22 +2828,6 @@ static void keys_open(void) {
         for (size_t i = 0; i < K.file_n; i++) seen_add(rec_hash((const KeyRec *)K.file + i));
         if (len != (long)(sizeof h + n * sizeof(KeyRec)))   // a torn append: rewrite the file from what was read
             K.header_ok = 0;
-    } else if (head && h.version == 3 && h.rec_size == sizeof(KeyRecV3)) {
-        // the vertex pipelines of a version 3 file keep their prewarm: each record without a task stage, and the
-        // file rewritten in this version below (header_ok 0)
-        size_t n = ((size_t)len - sizeof h) / sizeof(KeyRecV3);
-        KeyRecV3 *old = n ? malloc(n * sizeof *old) : NULL;
-        if (old && fread(old, sizeof *old, n, f) == n && (K.file = calloc(n, sizeof(KeyRec)))) {
-            KeyRec *r = (KeyRec *)K.file;
-            for (size_t i = 0; i < n; i++) {
-                memcpy(r[i].vs, old[i].vs, 32), memcpy(r[i].fs, old[i].fs, 32);
-                r[i].has_fs = old[i].has_fs, r[i].s = old[i].s;
-                seen_add(rec_hash(&r[i]));
-            }
-            K.file_n = n;
-            rt_log("vk_pipeline: %s: %zu version 3 records converted; the file is rewritten", K.path, n);
-        }
-        free(old);
     } else {
         rt_log("vk_pipeline: %s has another format or version; it is rewritten", K.path);
     }
