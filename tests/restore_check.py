@@ -372,6 +372,14 @@ def pack_members():
         {'A/one.bgyml': 8, 'B/two.bin': 0x100, 'C/three.bgyml': 0x80}
 
 
+def _frame_dict(frame):
+    """The dictionary id a zstd frame names."""
+    try:
+        return _zstd.get_frame_info(frame).dictionary_id
+    except NameError:
+        return zstandard.get_frame_parameters(frame).dict_id
+
+
 def build(cc, flags, env):
     exe = OUT / ('restore-check.exe' if os.name == 'nt' else 'restore-check')
     srcs = [ROOT / 'tests' / 'restore_check.c'] + [ROOT / 'runtime' / n
@@ -485,6 +493,19 @@ def main():
     for n in longs:
         i = int(n.split('/')[1])
         check(g2[n][1] == b'new\0\x01\x02\x03' and g2[n][0] % (0x100 if i % 2 else 8) == 0, 'long names: ' + n)
+
+    # files the game lacks, made as copies (NEW_FILE)
+    m3 = sarc_decode(decompress((OUT / 'new.out.zs').read_bytes(), {}))
+    check(set(m3) == set(old) | {'N/copy.bgyml'}, 'new file: the member set')
+    for n in old:
+        check(m3[n][1] == old[n] and m3[n][0] % aligns[n] == 0, 'new file: %s lost its bytes or alignment' % n)
+    check(same(byml_decode(m3['N/copy.bgyml'][1]), {'Params': {'Speed': F32(1.5), 'Count': 11, 'Flag': True}}),
+          'new file: the member added to the copy')
+    made = (OUT / 'new.bcett.out.zs').read_bytes()
+    want = placement()
+    want['Actors'][2]['Dynamic']['Count'] = 13
+    check(same(byml_decode(decompress(made, dics)), want), 'new file, packed with a dictionary: the tree')
+    check(_frame_dict(made) == id2, 'new file, packed with a dictionary: not packed with the copied file\'s')
 
     fails = [f for f in fails if f]
     for f in fails:

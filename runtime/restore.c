@@ -198,10 +198,12 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
         for (b = a; b < np && !strcmp(list[picks[b].r]->edits[picks[b].e].file, file); b++)
             edits[b - a] = &list[picks[b].r]->edits[picks[b].e];
         Group g = {picks + a, file};
-        size_t n, out_n = 0;
+        size_t n = 0, out_n = 0;
         void *in = read(file, &n), *out = NULL;
+        int makes = 0;   // a NEW_FILE edit makes the file when the game lacks it
+        for (int k = 0; k < b - a; k++) makes |= edits[k]->kind == RESTORE_KIND_NEW_FILE;
         if (probing) printf("%s\n", file);
-        if (!in) {
+        if (!in && !makes) {
             for (int k = 0; k < b - a; k++) {
                 ok[k] = 0;
                 note(&g, k, "skipped: the file is missing");

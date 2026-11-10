@@ -439,6 +439,8 @@ static int apply_one(Ctx *c, Byml *b, const RestoreEdit *e, int k) {
     }
     case RESTORE_KIND_ADD_MEMBER:
         break;
+    case RESTORE_KIND_NEW_FILE:   // restore_file makes the file before any document is edited
+        break;
     }
     say(c, k, "skipped: an edit of this kind needs %s", e->kind == RESTORE_KIND_ADD_MEMBER ? "a pack" : "more fields");
     return 0;
@@ -520,6 +522,28 @@ static int add_member(Ctx *c, const RestoreEdit *e, int k, uint8_t **raw, size_t
     return 1;
 }
 
+// A NEW_FILE edit when the file is not there (there: 0): the file it copies, as stored (*made, malloc'd; *made_n its
+// size) and 1, else 0.
+static int new_file(Ctx *c, const RestoreEdit *e, int k, int there, void **made, size_t *made_n) {
+    if (!e->from) {
+        say(c, k, "skipped: a NEW_FILE names the file it copies");
+        return 0;
+    }
+    if (there) {
+        say(c, k, "skipped: the file is there already");
+        return 0;
+    }
+    size_t n = 0;
+    void *bytes = c->fetch ? c->fetch(e->from, &n) : NULL;
+    if (!bytes) {
+        say(c, k, "skipped: %s: the file is missing", e->from);
+        return 0;
+    }
+    *made = bytes, *made_n = n;
+    say(c, k, "made as a copy of %s (%zu bytes)", e->from, n);
+    return 1;
+}
+
 static int same_member(const char *a, const char *b) { return a == b || (a && b && !strcmp(a, b)); }
 
 void *restore_file(const RestoreEdit *const *edits, int n, const void *in, size_t size, const void *dic, size_t dic_n,
@@ -530,18 +554,30 @@ void *restore_file(const RestoreEdit *const *edits, int n, const void *in, size_
     const uint8_t *p = in, *dict = NULL;
     size_t rn = 0, dict_n = 0, raw_was = 0;
     uint8_t *raw = NULL, *out = NULL;
+    void *made = NULL;   // NEW_FILE: the file it copied, as stored
     int *idx = malloc(sizeof *idx * (n ? n : 1)), *done = calloc(n ? n : 1, sizeof *done);
-    int packed = size >= 4 && !memcmp(p, "\x28\xb5\x2f\xfd", 4), any = 0;
+    int packed = 0, any = 0;
     const char *why = NULL;
     for (int k = 0; k < n; k++) ok[k] = 0;
     if (sizes)
         for (int k = 0; k < n; k++) sizes[k] = (RestoreMemberSize){0, 0};
     if (!idx || !done) why = "out of memory";
-    else raw = unpack(&c, p, size, &rn, &dict, &dict_n, &why);
+    // A file the game lacks, first: the other edits apply to the copy.
+    for (int k = 0; idx && done && k < n; k++)
+        if (edits[k]->kind == RESTORE_KIND_NEW_FILE) {
+            done[k] = 1;
+            if ((ok[k] = new_file(&c, edits[k], k, in != NULL || made != NULL, &made, &size))) p = made;
+        }
+    if (!why && !p) why = "the file is missing";
+    if (!why) raw = unpack(&c, p, size, &rn, &dict, &dict_n, &why);
     if (!raw) {
-        for (int k = 0; k < n; k++) say(&c, k, "skipped: %s", why);
+        for (int k = 0; k < n; k++)
+            if (!done || !done[k]) say(&c, k, "skipped: %s", why);
+            else if (ok[k]) say(&c, k, "undone: %s", why);
+        for (int k = 0; k < n; k++) ok[k] = 0;
         goto done;
     }
+    packed = size >= 4 && !memcmp(p, "\x28\xb5\x2f\xfd", 4);
     raw_was = rn;
     // The members a pack gains, first: an edit of the same file may then set values in one.
     for (int k = 0; k < n; k++)
@@ -623,6 +659,7 @@ done:
         free(c.src[i].rel);
     }
     free(raw);
+    free(made);
     free(c.compound);
     free(idx);
     free(done);

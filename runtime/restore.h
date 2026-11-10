@@ -20,6 +20,7 @@
 
 typedef enum {
     RESTORE_KIND_SET = 1, RESTORE_KIND_REMOVE, RESTORE_KIND_ADD, RESTORE_KIND_SET_TEXT, RESTORE_KIND_ADD_MEMBER,
+    RESTORE_KIND_NEW_FILE,
 } RestoreKind;
 
 typedef struct {
@@ -51,6 +52,8 @@ typedef struct {
     const void *bytes;
     size_t nbytes;
     const char *from_member;
+    // NEW_FILE: file is not there, and is made as a copy of the file from (its bytes as stored, packed as that one is);
+    // the file's other edits then apply to the copy. from (above) names the file copied.
 } RestoreEdit;
 
 typedef struct {
@@ -99,6 +102,8 @@ typedef struct {
     {.kind = RESTORE_KIND_ADD_MEMBER, .file = file_, .member = member_, .bytes = data, .nbytes = sizeof data}
 #define RESTORE_COPY_MEMBER(file_, member_, src, src_member) \
     {.kind = RESTORE_KIND_ADD_MEMBER, .file = file_, .member = member_, .from = src, .from_member = src_member}
+// Make the file, which the game does not have, as a copy of the file src; the file's other edits apply to the copy.
+#define RESTORE_NEW_FILE(file_, src) {.kind = RESTORE_KIND_NEW_FILE, .file = file_, .from = src}
 
 // The registry: every RESTORATION of the linked objects meets in one section (as host.h's HOST_OVERRIDE entries do),
 // which restore.c walks: on PE/COFF ".rst$m", sorted between restore.c's ".rst$a" and ".rst$z" markers; on ELF
@@ -124,7 +129,7 @@ void restore_started(const Restoration *r, int *applied, int *skipped);
 
 // romfs.c overlay_init: applies the switched-on restorations. read returns a RomFS file as the game would read it
 // (malloc'd, NULL when missing): the files edited, and the files edits copy from; serve takes over out[0..n) and serves
-// it in place of rel, and returns 0 when it cannot.
+// it in place of rel (or as a new file of the RomFS when rel is not one, NEW_FILE), and returns 0 when it cannot.
 void restore_apply(void *(*read)(const char *rel, size_t *n), int (*serve)(const char *rel, void *out, size_t n));
 // The pack members the last start added (ADD_MEMBER) or rewrote, for romfs.c restbl_overlay, which sizes the game's
 // buffer for each from the member's own entry: member i's RomFS-style path, its size before the edits (0: added) and
@@ -145,15 +150,16 @@ const char *romfs_with(const char *prefix, int i);
 typedef struct { size_t was, now; } RestoreMemberSize;
 
 // The edit engine on one file (restore.c; tests/restore_check.c runs it on files of its own): applies edits[0..n),
-// all naming this file, to in[0..size), the file's bytes as stored. A zstd frame is unpacked and packed again with the
-// dictionary of its id among the members of dic[0..dic_n), Pack/ZsDic.pack.zs unpacked (NULL: none). fetch returns
-// another file as stored (malloc'd, NULL when missing): what ADD (from) and ADD_MEMBER (from) copy from, and the
-// area's other placement file a copy's Hash is checked against. list returns the i-th RomFS path that starts with
-// prefix (NULL past the last; NULL list: none): the area's static compound collision (Phive/StaticCompoundBody/...),
-// which a removal is checked against. ok[k] gets 1 for each edit applied; sizes[k] (NULL: not wanted) the member an
-// ADD_MEMBER added (was 0), and for the first applied edit of each pack member rewritten, that member's size before
-// and after its edits; note gets what each edit did or why it was skipped (k = -1: the file itself). Returns the
-// edited file (malloc'd, packed as the original was) when an edit applied, else NULL.
+// all naming this file, to in[0..size), the file's bytes as stored (in NULL: the file is missing, and only a NEW_FILE
+// edit makes it). A zstd frame is unpacked and packed again with the dictionary of its id among the members of
+// dic[0..dic_n), Pack/ZsDic.pack.zs unpacked (NULL: none). fetch returns another file as stored (malloc'd, NULL when
+// missing): what ADD (from), ADD_MEMBER (from) and NEW_FILE copy from, and the area's other placement file a copy's
+// Hash is checked against. list returns the i-th RomFS path that starts with prefix (NULL past the last; NULL list:
+// none): the area's static compound collision (Phive/StaticCompoundBody/...), which a removal is checked against.
+// ok[k] gets 1 for each edit applied; sizes[k] (NULL: not wanted) the member an ADD_MEMBER added (was 0), and for the
+// first applied edit of each pack member rewritten, that member's size before and after its edits; note gets what
+// each edit did or why it was skipped (k = -1: the file itself). Returns the edited file (malloc'd, packed as the
+// original was) when an edit applied, else NULL.
 void *restore_file(const RestoreEdit *const *edits, int n, const void *in, size_t size, const void *dic, size_t dic_n,
                    void *(*fetch)(const char *rel, size_t *n), const char *(*list)(const char *prefix, int i), int *ok,
                    RestoreMemberSize *sizes, void (*note)(void *ctx, int k, const char *text), void *ctx,

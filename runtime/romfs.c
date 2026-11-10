@@ -585,8 +585,9 @@ static void *read_served(const char *rel, Overlay **base, size_t *n, const char 
     return in;
 }
 
-// Serves out[0..out_n) (malloc'd, freed here) in place of RomFS file `rel` and of an overlay that replaces it (base):
-// written to <profile>/<sub>/<file name of rel>. `what` names the change in the log. 0 when it cannot be written.
+// Serves out[0..out_n) (malloc'd, freed here) in place of RomFS file `rel` and of an overlay that replaces it (base),
+// or as a file the RomFS lacks: written to <profile>/<sub>/<file name of rel>. `what` names the change in the log. 0
+// when it cannot be written.
 static int serve_generated(const char *rel, Overlay *base, void *out, size_t out_n, const char *sub, const char *what,
                            const char *keeps) {
     char dir[2100], file[2200];
@@ -618,7 +619,13 @@ static int serve_generated(const char *rel, Overlay *base, void *out, size_t out
         }
         char *name = strdup(rel);
         need(name != NULL, "overlay path copy");
-        overlays[noverlay++] = (Overlay){lower(rel), out_n, copy, name, id};
+        uint64_t i = lower(rel);   // a file the RomFS lacks (a restoration's NEW_FILE) is an added one
+        int has = i < file_count && !strcmp(entry_name(entry(i)), rel);
+        overlays[noverlay++] = (Overlay){has ? i : ADDED, out_n, copy, name, id};
+        if (!has) {
+            rt_log("RomFS overlay: %s (%zu bytes, %s) is added as %s", file, out_n, what, rel);
+            return 1;
+        }
     }
     rt_log("RomFS overlay: %s (%zu bytes, %s) replaces %s", file, out_n, what, base ? "the mod's file" : "the original");
     return 1;
@@ -810,7 +817,7 @@ static void camera_overlay(void) {
 // version, else the original), edited and written to <profile>/restore/<its folder>/, served in the base's place and
 // marked for restbl_overlay. restore_apply also reads the files edits copy from or check against between reading a
 // file and serving it, so restore_serve finds the file's base itself.
-static const char restore_keeps[] = "the restorations that edit it skip it";
+static const char restore_keeps[] = "the restorations that edit it skip it, unless one makes it (NEW_FILE)";
 
 void *romfs_read_served(const char *rel, size_t *n) {
     Overlay *base;
@@ -832,12 +839,13 @@ static int restore_serve(const char *rel, void *out, size_t n) {
         return 0;
     }
     uint64_t i = lower(rel);
+    if (i >= file_count || strcmp(entry_name(entry(i)), rel)) i = ADDED;   // a new file (NEW_FILE), or a mod's
     Overlay *base = NULL;   // as read_served chose it
     for (size_t k = 0; k < noverlay; k++)
-        if (overlays[k].index == i) base = &overlays[k];
+        if (overlays[k].index == i && (i != ADDED || !strcmp(overlays[k].name, rel))) base = &overlays[k];
     if (!serve_generated(rel, base, out, n, sub, "restorations", restore_keeps)) return 0;
     for (size_t k = 0; k < noverlay; k++)
-        if (overlays[k].index == i) overlays[k].restored = 1;
+        if (overlays[k].index == i && (i != ADDED || !strcmp(overlays[k].name, rel))) overlays[k].restored = 1;
     return 1;
 }
 

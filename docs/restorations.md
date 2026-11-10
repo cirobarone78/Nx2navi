@@ -85,6 +85,8 @@ static const RestoreEdit edits[] = {
     // add a pack member: a copy of another pack's (NULL: this pack's), or bytes declared in an array
     RESTORE_COPY_MEMBER("Pack/Actor/Obj_W.pack.zs", "Component/LiftableParam/Obj_V.game__component__LiftableParam.bgyml",
                         "Pack/Actor/Obj_V.pack.zs", "Component/LiftableParam/Obj_V.game__component__LiftableParam.bgyml"),
+    // make a file the game does not have as a copy of one it has; the file's other edits then change the copy
+    RESTORE_NEW_FILE("Pack/Actor/Obj_N.pack.zs", "Pack/Actor/Obj_W.pack.zs"),
 };
 
 RESTORATION(name, "KEY", "Menu label", "One-line description for the menu.", edits);
@@ -101,6 +103,9 @@ RESTORATION(name, "KEY", "Menu label", "One-line description for the menu.", edi
   need nothing else.
 - An added member's bytes come from the player's files (a copy) or from the restoration's declaration; declared bytes
   must be our own, never data taken from the game.
+- A new file (`RESTORE_NEW_FILE`) is made only when the game's RomFS lacks that path; it is a copy of the file named,
+  packed as that one is, served as a file added to the RomFS (with an estimated resource size table entry). Where the
+  path exists the edit is skipped and the file's other edits apply to what is there, each by its own checks.
 - Run `--probe-restore` on a game build: every edit of the new restoration should say what it did.
 
 Not yet possible: removing a key or a pack member, adding dicts or array items, editing logic graphs (`.ainb`), text

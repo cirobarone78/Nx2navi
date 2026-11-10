@@ -491,6 +491,51 @@ static void others(void) {
     free(dic);
 }
 
+// A file the game lacks, made as a copy of another one (NEW_FILE); the script checks the copies.
+static void new_file(void) {
+    size_t n, dn, out_n;
+    uint8_t *have = load("pack.zs", &n), *dic = load("zsdic.sarc", &dn);
+    static const RestoreEdit edits[] = {
+        RESTORE_NEW_FILE("test/new.pack.zs", "test/pack.zs"),                                // 0 applies
+        RESTORE_NEW_FILE("test/new.pack.zs", "test/pack2.zs"),                               // 1 made already
+        RESTORE_COPY_MEMBER("test/new.pack.zs", "N/copy.bgyml", NULL, "C/three.bgyml"),     // 2 applies, on the copy
+        RESTORE_SET_MEMBER("test/new.pack.zs", "N/copy.bgyml", "Params/Count", 4, 11),      // 3 applies
+    };
+    static const int want[] = {1, 0, 1, 1};
+    void *out = run("new file", edits, 4, NULL, 0, NULL, 0, want, &out_n);
+    if (out) save("new.out.zs", out, out_n);
+    free(out);
+    // A copy of a file packed with a dictionary keeps it; an edit then changes the copy.
+    static const RestoreEdit placed[] = {
+        RESTORE_NEW_FILE("test/new.bcett.byml.zs", "test/place.byml.zs"),                   // 0 applies
+        RESTORE_SET("test/new.bcett.byml.zs", "Obj_A", 1003, 7, 8, 9, "Dynamic/Count", 5, 13),   // 1 applies
+    };
+    static const int yes2[] = {1, 1};
+    out = run("new file, packed with a dictionary", placed, 2, NULL, 0, dic, dn, yes2, &out_n);
+    if (out) save("new.bcett.out.zs", out, out_n);
+    free(out);
+    // The file is there: NEW_FILE skips, the other edits apply to what is there.
+    static const RestoreEdit there[] = {RESTORE_NEW_FILE(P, "test/pack2.zs"),
+                                        RESTORE_SET_MEMBER(P, "C/three.bgyml", "Params/Count", 4, 12)};
+    static const int want2[] = {0, 1};
+    free(run("new file, there already", there, 2, have, n, NULL, 0, want2, &out_n));
+    // The file it copies is missing: nothing is made, the other edits skip.
+    static const RestoreEdit none[] = {RESTORE_NEW_FILE("test/new2.zs", "test/none.zs"),
+                                       RESTORE_SET_MEMBER("test/new2.zs", "C/three.bgyml", "Params/Count", 4, 12)};
+    static const int no2[] = {0, 0};
+    free(run("new file, nothing to copy", none, 2, NULL, 0, NULL, 0, no2, &out_n));
+    // A NEW_FILE that names no file to copy; a missing file without a NEW_FILE.
+    static const RestoreEdit bare[] = {{.kind = RESTORE_KIND_NEW_FILE, .file = "test/new3.zs"}};
+    static const int no1[] = {0};
+    free(run("new file, no source named", bare, 1, NULL, 0, NULL, 0, no1, &out_n));
+    free(run("a missing file without a NEW_FILE", none + 1, 1, NULL, 0, NULL, 0, no1, &out_n));
+    // A copy of a file that does not unpack: undone.
+    static const RestoreEdit junk[] = {RESTORE_NEW_FILE("test/new4.zs", "test/otherdic.zs")};
+    free(run("new file, the copy does not unpack", junk, 1, NULL, 0, dic, dn, no1, &out_n));
+    free(have);
+    free(dic);
+}
+
 static void put32le(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
@@ -713,6 +758,7 @@ int main(int argc, char **argv) {
     pack();
     pack_more();
     others();
+    new_file();
     order();
     switches();
     printf("restore_check.c: %s (%d failures)\n", fails ? "FAILED" : "passed", fails);
