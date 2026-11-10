@@ -611,6 +611,8 @@
 # ones switched on and logs each edit, or why it skipped one (a mod or another game version changed what it edits),
 # so a change takes effect at the next start. docs/restorations.md.
 # Default: every one off.
+# The two Wolfos in the Forest Temple's first room appear when Link is about 4 m away, not 12 m.
+# restore_wolfos_ambush = 0
 
 [diagnostics]
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's

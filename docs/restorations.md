@@ -7,6 +7,7 @@ a restoration is a list of edits, and the game applies them once at start to the
 
 | Key | What it restores |
 |---|---|
+| `WOLFOS_AMBUSH` | The two Wolfos in the Forest Temple's first room appear when Link is about 4 m away, not 12 m. |
 
 The tab's own texts are in the menu's four languages; a restoration's name and description are English.
 
