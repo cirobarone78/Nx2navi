@@ -491,7 +491,8 @@
 # discord_image = nx2navi_512x512
 
 [coop]
-# Co-op: your own game and save, with the other players' progress and positions shared through a relay (docs/coop.md).
+# Co-op: your own game and save, with the other players' progress shared through a relay (docs/coop.md). Positions are
+# not shared yet: you do not see the other players in your world.
 # 0 = off: no thread work, no socket. Takes effect at once.
 # coop = 0
 # Your name for the other players, at most 24 bytes. Default: Player- and four random hex digits.
@@ -503,8 +504,9 @@
 # coop_port = 0
 # For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
 # room's secret of 18 characters from 23456789BCDFGHJKMNPRSTVWXYZ, XXXXXX-XXXXXX-XXXXXX; a create without it makes a new
-# one). While the session runs, a room the relay lost (a restart) is made again or waited for, and a create that finds
-# the room open joins it. Joining is not accepting: nothing from the room is applied before you accept it (coop_accept).
+# one). While the session runs, a room the relay lost (a restart) is made again or waited for (asked for every 10 s; a
+# refusal for too many joins from your network waits a minute), and a create that finds the room open joins it. Joining
+# is not accepting: nothing from the room is applied before you accept it (coop_accept).
 # off = no session at launch.
 # coop_auto = off
 # coop_room =
@@ -527,15 +529,19 @@
 # Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
 # your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
 # offer with a number (eight hex digits, new at each start of the game); put that number here while the game runs to
-# accept that offer. A new member, other rules or another save loaded make a new offer with a new number. A member who
-# never says who it is keeps the room from being accepted. Accepting every room (always) is taken from the environment
-# only (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a room for you.
+# accept that offer (this line as the file is now counts, before the one read at start). A new member, other rules or
+# another save loaded make a new offer with a new number. A member who never says who it is keeps the room from being
+# accepted. Your key pools count only you and the players you accepted, among those the room's maker lets use them.
+# Accepting every room (always) is taken from the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file,
+# so an ini someone hands you cannot accept a room for you.
 # coop_accept = ask
-# The room's maker, no menu row yet: coop_remove = a member's id (1 to 8) while it is in the room, or its key's
-# fingerprint (xxxx-xxxx-xxxx-xxxx, as the log shows it), also after it left; every game drops that key and what it
-# spent from the pools. coop_reset_pools = any new value (1, 2, ...): every game joins the pools again with what they
-# held for the players in the room. Both act when the value changes while the game runs. The key your game signs the
-# rules of a room you made with is kept in the profile folder (coop-keys), so a restart keeps you the room's maker.
+# The room's maker, no menu row yet: coop_remove = a player's key fingerprint (xxxx-xxxx-xxxx-xxxx, as the log shows it
+# beside each member), in the room or after it left; every game drops that key and what it took from the pools. A member
+# number here is not taken: numbers pass to other players as members come and go. coop_reset_pools = a new value (1,
+# then 2, or 0 and then 1 again): every game joins the pools again with what they held for the players in the room.
+# Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs
+# the rules of a room you made with is kept in the profile folder (coop-keys, readable by your account only), so a
+# restart keeps you the room's maker; never hand out a copy of the profile folder.
 # coop_remove =
 # coop_reset_pools =
 
