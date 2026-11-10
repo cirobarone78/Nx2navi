@@ -107,6 +107,24 @@ folder's `licenses/` and in each component's own folder.
 | Weeping of the Empire menu cursor: eui's focus box read through ScreenMgr, BoxCursorMgr and the screens' node lists, AnimButton's hit test, the stale-hit-pane fallback to the parts panes, the three writes of moveBoxCursor, the structure offsets (1.0.0; the ScreenMgr instance placed in 1.4.3 by us) | https://github.com/daniel-madrid-07/weeping-of-the-empire @ `df0586cdc5702ca19bbebfa59697e0b6980f6237` (`engine/runtime/nx2navi_menu_cursor.cpp`), Copyright (c) 2026 daniel-madrid-07 | MIT | `runtime/menu_cursor.c` |
 | AMD FidelityFX API headers (FSR 3.1 upscaling and frame generation) and its signed Vulkan library | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK @ `v1.1.4` (`ffx-api/include/ffx_api/`, `PrebuiltSignedDLL/amd_fidelityfx_vk.dll`), Copyright (C) 2024 Advanced Micro Devices, Inc. | MIT | `runtime/third_party/ffx_api/` (unmodified, with `LICENSE.txt`), used by `runtime/vk_ffx.cpp`; the library ships in the build kit's `bin/` and beside the built game (never in this repository) |
 
+## Distributed in the Linux build kit AppImage
+
+`tools/make_appimage.py` puts the toolchain that `tools/linux_toolchain.py` assembles into the AppImage's
+`usr/kit/llvm/` (not with `--no-toolchain`). Versions and sha256 of every download are pinned in those two scripts and
+in `tools/make_release_linux.py`; licence texts are in `usr/kit/llvm/licenses/`. meson 1.12.1, nasm 3.02 and CMake 4.4.5
+build dav1d and SDL there and are not distributed. The game built with the toolchain links SDL3, Opus, libvpx, dav1d,
+zstd, libstdc++ and libatomic statically; it is built on the player's PC and never distributed.
+
+| Component | Source | License | Where in the AppImage |
+|---|---|---|---|
+| LLVM 23.1.4 official Linux X64 release: `clang`, `lld` and the clang resource headers; `llvm-LICENSE.txt` from the `llvmorg-23.1.4` source tag | https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.4 | Apache-2.0 with LLVM exception | `usr/kit/llvm/bin/`, `usr/kit/llvm/lib/clang/` |
+| Steam Runtime 3 "sniper" SDK sysroot 3.0.20261021.266025 (Debian 11 based), only the C, C++ and kernel headers and the libraries a game build reads: glibc 2.31 (headers, `crt*.o`, `libc_nonshared.a`, link libraries), GCC 10 `libstdc++.a`, `libsupc++.a`, `libgcc` and `libatomic.a`, libopus 1.3.1 and libvpx 1.9.0 (static, with their headers), the Vulkan loader's link library; their Debian `copyright` files go into `licenses/`. The corresponding source is the snapshot's `sources/` folder | https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/ | glibc LGPL-2.1+; libstdc++, libgcc and libatomic GPL-3.0 with the GCC Runtime Library Exception; libopus BSD-3-Clause; libvpx BSD-3-Clause with the WebM patent grant (`libvpx-PATENTS.txt` from the v1.17.0 source tag); Vulkan loader Apache-2.0 | `usr/kit/llvm/sysroot/` |
+| Vulkan-Headers 1.4.363 (source tag), the C headers | https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.4.363 | Apache-2.0 OR MIT | `usr/kit/llvm/sysroot/usr/local/include/` |
+| Zstandard 1.5.7, built from the release tarball into a static `libzstd.a` | https://github.com/facebook/zstd/releases/tag/v1.5.7 | BSD-3-Clause | `usr/kit/llvm/sysroot/usr/local/` |
+| dav1d 1.5.4, built from the release tarball into a static `libdav1d.a` with its assembly | https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/ | BSD-2-Clause | `usr/kit/llvm/sysroot/usr/local/` |
+| SDL 3.4.18, built from the release tarball into a static `libSDL3.a` that loads the window, sound and input libraries (X11, Wayland, libdecor, ALSA, PulseAudio, PipeWire, D-Bus, libudev) when the game starts | https://github.com/libsdl-org/SDL/releases/tag/release-3.4.18 | zlib | `usr/kit/llvm/sysroot/usr/local/` |
+| wayland 1.24.0 client headers, compiled into SDL's Wayland code (not shipped as files) | https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0 | MIT | inside `libSDL3.a`; `licenses/wayland-COPYING.txt` |
+
 ## Distributed in the launcher release
 
 `tools/make_launcher.py` assembles these into `NX2navi-Setup-<version>.exe` and the update archives of

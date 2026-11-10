@@ -132,10 +132,14 @@ switches at once, with a *DLSS multiplier* of 2x to 6x (above 2x on RTX 50 cards
 frames needed to reach the display's refresh rate (`framegen = dlss` and `fg_mult` in `nx2navi.ini`). The log says
 `ngxfg: DLSS Frame Generation available` when NGX found the library.
 
-`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
-players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
-`--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
-beside the game.
+`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python and
+its own compiler, for players without a source checkout: clang and lld of LLVM 23 with the headers and libraries the
+build reads (`tools/linux_toolchain.py`: the Steam Runtime 3 SDK's glibc 2.31 and C++ library, and SDL3, Opus, libvpx,
+dav1d and zstd, which the game links in), so it needs none of the packages above, not on a Steam Deck either. The game it
+builds needs glibc 2.31 and the graphics driver's Vulkan loader; the compiler needs glibc 2.34 (SteamOS 3, Ubuntu
+22.04, Debian 12). It installs zbic with pip on its first run, picks `--jobs` from the memory, builds into
+`~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh` beside the game. An AppImage made with
+`--no-toolchain` is about 150 MB smaller and checks for the packages above instead.
 
 ## Playing
 
