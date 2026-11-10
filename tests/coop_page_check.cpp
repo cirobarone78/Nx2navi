@@ -695,6 +695,24 @@ static void check_unidentified(const Input &in) {
     printf("  Accept greyed while Carol is not identified; 1 accept once she is\n");
 }
 
+// What of a row's note the Co-op tab shows. option_rows.cpp draws a row's note at 0.72 of the font size, at most 60 % of
+// (row width - 2 pad) wide, and clips the rest. At the harness's 1903x1030 window Review T measured, from a picture of
+// the tab, a row 689 px wide with a 23 px pad (a note shows at most 386 px) and the note "press to show" 113 px wide;
+// the menu's font is Roboto Medium (runtime/ui/fonts, the menu's text below the CJK glyphs it takes from the game), here
+// scaled to that size. The first part of the note up to its first "  ·  " must show whole. zh-Hans is not measured: its
+// glyphs come from the game's own files.
+static ImFont *g_roboto;
+static void note_fits(const char *what, const char *note) {
+    CHECK(g_roboto, "the menu's font (COOP_PAGE_FONT) did not load: the note's width is not measured");
+    if (!g_roboto) return;
+    const float row = 689, pad = 23, ref_px = 113, cap = (row - 2 * pad) * 0.6f;
+    const float size = 26.0f * 0.72f * ref_px / g_roboto->CalcTextSizeA(26.0f * 0.72f, 1e9f, 0, "press to show").x;
+    const char *end = strstr(note, "  ·  ");
+    const float width = g_roboto->CalcTextSizeA(size, 1e9f, 0, note, end ? end : note + strlen(note)).x;
+    CHECK(width <= cap, "%s: the note's first part is %.0f px, of which the row shows %.0f: '%s'", what, width, cap, note);
+    printf("  %s: the note's first part %.0f px of the %.0f px a row shows\n", what, width, cap);
+}
+
 // A key the player accepted that now signs another name (the seventh review: it took another member's place in the
 // room): Dave holds member 3 with the key the player accepted as Carol. The engine makes it a new offer
 // (CoopOfferMember.accepted_as); the page says the name it was accepted as in the offer, in Dave's row and in the Accept
@@ -709,15 +727,21 @@ static void check_moved_key(const Input &in) {
     snprintf(g_fake_offer.member[1].accepted_as, sizeof g_fake_offer.member[1].accepted_as, "Carol");
     counters_clear();
     frames(4);
-    char moved[96], in_offer[128], in_row[160], note[400];
+    char moved[96], in_offer[128], note[400];
     snprintf(moved, sizeof moved, menu_text(UI_MENU_COOP_ACCEPTED_AS), "Carol");
     snprintf(in_offer, sizeof in_offer, "Dave (%s)", moved);
-    snprintf(in_row, sizeof in_row, menu_text(UI_MENU_COOP_KEY), kCarolKey);
-    snprintf(in_row + strlen(in_row), sizeof in_row - strlen(in_row), "  ·  %s", moved);
-    // the row's note is drawn into the draw list, not logged as text: it is checked as the page builds it
+    // the row's note is drawn into the draw list, not logged as text: it is checked as the page builds it, and a row
+    // shows only the start of a long note, so the name the key was accepted as comes first
     member_note(g_fake.member[2], offer_member(g_fake_offer, 3), false, note, sizeof note);
     CHECK(shows_text(in_offer), "the offer does not say Dave's key was accepted as Carol");
-    CHECK(strstr(note, in_row) != nullptr, "Dave's row does not say his key was accepted as Carol: '%s'", note);
+    CHECK(!strncmp(note, moved, strlen(moved)), "Dave's row does not begin with his key's accepted name: '%s'", note);
+    note_fits("Dave's row", note);
+    static const char *const others[] = {"ru", "pt-BR"};   // the same part in the other languages; zh-Hans: see note_fits
+    for (const char *l : others) {
+        char other[160];
+        snprintf(other, sizeof other, ui_text_in(l, UI_MENU_COOP_ACCEPTED_AS), "Carol");
+        note_fits(l, other);
+    }
     press_row(in, "##coop_answer");
     CHECK(g_open && g_page == P_ACCEPT && !strcmp(nav_name(), "Not now##no") && shows_text(in_offer),
           "Accept window with Carol's key under Dave: cursor on %s", nav_name());
@@ -791,7 +815,9 @@ int main(void) {
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;   // as menu.cpp
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    io.Fonts->AddFontDefault();
+    io.Fonts->AddFontDefault();   // the font the page is drawn with here; Roboto only measures notes (note_fits)
+    static const ImWchar ranges[] = {0x20, 0x24f, 0x400, 0x4ff, 0x2000, 0x206f, 0};
+    if (const char *f = getenv("COOP_PAGE_FONT")) g_roboto = io.Fonts->AddFontFromFileTTF(f, 26.0f, nullptr, ranges);
     unsigned char *px;
     int w, h;
     io.Fonts->GetTexDataAsRGBA32(&px, &w, &h);

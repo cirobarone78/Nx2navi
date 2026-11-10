@@ -43,10 +43,11 @@ def main():
     exe = work / ('coop_page_check.exe' if os.name == 'nt' else 'coop_page_check')
     if subprocess.run([cxx, *objs, '-o', str(exe), '-lm']).returncode:
         sys.exit('the link failed')
-    r = subprocess.run([str(exe)])
+    env = {**os.environ, 'COOP_PAGE_FONT': str(RT / 'ui' / 'fonts' / 'Roboto-Medium.ttf')}   # measures the rows' notes
+    r = subprocess.run([str(exe)], env=env)
     if r.returncode:
         sys.exit(r.returncode)
-    fault = subprocess.run([str(exe)], env={**os.environ, 'COOP_PAGE_FAULT': '1'}, capture_output=True, text=True)
+    fault = subprocess.run([str(exe)], env={**env, 'COOP_PAGE_FAULT': '1'}, capture_output=True, text=True)
     fails = [line for line in fault.stdout.splitlines() if line.startswith('FAIL ')]
     print(f'deliberate fault (the cursor moved onto the acting button as a window opens): {len(fails)} checks fail')
     for line in fails[:3]:

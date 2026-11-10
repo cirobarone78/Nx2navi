@@ -349,8 +349,9 @@ static void offer_rows(const CoopOffer &o) {
     }
 }
 
-// The note under a player's row: made the room, when they were last heard, their key (or not identified, or removed),
-// and the name the player accepted that key as when it now signs another (a new offer). om: NULL for this player.
+// The note under a player's row: the name the player accepted that key as when it now signs another (a new offer),
+// first, since a row shows only the start of a long note (option_rows.cpp: at most 60 % of the row); then made the room,
+// when they were last heard, their key (or not identified, or removed). om: NULL for this player.
 static void member_note(const CoopPeer &m, const CoopOfferMember *om, bool self, char *note, size_t cap) {
     char heard[64] = "", key[64] = "", moved[COOP_NAME_MAX + 128] = "";
     if (!self) {
@@ -363,8 +364,9 @@ static void member_note(const CoopPeer &m, const CoopOfferMember *om, bool self,
     else if (om) snprintf(key, sizeof key, "%s", menu_text(UI_MENU_COOP_NOT_IDENTIFIED));
     if (om && om->heard && !om->removed && om->accepted_as[0])
         snprintf(moved, sizeof moved, menu_text(UI_MENU_COOP_ACCEPTED_AS), om->accepted_as);
-    size_t k = (size_t)snprintf(note, cap, "%s", m.maker ? menu_text(UI_MENU_COOP_MAKER) : "");
-    const char *const parts[] = {heard, key, moved};
+    const char *const parts[] = {moved, m.maker ? menu_text(UI_MENU_COOP_MAKER) : "", heard, key};
+    size_t k = 0;
+    note[0] = 0;
     for (const char *part : parts)
         if (part[0] && k < cap) k += (size_t)snprintf(note + k, cap - k, "%s%s", k ? "  ·  " : "", part);
 }
