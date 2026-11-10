@@ -520,7 +520,7 @@ static void destroy_tex(Tex *e);
 static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, uint64_t guest_size, VkMemSpan *sp) {
     if ((e->f.depth || e->f.stencil) && req->size > guest_size) return 0;
     if (!req->size) return 0;   // an image the device could not lay out (image_size)
-    if (!vk_mem_resolve(e->pub.addr, req->size, sp) || !sp->alloc || sp->alloc_offset % req->alignment) return 0;
+    if (!vk_mem_lookup(e->pub.addr, req->size, sp) || !sp->alloc || sp->alloc_offset % req->alignment) return 0;
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp->alloc, &info);
     return req->memoryTypeBits >> info.memoryType & 1;

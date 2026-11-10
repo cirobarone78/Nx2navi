@@ -93,8 +93,7 @@ With 16 GB of RAM, add `--jobs 4`: the compiles run beside the 26 GB RomFS image
 processor can fill memory and swap until the kernel stops processes of the desktop session (about 10 minutes on a
 12-thread Ryzen with 4 jobs). Do not play or prepare shaders while it builds.
 
-On NVIDIA, start the game with `NX2NAVI_SHADOW=0` if the 3D world stays black while the HUD draws (issue #72). The
-profile, logs and settings are in the `--out` folder as on Windows.
+The profile, logs and settings are in the `--out` folder as on Windows.
 
 On NVIDIA the driver keeps the shaders it compiled in `nvidia-cache` beside `ocarina`, not in `~/.cache/nvidia`, where
 one run adds at most 1 GiB while the preparation at the end of the build makes about 1.5 GB. The game sets the folder

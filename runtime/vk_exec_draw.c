@@ -1248,7 +1248,7 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     uint64_t off = (uint64_t)r->handle * 4, a = 0;
     VkMemSpan sp;
     if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
-    if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
+    if (vk_mem_lookup(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
 
@@ -1332,7 +1332,7 @@ static uint64_t ptr_addr(const VkExec *ex, int st, const GfxShaderRes *r) {
     uint64_t off = r->ptr - 1u, a = 0;
     VkMemSpan sp;
     if (!b || !b->addr || (b->size && b->size < off + 8) || upd_read(ex, b->addr + off, &a, 8)) return a;
-    if (vk_mem_resolve(b->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(b->addr + off), 8);
+    if (vk_mem_lookup(b->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(b->addr + off), 8);
     return a;
 }
 
