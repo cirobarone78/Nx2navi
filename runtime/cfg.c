@@ -74,6 +74,7 @@ static const char *const known[] = {
     "COOP", "COOP_NAME", "COOP_SERVER", "COOP_PORT", "COOP_ROOM", "COOP_AUTO", "COOP_DROP",   // co-op (coop.c); the last three have no menu row
     "COOP_PROGRESS", "COOP_ITEMS", "COOP_SONGS", "COOP_QUEST", "COOP_KEYS", "COOP_RUPEES", "COOP_AMMO",   // the room's rules (coop_game.c)
     "COOP_TEST_SET",   // test: sets flags by hash at given frames (coop_game.c); no menu row
+    "COOP_ACCEPT",     // accepts a co-op room's members and rules before anything of it is applied (coop_game.c)
 };
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
@@ -98,7 +99,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"COOP", "coop"}, {"COOP_NAME", "coop"}, {"COOP_SERVER", "coop"}, {"COOP_PORT", "coop"},
     {"COOP_PROGRESS", "coop"}, {"COOP_ITEMS", "coop"}, {"COOP_SONGS", "coop"}, {"COOP_QUEST", "coop"}, {"COOP_KEYS", "coop"},
-    {"COOP_RUPEES", "coop"}, {"COOP_AMMO", "coop"},
+    {"COOP_RUPEES", "coop"}, {"COOP_AMMO", "coop"}, {"COOP_ACCEPT", "coop"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
     {"PCSS", "display"},
     {"MODS_DIR", "mods"}, {"MODS_ORDER", "mods"}, {"MODS_DISABLED", "mods"}, {"MODS_REBUILD", "mods"},
@@ -230,6 +231,9 @@ static const CfgMeta metas[] = {
     {"COOP_PROGRESS", "shared", "shared|own", LIVE}, {"COOP_ITEMS", "shared", "shared|own", LIVE},
     {"COOP_SONGS", "shared", "shared|own", LIVE}, {"COOP_QUEST", "shared", "shared|own", LIVE},
     {"COOP_KEYS", "pool", "pool|own", LIVE}, {"COOP_RUPEES", "own", "own|pool", LIVE}, {"COOP_AMMO", "own", "own|pool", LIVE},
+    // Nothing from a room is applied before its members and rules are accepted (coop_game.c): ask (the log names the
+    // offer's number, which this setting or the menu accepts), always (every room, the save still copied first), or a number.
+    {"COOP_ACCEPT", "ask", NULL, LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},

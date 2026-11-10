@@ -580,6 +580,59 @@ void fs_save_flush(void) {
     plat_mutex_unlock(&pend_lock);
 }
 
+int fs_save_snapshot(const char *folder, int keep, char *out, size_t cap) {
+    char root[1100];
+    if (cap) out[0] = 0;
+    if (!*profile || snprintf(root, sizeof root, "%s/%s", profile, folder) >= (int)sizeof root) return 0;
+    make_dirs(root);
+    uint64_t ns = plat_unix_time_ns();
+    struct tm t;
+    plat_gmtime((int64_t)(ns / 1000000000u), &t);
+    char name[48];
+    int len = snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d-%03u", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                       t.tm_hour, t.tm_min, t.tm_sec, (unsigned)(ns / 1000000u % 1000u));
+    char *dst = join(root, name);
+    for (unsigned k = 1; exists(dst) && k < 1000; k++) {   // two in one millisecond
+        free(dst);
+        snprintf(name + len, sizeof name - (size_t)len, "-%03u", k);
+        dst = join(root, name);
+    }
+    int nfiles = 0, nlinked = 0, have = 0, ok = 0;
+    uint64_t bytes = 0;
+    plat_mutex_lock(&tx_lock);   // no Commit swaps the save while it is copied
+    const char *src = newest_save();
+    have = exists(src);
+    if (have) ok = !copy_tree(src, dst, NULL, 1, &nfiles, &nlinked, &bytes);
+    plat_mutex_unlock(&tx_lock);
+    if (!have) {
+        free(dst);
+        return 1;   // nothing saved yet: nothing to go back to
+    }
+    if (!ok) {
+        rt_log("fs: cannot copy the save to %s", dst);
+        remove_tree(dst);
+        free(dst);
+        return 0;
+    }
+    if (cap) snprintf(out, cap, "%s", dst);
+    free(dst);
+    Listing l;   // the newest keep copies stay; their names sort by time
+    if (!list_dir(root, &l)) {
+        qsort(l.e, (size_t)l.n, sizeof *l.e, listed_cmp);
+        int dirs = 0;
+        for (int i = 0; i < l.n; i++) dirs += l.e[i].kind == PLAT_FS_DIR && l.e[i].name[0] >= '0' && l.e[i].name[0] <= '9';
+        for (int i = 0; i < l.n && dirs > keep; i++) {
+            if (l.e[i].kind != PLAT_FS_DIR || l.e[i].name[0] < '0' || l.e[i].name[0] > '9') continue;
+            char *p = join(root, l.e[i].name);
+            remove_tree(p);
+            free(p);
+            dirs--;
+        }
+        listing_free(l.e, l.n);
+    }
+    return 1;
+}
+
 static uint32_t commit_run(void) {
     plat_mutex_lock(&tx_lock);
     uint32_t r = save_commit_locked();

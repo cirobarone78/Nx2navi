@@ -526,6 +526,11 @@
 # Rupees and ammunition: own, or pool = one count every player adds to and spends from.
 # coop_rupees = own
 # coop_ammo = own
+# Nothing from a room is applied to your game before you accept who is in it and its rules, and before your save is copied
+# to coop-backup in the profile folder (docs/coop.md: going back). ask = the log names the room's offer and its number,
+# which you put here (or accept in the menu); a new member or other rules make a new offer. always = accept every room
+# (the save is still copied first).
+# coop_accept = ask
 
 [audio]
 # none mixes without opening an audio device.

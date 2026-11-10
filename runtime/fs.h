@@ -76,3 +76,7 @@ int fs_save_import_waiting(void);                          // 1 while an import 
 int fs_save_import_cancel(void);                           // drops it; 0 on success
 const char *fs_save_import_done(void);                     // the backup of the save an import replaced at this start,
                                                            // "-" when there was none, "" when no import ran
+// A copy of the newest committed save (every slot) in <profile>/<folder>/<UTC time>/, flushed, taken while no Commit
+// runs; the newest keep copies stay. 1 and the copy's path in out (empty when nothing is saved yet: nothing to copy),
+// 0 when it could not be made (logged). Slow (the whole save): not on the game's thread.
+int fs_save_snapshot(const char *folder, int keep, char *out, size_t cap);
