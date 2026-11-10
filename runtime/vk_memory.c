@@ -2833,7 +2833,18 @@ static void retire(VkCtx *c, int wait_all) {
     ninflight -= k;
 }
 
-static void collect_locked(VkCtx *c) {
+static void destroy_dead(VkCtx *c, const Dead *d) {
+    switch (d->kind) {
+    case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
+    case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
+    case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
+    case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
+    }
+}
+
+// The objects the GPU is done with: destroyed here (out != NULL: moved to *out, for the caller to destroy without
+// cmd_lock; *nout of them).
+static void collect_locked_out(VkCtx *c, Dead **out, int *nout, int *cout) {
     retire(c, 0);
     uint64_t tl = 0;
     if (c->timeline) vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
@@ -2847,15 +2858,14 @@ static void collect_locked(VkCtx *c) {
         }
         rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, d->handle, 1,
                          d->tl, tl);
-        switch (d->kind) {
-        case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
-        case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
-        case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
-        case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
-        }
+        if (!out) { destroy_dead(c, d); continue; }
+        if (*nout == *cout) grow((void **)out, cout, sizeof **out);
+        (*out)[(*nout)++] = *d;
     }
     ndead = k;
 }
+
+static void collect_locked(VkCtx *c) { collect_locked_out(c, NULL, NULL, NULL); }
 
 VkCommandBuffer vk_upload_begin(void) {
     plat_once(&cmd_once, cmd_init, NULL);
@@ -3084,13 +3094,20 @@ void vk_mem_note_submit(uint64_t timeline_value) {
     plat_rmutex_unlock(&cmd_lock);
 }
 
+// The objects go once cmd_lock is released: destroying an image and its memory takes up to milliseconds (the
+// collect's 0.3 slow ones a frame took a median 0.26-0.43 ms, up to 1.9 ms), and the replay's uploads
+// (vk_upload_begin) wait for cmd_lock.
 void vk_mem_collect(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     plat_once(&cmd_once, cmd_init, NULL);
+    Dead *out = NULL;
+    int nout = 0, cout = 0;
     plat_rmutex_lock(&cmd_lock);
-    collect_locked(c);
+    collect_locked_out(c, &out, &nout, &cout);
     plat_rmutex_unlock(&cmd_lock);
+    for (int i = 0; i < nout; i++) destroy_dead(c, &out[i]);
+    free(out);
 }
 
 void vk_mem_stats(VkMemStats *s) {
