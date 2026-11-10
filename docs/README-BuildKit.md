@@ -101,6 +101,12 @@ one run adds at most 1 GiB while the preparation at the end of the build makes a
 and a limit of 8 GiB itself (`__GL_SHADER_DISK_CACHE_PATH` and `__GL_SHADER_DISK_CACHE_SIZE` in the environment take
 precedence). Deleting the folder costs one slow start; `./ocarina --warm-shaders` fills it again.
 
+The game reads the memory it may use: the limit of its cgroup v2 (`systemd-run --user --scope -p MemoryMax=16G
+ocarina`, a container's) and the machine's `MemAvailable`, whichever leaves less. Linux does not fail an allocation when
+memory runs short, it ends the process, so while less than the larger of 4 GB and a tenth of that limit is left the game
+drops stale textures and evicts idle ones. The log names the limits at the first check (`platform: memory limits`). That
+cannot give back what the game needs after its start: about 10 GB in Kokiri Forest at a 2160p game resolution.
+
 `tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
 players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`

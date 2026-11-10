@@ -112,7 +112,8 @@
 # 1: very large compute shaders that no cache holds are built on one background thread after the start. 0: each is
 # built when the game first uses it, which can hold that frame for a second or two.
 # lib_prebuild_big_bg = 1
-# The commit headroom in MB those background builds wait for (0: no check).
+# The commit headroom in MB those background builds wait for (0: no check). On Linux the headroom is the smaller of
+# the room left under the cgroup's memory limit (memory.max, memory.high) and the memory available on the machine.
 # big_build_free_mb = 8192
 # How far those background builds may raise the process commit in MB before the rest wait for their first use instead
 # (0: no limit). Each large shader costs the driver 1-4 GB; on a 31 GB machine four of them took the process from 15 to
@@ -189,7 +190,8 @@
 # tex_vram_pressure = 80
 # Megabytes this process may commit before textures give way as they do while the system's commit runs low (Windows
 # counts video memory against the commit). Default: the installed memory, at least 24576, so that it does not depend
-# on the size of the page file. 0: no bound of its own; only the system's commit counts.
+# on the size of the page file. 0: no bound of its own; only the system's commit counts. On Linux it counts the
+# process's resident anonymous memory, which stays under the installed memory, so there only a smaller value holds.
 # tex_proc_commit_mb = 32768
 # 1: a texture the game releases or takes back, with nothing else changed at its address, puts the texture table's
 # slots there back in a state they were in before, and they are not all looked up again (large towns release and take

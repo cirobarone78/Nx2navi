@@ -457,9 +457,20 @@ void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb);
 void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 // Commit charge in MB: this process's private bytes, the system's commit in use and its limit (RAM plus page files).
 // An allocation fails when the system's reaches the limit, however much physical memory is free. -1 when unknown.
+// Linux overcommits and ends the process instead (the OOM killer), so there the limit is the one with the least
+// headroom of the cgroup v2 limits (memory.max, memory.high) the process lives under and the machine's RAM
+// (MemAvailable against MemTotal), with vm.overcommit_memory = 2 also CommitLimit.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);
-// Whether an allocation fails at that limit: always on Windows; on Linux only with vm.overcommit_memory = 2.
+// Whether the limit is one to stay below: always on Windows (an allocation fails at it); on Linux whenever the kernel
+// reports a memory limit. 0 when none is known.
 int plat_commit_enforced(void);
+// The limits the first plat_commit_info call found, for the log, as text into out ("memory limits: cgroup ... memory.max
+// 12288 MB (...); RAM ...; the one with the least headroom counts (now: ...)"); 0 when there is nothing to add to the
+// numbers (Windows, whose one limit is the system's commit).
+int plat_commit_note(char *out, size_t cap);
+// Whether a discrete GPU's own memory counts against that limit: on Windows the driver charges device memory to the
+// system's commit; Linux's limits count system memory only.
+int plat_commit_counts_vram(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);

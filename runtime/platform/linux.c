@@ -14,6 +14,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1795,38 +1796,229 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     fclose(f);
 }
 
-// Linux overcommits by default, so CommitLimit binds only with vm.overcommit_memory = 2; Committed_AS is what the
-// system has promised. The process's share is its resident anonymous memory, the nearest to Windows' private bytes.
-void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
-    *proc_mb = *used_mb = *limit_mb = -1;
+// ---- memory limits
+//
+// Linux overcommits, so memory that runs short does not fail an allocation: the OOM killer ends the process, when it
+// outgrew its cgroup's memory.max or when the machine's RAM is gone, and Committed_AS against CommitLimit (which binds
+// only with vm.overcommit_memory = 2) says neither. plat_commit_info reports the limit with the least headroom of
+//   - each cgroup v2 level from this process's cgroup up to the root that sets memory.max or memory.high (the smaller;
+//     the kernel throttles at memory.high), against that level's memory.current less its file cache (memory.stat file
+//     without shmem): the kernel drops the cache before it ends anything, so a cache that filled the limit is no
+//     shortage;
+//   - the machine's RAM: MemTotal against MemTotal less MemAvailable;
+//   - with vm.overcommit_memory = 2 only, where an allocation does fail: CommitLimit against Committed_AS.
+// The process's share is its resident anonymous memory, the nearest to Windows' private bytes. The sweeps that ask
+// run several times a second, so a read is reused for 250 ms. The first read keeps every limit it found as text, which
+// the runtime logs (plat_commit_note): stderr alone does not reach the log file when the launcher starts the game.
+
+static char cg_leaf[PATH_MAX];   // this process's cgroup v2 directory ("" when it has none)
+static size_t cg_floor;          // the length of the cgroup2 mount point at the start of cg_leaf
+
+// The process's cgroup v2 directory: its path from /proc/self/cgroup below the root of the cgroup2 mount that
+// /proc/self/mountinfo shows (a container's own cgroup is mounted as the root), else the nearest directory above it
+// that exists.
+static void cg_locate(void) {
+    char path[PATH_MAX] = "", mnt[PATH_MAX] = "", root[PATH_MAX] = "", line[2 * PATH_MAX];
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "0::", 3)) {
+                line[strcspn(line, "\n")] = 0;
+                snprintf(path, sizeof path, "%s", line + 3);
+            }
+        fclose(f);
+    }
+    f = path[0] ? fopen("/proc/self/mountinfo", "r") : NULL;
+    while (f && fgets(line, sizeof line, f)) {
+        char r[PATH_MAX], m[PATH_MAX];
+        if (!strstr(line, " - cgroup2 ") || sscanf(line, "%*d %*d %*s %4095s %4095s", r, m) != 2) continue;
+        snprintf(root, sizeof root, "%s", r);
+        snprintf(mnt, sizeof mnt, "%s", m);
+        break;
+    }
+    if (f) fclose(f);
+    if (!mnt[0]) return;
+    size_t rl = strlen(root);
+    const char *rel = path;
+    // A mount of a cgroup below the root of the hierarchy shows the process's path without that prefix.
+    if (rl > 1 && !strncmp(path, root, rl) && (!path[rl] || path[rl] == '/')) rel = path + rl;
+    else if (rl > 1) rel = "";
+    if (!strcmp(rel, "/")) rel = "";
+    snprintf(cg_leaf, sizeof cg_leaf, "%s%s", mnt, rel);
+    cg_floor = strlen(mnt);
+    struct stat st;
+    while (stat(cg_leaf, &st) || !S_ISDIR(st.st_mode)) {   // not shown by the mount: the nearest directory above
+        char *s = strrchr(cg_leaf, '/');
+        if (!s || (size_t)(s - cg_leaf) < cg_floor) {
+            cg_leaf[0] = 0;
+            return;
+        }
+        *s = 0;
+    }
+}
+
+// A cgroup file into buf as text; 0 when it is missing (the controller is not enabled there).
+static int cg_file(const char *dir, const char *name, char *buf, size_t n) {
+    char p[PATH_MAX + 32];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t r = read(fd, buf, n - 1);
+    close(fd);
+    if (r <= 0) return 0;
+    buf[r] = 0;
+    return 1;
+}
+
+// A byte limit file: its value in bytes, -1 for "max" or when missing.
+static double cg_bytes(const char *dir, const char *name) {
+    char b[64];
+    if (!cg_file(dir, name, b, sizeof b) || !strncmp(b, "max", 3)) return -1;
+    return (double)strtoull(b, NULL, 10);
+}
+
+// A memory.stat counter in bytes, 0 when it is missing.
+static double cg_stat(const char *stat, const char *key) {
+    size_t kl = strlen(key);
+    for (const char *p = stat; p; p = strchr(p, '\n')) {
+        if (*p == '\n') p++;
+        if (!strncmp(p, key, kl) && p[kl] == ' ') return (double)strtoull(p + kl + 1, NULL, 10);
+    }
+    return 0;
+}
+
+typedef struct {
+    double proc, used, limit;   // MB; -1 when unknown
+    const char *who;            // the limit that is the tightest, for the first read's log line
+    uint64_t at;                // plat_now_ms of the read, 0 before the first
+} CommitSnap;
+
+// Makes (limit, used) the snapshot's when its headroom is smaller than the one held.
+static void commit_pick(CommitSnap *s, double limit, double used, const char *who) {
+    if (s->limit < 0 || limit - used < s->limit - s->used) s->limit = limit, s->used = used, s->who = who;
+}
+
+// Appends one limit found to the note of the first read ("; " between them; a full note takes no more).
+static void note_add(char *note, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+#define NOTE_MAX 2048
+static void note_add(char *note, const char *fmt, ...) {
+    size_t n = strlen(note);
+    if (n + 3 >= NOTE_MAX) return;
+    if (n) memcpy(note + n, "; ", 3), n += 2;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(note + n, NOTE_MAX - n, fmt, ap);
+    va_end(ap);
+}
+
+// The cgroups from the process's up to the root that limit memory.
+static void commit_cgroups(CommitSnap *s, char *note) {
+    char d[PATH_MAX];
+    snprintf(d, sizeof d, "%s", cg_leaf);
+    while (d[0]) {
+        double max = cg_bytes(d, "memory.max"), high = cg_bytes(d, "memory.high");
+        int use_high = max < 0 || (high >= 0 && high < max);
+        double lim = use_high ? high : max;
+        double cur = lim < 0 ? -1 : cg_bytes(d, "memory.current");
+        if (cur >= 0) {
+            char st[4096] = "";   // memory.stat starts with anon and file; the counters needed lie in its first lines
+            cg_file(d, "memory.stat", st, sizeof st);
+            double cache = cg_stat(st, "file") - cg_stat(st, "shmem");
+            cache = cache < 0 ? 0 : cache > cur ? cur : cache;
+            commit_pick(s, lim / 1048576.0, (cur - cache) / 1048576.0,
+                        use_high ? "cgroup memory.high" : "cgroup memory.max");
+            if (note)
+                note_add(note, "cgroup %s %s %.0f MB (%.0f MB in use, %.0f MB of it file cache)",
+                         d[cg_floor] ? d + cg_floor : "/", use_high ? "memory.high" : "memory.max", lim / 1048576.0,
+                         cur / 1048576.0, cache / 1048576.0);
+        }
+        char *sl = strrchr(d, '/');
+        if (strlen(d) <= cg_floor || !sl || (size_t)(sl - d) < cg_floor) break;
+        *sl = 0;
+    }
+}
+
+// The machine's RAM, and the system's commit when vm.overcommit_memory = 2.
+static void commit_machine(CommitSnap *s, char *note) {
+    static int overcommit = -1;
+    unsigned long long total = 0, avail = 0, cl = 0, as = 0, k;
     char line[128];
-    unsigned long long k;
     FILE *f = fopen("/proc/meminfo", "r");
     if (f) {
         while (fgets(line, sizeof line, f)) {
-            if (sscanf(line, "CommitLimit: %llu kB", &k) == 1) *limit_mb = (double)(k >> 10);
-            else if (sscanf(line, "Committed_AS: %llu kB", &k) == 1) *used_mb = (double)(k >> 10);
+            if (sscanf(line, "MemTotal: %llu kB", &k) == 1) total = k;
+            else if (sscanf(line, "MemAvailable: %llu kB", &k) == 1) avail = k;
+            else if (sscanf(line, "CommitLimit: %llu kB", &k) == 1) cl = k;
+            else if (sscanf(line, "Committed_AS: %llu kB", &k) == 1) as = k;
         }
         fclose(f);
     }
+    if (total && avail && avail <= total) {
+        commit_pick(s, (double)total / 1024.0, (double)(total - avail) / 1024.0, "RAM");
+        if (note) note_add(note, "RAM %.0f MB (%.0f MB available)", (double)total / 1024.0, (double)avail / 1024.0);
+    }
+    if (overcommit < 0) {
+        FILE *o = fopen("/proc/sys/vm/overcommit_memory", "r");
+        if (!o || fscanf(o, "%d", &overcommit) != 1) overcommit = 0;
+        if (o) fclose(o);
+    }
+    if (overcommit == 2 && cl) {
+        commit_pick(s, (double)cl / 1024.0, (double)as / 1024.0, "commit limit");
+        if (note)
+            note_add(note, "commit limit %.0f MB (%.0f MB committed, vm.overcommit_memory = 2)", (double)cl / 1024.0,
+                     (double)as / 1024.0);
+    }
+}
+
+static char commit_note[NOTE_MAX + 128];   // the first read's limits (plat_commit_note); not written after it
+
+static void commit_read(CommitSnap *s, int first) {
+    char note[NOTE_MAX] = "";
+    s->proc = s->used = s->limit = -1;
+    s->who = NULL;
+    if (first) cg_locate();
+    commit_cgroups(s, first ? note : NULL);
+    commit_machine(s, first ? note : NULL);
     uint64_t resident, private_bytes;
     plat_process_memory(&resident, &private_bytes);
-    if (private_bytes) *proc_mb = (double)(private_bytes >> 20);
+    if (private_bytes) s->proc = (double)(private_bytes >> 20);
+    if (first) {
+        if (note[0])
+            snprintf(commit_note, sizeof commit_note,
+                     "memory limits: %s; the one with the least headroom counts (now: %s)", note, s->who);
+        else snprintf(commit_note, sizeof commit_note, "no memory limit readable");
+    }
+}
+
+void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    static CommitSnap snap;
+    plat_mutex_lock(&lock);
+    uint64_t now = plat_now_ms();
+    if (!snap.at || now - snap.at >= 250) {
+        commit_read(&snap, !snap.at);
+        snap.at = now ? now : 1;
+    }
+    *proc_mb = snap.proc, *used_mb = snap.used, *limit_mb = snap.limit;
+    plat_mutex_unlock(&lock);
 }
 
 int plat_commit_enforced(void) {
-    static int v = -1;   // read once
-    if (v < 0) {
-        int mode = 0;
-        FILE *f = fopen("/proc/sys/vm/overcommit_memory", "r");
-        if (f) {
-            if (fscanf(f, "%d", &mode) != 1) mode = 0;
-            fclose(f);
-        }
-        v = mode == 2;
-    }
-    return v;
+    double proc, used, limit;
+    plat_commit_info(&proc, &used, &limit);
+    return limit > 0;
 }
+
+// The first read wrote the note under plat_commit_info's lock; taking that lock here orders the copy after it.
+int plat_commit_note(char *out, size_t cap) {
+    double proc, used, limit;
+    plat_commit_info(&proc, &used, &limit);
+    snprintf(out, cap, "%s", commit_note);
+    return out[0] != 0;
+}
+
+// The cgroup's memory.current and MemAvailable count system memory only: a graphics card's own memory is in neither.
+int plat_commit_counts_vram(void) { return 0; }
 
 // ---- child processes
 

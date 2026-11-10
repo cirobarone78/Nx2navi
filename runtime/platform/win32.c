@@ -1888,6 +1888,15 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 
 int plat_commit_enforced(void) { return 1; }
 
+// The numbers name the one limit there is, the system's commit.
+int plat_commit_note(char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+// The driver charges the device memory it allocates to the system's commit.
+int plat_commit_counts_vram(void) { return 1; }
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
     *resident = *private_bytes = 0;

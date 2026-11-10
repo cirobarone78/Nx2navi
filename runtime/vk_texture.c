@@ -1105,7 +1105,9 @@ static int idle(const Tex *e, uint64_t now);
 // commit then ran out at an area load (device lost); only entries released STALE_FRAMES presents ago go, so the
 // transient ones the game takes back within frames stay. NX2NAVI_TEX_COMMIT_FREE_MB (default the larger of 4 GiB and a tenth of the commit
 // limit; 0 = off) lowers that bound to COMMIT_LOW_KEEP while less of the system's commit is free: an allocation that
-// fails there ends the game. Both drop only stale entries (drop_stale), a few per check like the VRAM pressure.
+// fails there ends the game. On Linux nothing fails at the limit: the OOM killer ends the game when its cgroup or the
+// machine runs out of memory, and plat_commit_info reports the tighter of the two. Both drop only stale entries
+// (drop_stale), a few per check like the VRAM pressure.
 //
 // NX2NAVI_TEX_PROC_COMMIT_MB (default the installed memory, at least PROC_COMMIT_MIN_MB; 0 = off) counts the commit as
 // low too while this process's own commit is above it. The system's figure depends on the page file and on what else
@@ -1114,7 +1116,9 @@ static int idle(const Tex *e, uint64_t now);
 // more commit than the PC has memory: beyond that it lives on the page file, whatever its size. The bound holds until
 // the process is a thirty-second under it, so that it does not flip with every texture freed. The floor keeps it out
 // of the way on PCs with less memory, where a bound at the installed memory could hold all through play: the system's
-// figure decides there, as before.
+// figure decides there, as before. On Linux the process's figure is its resident anonymous memory, which cannot pass
+// the installed memory, so only a bound set below that holds there; a cgroup's limit and the machine's RAM act through
+// the system's figure.
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
@@ -1154,7 +1158,9 @@ static int commit_is_low(void) {
             plat_mem_info(&ram_used, &ram_total, &ram_proc);
             proc_commit_mb = ram_total > PROC_COMMIT_MIN_MB ? (long long)ram_total : PROC_COMMIT_MIN_MB;
         }
-        if (!plat_commit_enforced()) commit_free_mb = proc_commit_mb = 0;   // a limit no allocation fails at
+        if (!plat_commit_enforced()) commit_free_mb = proc_commit_mb = 0;   // no limit known
+        char note[2048];   // the platform layer's own lines go to stderr only, so the log file gets this through here
+        if (plat_commit_note(note, sizeof note)) rt_log("platform: %s", note);
         if (proc_commit_mb)
             rt_log("vk: textures give way as under low commit while this process's commit is above %lld MB "
                    "(NX2NAVI_TEX_PROC_COMMIT_MB; 0 = off)", proc_commit_mb);
