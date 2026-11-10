@@ -34,6 +34,7 @@ void menu_event_mouse_pos(float x, float y);
 void menu_event_mouse_button(int button, int down);   // 0 left, 1 right, 2 middle
 void menu_event_wheel(float dx, float dy);
 void menu_event_focus(int focused);
+void menu_event_char(unsigned c);         // a character typed, a Unicode code point (a text field takes it)
 
 // ---- the overlay, drawn into the swapchain image after the game image (gfx_present.c, present lock held)
 typedef struct {
@@ -63,11 +64,17 @@ void menu_vk_release(void);               // before the device goes away (gfx_wi
 // The check the font atlas runs on a system font, on the embedded font and damaged copies of it: 1 when it takes the
 // whole font and refuses a cut-off one, one without a character map and one with an unknown tag (--probe-window).
 int menu_font_check(void);
+// The window's text input follows the menu's text fields (ui/menu_text_input.cpp): menu_overlay_frame calls this on
+// each of its frames, those of a closed menu too, with whether the open menu has a field taking typing, and it calls
+// gfx_window_text_input when that changes.
+void menu_text_input_follow(int want);
 
 // ---- what the menu asks of the platform side (gfx_window_win.c, gfx_window_sdl.c)
 void gfx_window_apply_settings(void);     // NX2NAVI_FULLSCREEN or NX2NAVI_WINDOW_SIZE changed: the window follows
 void gfx_window_request_close(void);      // as the window's close button: the process ends
 void gfx_window_request_restart(void);    // the same, then nx2navi.exe starts again with the same command line
+void gfx_window_text_input(int on);       // a menu text field is active (on) or no longer: the window delivers typed
+                                          // characters to menu_event_char meanwhile, and a handheld shows its keyboard
 int gfx_window_monitor_size(int *w, int *h);   // pixels of the monitor the window is on; 0 when unknown
 double gfx_window_refresh_hz(void);            // its refresh rate (NX2NAVI_FPS_LIMIT=display); 0 when unknown
 unsigned gfx_window_dpi(void);                 // the window's DPI (96 at 100% display scale); any thread

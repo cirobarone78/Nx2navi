@@ -133,7 +133,7 @@ extern "C" void menu_toggle(void) {
 }
 
 // ---- events from the window adapter, queued while the menu is open; the present path hands them to ImGui
-enum { EV_KEY, EV_POS, EV_BUTTON, EV_WHEEL, EV_FOCUS, EV_MAX = 256 };
+enum { EV_KEY, EV_POS, EV_BUTTON, EV_WHEEL, EV_FOCUS, EV_CHAR, EV_MAX = 256 };
 struct Ev { int type, a, b; float x, y; };
 static Ev ev_q[EV_MAX];
 
@@ -156,6 +156,7 @@ extern "C" void menu_event_mouse_pos(float x, float y) { push({EV_POS, 0, 0, x, 
 extern "C" void menu_event_mouse_button(int button, int down) { push({EV_BUTTON, button, down, 0, 0}); }
 extern "C" void menu_event_wheel(float dx, float dy) { push({EV_WHEEL, 0, 0, dx, dy}); }
 extern "C" void menu_event_focus(int focused) { push({EV_FOCUS, focused, 0, 0, 0}); }
+extern "C" void menu_event_char(unsigned c) { push({EV_CHAR, (int)c, 0, 0, 0}); }
 
 static void drain_events(ImGuiIO &io) {
     Ev q[EV_MAX];
@@ -177,6 +178,7 @@ static void drain_events(ImGuiIO &io) {
         case EV_BUTTON: io.AddMouseButtonEvent(e.a, e.b != 0); break;
         case EV_WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
         case EV_FOCUS: io.AddFocusEvent(e.a != 0); break;
+        case EV_CHAR: io.AddInputCharacter((unsigned)e.a); break;
         }
     }
 }
@@ -1690,7 +1692,7 @@ static void perf_draw(const MenuTarget *t, float scale) {
     dl->AddText(ImVec2(p.x + padx, p.y + pady), SKIN_TEXT, g_perf_text);
 }
 
-extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
+static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     *shot = NULL;
     if (t->phys && t->phys != g_gpu_vendor_of) {   // the GPU's vendor for the rows that depend on it (dlss_offered)
         VkPhysicalDeviceProperties props;
@@ -1794,6 +1796,16 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         }
     }
     return ImGui::GetDrawData()->TotalVtxCount > 0;
+}
+
+// A text field takes typing: the window delivers characters (and a handheld shows its keyboard) while one is active.
+// Every overlay frame lets the window follow, also those overlay_frame leaves early because the menu is closed: when
+// only the frames the menu laid out did, closing it with a field active (F1, Minus and Plus) left SDL's text input on,
+// and on Windows the input method attached to the game window, until the menu opened again.
+extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
+    int r = overlay_frame(frame, t, shot);
+    menu_text_input_follow(g_ctx_ok && g_open.load(std::memory_order_relaxed) && ImGui::GetIO().WantTextInput);
+    return r;
 }
 
 // ---- the boot screen (boot.c's wait for the prewarm; gfx_present_boot presents it on a black frame)
