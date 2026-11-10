@@ -2988,6 +2988,17 @@ static VkCompareOp compare_op(uint32_t f) {
 
 static struct { int init, mirror_clamp_edge, minmax, border_no_format; float aniso; } sf;   // aniso: NX2NAVI_ANISO, 0 = the game's
 
+static float aniso_setting(void) {
+    const char *an = cfg_value("NX2NAVI_ANISO");
+    return strcmp(an, "game") ? (float)atoi(an) : 0;
+}
+
+static void aniso_log(void) {
+    if (sf.aniso > 1) rt_log("vk: anisotropic filtering: %gx", sf.aniso);
+    else rt_log("vk: anisotropic filtering: the game's");
+}
+
+// Caller holds the lock.
 static void sampler_features(VkCtx *c) {
     if (sf.init) return;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
@@ -2998,10 +3009,23 @@ static void sampler_features(VkCtx *c) {
     sf.mirror_clamp_edge = f12.samplerMirrorClampToEdge;
     sf.minmax = f12.samplerFilterMinmax;
     sf.border_no_format = c->has_custom_border_color && cbf.customBorderColors && cbf.customBorderColorWithoutFormat;
-    const char *an = cfg_value("NX2NAVI_ANISO");
-    sf.aniso = strcmp(an, "game") ? (float)atoi(an) : 0;
-    rt_log("vk: anisotropic filtering: %s", sf.aniso > 1 ? an : "the game's");
+    sf.aniso = aniso_setting();
+    aniso_log();
     sf.init = 1;
+}
+
+// NX2NAVI_ANISO raises the level for filtered, mipmapped colour samplers that repeat on U and V: the surface textures,
+// which tile, so ground and walls seen at a shallow angle stay sharp into the distance. Depth-compare (shadow)
+// samplers, nearest or unmipmapped ones (data maps, LUTs) and clamped ones keep the game's level: clamped samplers
+// read screen-sized buffers, whose coordinates can stretch steeply at an object's edge, where anisotropic taps reach
+// across it and leave a speckled fringe (the inventory's character preview). The game's own wrap modes decide: a
+// mirror-clamp one maps to MIRRORED_REPEAT where the device lacks mirror-clamp-to-edge (make_sampler). Caller holds the
+// lock, after sampler_features.
+static int aniso_raised(const samp_par *d) {
+    int tiled = (d->ws == NVN_WRAP_MODE_REPEAT || d->ws == NVN_WRAP_MODE_MIRRORED_REPEAT) &&
+                (d->wt == NVN_WRAP_MODE_REPEAT || d->wt == NVN_WRAP_MODE_MIRRORED_REPEAT);
+    return sf.aniso > d->aniso && tiled && !d->cmp_mode && d->magf == NVN_MAG_FILTER_LINEAR &&
+           (d->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || d->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR);
 }
 
 static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
@@ -3035,21 +3059,10 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     float lim = c->props.limits.maxSamplerLodBias;
     si.mipLodBias = fmaxf(-lim, fminf(lim, d->lod_bias));
-    // NX2NAVI_ANISO raises the level for filtered, mipmapped colour samplers that repeat on U and V: the surface textures,
-    // which tile, so ground and walls seen at a shallow angle stay sharp into the distance. Depth-compare (shadow)
-    // samplers, nearest or unmipmapped ones (data maps, LUTs) and clamped ones keep the game's level: clamped samplers
-    // read screen-sized buffers, whose coordinates can stretch steeply at an object's edge, where anisotropic taps reach
-    // across it and leave a speckled fringe (the inventory's character preview).
-    float aniso = d->aniso;
-    // The game's own wrap modes: a mirror-clamp one maps to MIRRORED_REPEAT where the device lacks mirror-clamp-to-edge.
-    int tiled = (d->ws == NVN_WRAP_MODE_REPEAT || d->ws == NVN_WRAP_MODE_MIRRORED_REPEAT) &&
-                (d->wt == NVN_WRAP_MODE_REPEAT || d->wt == NVN_WRAP_MODE_MIRRORED_REPEAT);
-    if (sf.aniso > aniso && tiled && !d->cmp_mode && si.magFilter == VK_FILTER_LINEAR && si.minFilter == VK_FILTER_LINEAR &&
-        (mf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || mf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR))
-        aniso = sf.aniso;
-    if (aniso > 1) {
+    // d->aniso holds NX2NAVI_ANISO's level where it applies (sampler_for, aniso_raised)
+    if (d->aniso > 1) {
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = fminf(aniso, c->props.limits.maxSamplerAnisotropy);
+        si.maxAnisotropy = fminf(d->aniso, c->props.limits.maxSamplerAnisotropy);
     }
     if (d->cmp_mode) {
         si.compareEnable = VK_TRUE;
@@ -3122,12 +3135,35 @@ void vk_sampler_dlss_bias(float b) {
     unlock();
 }
 
+// NX2NAVI_ANISO, read again at each present after a settings change (vk_backend.c present_image, beside the DLSS bias of
+// vk_dlaa_frame): the raised level is part of the sampler key (sampler_for), so on a change the slots look their
+// samplers up again and the descriptor caches follow samp_gen, as for vk_sampler_dlss_bias. The old level's samplers
+// stay until shutdown like every sampler: one set per level at most. Before the first sampler there is nothing to do:
+// sampler_features reads the setting then.
+void vk_sampler_aniso_live(void) {
+    static unsigned seen = ~0u;
+    unsigned v = cfg_version();
+    if (v == seen) return;
+    seen = v;
+    lock();
+    float a = aniso_setting();
+    if (sf.init && a != sf.aniso) {
+        sf.aniso = a;
+        aniso_log();
+        for (int i = 0; i < nsslots; i++) sslots[i].s = sslots[i].sp = sslots[i].sc = VK_NULL_HANDLE;   // looked up again (the key moves)
+        samp_gen++;
+    }
+    unlock();
+}
+
 // Caller holds the lock.
 static VkSampler sampler_for(VkCtx *c, const samp_par *s) {
+    sampler_features(c);
     samp_par k;
     memset(&k, 0, sizeof k);
     k = *s;
     if (dlss_bias != 0 && dlss_biased(&k)) k.lod_bias += dlss_bias;   // part of the key: samplers live until shutdown
+    if (aniso_raised(&k)) k.aniso = sf.aniso;                          // likewise
     VkSampler v = (VkSampler)nvn_hm_get(&samplers, &k);
     if (!v) {
         v = make_sampler(c, &k);

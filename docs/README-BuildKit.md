@@ -108,7 +108,7 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
-- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
+- **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
   on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
   DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
   display's refresh rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the

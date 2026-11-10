@@ -274,7 +274,8 @@
 # aspect = fit
 # Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch) or 2, 4, 8, 16. Keeps
 # ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered, mipmapped textures that tile
-# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Read at start.
+# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes while the game runs take
+# effect at once.
 # aniso = game
 # Sun shadow map size: game (the game's own, which changes with the view and drops to about 400 near the ground, so
 # leaf shadows look blocky and jump) or a fixed 256, 512, 768, 1024, 1536 or 2048. Above 960 the texture heap grows with

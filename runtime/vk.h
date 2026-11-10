@@ -526,6 +526,7 @@ uint32_t vk_texture_entry_gen(void);                 // vk_texture.c: bumped by 
 int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg);
 uint64_t vk_texture_dirty_pos_locked(void);
 void vk_sampler_dlss_bias(float bias);           // texture LOD bias added for DLSS upscaling (material samplers)
+void vk_sampler_aniso_live(void);                   // each present: NX2NAVI_ANISO after a settings change (tiled samplers)
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 // The live image of the given format and img's size at img's storage address, NULL when there is none. Texture lock held.
