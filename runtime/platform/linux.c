@@ -100,6 +100,11 @@ static void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+// Set in the thread that took a core in plat_cpu_reserve: the processors the threads it starts run on (not that core).
+// Threads inherit the mask of the thread that starts them, which for those would be the reserved core alone.
+static __thread cpu_set_t cpu_rest;
+static __thread int cpu_rest_set;
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();
@@ -123,6 +128,7 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     pthread_attr_init(&a);
     // The stack is mapped lazily, as Windows reserves it: only the pages a thread touches cost memory.
     pthread_attr_setstacksize(&a, stack ? stack : PLAT_STACK_DEFAULT);
+    if (cpu_rest_set) pthread_attr_setaffinity_np(&a, sizeof cpu_rest, &cpu_rest);
     int e = pthread_create(&t->t, &a, thread_main, t);
     pthread_attr_destroy(&a);
     if (e) { free(t); return NULL; }
@@ -189,19 +195,37 @@ uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
     return die & in_set;
 }
 
+// The core plat_cpu_reserve took: its processors and the thread that holds them (0 before the call), and the
+// processors every other thread got then or at the last plat_process_affinity. cpu_lock orders the functions that set
+// the masks of every thread.
+static PlatMutex cpu_lock = PLAT_MUTEX_INIT;
+static cpu_set_t cpu_taken, cpu_others;
+static pid_t cpu_taker;
+
+static void cpu_clear(cpu_set_t *set, const cpu_set_t *drop) {
+    for (int i = 0; i < CPU_SETSIZE; i++)
+        if (CPU_ISSET(i, drop)) CPU_CLR(i, set);
+}
+
 // Linux has no process-wide affinity: each thread of /proc/self/task gets the mask, and threads started later inherit
-// it from the thread that starts them.
+// it from the thread that starts them. The core plat_cpu_reserve took stays out of the mask of every thread but its
+// holder, which keeps the mask it has.
 int plat_process_affinity(uint64_t mask) {
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; i++)
         if (mask >> i & 1) CPU_SET(i, &set);
-    DIR *d = opendir("/proc/self/task");
-    if (!d) return 0;
-    int ok = 1;
-    for (struct dirent *e; (e = readdir(d));)
-        if (e->d_name[0] != '.' && sched_setaffinity((pid_t)atoi(e->d_name), sizeof set, &set)) ok = 0;
-    closedir(d);
+    plat_mutex_lock(&cpu_lock);
+    if (cpu_taker) cpu_clear(&set, &cpu_taken);
+    DIR *d = CPU_COUNT(&set) ? opendir("/proc/self/task") : NULL;
+    int ok = d != NULL;
+    if (ok && cpu_taker) cpu_others = set;
+    for (struct dirent *e; d && (e = readdir(d));) {
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid > 0 && tid != cpu_taker && sched_setaffinity(tid, sizeof set, &set)) ok = 0;
+    }
+    if (d) closedir(d);
+    plat_mutex_unlock(&cpu_lock);
     return ok;
 }
 
@@ -426,27 +450,185 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
 // The thread keeps using t->fn and t->arg, so the struct stays allocated (a few bytes per detached thread).
 void plat_thread_detach(PlatThread *t) { pthread_detach(t->t); }
 
-// The calling thread gets the last processor of its affinity mask to itself: every other thread of the process now
-// running loses that processor (threads they start later inherit their masks), and the caller keeps only it. Returns
-// 1, or 0 when the mask has fewer than three processors or the caller's mask cannot be set.
-int plat_cpu_reserve(void) {
+// ---- a core for the recording thread (plat_cpu_reserve)
+
+// The processors a sysfs CPU list ("0-15", "0,2,4-7") names, added to *set; 0 when s is not such a list.
+static int cpu_list_parse(const char *s, cpu_set_t *set) {
+    for (;;) {
+        char *e;
+        long a = strtol(s, &e, 10), b = a;
+        if (e == s || a < 0 || a >= CPU_SETSIZE) return 0;
+        if (*e == '-') {
+            s = e + 1;
+            b = strtol(s, &e, 10);
+            if (e == s || b < a || b >= CPU_SETSIZE) return 0;
+        }
+        for (long i = a; i <= b; i++) CPU_SET((int)i, set);
+        if (*e != ',') return *e == '\n' || !*e;
+        s = e + 1;
+    }
+}
+
+static int cpu_list_file(const char *path, cpu_set_t *set) {
+    char text[512];
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    CPU_ZERO(set);
+    return cpu_list_parse(text, set);
+}
+
+// cpu<n>/<file> under root/system/cpu holds one number per processor (cpu_capacity, cpufreq/cpuinfo_max_freq). When
+// the processors of `in` differ in it by more than a tenth, *out gets the ones within a tenth of the highest and the
+// result is 1; otherwise 0 and *out stays as it was. A processor without the file counts as the lowest.
+static int cpus_highest_by(const char *root, const char *file, const cpu_set_t *in, cpu_set_t *out) {
+    uint64_t v[CPU_SETSIZE], top = 0, low = UINT64_MAX;
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        char path[160];
+        v[i] = 0;
+        if (!CPU_ISSET(i, in)) continue;
+        snprintf(path, sizeof path, "%s/system/cpu/cpu%d/%s", root, i, file);
+        if (!read_u64_file(path, &v[i])) v[i] = 0;
+        if (v[i] > top) top = v[i];
+        if (v[i] < low) low = v[i];
+    }
+    if (low * 10 >= top * 9) return 0;
+    CPU_ZERO(out);
+    for (int i = 0; i < CPU_SETSIZE; i++)
+        if (CPU_ISSET(i, in) && v[i] * 10 >= top * 9) CPU_SET(i, out);
+    return 1;
+}
+
+// The processors of `all` on the fastest kind of core, and what makes them so. A hybrid Intel CPU lists its performance
+// cores in root/cpu_core/cpus; for the others, cores of different capacity or top clock (a tenth apart or less counts
+// as the same) keep the highest; a CPU with one kind of core keeps all of `all`.
+static const char *cpus_fast(const char *root, const cpu_set_t *all, cpu_set_t *fast) {
+    cpu_set_t perf;
+    char path[160];
+    snprintf(path, sizeof path, "%s/cpu_core/cpus", root);
+    if (cpu_list_file(path, &perf)) {
+        CPU_AND(fast, &perf, all);
+        if (CPU_COUNT(fast)) return "a performance core";
+    }
+    if (cpus_highest_by(root, "cpu_capacity", all, fast)) return "a core of the highest capacity";
+    if (cpus_highest_by(root, "cpufreq/cpuinfo_max_freq", all, fast)) return "a core of the highest clock";
+    *fast = *all;
+    return "a core";
+}
+
+// The processors plat_cpu_reserve takes into *mine: every processor of `all` on the fast core (cpus_fast) that clocks
+// highest, the highest-numbered one when several do. A core with a processor outside the fast ones is no fast core.
+// Returns how many processors, 0 when fewer than four cores are fast: one of them is then too much to lose. *kind
+// names what makes the core fast.
+static int cpu_pick_core(const char *root, const cpu_set_t *all, cpu_set_t *mine, const char **kind) {
+    cpu_set_t fast;
+    *kind = cpus_fast(root, all, &fast);
+    int cores = 0;
+    uint64_t best = 0;
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        char path[160];
+        cpu_set_t sib, in;
+        uint64_t freq = 0;
+        if (!CPU_ISSET(i, &fast)) continue;
+        snprintf(path, sizeof path, "%s/system/cpu/cpu%d/topology/thread_siblings_list", root, i);
+        if (!cpu_list_file(path, &sib)) CPU_ZERO(&sib);
+        CPU_SET(i, &sib);
+        CPU_AND(&sib, &sib, all);
+        int first = 0;
+        while (!CPU_ISSET(first, &sib)) first++;
+        CPU_AND(&in, &sib, &fast);
+        if (first != i || !CPU_EQUAL(&in, &sib)) continue;   // counted at its first processor, or not fast
+        snprintf(path, sizeof path, "%s/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", root, i);
+        read_u64_file(path, &freq);
+        if (++cores == 1 || freq >= best) best = freq, *mine = sib;
+    }
+    return cores < 4 ? 0 : CPU_COUNT(mine);
+}
+
+// The calling thread gets a fast core to itself (cpu_pick_core): every other thread of the process now running loses
+// the core's processors, and the caller keeps only them. Threads the caller starts later through plat_thread_new_ex
+// get the others; a thread started by another one inherits that one's mask, which no longer has the core.
+// plat_process_affinity leaves the core with the caller. Returns the processors reserved, 0 when no core is fast
+// enough or the caller's mask cannot be set; *which (when not NULL) receives them as text, such as "10,11 of a
+// performance core".
+int plat_cpu_reserve(char *which, size_t size) {
     cpu_set_t all, mine, rest;
-    if (sched_getaffinity(0, sizeof all, &all) || CPU_COUNT(&all) < 3) return 0;
-    int last = -1;
-    for (int i = CPU_SETSIZE - 1; i >= 0 && last < 0; i--)
-        if (CPU_ISSET(i, &all)) last = i;
-    rest = all;
-    CPU_CLR(last, &rest);
-    CPU_ZERO(&mine);
-    CPU_SET(last, &mine);
+    const char *kind;
     pid_t me = (pid_t)syscall(SYS_gettid);
+    if (which && size) which[0] = 0;
+    if (sched_getaffinity(0, sizeof all, &all) || !cpu_pick_core("/sys/devices", &all, &mine, &kind)) return 0;
+    CPU_XOR(&rest, &all, &mine);
+    plat_mutex_lock(&cpu_lock);
+    if (sched_setaffinity(0, sizeof mine, &mine)) {
+        plat_mutex_unlock(&cpu_lock);
+        return 0;
+    }
+    cpu_rest = rest, cpu_rest_set = 1;
+    cpu_taken = mine, cpu_taker = me, cpu_others = rest;
+    // A thread started during a pass by one it has not reached yet is found by the next.
+    for (int pass = 0, moved = 1; moved && pass < 3; pass++) {
+        DIR *d = opendir("/proc/self/task");
+        moved = 0;
+        for (struct dirent *e; d && (e = readdir(d));) {
+            pid_t tid = (pid_t)atoi(e->d_name);
+            cpu_set_t cur, now;
+            if (tid <= 0 || tid == me || sched_getaffinity(tid, sizeof cur, &cur)) continue;
+            now = cur;
+            cpu_clear(&now, &mine);
+            if (CPU_EQUAL(&now, &cur)) continue;
+            if (!CPU_COUNT(&now)) now = rest;   // it was pinned to the core alone
+            if (!sched_setaffinity(tid, sizeof now, &now)) moved = 1;
+        }
+        if (d) closedir(d);
+    }
+    plat_mutex_unlock(&cpu_lock);
+    if (which && size) {
+        size_t n = 0;
+        for (int i = 0; i < CPU_SETSIZE && n < size; i++)
+            if (CPU_ISSET(i, &mine)) n += (size_t)snprintf(which + n, size - n, "%s%d", n ? "," : "", i);
+        if (n < size) snprintf(which + n, size - n, " of %s", kind);
+    }
+    return CPU_COUNT(&mine);
+}
+
+// A thread the holder starts by other means than plat_thread_new_ex (a library's audio thread, a driver's worker)
+// inherits its mask, the core alone, after plat_cpu_reserve's sweep ran, and plat_process_affinity seldom runs again:
+// each thread whose mask lies within the core, the holder aside, gets the others' processors here. A thread with
+// anything beside the core in its mask keeps it. Once the holder has ended, nothing would use the core, so it goes back:
+// the threads with the others' mask get its processors again and the reservation ends. Returns the threads moved, -1
+// when the core went back.
+int plat_cpu_reserve_sweep(void) {
+    plat_mutex_lock(&cpu_lock);
+    if (!cpu_taker) {
+        plat_mutex_unlock(&cpu_lock);
+        return 0;
+    }
+    char path[48];
+    snprintf(path, sizeof path, "/proc/self/task/%d", (int)cpu_taker);
+    int ended = access(path, F_OK) != 0, moved = 0;
+    cpu_set_t back;
+    CPU_OR(&back, &cpu_others, &cpu_taken);
     DIR *d = opendir("/proc/self/task");
     for (struct dirent *e; d && (e = readdir(d));) {
         pid_t tid = (pid_t)atoi(e->d_name);
-        if (tid > 0 && tid != me) sched_setaffinity(tid, sizeof rest, &rest);
+        cpu_set_t cur, in;
+        if (tid <= 0 || tid == cpu_taker || sched_getaffinity(tid, sizeof cur, &cur)) continue;
+        if (ended) {
+            if (CPU_EQUAL(&cur, &cpu_others) && !sched_setaffinity(tid, sizeof back, &back)) moved++;
+            continue;
+        }
+        CPU_AND(&in, &cur, &cpu_taken);
+        if (CPU_COUNT(&cur) && CPU_EQUAL(&in, &cur) && !sched_setaffinity(tid, sizeof cpu_others, &cpu_others)) moved++;
     }
     if (d) closedir(d);
-    return sched_setaffinity(0, sizeof mine, &mine) == 0;
+    if (ended) {
+        cpu_taker = 0;
+        CPU_ZERO(&cpu_taken);
+    }
+    plat_mutex_unlock(&cpu_lock);
+    return ended ? -1 : moved;
 }
 
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {

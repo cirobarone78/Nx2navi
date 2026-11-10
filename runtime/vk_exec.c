@@ -1227,39 +1227,46 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
     }
 }
 
+// The replay records on the thread the game submitted from, and the kernel schedules that like any other guest
+// thread: a preemption in the middle of a part leaves the submission late for the frame it belongs to (Kokiri
+// Forest: 274 of 2,737 frames had a late submit). The recording thread therefore keeps the highest priority so the
+// scheduler prefers it over the guest's other cores (NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone) and
+// gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's cores, the audio, the
+// shader and pipeline workers, is kept off it, so nothing of this process preempts the recording. That core is then
+// lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only with 12 or more logical processors;
+// 1 always, 0 never. Linux reserves none with fewer than four fast cores.
+// The recording thread is not the first to call vk_exec_record: the game's main thread submits first and goes on
+// submitting a little at a time, while another guest thread does the work (Kokiri Forest: that thread spent 21.9 of
+// the 22.5 s the replay took in a minute and a half, the first one 0.5 s). The first thread to have spent
+// REC_CLAIM_NS in vk_exec_record is the one that keeps both.
+#define REC_CLAIM_NS 500000000ull
+static _Thread_local uint64_t rec_spent_ns;   // time this thread has spent in vk_exec_record
+
+static void rec_claim(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    rt_log("vk: thread %u is the recording thread (the first to spend %.1f s in it)", plat_thread_id(),
+           REC_CLAIM_NS / 1e9);
+    const char *e = cfg_get("NX2NAVI_RECORDER_PRIO");
+    if (!(e && !strcmp(e, "0"))) {
+        plat_thread_priority(PLAT_PRIO_HIGHEST);
+        rt_log("vk: the recording thread keeps the highest scheduling priority (NX2NAVI_RECORDER_PRIO=0 turns it off)");
+    }
+    const char *rc = cfg_value("NX2NAVI_RECORDER_CORE");
+    unsigned ncpu = plat_cpu_usable();
+    if (!strcmp(rc, "1") || (!strcmp(rc, "auto") && ncpu >= 12)) {
+        char which[96];
+        int n = plat_cpu_reserve(which, sizeof which);
+        if (n) rt_log("vk: the recording thread has a core of its own: logical processor%s %s (%d of %u; "
+                      "NX2NAVI_RECORDER_CORE=0 turns it off)", n > 1 ? "s" : "", which, n, ncpu);
+        else rt_log("vk: no core was reserved for the recording thread (too few fast cores, or the system refused it; "
+                    "NX2NAVI_RECORDER_CORE=0 stops the attempt)");
+    }
+}
+
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
-    // The replay records on the thread the game submitted from, and the kernel schedules that like any other guest
-    // thread: a preemption in the middle of a part leaves the submission late for the frame it belongs to (Kokiri
-    // Forest: 274 of 2,737 frames had a late submit). Recording keeps the highest priority so the scheduler prefers it
-    // over the guest's other cores; NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone.
-    static int prio_done;
-    static uint32_t rec_thread;   // the thread that got the priority and the core
-    if (!prio_done) {
-        prio_done = 1;
-        const char *e = cfg_get("NX2NAVI_RECORDER_PRIO");
-        if (!(e && !strcmp(e, "0"))) {
-            plat_thread_priority(PLAT_PRIO_HIGHEST);
-            rt_log("vk: the recording thread keeps the highest scheduling priority (NX2NAVI_RECORDER_PRIO=0 turns it off)");
-        }
-        // The recorder also gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's
-        // cores, the audio, the shader and pipeline workers, is kept off it, so nothing of this process preempts the
-        // recording. That core is then lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only
-        // with 12 or more logical processors; 1 always, 0 never.
-        const char *rc = cfg_value("NX2NAVI_RECORDER_CORE");
-        unsigned ncpu = plat_cpu_usable();
-        if (!strcmp(rc, "1") || (!strcmp(rc, "auto") && ncpu >= 12)) {
-            int n = plat_cpu_reserve();
-            if (n) rt_log("vk: the recording thread has a core of its own (%d logical processor%s of %u; "
-                          "NX2NAVI_RECORDER_CORE=0 turns it off)", n, n > 1 ? "s" : "", ncpu);
-            else rt_log("vk: could not reserve a core for the recording thread (NX2NAVI_RECORDER_CORE)");
-        }
-        rec_thread = plat_thread_id();
-    }
-    if (rec_thread && plat_thread_id() != rec_thread) {   // the priority and the core stay with the first thread
-        static int said;
-        if (!said++) rt_log("vk: a submission is recorded on another thread than the first one; it runs without the "
-                            "recorder's priority and core");
-    }
+    uint64_t in_ns = kern_now_ns();
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME
     if (prof_replay_tid != plat_thread_id()) perf_replay_thread();   // the profiler follows the thread replaying now
     perf_rec_waits = rec_wait_totals;
@@ -1352,5 +1359,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
         n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
     }
+    rec_spent_ns += kern_now_ns() - in_ns;
+    if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();
     return ex->recorded - part_start;   // what the last part holds
 }

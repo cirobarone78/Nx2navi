@@ -331,8 +331,9 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
 // core. The core is the highest-numbered one of the fastest efficiency class (a performance core on a hybrid CPU),
 // with both its logical processors when it has two; only processors in group 0 and in the process's affinity mask
 // count. CPU sets are soft: the scheduler may still use the core when nothing else wants it. Returns the logical
-// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify.
-int plat_cpu_reserve(void) {
+// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify; *which
+// (when not NULL, size bytes) receives their numbers, such as "10,11".
+int plat_cpu_reserve(char *which, size_t size) {
     typedef BOOL(WINAPI * GetInfoFn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
     typedef BOOL(WINAPI * SetProcFn)(HANDLE, const ULONG *, ULONG);
     typedef BOOL(WINAPI * SetThreadFn)(HANDLE, const ULONG *, ULONG);
@@ -362,6 +363,7 @@ int plat_cpu_reserve(void) {
         o += s->Size;
     }
     ULONG rest[64], mine[8];
+    unsigned mine_cpu[8];   // the logical processor numbers of mine
     int nrest = 0, nmine = 0;
     for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
         const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
@@ -369,7 +371,7 @@ int plat_cpu_reserve(void) {
         if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
             (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
             if (s->CpuSet.EfficiencyClass == best_class && s->CpuSet.CoreIndex == best_core) {
-                if (nmine < 8) mine[nmine++] = s->CpuSet.Id;
+                if (nmine < 8) mine_cpu[nmine] = s->CpuSet.LogicalProcessorIndex, mine[nmine++] = s->CpuSet.Id;
             } else if (nrest < 64) {
                 rest[nrest++] = s->CpuSet.Id;
             }
@@ -383,8 +385,16 @@ int plat_cpu_reserve(void) {
         set_proc(GetCurrentProcess(), NULL, 0);   // back to every processor
         return 0;
     }
+    if (which && size) {
+        size_t n = 0;
+        which[0] = 0;
+        for (int i = 0; i < nmine && n < size; i++)
+            n += (size_t)snprintf(which + n, size - n, "%s%u", n ? "," : "", mine_cpu[i]);
+    }
     return nmine;
 }
+
+int plat_cpu_reserve_sweep(void) { return 0; }
 
 uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);

@@ -62,8 +62,12 @@
 # free_cores = 0
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
-# The thread that records the GPU work keeps the highest scheduling priority (recorder_prio), and a core of its own that
-# the process's other threads stay off (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never).
+# The thread that records the GPU work (the first to spend half a second doing it, not the one that submits first) keeps
+# the highest scheduling priority (recorder_prio), and a core of its own that the process's other threads stay off
+# (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never). That is a fast core, with both of its
+# logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the performance
+# core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when fewer than
+# four cores are that fast. The log names the thread and its logical processors.
 # recorder_prio = 1
 # recorder_core = auto
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).

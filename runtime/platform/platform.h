@@ -31,10 +31,18 @@ void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
 // Restricts t (NULL: the calling thread) to the logical processors in mask (bit n = processor n of the first group).
 // Returns the previous mask, 0 on failure.
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
-// The calling thread gets a core to itself: the process's other threads are kept off it and the caller on it (Windows:
-// CPU sets, a performance core; Linux: the last processor of the affinity mask). Returns the logical processors
-// reserved, 0 when it could not.
-int plat_cpu_reserve(void);
+// The calling thread gets a fast core to itself: the process's other threads are kept off it and the caller on it, with
+// both logical processors of the core when it has two; threads the caller starts later run with the others. Windows
+// takes the highest-numbered core of the fastest efficiency class (CPU sets). Linux takes the core of a hybrid CPU's
+// performance cores that clocks highest, else of the highest capacity or clock, and none when fewer than four cores
+// are that fast. Returns the logical processors reserved, 0 when it could not; *which (when not NULL, size bytes)
+// receives them as text, such as "10,11" (Linux adds what makes the core fast: "10,11 of a performance core").
+int plat_cpu_reserve(char *which, size_t size);
+// Keeps the reserved core reserved: on Linux a thread the holder starts through a library inherits its mask, the core
+// alone, and gets the others' processors here; once the holder has ended, the core goes back to every thread. Returns
+// the threads moved, -1 when the core went back. Windows needs none of it (threads without CPU sets of their own run
+// on the process's default sets, which leave the core out) and returns 0.
+int plat_cpu_reserve_sweep(void);
 uint32_t plat_cpu_count(void);            // logical processors of the machine (system info)
 uint32_t plat_cpu_usable(void);           // the ones this process may run on (its affinity mask): size thread pools by it
 uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id tid (plat_thread_id) so far; 0 unknown
@@ -45,7 +53,9 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first);
 // are not all the same size: the die with AMD's 3D V-Cache on a two-die X3D processor. 0 when they are (one die, or
 // equal dies) or the topology is unknown. *l3_kb: that cache's size.
 uint64_t plat_cpu_cache_die(uint32_t *l3_kb);
-int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
+// Every thread of the process to the processors in mask; 1 on success. On Linux the core plat_cpu_reserve took stays
+// out of the mask for every thread but its holder, which keeps the processors it has.
+int plat_process_affinity(uint64_t mask);
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it
 // wherever it runs, reads where it is, may send it elsewhere, and lets it go on. While it is stopped the caller must not
