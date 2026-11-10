@@ -464,8 +464,11 @@ guess) co-op stays off.
    pool with that stranger in it until the maker removes them, and the maker alone decides who may use the pools at
    all. If anyone you do not know is in the room, even one you declined, do not accept: leave, and ask the maker for a
    new room (a new secret) for the people you know.
-3. **Check the maker's key, and keep yours to yourself.** Before you accept, compare the fingerprint of the key that
-   signs the room's rules with the maker's, by voice or chat. Never start the game with `NX2NAVI_COOP_ACCEPT=always`,
+3. **Check the keys, and keep yours to yourself.** Before you accept, compare the fingerprint of the key that signs
+   the room's rules with the maker's, and each player's with that player's, by voice or chat: a name is what a member
+   says it is, and someone who knows the secret and runs the relay can hold back a player's own identity and show its
+   own key under that player's name and member number until that player's arrives. Never start the game with
+   `NX2NAVI_COOP_ACCEPT=always`,
    or with a script or `nx2navi.ini` someone hands you. Never hand out a copy of your profile folder: its `coop-keys`
    folder makes whoever has it, with a room's secret, the maker of that room (your game logs a member that presents its
    key).
