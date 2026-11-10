@@ -75,15 +75,43 @@ static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
 
+// Probed regions (NX2NAVI_WB_PROBE=1, a diagnosis). The back end copies what the GPU wrote into a mirrored pool back
+// into guest memory after every submission, in case the CPU or a host path reads it; whether anything does is what
+// the probe finds out. A 2 MiB region that lies wholly inside a range just written back is made inaccessible
+// (mem_probe). Its first read or write faults: probe_fault gives the region back the protection it had (read-only
+// when frozen, else read-write), notes the address, the instruction and the thread, and the access runs again. The
+// bytes are in guest memory all along, so the probe only watches. A probed region is not frozen anew (freeze_locked
+// finds pages that are not read-write), and every thaw, which precedes file reads into guest memory and mapping
+// changes, ends the probe of its region first.
+#define PRB_HITS 64
+static volatile uint8_t prb[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+static volatile int32_t nprb, prb_on;
+static struct { uint64_t addr, ip; uint32_t tid; uint8_t write; } prb_hit[PRB_HITS];   // frz_lock: the first of each report
+static int prb_nhit;                    // frz_lock
+static uint64_t prb_arms, prb_ends[2];  // frz_lock: regions armed; probes ended by a read, by a write
+
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
     return (addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size) ||
            (addr >= g->alias.base && size <= ALIAS_SIZE && addr - g->alias.base <= ALIAS_SIZE - size);
 }
 
+// frz_lock held exclusively: the pages of a probed region get back what they had, read-only in a frozen region.
+static void unprobe_locked(uint64_t r) {
+    if (!prb[r]) return;
+    int prot = frz[r] ? PLAT_PROT_READ : PLAT_PROT_RW;
+    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, b;
+    for (; a < end; a = b)   // every inaccessible run is the probe's: mem_probe took only regions without one
+        if (plat_mem_state(a, end, &b) == PLAT_PROT_NONE && !plat_mem_protect(a, b - a, prot))
+            rt_fatal("memory: ending the probe of %#llx+%#llx failed", (unsigned long long)a, (unsigned long long)(b - a));
+    __atomic_store_n(&prb[r], 0, __ATOMIC_RELEASE);
+    plat_dec32(&nprb);
+}
+
 // frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
 static void thaw_locked(uint64_t r, int why) {
     if (why == 2) thaw_ms[r] = (uint32_t)plat_now_ms() | 1;
+    if (prb[r]) unprobe_locked(r);
     if (!frz[r]) return;
     // The read-only runs only: freeze_locked left reserved holes (heap pages given back) as they were. Every committed
     // page of a frozen region was read-write at the freeze, and mapping changes thaw before they run, so these are all
@@ -148,6 +176,92 @@ int mem_freeze(uint64_t a) {
 }
 
 int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE); }
+
+// Probes the 2 MiB regions that lie wholly inside [a, a + n): makes them inaccessible until their first access.
+// Returns how many it armed. Not a region a file read may still be writing into (the thaw hold), nor one with a page
+// that is not plainly read-write (read-only when frozen): those are left alone.
+int mem_probe(uint64_t a, uint64_t n) {
+    if (!__atomic_load_n(&prb_on, __ATOMIC_RELAXED) || n < FRZ_SIZE || a >= RT_ADDRESS_LIMIT || !watched(a, n)) return 0;
+    uint64_t r0 = (a + FRZ_SIZE - 1) >> FRZ_SHIFT, r1 = (a + n) >> FRZ_SHIFT;   // [r0, r1)
+    int armed = 0;
+    plat_mutex_lock(&frz_lock);
+    for (uint64_t r = r0; r < r1; r++) {
+        if (prb[r]) continue;
+        if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) continue;
+        int want = frz[r] ? PLAT_PROT_READ : PLAT_PROT_RW, k = 0, ok = 1;
+        uint64_t run[16][2];
+        for (uint64_t x = r << FRZ_SHIFT, end = x + FRZ_SIZE, y; x < end && ok; x = y) {
+            int st = plat_mem_state(x, end, &y);
+            if (st >= PLAT_PROT_NONE) {
+                if (st != want || k == 16) ok = 0;
+                else run[k][0] = x, run[k][1] = y, k++;
+            } else if (st != PLAT_MEM_RESERVED) ok = 0;
+        }
+        if (!ok || !k) continue;
+        for (int i = 0; i < k && ok; i++)
+            if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_NONE)) {
+                while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], want);
+                ok = 0;
+            }
+        if (!ok) continue;
+        __atomic_store_n(&prb[r], 1, __ATOMIC_RELEASE);
+        plat_inc32(&nprb);
+        prb_arms++, armed++;
+    }
+    plat_mutex_unlock(&frz_lock);
+    return armed;
+}
+
+int mem_probing(void) { return __atomic_load_n(&prb_on, __ATOMIC_RELAXED); }
+
+// The platform's access-fault hook while the probe is on: the first access of a probed region ends its probe and is
+// noted; 1 runs the access again. A read that faulted in a region another thread gave back meanwhile retries too; a
+// write goes on to thaw_fault, and any other fault to the crash handler.
+static int probe_fault(uint64_t a, int write, uint64_t ip) {
+    if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
+    uint64_t r = a >> FRZ_SHIFT;
+    plat_mutex_lock(&frz_lock);
+    int was = prb[r];
+    if (was) {
+        unprobe_locked(r);
+        prb_ends[write != 0]++;
+        if (prb_nhit < PRB_HITS) prb_hit[prb_nhit++] = (typeof(prb_hit[0])){a, ip, plat_thread_id(), (uint8_t)(write != 0)};
+    }
+    plat_mutex_unlock(&frz_lock);
+    if (was) return 1;
+    if (write) return 0;
+    uint64_t end;
+    return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) >= PLAT_PROT_READ;
+}
+
+// One log block for the probe since the last one: how many regions were armed, how many probes a read or a write
+// ended, and the first accesses by instruction (an address inside the executable as nx2navi+offset, for the linker
+// map or nm). Nothing while the probe is off.
+void mem_probe_report(uint64_t frame) {
+    if (!__atomic_load_n(&prb_on, __ATOMIC_RELAXED)) return;
+    typeof(prb_hit[0]) hit[PRB_HITS];
+    plat_mutex_lock(&frz_lock);
+    uint64_t arms = prb_arms, reads = prb_ends[0], writes = prb_ends[1];
+    int n = prb_nhit;
+    memcpy(hit, prb_hit, sizeof hit[0] * (size_t)n);
+    prb_arms = prb_ends[0] = prb_ends[1] = 0, prb_nhit = 0;
+    plat_mutex_unlock(&frz_lock);
+    rt_log("mem: write-back probe at frame %llu: %llu regions of 2 MiB armed, probes ended by %llu reads and %llu writes "
+           "since the last line; %d probed now", (unsigned long long)frame, (unsigned long long)arms,
+           (unsigned long long)reads, (unsigned long long)writes, (int)__atomic_load_n(&nprb, __ATOMIC_RELAXED));
+    uintptr_t exe = plat_exe_base();
+    for (int i = 0, lines = 0; i < n && lines < 12; i++) {
+        if (!hit[i].ip) continue;   // counted with an earlier access of the same instruction
+        int same = 1;
+        for (int j = i + 1; j < n; j++)
+            if (hit[j].ip == hit[i].ip && hit[j].write == hit[i].write) same++, hit[j].ip = 0;
+        rt_log("mem:   %d x a %s at %#llx.. from %s%#llx (thread %u)", same, hit[i].write ? "write" : "read",
+               (unsigned long long)hit[i].addr, hit[i].ip >= exe && hit[i].ip - exe < (1ull << 32) ? "nx2navi+" : "",
+               (unsigned long long)(hit[i].ip >= exe && hit[i].ip - exe < (1ull << 32) ? hit[i].ip - exe : hit[i].ip),
+               hit[i].tid);
+        lines++;
+    }
+}
 
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
     *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
@@ -233,6 +347,10 @@ void mem_init(void) {
     // nx2navi.ini is read here, once the address space is claimed and before the first setting: the pool size below
     // depends on NX2NAVI_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
     cfg_init();
+    if (cfg_bool("NX2NAVI_WB_PROBE")) {   // a diagnosis: off, no access fault reaches probe_fault and nothing is probed
+        plat_mem_access_hook(probe_fault);
+        __atomic_store_n(&prb_on, 1, __ATOMIC_RELEASE);
+    }
     const char *pool = cfg_get("NX2NAVI_APP_POOL");
     L = (RtGuestLayout){
         .aslr = {low, RT_ADDRESS_LIMIT - low},

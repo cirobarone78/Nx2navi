@@ -95,4 +95,5 @@ of Zelda*, *Ocarina of Time* and *Nintendo Switch* are trademarks of Nintendo.
 [docs/building.md](docs/building.md) lists the toolchain and the steps. `tools/make_game.py` also builds the game
 natively on Linux ([docs/README-BuildKit.md](docs/README-BuildKit.md), "Linux"); the launcher and the setup are
 Windows only. Everything the build writes stays under
-`build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit.
+`build\` and `generated\`, which git ignores, as it does the runtime's shaders the build compiles
+(`runtime\*_spv.h`; the repository holds their source only); run `tools/check_content.py` before a commit.
