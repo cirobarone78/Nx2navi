@@ -300,6 +300,14 @@ static void run_stripes(Stripe base) {
         if (th[i]) plat_thread_join(th[i]);
 }
 
+// Out of memory for a decoded frame: the frame is dropped (the game shows the previous one a little longer) and
+// the first drop of a run is logged. The game used to stop here; on a PC whose commit charge reached its limit
+// for a moment, that ended a run that the next second would have had memory for.
+static void movie_oom_log(int w, int h) {
+    static volatile int32_t drops;
+    if (plat_xchg32(&drops, 1) == 0) rt_log("movie: out of memory for a %dx%d frame: dropped (later drops not logged)", w, h);
+}
+
 // One dav1d picture (8- or 10-bit 4:2:0) -> NV12 with 8-bit samples, and its RGBA; decoder thread
 static int make_picture(const Dav1dPicture *pic, Picture *p) {
     int w = pic->p.w, h = pic->p.h, hbd = pic->p.bpc > 8, sh = pic->p.bpc - 8;
@@ -322,7 +330,11 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
         overlay = e && strcmp(e, "0");
     }
     uint8_t *o = malloc((size_t)w * h * 3 / 2), *rgba = overlay ? malloc((size_t)w * h * 4) : NULL;
-    if (!o || (overlay && !rgba)) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
+    if (!o || (overlay && !rgba)) {   // a frame the PC has no memory for is dropped, not the game
+        free(o), free(rgba);
+        movie_oom_log(w, h);
+        return 0;
+    }
     const ptrdiff_t ys = pic->stride[0], cs = pic->stride[1];
     static int deband_on = -1;   // NX2NAVI_MOVIE_DEBAND=0 keeps the decoded planes
     if (deband_on < 0) {
@@ -358,7 +370,11 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
     // debanded planes (NX2NAVI_MOVIE_DEBAND=0 keeps the decoded ones), then the overlay's RGBA or the dithered NV12
     {
         uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
-        if (!Y16 || !U16 || !V16) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
+        if (!Y16 || !U16 || !V16) {
+            free(Y16), free(U16), free(V16), free(o), free(rgba);
+            movie_oom_log(w, h);
+            return 0;
+        }
         Stripe base = {0, 0, 0, w, h, o, Y16, U16, V16, rgba};
         if (deband_on) {
             run_stripes(base);
@@ -707,7 +723,15 @@ static void ov_decode(Cpu *c) {
     Sample s = {NULL, 0, ts, eos};
     if (data && size) {
         s.data = malloc((size_t)size);
-        if (!s.data) rt_fatal("movie: out of memory for a %llu-byte sample", (unsigned long long)size);
+        if (!s.data) {   // no memory for the sample now: the game is told to try again, as with a full queue
+            static volatile int32_t logged;
+            if (plat_xchg32(&logged, 1) == 0)
+                rt_log("movie: out of memory for a %llu-byte sample: retried (later ones not logged)", (unsigned long long)size);
+            update_events(v);
+            plat_mutex_unlock(&v->lock);
+            ret_x(c, R_BUSY);
+            return;
+        }
         memcpy(s.data, data, (size_t)size);
         s.size = (size_t)size;
     }
