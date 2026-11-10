@@ -572,8 +572,15 @@ int coop_test_set(const char *key, const char *value) {
         else if (!strcmp(value, "join")) open_field(P_JOIN, "", "##coop_join");
         else if (!strcmp(value, "accept")) open_accept();
         else if (!strcmp(value, "leave")) open_window(P_LEAVE, "##coop_leave");
-        else if (!strncmp(value, "remove:", 7)) open_remove(atoi(value + 7), "");
-        else return 0;
+        else if (!strncmp(value, "remove:", 7)) {
+            const int id = atoi(value + 7);
+            const char *name = "";
+            for (int i = 0; i < g_view.n; i++)
+                if (g_view.member[i].id == id) name = g_view.member[i].name;
+            open_remove(id, name);
+        } else {
+            return 0;
+        }
         g_by_pad = true;   // the cursor as a pad's A would leave it: on the safe button
     } else if (!strcmp(key, "NX2NAVI_COOP_JOIN")) {
         char canon[COOP_SECRET_LEN + 1];
