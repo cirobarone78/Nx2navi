@@ -584,8 +584,11 @@ static void mock_connect(MockRelay *r, const uint8_t *d, size_t n, const CoopHdr
     for (int i = 0; i < 4; i++)
         if (r->rooms[i].used && !memcmp(r->rooms[i].locator, c.locator, COOP_KEY_LEN)) room = &r->rooms[i];
     int id = 0;
-    for (int i = 1; room && i <= COOP_MAX_MEMBERS; i++)   // the same member with its token: its id, no cookie needed
-        if (room->m[i].used && room->m[i].cid == c.client_id && !memcmp(room->m[i].token, c.token, COOP_COOKIE_LEN)) id = i;
+    // the same member with its token (its id, no cookie needed), or the same CONNECT sent again because the JOINED was lost
+    for (int i = 1; room && i <= COOP_MAX_MEMBERS; i++)
+        if (room->m[i].used && room->m[i].cid == c.client_id &&
+            (!memcmp(room->m[i].token, c.token, COOP_COOKIE_LEN) || (room->m[i].connect_seq == h->seq && plat_addr_eq(&room->m[i].addr, from))))
+            id = i;
     uint8_t cookie[COOP_COOKIE_LEN];
     mock_cookie(r, from, cookie);
     if (!id && memcmp(cookie, c.cookie, sizeof cookie)) {
@@ -765,7 +768,7 @@ static void mock_main(void *arg) {
         }
         if (r->fuzz) mock_fuzz(r), r->fuzz = 0;
         if (r->forge) mock_forge(r), r->forge = 0;
-        if (r->replay) mock_replay(r), r->replay = 0;
+        for (; r->replay; r->replay--) mock_replay(r);   // several copies: the test's loss may drop some
         int n = plat_udp_recv(r->sock, buf, sizeof buf, &from, 10);
         if (n > 0) mock_handle(r, buf, (size_t)n, &from);
         if (plat_now_ms() >= r->next_roster) {   // the roster again every second: a lost update repairs itself
@@ -1021,9 +1024,9 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     coop_u32_pack(m + 5, 4, 700);
     for (int i = 0; i < 20 && mock->record_from; i++) coop_sess_send(bob->sess, 0, COOP_K_TEST, m, sizeof m), plat_sleep_ms(50);
     CHECK(WAIT_FOR(!mock->record_from && mock->recorded_n, 3000), "the relay recorded a message of Bob's");
-    CHECK(WAIT_FOR(alice->seen[700 / 32] & (1u << (700 % 32)), 3000), "and Alice got it once");
+    CHECK(drop || WAIT_FOR(alice->seen[700 / 32] & (1u << (700 % 32)), 3000), "and Alice got it once");
     unsigned dups = alice->dups;
-    mock->replay = 1;   // the same session still: a replay within the window
+    mock->replay = 5;   // the same session still: a replay within the window
     CHECK(WAIT_FOR(!mock->replay, 3000), "replayed");
     plat_sleep_ms(300);
     CHECK(alice->dups == dups, "a message sent again in the same session is not delivered twice");
@@ -1031,7 +1034,7 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     CHECK(WAIT_FOR(in_room(bob, 2) && in_room(alice, 2), ROSTER_WAIT_MS), "Bob is back");
     plat_sleep_ms(1500);   // the roster with Bob's new session has reached Alice
     uint32_t lost = view_of(alice).lost;
-    mock->replay = 1;
+    mock->replay = 5;
     CHECK(WAIT_FOR(!mock->replay, 3000), "replayed after the rejoin");
     plat_sleep_ms(300);
     CHECK(alice->dups == dups && view_of(alice).lost > lost, "a message recorded before Bob joined again is refused after it (%u thrown away)",
