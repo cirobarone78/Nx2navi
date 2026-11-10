@@ -368,17 +368,15 @@ static void mouse_camera(int32_t out[2], int selector) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
-            input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
+            input_mouse_stick(dx, dy, dt, mouse_sens_get(), cam_speed_applied(), held);
             frame = fr;
             t0 = now;
         } else if (age > 0.1) {
             held[0] = held[1] = 0;   // frames stopped: do not hold a deflection
         }
     }
-    double k = cam_speed_applied(), x = held[0] / k, y = held[1] / k, len = sqrt(x * x + y * y);
-    if (len > STICK_MAX) x *= STICK_MAX / len, y *= STICK_MAX / len;
-    out[0] = (int32_t)lround(x);
-    out[1] = (int32_t)lround(y);
+    out[0] = held[0];
+    out[1] = held[1];
 }
 
 static float stick_dead[2] = {-1, -1};     // input_pad_deadzone of the left and right stick; live (cfg_version)

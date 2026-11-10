@@ -349,10 +349,10 @@ void input_map_stick(const uint8_t down[KEY_COUNT], int stick, int32_t out[2]) {
     out[1] = dy * m;
 }
 
-void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t out[2]) {
+void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, float cam, int32_t out[2]) {
     out[0] = out[1] = 0;
-    if (!(dt_s > 0) || !(sens > 0)) return;
-    double k = STICK_MAX * (double)sens / (MOUSE_FULL_CPS * dt_s);
+    if (!(dt_s > 0) || !(sens > 0) || !(cam > 0)) return;
+    double k = STICK_MAX * (double)sens / (MOUSE_FULL_CPS * dt_s * cam);
     double x = dx * k, y = -dy * k, len = sqrt(x * x + y * y);
     if (len > STICK_MAX) { x *= STICK_MAX / len; y *= STICK_MAX / len; }
     out[0] = (int32_t)lrint(x);

@@ -513,7 +513,8 @@
 # the stick reads centred, and the rest of its travel is scaled to start there.
 # stick_deadzone = 8
 # Right-stick camera speed (0.1 to 3): multiplies the game's own camera turn rates, top speed included, at each of the
-# five camera sensitivities in the game's Options. Keys bound to the right stick follow it; the mouse keeps mouse_sens.
+# five camera sensitivities in the game's Options. Keys bound to the right stick follow it; the mouse keeps mouse_sens
+# for its turn per movement, and in stick mode the fastest turn it can reach rises and falls with this.
 # A change while the game runs takes effect at once (the first one of a run within a few seconds).
 # stick_sens = 1
 # The dead zone of one stick, in place of stick_deadzone for that stick (0 to 50; unset = stick_deadzone). The Controls
