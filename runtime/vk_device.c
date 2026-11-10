@@ -299,7 +299,22 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop;   // AMD FSR SDK 2 (vk_ffx.cpp): FSR 4's and FSR FG 4's networks
+#ifdef VK_EXT_shader_float8   // Vulkan headers 1.4.317 and later
+    VkPhysicalDeviceShaderFloat8FeaturesEXT f8;
+#endif
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT ia64;     // FG 4's splatting shaders
+#ifdef VK_KHR_compute_shader_derivatives   // Vulkan headers 1.3.295 and later
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR csd;    // FG 3.1.6's and FSR 4 INT8's passes
+#endif
 } FeatureChain;
+
+// 1 when name is in the first n of ext already
+static int ext_listed(const char *const *ext, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(ext[i], name)) return 1;
+    return 0;
+}
 
 static int create_device(void) {
     uint32_t ne = 0;
@@ -395,6 +410,46 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // AMD FSR SDK 2 (vk_ffx.cpp, with its loader and both effect libraries next to the executable): FSR 4 upscaling and
+    // FSR Frame Generation 4 run machine-learning passes on cooperative matrices (FP8 on RDNA 4, INT8 and integer dot
+    // products on RDNA 3); FG 4's splatting shaders use 64-bit atomics on storage images, and the passes of FG 3.1.6 and
+    // FSR 4 INT8 use compute-shader derivatives. Each is enabled only where the GPU has it, and FP8 and the derivatives
+    // only where the Vulkan headers know them (VK_EXT_shader_float8 from 1.4.317, VK_KHR_compute_shader_derivatives from
+    // 1.3.295), so older headers build as before. The SDK's Vulkan back end also picks its shader variants and commands
+    // from the extensions the GPU lists (subgroup size control, float16/int8 and synchronization2 among them) and looks up
+    // some functions by their suffixed names, which resolve only with the extension enabled (as FSR 3.1's did, above):
+    // the extensions of those features, core since Vulkan 1.1 to 1.3, are enabled by name too. Before the graphics
+    // pipeline library, which stays last.
+    int ffx2 = vk_ffx_sdk2_wanted();
+    if (ffx2) {
+        if (has_ext(ep, ne, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && n_ext < 54) {
+            ext[n_ext++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+            CHAIN(coop, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR);
+        }
+#ifdef VK_EXT_shader_float8
+        if (has_ext(ep, ne, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && n_ext < 54) {
+            ext[n_ext++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
+            CHAIN(f8, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
+        }
+#endif
+        if (has_ext(ep, ne, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) && n_ext < 54) {
+            ext[n_ext++] = VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME;
+            CHAIN(ia64, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT);
+        }
+#ifdef VK_KHR_compute_shader_derivatives
+        if (has_ext(ep, ne, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) && n_ext < 54) {
+            ext[n_ext++] = VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME;
+            CHAIN(csd, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR);
+        }
+#endif
+        static const char *const promoted[] = {
+            VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+            VK_KHR_8BIT_STORAGE_EXTENSION_NAME, VK_KHR_16BIT_STORAGE_EXTENSION_NAME, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+            VK_KHR_MAINTENANCE_4_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+            VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME};
+        for (size_t i = 0; i < sizeof promoted / sizeof *promoted && n_ext < 58; i++)
+            if (has_ext(ep, ne, promoted[i]) && !ext_listed(ext, n_ext, promoted[i])) ext[n_ext++] = promoted[i];
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -448,6 +503,19 @@ static int create_device(void) {
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
         rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    if (ffx2) {
+        int f8 = 0, f8_coop = 0, derivatives = 0;   // 0 where the Vulkan headers lack the extension (above)
+#ifdef VK_EXT_shader_float8
+        f8 = (int)c->f8.shaderFloat8, f8_coop = (int)c->f8.shaderFloat8CooperativeMatrix;
+#endif
+#ifdef VK_KHR_compute_shader_derivatives
+        derivatives = (int)c->csd.computeDerivativeGroupLinear;
+#endif
+        rt_log("vk: AMD FSR SDK 2 next to the executable: cooperative matrix %d, float8 %d (cooperative %d), integer dot "
+               "product %d, int8 %d, float16 %d, image int64 atomics %d, compute derivatives %d",
+               (int)c->coop.cooperativeMatrix, f8, f8_coop, (int)c->f13.shaderIntegerDotProduct, (int)c->f12.shaderInt8,
+               (int)c->f12.shaderFloat16, (int)c->ia64.shaderImageInt64Atomics, derivatives);
+    }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;

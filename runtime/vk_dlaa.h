@@ -33,6 +33,9 @@ typedef struct {
     float fov_y, aspect;
 } VkDlaaCamera;
 int vk_dlaa_fg_views(VkImageView *depth, VkImageView *mv);
+// AMD FSR Frame Generation 4 (vk_fg.cpp, SDK 2): 1 once when the upscaler's history restarted since the last call (a
+// cut, another scene size or target), so generation restarts its own instead of blending two unrelated pictures.
+int vk_dlaa_fg_reset(void);
 // The picture without the HUD at the size of the game's picture, in *fmt: RGBA8 UNORM bytes like it (sRGB-encoded), or
 // RGBA16F linear with HDR on; made at each evaluation while vk_dlaa_hudless_wanted (frame generation sets it); 1 once per
 // evaluation.

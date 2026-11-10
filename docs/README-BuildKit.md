@@ -165,6 +165,11 @@ beside the game.
   and FSR 3.1's `amd_fidelityfx_vk.dll` beside `ocarina.exe` from the kit's `bin\`. To use another DLSS version, put
   your own `nvngx_dlss.dll` there: later builds keep it. On Linux the library is `libnvidia-ngx-dlss.so.<version>`
   (see "Linux").
+- With AMD's FSR SDK 2 libraries beside `ocarina.exe` (`amd_fidelityfx_loader_vk.dll`, `amd_fidelityfx_upscaler_vk.dll`
+  and `amd_fidelityfx_framegeneration_vk.dll`, from `Kits/FidelityFX/signedbin` of AMD's FidelityFX SDK 2.4.0), the
+  FSR upscaling and frame generation settings run through them: FSR 4 upscaling on Radeon RX 9000 and RX 7000 cards,
+  FSR Frame Generation 4 on RX 9000 cards. Later builds keep them. `ffx_sdk2 = 0` in `nx2navi.ini` goes back to
+  `amd_fidelityfx_vk.dll`.
 - A kit with `bin\dlssg\` (made with `tools/make_kit.py --dlssg`) also brings DLSS Frame Generation on GeForce RTX 40
   and 50 cards: the build copies `nx2navi_dlssg.dll`, NVIDIA Streamline's runtime, `nvngx_dlssg.dll` and their licence
   texts beside `ocarina.exe`, and Frame generation in the Screen menu then offers DLSS too.

@@ -996,7 +996,8 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None):
         guest = dst.name.startswith(('main_', 'sdk_', 'subsdk0_'))
         march = [f'-march=x86-64-v{level}'] if guest and level else []
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
-        # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
+        # -fdeclspec: AMD's FSR API header (third_party/ffx_sdk24/api/include/ffx_api.h) declares its entry points
+        # __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
         return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
                 *march, '-fno-strict-aliasing', '-w', *declspec, *inc, '-o', str(dst), str(src)]

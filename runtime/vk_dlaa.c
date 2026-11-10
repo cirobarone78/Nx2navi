@@ -590,6 +590,12 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
     return 1;
 }
 
+int vk_dlaa_fg_reset(void) {
+    int r = D.fg_reset;
+    D.fg_reset = 0;
+    return r;
+}
+
 const VkTexImage *vk_dlaa_swap_img;
 VkImageView vk_dlaa_swap_view;
 
@@ -1711,6 +1717,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     if (!NGX_OK(r)) return dl_fail("DLSS evaluation", r);
 evaluated:
     if (timed) times_mark(cb, T_DL1);   // through the recorder, after NGX's own commands
+    D.fg_reset |= D.reset;   // for frame generation 4 (vk_dlaa_fg_reset), until it takes it
     D.reset = 0;
     D.last = e, e->used = D.evals + 1;
     if (D.evals % 600 == 0) query_vram();

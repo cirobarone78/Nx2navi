@@ -434,6 +434,17 @@
 # Each step adds a little latency, and on a 60 Hz display 4 leaves the game drawing 15 fps. Changes while the game runs
 # take effect at once.
 # framegen_multiplier = 2
+# AMD FSR SDK 2 (Windows): with AMD's FSR SDK 2 libraries next to the executable (amd_fidelityfx_loader_vk.dll,
+# amd_fidelityfx_upscaler_vk.dll and amd_fidelityfx_framegeneration_vk.dll, all three), FSR upscaling (taa = fsr3) and
+# framegen = fsr3 run through them instead of amd_fidelityfx_vk.dll, in the version AMD's library picks for the GPU:
+# FSR 4 upscaling on Radeon RX 9000 and RX 7000 GPUs, FSR Frame Generation 4 on RX 9000 GPUs. The log lists the
+# versions offered and names the one each context runs ("ffx: upscaler versions offered", "ffx: AMD FSR SDK 2
+# upscaling at"). 0: amd_fidelityfx_vk.dll as before, even with those libraries there. Read at start.
+# ffx_sdk2 = 1
+# With the FSR SDK 2: the upscaler's and frame generation's version instead of AMD's pick, by the start of a name the
+# log lists ("4", "3.1", or a whole one such as "3.1.6"); unset, AMD's pick. Read when FSR makes its context.
+# ffx_upscaler =
+# ffx_framegen =
 
 # HDR output: hdr = 1 sends the picture as HDR10 through the HDR tone mapper, hdr = native as the game renders it in
 # its own HDR mode (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management; without it
