@@ -16,6 +16,7 @@ enum {
                           // the libraries are built with, or the build's preparation, which writes no shader-warm.txt
     LW_COLD_AFTER_WARM,   // cold again right after a finished warm on the same driver
     LW_COLD_GAVE_UP,      // cold after two finished warms in a row: warming is no longer tried on this driver
+    LW_WARM_FORCED,       // lib_warm = force on a cache the sample found warm: nothing lost, no cause to name
 };
 
 #define LW_VENDOR_NVIDIA 0x10de
@@ -39,6 +40,8 @@ static inline const char *lw_cold_hint(uint32_t vendor, int why) {
                         "app, start once with lib_warm = force (or delete shader-warm.txt) to warm again."
                       : " Once the driver's cache can hold them, start once with lib_warm = force (or delete "
                         "shader-warm.txt) to warm again.";
+    case LW_WARM_FORCED:
+        return "";
     }
     return "";
 }

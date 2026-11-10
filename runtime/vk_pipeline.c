@@ -5172,7 +5172,8 @@ static void lw_main(void *arg) {
                "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
                "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
                "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
-               lw_cold_hint(LW.vendor, same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST));
+               lw_cold_hint(LW.vendor, median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                                       : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST));
     LW.t0 = now_ms();
     LW.running = t;
     int started = 0;

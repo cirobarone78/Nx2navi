@@ -38,6 +38,12 @@ int main(void) {
     CHECK(has(lw_cold_hint(NVIDIA, LW_COLD_GAVE_UP), "Shader Cache Size"), "NVIDIA gave up: names the setting");
     CHECK(!has(lw_cold_hint(AMD, LW_COLD_GAVE_UP), "Shader Cache Size"), "AMD gave up: no NVIDIA setting");
 
+    // A warm lib_warm = force started on a cache that is not cold: no cause to name, on any vendor.
+    for (unsigned v = 0; v < 3; v++) {
+        unsigned vendor = v == 0 ? NVIDIA : v == 1 ? AMD : INTEL;
+        CHECK(!strcmp(lw_cold_hint(vendor, LW_WARM_FORCED), ""), "vendor %04x forced warm: no hint", vendor);
+    }
+
     if (!fails) printf("warm hint: all checks passed\n");
     return fails != 0;
 }
