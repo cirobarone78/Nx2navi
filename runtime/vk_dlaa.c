@@ -147,6 +147,35 @@ int vk_dlaa_needs_restart(void) {
     return strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? !N.ngx_up && !N.tried : N.ngx_up;
 }
 
+#ifdef _WIN32
+// The NGX core's folder when the driver has not written NGXCore\FullPath (seen with driver 617.42, whose key held
+// only DLSS override values): the core sits in the driver's own DriverStore folder, the one its Vulkan driver is in.
+// That is the display adapter's VulkanDriverName, where the Vulkan loader itself finds the driver.
+static int ngx_dir_from_adapter(char *dir, DWORD size) {
+    HKEY cls;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                      0, KEY_READ, &cls) != ERROR_SUCCESS)
+        return 0;
+    int found = 0;
+    for (DWORD i = 0; !found; i++) {
+        char sub[64], val[MAX_PATH + 1] = {0}, probe[MAX_PATH + 32];
+        DWORD sn = sizeof sub, vn = MAX_PATH;
+        if (RegEnumKeyExA(cls, i, sub, &sn, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        if (RegGetValueA(cls, sub, "VulkanDriverName", RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ, NULL, val, &vn) != ERROR_SUCCESS)
+            continue;
+        char *slash = strrchr(val, '\\');
+        if (!slash) continue;
+        *slash = 0;
+        snprintf(probe, sizeof probe, "%s\\_nvngx.dll", val);
+        if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) continue;
+        snprintf(dir, size, "%s", val);
+        found = 1;
+    }
+    RegCloseKey(cls);
+    return found;
+}
+#endif
+
 static int core_load(void) {
     if (N.tried) return N.loaded;
     N.tried = 1;
@@ -154,8 +183,8 @@ static int core_load(void) {
     char dir[MAX_PATH] = {0}, path[MAX_PATH + 32];
     DWORD n = sizeof dir;
     if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", "FullPath", RRF_RT_REG_SZ,
-                     NULL, dir, &n) != ERROR_SUCCESS) {
-        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing): DLAA off");
+                     NULL, dir, &n) != ERROR_SUCCESS && !ngx_dir_from_adapter(dir, sizeof dir)) {
+        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing, none beside its Vulkan driver): DLAA off");
         return 0;
     }
     snprintf(path, sizeof path, "%s\\_nvngx.dll", dir);
