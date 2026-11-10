@@ -895,7 +895,9 @@ static void on_tick(uint64_t now, void *user) {
         // coop_remove = a key's fingerprint (a member id is coop.c's), coop_reset_pools = any new value, set from the
         // environment or by the menu's test hook (the Co-op tab's rows ask coop_offer.h instead). The values at start
         // are only noted: one left from an earlier session acts on nothing
-        const char *rm = cfg_value("NX2NAVI_COOP_REMOVE"), *rp = cfg_value("NX2NAVI_COOP_RESET_POOLS");
+        // read with cfg_get: neither has a row in the settings table, and cfg_value stops the game for such a key
+        const char *rm = cfg_get("NX2NAVI_COOP_REMOVE"), *rp = cfg_get("NX2NAVI_COOP_RESET_POOLS");
+        rm = rm ? rm : "", rp = rp ? rp : "";
         uint64_t kid;
         int primed = G.cfg_primed;
         G.cfg_primed = 1;
