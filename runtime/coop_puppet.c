@@ -7,18 +7,27 @@
 //
 // Actors. The actor manager *(main+0x4e91888) takes create requests (main+0x372a70): x1 the address of the actor
 // name's pointer ("Pack/Actor/<name>.pack" is loaded), x2 the placement (+0x00 position, +0x0c a 3x3 rotation, +0x30
-// scale, +0x40 a text, +0x98 a mode byte), x3 a cell the game puts the request's handle into, w4 1, x5..x7 0, then on the
-// stack a byte 0, a u32 for the outcome, and 0. The handle (a 0x30-byte pool entry) is released as the game releases
-// its own (main+0x9360): a search of the pending creates (main+0xb2e020 over *(main+0x4e90d90)+0x458, with a matcher
-// whose vtable is main+0x4c595e0) cancels one not made yet (and main+0xb2e6e0 frees its handle), else main+0xb2e2e0
-// (handle, 1) deletes the actor.
+// scale, +0x40 a text, +0x48 a byte, +0x98 a mode byte), x3 a cell the game puts the request into (a 0x30-byte pool
+// entry: +0 its state in the low 16 bits, +8 the actor), w4 1, x5..x7 0, then on the stack a byte 0, a u32 for the
+// outcome, and 0. The actor is made (actor state 3) but is in no list of the actor system: when the request reaches
+// state 3 its asker must take the actor (main+0x36fbd0(request, 1, 0), as the game's own askers do at main+0x32bcb88
+// and main+0xbcd89c). The take wakes it (main+0x94f30: flags at actor +0x30, then main+0xb3db0 links it into the
+// actor system's list at +0x3e8), and from that list it enters the scene (state 4) and is updated and drawn; the
+// request is the game's again. An actor never taken stays in state 3 for good, not drawn. A request the game gives up
+// (state 4) is dropped (main+0x36fde0), one that failed (5, 6) released. A taken actor is removed with the game's
+// generic delete (main+0xa6490(actor, 0), the call behind the AI's "delete this actor"); a request not yet made is
+// cancelled in the pending queue (main+0xb2e020 over *(main+0x4e90d90)+0x458, with a matcher whose vtable is
+// main+0x4c595e0, then main+0xb2e6e0 frees it), else main+0xb2e2e0(request, 1) deletes its actor.
 //
-// Status (game 1.1.1, run-checked): the hook runs on the game's update thread; a create of Obj_Pot_A_01 or of the
-// puppet (CoopPuppet_Child / _Adult, coop_puppet_files.c) makes the actor within 2..4 frames, with Link's AS (9 slots)
-// that plays his nodes by name; the release deletes it; two games in one room exchange POS and each asks for and
-// removes the other's puppet. But every actor made here stays in actor state 3 and is not drawn, with +0x48 of the
-// placement 0 or 0x10000/0x10001; put in state 4 by hand it is still not drawn. So the other players' puppets are off
-// unless NX2NAVI_COOP_PUPPETS is set; NX2NAVI_COOP_PUPPET_TEST (spike, shadow), _MODE, _FLAGS and _WAKE are tests.
+// Posing: the engine's transform setter main+0xc6fd60(actor, 3x4 matrix, 0) hands the transform to the actor's physics
+// body or keeps it for the actor's next update (+0x358, +0x364); the actor's own copies (+0x31c, +0x328) are written
+// as well so that a read in the same frame sees it.
+//
+// Status (game 1.1.1, run-checked): a pot and the puppet (CoopPuppet_Child / _Adult, coop_puppet_files.c) are made,
+// taken and drawn where they were asked for, the puppet plays Link's nodes and follows a pose, and two games in one
+// room each make the other's Link as a puppet. The puppet's arms stay half raised where Link's hang down, and it wears
+// no equipment, so the other players' puppets stay off unless NX2NAVI_COOP_PUPPETS is set.
+// NX2NAVI_COOP_PUPPET_TEST=spike|shadow are the one-game tests.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,9 +52,13 @@
 #define CREATE_FN (MAIN + 0x372a70)         // the create request
 #define ACTOR_SYS (MAIN + 0x4e90d90)        // *: +0x458 the queue of pending creates
 #define QUEUE_FIND (MAIN + 0xb2e020)        // (queue, matcher): a pending create the matcher names is taken out (1)
-#define MATCH_VTBL (MAIN + 0x4c595e0)       // the matcher: {vtable, address of the handle cell}
-#define HANDLE_FREE (MAIN + 0xb2e6e0)       // (handle): a handle whose create never ran goes back to its pool
-#define HANDLE_DELETE (MAIN + 0xb2e2e0)     // (handle, 1): the actor the handle holds is deleted
+#define MATCH_VTBL (MAIN + 0x4c595e0)       // the matcher: {vtable, address of the request cell}
+#define HANDLE_FREE (MAIN + 0xb2e6e0)       // (request): a request whose create never ran goes back to its pool
+#define HANDLE_DELETE (MAIN + 0xb2e2e0)     // (request, 1): the actor the request holds is deleted
+#define CREATE_TAKE (MAIN + 0x36fbd0)       // (request, 1, 0) -> the actor, woken into the scene
+#define CREATE_DROP (MAIN + 0x36fde0)       // (request): a request in state 4 is given up
+#define ACTOR_DELETE (MAIN + 0xa6490)       // (actor, 0): the game's generic delete of an actor
+#define ACTOR_SET_MTX (MAIN + 0xc6fd60)     // (actor, 3x4 row-major matrix, 0): the engine's transform setter
 #define EMPTY_TEXT (MAIN + 0x3ee4f8c)       // "" in main's read-only data
 #define PLAYER_HOLDER (MAIN + 0x4e371d0)    // *: +0x480 Link's actor
 #define AS_PLAY (MAIN + 0x2022a0)           // (request): an AS node by name on an actor's AS slot
@@ -54,7 +67,8 @@
 #define FLAGS_MGR (MAIN + 0x4e842a8)        // *: the game's flag database (coop_game.c)
 
 // Actor layout
-#define A_STATE 0x2c        // u32: 4 while it lives
+#define A_STATE 0x2c        // u32: 3 made, 4 in the scene
+#define A_SLEEP 0x30        // u32: flags the take sets while the actor waits in the actor system's list (0 in the scene)
 #define A_DEF_NAME 0x260    // char *: the actor pack's name
 #define A_COMPONENTS 0x270  // -> +0x40 -> +0x18 -> +0x18: the AS control
 #define A_POS 0x31c         // float[3]
@@ -70,11 +84,12 @@
 
 typedef struct {
     uint64_t name;          // char * of the actor's name: the request's x1 points here
-    uint64_t handle;        // the request's handle (x3 points here)
+    uint64_t handle;        // the create request (x3 points here) until its actor is taken
     uint32_t status;        // the request's outcome
     uint32_t pad;
     uint8_t place[0xa0];    // the placement (x2)
     uint64_t matcher[2];    // for the release
+    uint64_t actor;         // the actor once taken
     char text[64];          // the name's bytes
 } __attribute__((aligned(16))) Spawn;
 
@@ -91,12 +106,7 @@ typedef struct {
 
 static struct {
     int test;               // NX2NAVI_COOP_PUPPET_TEST: 1 spike, 2 shadow
-    int mode;               // the placement's byte +0x98: NX2NAVI_COOP_PUPPET_MODE (test), 0 by default
-    uint32_t flags48;       // the placement's u32 at +0x48: NX2NAVI_COOP_PUPPET_FLAGS (test), 0x10000 by default
-    int wake;               // NX2NAVI_COOP_PUPPET_WAKE (test): a puppet left in state 3 is put in state 4 as the create
-                            // job's last step does (main+0x14acc, a CAS 3 -> 4 on actor +0x2c)
-    int remote;             // NX2NAVI_COOP_PUPPETS: the other players' puppets (off by default: the actor is made but
-                            // stays in state 3, not drawn, until the create's activation is understood)
+    int remote;             // NX2NAVI_COOP_PUPPETS: the other players' puppets
     unsigned cfg_seen;
     int set;                // the patch set's index
     int want;               // the present thread's verdict: the hook has work
@@ -111,7 +121,7 @@ static struct {
     uint32_t asked_frame[2];
     // the shadow test
     char shadow_name[64];   // "": CoopPuppet_<Link's age>
-    float side;             // metres to the right of where Link was
+    float side;             // metres to the left of where Link was
     Pose ring[RING];
 } P;
 
@@ -212,10 +222,10 @@ static int spawn_request(Cpu *c, Spawn *s, const char *name, const float pos[3],
     memcpy(s->place + 0x30, one, 12);
     uint64_t empty = EMPTY_TEXT;
     memcpy(s->place + 0x40, &empty, 8);
-    // +0x48: the game's own callers store 0x10000 (main+0xbccecc) or 0x10001 (main+0x9457a8) there, +0x98 is 0 (their
-    // memset of +0x58..+0x98); with +0x48 all zero the actor was made but stayed in state 3, never shown
-    memcpy(s->place + 0x48, &P.flags48, 4);
-    s->place[0x98] = (uint8_t)P.mode;
+    // +0x48 and +0x98 as the AI's create node sets them for an actor it makes in play (main+0x32bca60..0x32bcaa0):
+    // +0x48 a byte 0 (with 1 the asker leaves the actor asleep when it takes it; other callers store 0x10000 or
+    // 0x10001) and +0x98 1
+    s->place[0x98] = 1;
     uint64_t sp = c->sp;
     c->sp = (sp - 0x40) & ~15ull;
     ST64(c->sp + 0x00, 0);
@@ -232,6 +242,15 @@ static int spawn_request(Cpu *c, Spawn *s, const char *name, const float pos[3],
 }
 
 static void spawn_release(Cpu *c, Spawn *s) {
+    if (s->actor) {
+        uint64_t a = s->actor;
+        uint32_t st = LD32(a + A_STATE);
+        uint64_t r = rt_call(c, ACTOR_DELETE, 2, a, 0ull) & 1;
+        rt_log("coop: puppet: w=%.2f release %s: delete actor %#llx -> %llu (state %u -> %u)", wsec(), s->text,
+               (unsigned long long)a, (unsigned long long)r, st, LD32(a + A_STATE));
+        s->actor = 0;
+        return;
+    }
     if (!s->handle) return;
     uint64_t sys = LD64(ACTOR_SYS);
     s->matcher[0] = MATCH_VTBL;
@@ -241,33 +260,62 @@ static void spawn_release(Cpu *c, Spawn *s) {
     uint32_t st = LD32(h);
     if (pending) rt_call(c, HANDLE_FREE, 1, h);
     else rt_call(c, HANDLE_DELETE, 2, h, 1ull);
-    rt_log("coop: puppet: w=%.2f release %s: %s (handle state %#x -> %#x)", wsec(), s->text,
-           pending ? "the create was still pending" : "the actor is deleted", st, LD32(h));
+    rt_log("coop: puppet: w=%.2f release %s: %s (request state %#x -> %#x)", wsec(), s->text,
+           pending ? "the create was still pending" : "its actor is deleted", st, LD32(h));
     s->handle = 0;
 }
 
-// The actor of a create request once it is made: tried at the handle's +8 (checked by the actor's pack name).
-static uint64_t spawn_actor(Spawn *s) {
-    if (!s->handle || !ok_ptr(s->handle, 0x30)) return 0;
-    for (int off = 0; off < 0x30; off += 8) {
-        uint64_t a = LD64(s->handle + off);
-        if (!ok_ptr(a, 0x400)) continue;
-        char n[64];
-        if (!strcmp(text_at(LD64(a + A_DEF_NAME), n, sizeof n), s->text)) return a;
+enum { SPAWN_FAILED = -1, SPAWN_PENDING = 0, SPAWN_MADE = 1 };
+
+// Follows a create request: once it is ready (state 3) the actor is taken as the game's askers take theirs, which
+// puts it in the actor system's list and so into the scene; the request is then forgotten. SPAWN_MADE with s->actor
+// set, SPAWN_PENDING, or SPAWN_FAILED
+// (given up by the game, or failed; nothing is left to release).
+static int spawn_take(Cpu *c, Spawn *s) {
+    if (s->actor) return SPAWN_MADE;
+    if (!s->handle || !ok_ptr(s->handle, 0x30)) return SPAWN_FAILED;
+    uint64_t req = s->handle;
+    uint32_t st = LD32(req) & 0xffff;
+    if (st == 3) {
+        uint64_t made = LD64(req + 8);
+        uint32_t sleep_was = ok_ptr(made, 0x400) ? LD32(made + A_SLEEP) : 0;
+        uint64_t a = rt_call(c, CREATE_TAKE, 3, req, 1ull, 0ull);
+        s->handle = 0;
+        s->actor = ok_ptr(a, 0x400) ? a : 0;
+        rt_log("coop: puppet: w=%.2f %s taken from request %#llx: actor %#llx, state %u, +0x30 %#x -> %#x", wsec(),
+               s->text, (unsigned long long)req, (unsigned long long)a, s->actor ? LD32(a + A_STATE) : 0, sleep_was,
+               s->actor ? LD32(a + A_SLEEP) : 0);
+        return s->actor ? SPAWN_MADE : SPAWN_FAILED;
     }
-    return 0;
+    if (st == 4) {
+        rt_call(c, CREATE_DROP, 1, req);
+        s->handle = 0;
+        rt_log("coop: puppet: w=%.2f %s: the game gave the create up (request state 4)", wsec(), s->text);
+        return SPAWN_FAILED;
+    }
+    if (st == 5 || st == 6) {
+        rt_log("coop: puppet: w=%.2f %s: the create failed (request state %u)", wsec(), s->text, st);
+        spawn_release(c, s);
+        return SPAWN_FAILED;
+    }
+    return SPAWN_PENDING;
 }
 
-static void dump_handle(Spawn *s) {
-    if (!s->handle || !ok_ptr(s->handle, 0x30)) return;
-    uint64_t h = s->handle;
-    rt_log("coop: puppet: w=%.2f handle %#llx of %s: %016llx %016llx %016llx %016llx %016llx %016llx",
-           wsec(), (unsigned long long)h, s->text, (unsigned long long)LD64(h),
-           (unsigned long long)LD64(h + 8), (unsigned long long)LD64(h + 16), (unsigned long long)LD64(h + 24),
-           (unsigned long long)LD64(h + 32), (unsigned long long)LD64(h + 40));
+// Puts an actor at pos turned as rot (row-major) through the engine's setter, and into its own copies.
+static void put_actor(Cpu *c, uint64_t a, const float pos[3], const float rot[9]) {
+    static float m[12] __attribute__((aligned(16)));
+    for (int r = 0; r < 3; r++) {
+        memcpy(m + 4 * r, rot + 3 * r, 12);
+        m[4 * r + 3] = pos[r];
+    }
+    rt_call(c, ACTOR_SET_MTX, 3, a, (uint64_t)(uintptr_t)m, 0ull);
+    memcpy((void *)(uintptr_t)(a + A_POS), pos, 12);
+    memcpy((void *)(uintptr_t)(a + A_ROT), rot, 36);
+    memcpy((void *)(uintptr_t)(a + A_POS2), pos, 12);
+    memcpy((void *)(uintptr_t)(a + A_ROT2), rot, 36);
 }
 
-// ---- the spike (NX2NAVI_COOP_PUPPET_TEST=spike): an actor of the game two metres in front of Link, moved with him
+// ---- the spike (NX2NAVI_COOP_PUPPET_TEST=spike): actors of the game two metres in front of Link, left standing there
 
 static void place_ahead(uint64_t player, float dist, float pos[3], float rot[9]) {
     float m[9];
@@ -314,24 +362,13 @@ static int as_play(Cpu *c, uint64_t actor, const char *name, int slot, float ble
     return (int)(rt_call(c, AS_PLAY, 1, (uint64_t)(uintptr_t)req) & 1);
 }
 
-static void follow(uint64_t player, uint64_t actor, int both) {
-    float pos[3], rot[9];
-    place_ahead(player, 2.0f, pos, rot);
-    memcpy((void *)(uintptr_t)(actor + A_POS), pos, 12);
-    memcpy((void *)(uintptr_t)(actor + A_ROT), rot, 36);
-    if (both) {
-        memcpy((void *)(uintptr_t)(actor + A_POS2), pos, 12);
-        memcpy((void *)(uintptr_t)(actor + A_ROT2), rot, 36);
-    }
-}
-
-// The world clock's seconds of the spike: the pot is asked for at 4 s and follows by its transform (+0x31c) until 12 s,
-// by both copies of it until 20 s, and is released; the pause menu's Link is asked for at 23 s, follows until 45 s
-// (asked for two AS nodes at 30 s) and is released.
+// The seconds of the spike: the first actor (a pot) is asked for at 4 s and released at 20 s; the second (the pause
+// menu's Link unless named) is asked for at 23 s, asked for two AS nodes at 30 s and released at 45 s. Each stands
+// where it was asked for; its place and state are logged every second.
 static char spike_names[2][64] = {"Obj_Pot_A_01", "PouchPlayer_Child"};   // spike:<first>:<second> names others
 enum { SP_WAIT, SP_ASKED, SP_FOLLOW, SP_GONE };
 
-static void spike_one(Cpu *c, uint64_t player, int k, double w, double ask, double both_at, double play_at, double end) {
+static void spike_one(Cpu *c, uint64_t player, int k, double w, double ask, double play_at, double end) {
     Spawn *s = &P.spawn[k];
     int *st = &P.sp_state[k];
     uint64_t a = P.actor[k];
@@ -345,21 +382,17 @@ static void spike_one(Cpu *c, uint64_t player, int k, double w, double ask, doub
     }
     uint32_t in = P.player_frames - P.asked_frame[k];
     if (*st == SP_ASKED) {
-        if (in % 30 == 0) dump_handle(s);
-        a = spawn_actor(s);
-        if (a) {
-            P.actor[k] = a;
+        int r = spawn_take(c, s);
+        if (r == SPAWN_MADE) {
+            a = P.actor[k] = s->actor;
             char n1[64];
-            rt_log("coop: puppet: w=%.2f %s made after %u frames: actor %#llx, instance name '%s', state %u, vtable %#llx, "
-                   "pos %.2f %.2f %.2f, copy %.2f %.2f %.2f", wsec(), s->text, in, (unsigned long long)a,
-                   text_at(LD64(a + 0x20), n1, sizeof n1), LD32(a + A_STATE), (unsigned long long)LD64(a),
-                   f32_at(a + A_POS), f32_at(a + A_POS + 4), f32_at(a + A_POS + 8), f32_at(a + A_POS2),
-                   f32_at(a + A_POS2 + 4), f32_at(a + A_POS2 + 8));
-            dump_handle(s);
+            rt_log("coop: puppet: w=%.2f %s made after %u frames: actor %#llx, instance name '%s', state %u, "
+                   "pos %.2f %.2f %.2f", wsec(), s->text, in, (unsigned long long)a,
+                   text_at(LD64(a + 0x20), n1, sizeof n1), LD32(a + A_STATE), f32_at(a + A_POS),
+                   f32_at(a + A_POS + 4), f32_at(a + A_POS + 8));
             *st = SP_FOLLOW;
-        } else if (w >= end) {
+        } else if (r == SPAWN_FAILED || w >= end) {
             rt_log("coop: puppet: w=%.2f %s not made after %u frames", wsec(), s->text, in);
-            dump_handle(s);
             spawn_release(c, s);
             *st = SP_GONE;
         }
@@ -371,22 +404,18 @@ static void spike_one(Cpu *c, uint64_t player, int k, double w, double ask, doub
             *st = SP_GONE;
             return;
         }
-        int both = w >= both_at;
         if (in % 60 == 0) {
-            rt_log("coop: puppet: w=%.2f %s (%s): before the write pos %.2f %.2f %.2f, copy %.2f %.2f %.2f; Link %.2f %.2f %.2f",
-                   wsec(), s->text, both ? "both copies" : "+0x31c", f32_at(a + A_POS), f32_at(a + A_POS + 4),
-                   f32_at(a + A_POS + 8), f32_at(a + A_POS2), f32_at(a + A_POS2 + 4), f32_at(a + A_POS2 + 8),
-                   f32_at(player + A_POS), f32_at(player + A_POS + 4), f32_at(player + A_POS + 8));
-            if (k) log_as(c, "menu Link", a, 1, P.menu_anim);
+            rt_log("coop: puppet: w=%.2f %s: state %u, +0x30 %#x, at %.2f %.2f %.2f; Link at %.2f %.2f %.2f", wsec(),
+                   s->text, LD32(a + A_STATE), LD32(a + A_SLEEP), f32_at(a + A_POS), f32_at(a + A_POS + 4),
+                   f32_at(a + A_POS + 8), f32_at(player + A_POS), f32_at(player + A_POS + 4), f32_at(player + A_POS + 8));
+            if (k) log_as(c, "spike", a, 1, P.menu_anim);
         }
-        follow(player, a, both);
         if (k && !P.played && w >= play_at) {
-            // the pause menu Link's AS knows its own nodes: ask one, then the local Link's current one
+            // the pause menu Link's AS knows its own nodes, the puppet's Link's: ask one of each
             P.played = 1;
             int r1 = as_play(c, a, "PouchWait", 0, -1.0f);
-            log_as(c, "menu Link", a, 1, P.menu_anim);
             int r2 = as_play(c, a, P.anim[0], 0, -1.0f);
-            rt_log("coop: puppet: w=%.2f menu Link: play 'PouchWait' -> %d, play '%s' -> %d", wsec(), r1, P.anim[0], r2);
+            rt_log("coop: puppet: w=%.2f %s: play 'PouchWait' -> %d, play '%s' -> %d", wsec(), s->text, r1, P.anim[0], r2);
         }
         if (w >= end) {
             spawn_release(c, s);
@@ -395,15 +424,15 @@ static void spike_one(Cpu *c, uint64_t player, int k, double w, double ask, doub
         return;
     }
     if (*st == SP_GONE && a && in < 120 && in % 10 == 0)
-        rt_log("coop: puppet: w=%.2f after the release of %s: readable %d, state %u, handle cell %#llx", wsec(), s->text,
-               ok_ptr(a, 0x400), ok_ptr(a, 0x400) ? LD32(a + A_STATE) : 0, (unsigned long long)s->handle);
+        rt_log("coop: puppet: w=%.2f after the release of %s: readable %d, state %u", wsec(), s->text,
+               ok_ptr(a, 0x400), ok_ptr(a, 0x400) ? LD32(a + A_STATE) : 0);
 }
 
 static void spike(Cpu *c, uint64_t player) {
     double w = wsec();
     if (w < 0) return;
-    spike_one(c, player, 0, w, 4, 12, 0, 20);
-    if (P.sp_state[0] == SP_GONE) spike_one(c, player, 1, w, 23, 23, 30, 45);
+    spike_one(c, player, 0, w, 4, 0, 20);
+    if (P.sp_state[0] == SP_GONE) spike_one(c, player, 1, w, 23, 30, 45);
 }
 
 // ---- a puppet: an actor this file asked for and poses every frame
@@ -416,7 +445,6 @@ typedef struct {
     char asked[SLOTS][64];  // the node each AS slot was asked for
     int play_ok[SLOTS];
     uint32_t seen_state;    // the actor's state last logged
-    int woken;              // the wake test ran on it
 } Puppet;
 
 static void pose_of(Cpu *c, uint64_t actor, Pose *p) {
@@ -441,13 +469,12 @@ static void as_frame_set(Cpu *c, uint64_t asc, int slot, float f) {
 
 static void puppet_ask(Cpu *c, Puppet *p, const char *name, const float pos[3], const float rot[9]) {
     spawn_request(c, &p->s, name, pos, rot);
-    p->state = SP_ASKED, p->actor = 0, p->asked_frame = P.frames;
+    p->state = SP_ASKED, p->actor = 0, p->asked_frame = P.frames, p->seen_state = 0;
     memset(p->asked, 0, sizeof p->asked);
-    p->woken = 0;
 }
 
 // 1 while the actor is still the one made for the request (its pack name: a freed actor's memory may hold another)
-// and alive (state 4).
+// and alive (state 3 until the game has woken it, then 4).
 static int puppet_alive(const Puppet *p) {
     char n[64];
     uint64_t a = p->actor;
@@ -455,67 +482,50 @@ static int puppet_alive(const Puppet *p) {
     return (st == 3 || st == 4) && !strcmp(text_at(LD64(a + A_DEF_NAME), n, sizeof n), p->s.text);
 }
 
-// A request until its actor is made (given up after 20 s), then the actor while it lives. 1 when it can be posed.
+// A request until its actor is made and taken (given up after 20 s), then the actor while it lives. 1 when it can be
+// posed.
 static int puppet_step(Cpu *c, Puppet *p) {
     uint32_t in = P.frames - p->asked_frame;
     if (p->state == SP_ASKED) {
-        if (in % 30 == 0) dump_handle(&p->s);
-        if (!(p->actor = spawn_actor(&p->s))) {
-            if (in < 20 * 60) return 0;
+        int r = spawn_take(c, &p->s);
+        if (r != SPAWN_MADE) {
+            if (r == SPAWN_PENDING && in < 20 * 60) return 0;
             rt_log("coop: puppet: w=%.2f %s not made after %u frames", wsec(), p->s.text, in);
             spawn_release(c, &p->s);
             p->state = SP_GONE, p->asked_frame = P.frames;
             return 0;
         }
-        uint64_t a = p->actor;
+        uint64_t a = p->actor = p->s.actor;
         rt_log("coop: puppet: w=%.2f %s made after %u frames: actor %#llx, state %u, AS control %#llx with %d slots",
                wsec(), p->s.text, in, (unsigned long long)a, LD32(a + A_STATE), (unsigned long long)as_control(a),
                as_slots(as_control(a)));
         p->state = SP_FOLLOW;
     }
     if (p->state != SP_FOLLOW) return 0;
-    if (!puppet_alive(p)) {   // the game removed it (a new area): the handle is no longer ours to release
+    if (!puppet_alive(p)) {   // the game removed it (a new area): it is no longer ours to delete
         rt_log("coop: puppet: w=%.2f %s's actor is gone", wsec(), p->s.text);
-        p->state = SP_GONE, p->actor = 0, p->s.handle = 0, p->asked_frame = P.frames;
+        p->state = SP_GONE, p->actor = p->s.actor = 0, p->asked_frame = P.frames;
         return 0;
-    }
-    if (LD32(p->actor + A_STATE) == 3 && (P.frames - p->asked_frame) % 60 == 30) {
-        // the create job (main+0x130bc..0x14acc) puts an actor in state 4 once the object at +0x188 has its byte +0xdb
-        // at 2..5 and, when +0x1e0 is set, after more work: what holds this one
-        uint64_t r = LD64(p->actor + 0x188), l = P.player, lr = l ? LD64(l + 0x188) : 0;
-        rt_log("coop: puppet: w=%.2f %s in state 3: +0x188 %#llx (+0xdb %d), +0x1e0 %u; Link's %#llx (+0xdb %d), +0x1e0 %u",
-               wsec(), p->s.text, (unsigned long long)r, r && ok_ptr(r, 0xe0) ? (int)LD8(r + 0xdb) : -1,
-               LD32(p->actor + 0x1e0), (unsigned long long)lr, lr && ok_ptr(lr, 0xe0) ? (int)LD8(lr + 0xdb) : -1,
-               l ? LD32(l + 0x1e0) : 0);
-    }
-    if (P.wake && !p->woken && LD32(p->actor + A_STATE) == 3 && P.frames - p->asked_frame >= 30) {
-        uint32_t was = 3;
-        int ok = __atomic_compare_exchange_n((uint32_t *)(uintptr_t)(p->actor + A_STATE), &was, 4u, 0, __ATOMIC_SEQ_CST,
-                                             __ATOMIC_SEQ_CST);
-        p->woken = 1;
-        rt_log("coop: puppet: w=%.2f %s: woken, state 3 -> 4 %s", wsec(), p->s.text, ok ? "done" : "refused");
     }
     return 1;
 }
 
 static void puppet_release(Cpu *c, Puppet *p) {
     if (p->state == SP_ASKED || (p->state == SP_FOLLOW && puppet_alive(p))) spawn_release(c, &p->s);
-    p->state = SP_GONE, p->actor = 0, p->s.handle = 0, p->asked_frame = P.frames;
+    p->state = SP_GONE, p->actor = p->s.actor = p->s.handle = 0, p->asked_frame = P.frames;
 }
 
-// Puts the puppet at pos, turned as rot (row-major, both of the actor's copies of its transform), and has each of its AS
-// slots play the node anim names at anim's frame: asked for when it changes, the frame set every frame.
+// Puts the puppet at pos turned as rot (row-major), and has each of its AS slots play the node anim names at anim's
+// frame: asked for when it changes, the frame set every frame.
 static void puppet_pose(Cpu *c, Puppet *p, const float pos[3], const float rot[9], const Pose *anim, int verbose) {
     uint64_t a = p->actor;
     uint32_t st = LD32(a + A_STATE);
     if (st != p->seen_state) {
-        rt_log("coop: puppet: w=%.2f %s: actor state %u after %u frames", wsec(), p->s.text, st, P.frames - p->asked_frame);
+        rt_log("coop: puppet: w=%.2f %s: actor state %u, +0x30 %#x after %u frames", wsec(), p->s.text, st,
+               LD32(a + A_SLEEP), P.frames - p->asked_frame);
         p->seen_state = st;
     }
-    memcpy((void *)(uintptr_t)(a + A_POS), pos, 12);
-    memcpy((void *)(uintptr_t)(a + A_ROT), rot, 36);
-    memcpy((void *)(uintptr_t)(a + A_POS2), pos, 12);
-    memcpy((void *)(uintptr_t)(a + A_ROT2), rot, 36);
+    put_actor(c, a, pos, rot);
     uint64_t asc = as_control(a);
     int n = as_slots(asc) < anim->nslots ? as_slots(asc) : anim->nslots;
     for (int i = 0; i < n; i++) {
@@ -538,7 +548,7 @@ static int is_adult(uint64_t player) {
 }
 
 // ---- the shadow (NX2NAVI_COOP_PUPPET_TEST=shadow[:<actor>[:<side metres>]]): a puppet that is the local Link of one
-// second ago, side metres to his right then (so that the two stay apart while he stands): his transform, and on each
+// second ago, side metres to his left then (so that the two stay apart while he stands): his transform, and on each
 // AS slot the node he played and its frame. It is asked for 3 s after Link is found and released at 75 s.
 
 static Puppet shadow_p;
@@ -550,7 +560,7 @@ static void shadow(Cpu *c, uint64_t player) {
     const Pose *then = P.player_frames > DELAY ? &P.ring[(P.player_frames - DELAY) % RING] : now;
     float pos[3], rot[9];
     memcpy(rot, then->rot, sizeof rot);
-    for (int k = 0; k < 3; k++) pos[k] = then->pos[k] + rot[k * 3] * P.side;   // the first column: his right
+    for (int k = 0; k < 3; k++) pos[k] = then->pos[k] + rot[k * 3] * P.side;   // the first column: his left
     Puppet *p = &shadow_p;
     if (p->state == SP_WAIT) {
         if (w < 3) return;
@@ -762,7 +772,7 @@ static void puppet_frame(Cpu *c) {
             rt_log("coop: puppet: w=%.2f area '%s'", wsec(), area);
             snprintf(P.area, sizeof P.area, "%s", area);
         }
-        if (P.player_frames % 30 == 0) log_as(c, "Link", player, 0, P.anim);
+        if (P.test && P.player_frames % 30 == 0) log_as(c, "Link", player, 0, P.anim);
         if (P.test == 1) spike(c, player);
         if (P.test == 2) shadow(c, player);
     }
@@ -775,12 +785,8 @@ void coop_puppet_present(void) {
         P.cfg_seen = v;
         const char *t = cfg_get("NX2NAVI_COOP_PUPPET_TEST");
         P.test = !t ? 0 : !strncmp(t, "spike", 5) ? 1 : !strncmp(t, "shadow", 6) ? 2 : 0;
-        const char *m = cfg_get("NX2NAVI_COOP_PUPPET_MODE"), *f = cfg_get("NX2NAVI_COOP_PUPPET_FLAGS");
-        P.mode = m && *m ? atoi(m) : 0;
-        P.flags48 = f && *f ? (uint32_t)strtoul(f, NULL, 0) : 0x10000;
-        const char *wk = cfg_get("NX2NAVI_COOP_PUPPET_WAKE");
-        P.wake = wk && *wk && strcmp(wk, "0") != 0;
-        P.remote = cfg_bool("NX2NAVI_COOP_PUPPETS");
+        const char *r = cfg_get("NX2NAVI_COOP_PUPPETS");   // no row in the settings table: "" or unset is off
+        P.remote = r && *r && strcmp(r, "0") != 0;
         if (P.test == 1 && t[5] == ':') {
             char a[64] = "", b[64] = "";
             if (sscanf(t + 6, "%63[^:]:%63s", a, b) >= 1 && a[0]) snprintf(spike_names[0], sizeof spike_names[0], "%s", a);

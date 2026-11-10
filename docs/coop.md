@@ -5,8 +5,8 @@ game has no multiplayer of its own and its `nn::socket` stays offline: the layer
 (`runtime/coop.c`) with its own UDP socket.
 
 What exists so far: rooms, the relay, a sealed channel for messages between the players, progress sync (below) and the
-menu's Co-op tab (below), which makes, joins, accepts and leaves a room. Showing the other players in the world is in
-progress and off by default (below: the games exchange where their Links are, but the puppet actor is not drawn yet).
+menu's Co-op tab (below), which makes, joins, accepts and leaves a room. The other players can be shown in the world
+as puppets, off by default (below: the puppet is drawn and follows its player, but lacks his arms' pose and his gear).
 
 ## What joining a room means for your save
 
@@ -429,11 +429,15 @@ ASCII or a number that is not finite is dropped), so the other players see where
 player whose Link is in the same area as a puppet (`runtime/coop_puppet.c`): an actor made from the pause menu's Link
 with Link's world animations (`CoopPuppet_Child` / `_Adult`, files made at start while co-op is on,
 `runtime/coop_puppet_files.c`), put at that player's pose of about 100 ms ago and playing his animation; it goes when
-he leaves the area or the room or is not heard for 3 s. Not working yet: the actor is made and posed but stays in an
-inactive state and is not drawn, so the switch is off by default. With the switch or co-op off, or alone in a room,
-the game runs its original per-frame call and nothing of this is sent or logged. Log lines start with `coop: puppet:`
-(`member N is in <area>: asking for CoopPuppet_Child`, `... made after N frames`, `member N's puppet goes (<why>)`,
-`release ...`).
+he leaves the area or the room or is not heard for 3 s. Seen in two games on one PC: each makes the other's puppet,
+and the game that stood showed the other's Link walking off along the bridge. Still missing: the puppet's arms stay
+half raised where Link's hang down (what holds Link's arms is not found yet; the puppet gets the node and frame of his
+first four animation slots), and it wears no sword, shield or tunic; so the switch is off by default. With the switch
+or co-op off, or alone in a room, the game runs its original per-frame call and nothing of this is sent or logged.
+Log lines start with `coop: puppet:` (`member N is in <area>: asking for CoopPuppet_Child`, `... taken from request
+...`, `... made after N frames`, `member N's puppet goes (<why>)`, `release ...`). Tests in one game:
+`NX2NAVI_COOP_PUPPET_TEST=spike` (a pot, then the pause menu's Link, two metres in front of Link) and `=shadow` (a
+puppet one metre beside Link that does what he did a second before); both need `NX2NAVI_COOP=1` for the puppet's files.
 
 ## In the log
 
