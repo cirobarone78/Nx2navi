@@ -1333,6 +1333,22 @@ int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
     return snprintf(name, cap, "%s", n ? n + 1 : d.dli_fname) < (int)cap;
 }
 
+typedef struct { uintptr_t *pc; int n, max; } StackWalk;
+
+static _Unwind_Reason_Code stack_step(struct _Unwind_Context *ctx, void *p) {
+    StackWalk *w = p;
+    uintptr_t ip = _Unwind_GetIP(ctx);
+    if (!ip || w->n == w->max) return _URC_END_OF_STACK;
+    w->pc[w->n++] = ip;
+    return _URC_NO_REASON;
+}
+
+int plat_stack(uintptr_t *pc, int max) {
+    StackWalk w = {pc, 0, max};
+    _Unwind_Backtrace(stack_step, &w);
+    return w.n;
+}
+
 int plat_exe_path(char *out, size_t cap) {
     ssize_t n = readlink("/proc/self/exe", out, cap - 1);
     if (n <= 0 || (size_t)n >= cap - 1) return 0;

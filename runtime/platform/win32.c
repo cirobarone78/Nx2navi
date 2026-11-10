@@ -1503,6 +1503,13 @@ int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
     return WideCharToMultiByte(CP_UTF8, 0, n, -1, name, (int)cap, NULL, NULL) != 0;
 }
 
+int plat_stack(uintptr_t *pc, int max) {
+    void *f[62];
+    USHORT n = RtlCaptureStackBackTrace(1, max < 62 ? (DWORD)max : 62, f, NULL);
+    for (USHORT i = 0; i < n; i++) pc[i] = (uintptr_t)f[i];
+    return n;
+}
+
 int plat_exe_path(char *out, size_t cap) {
     wchar_t w[WPATH];
     DWORD n = GetModuleFileNameW(NULL, w, WPATH);

@@ -81,6 +81,15 @@ int vk_selftest(void);                      // 0 on success
 // process, after the GPU breadcrumbs (vk_crumbs_report). Any other result returns at once.
 void vk_device_fault_report(VkResult r);
 
+// ---- GPU address history (vk_vaddr.c, NX2NAVI_VA_REPORT=1, 2 with call stacks): VK_EXT_device_address_binding_report's
+// reports, kept so vk_device_fault_report can name the objects that held a faulting address.
+int vk_vaddr_wanted(void);
+void vk_vaddr_start(VkInstance instance);                 // create_instance, after vkCreateInstance
+void vk_vaddr_device(int supported);                      // create_device: the driver reports address bindings
+void vk_vaddr_fault(uint64_t addr, uint64_t precision);   // logs the reports whose range covered addr's page
+void vk_vaddr_dump(void);                                 // the whole history to vaddr-history.txt beside the log
+void vk_vaddr_stop(VkInstance instance);                  // before vkDestroyInstance
+
 // ---- GPU breadcrumbs (vk_crumbs.c): with VK_AMD_buffer_marker, each crumb has the GPU write its code into host memory
 // twice, when the command processor reaches it and when all work before it has finished. After a lost device the two
 // codes bracket the work that hung. Without the extension every call returns at once.

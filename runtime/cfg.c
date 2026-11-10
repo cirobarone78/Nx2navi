@@ -66,7 +66,7 @@ static const char *const known[] = {
     "ZSTD_CHECK", "ZSTD_NATIVE",
     "BIND_REUSE", "DYN_DELTA", "STG_ARENA", "SUBMIT_BATCH", "ASTC_GPU_DESWIZZLE", "ASTC_SCRATCH_KEEP", "ASTC_ARENA",
     "TEXUP_LOG_MS", "DYN_RES", "DYN_RES_TARGET", "DYN_RES_STEP",
-    "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET",
+    "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET", "VA_REPORT",
 };
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
@@ -117,7 +117,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"VK_NAN_PRESERVE", "performance"},
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"PASS_CRUMBS", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
     {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"MEM_CENSUS", "diagnostics"}, {"WB_NO_REUP", "diagnostics"}, {"FLUSH_UPLOAD", "diagnostics"}, {"GPA_TWIN_MAX_KB", "diagnostics"},
-    {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"},
+    {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"}, {"VA_REPORT", "diagnostics"},
 };
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
@@ -231,6 +231,7 @@ static const CfgMeta metas[] = {
     {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART}, {"MEM_CENSUS", "0", "0|1", RESTART}, {"WB_NO_REUP", "1", "0|1", RESTART}, {"FLUSH_UPLOAD", "0", "0|1", RESTART}, {"GPA_TWIN_MAX_KB", "0", "0..1048576", RESTART},
     {"WB_MERGE_MAX", "32", "1..256", RESTART}, {"TEXUP_LOG_MS", "0", "0..60000", RESTART},   // vk_texture.c vk_texstat_frame
     {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
+    {"VA_REPORT", "0", "0|1|2", RESTART},   // vk_vaddr.c GPU address history for a lost device's report; 2: call stacks
     {"INPUT_RECORD", "", NULL, RESTART},
 };
 
