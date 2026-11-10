@@ -35,6 +35,7 @@
 
 #include "cfg.h"
 #include "coop.h"
+#include "coop_offer.h"
 #include "coop_puppet.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -722,16 +723,19 @@ static void remotes(Cpu *c, uint64_t player, const char *area) {
     plat_mutex_unlock(&N.lock);
     uint64_t now = plat_now_ms();
     int alive = 0;
+    uint32_t shown = coop_game_shown();   // members accepted and identified (coop_offer_shown)
     for (int id = 1; id <= COOP_MAX_MEMBERS; id++) {
         Puppet *p = &N.puppet[id];
         CoopPos pose = {0};
-        int heard = others && id != self && r[id].n && now - r[id].recv_ms[r[id].head] < SILENT_MS;
+        int trusted = shown >> id & 1;
+        int heard = others && id != self && trusted && r[id].n && now - r[id].recv_ms[r[id].head] < SILENT_MS;
         if (heard) remote_pose(&r[id], (uint32_t)now, &pose);
         int want = heard && player && area[0] && (pose.flags & COOP_POS_IN_WORLD) && !strcmp(pose.area, area);
         char name[64] = "";
         if (want) puppet_name(name, sizeof name, pose.flags & COOP_POS_ADULT);
         if ((p->state == SP_ASKED || p->state == SP_FOLLOW) && (!want || strcmp(p->s.text, name))) {
-            rt_log("coop: puppet: member %d's puppet goes (%s)", id, !heard ? "not heard" : !want ? "not in this area" : "other age");
+            rt_log("coop: puppet: member %d's puppet goes (%s)", id,
+                   !trusted ? "not accepted or not identified" : !heard ? "not heard" : !want ? "not in this area" : "other age");
             puppet_release(c, p);
         }
         if (want && p->state != SP_ASKED && p->state != SP_FOLLOW && (p->state == SP_WAIT || P.frames - p->asked_frame > 120)) {

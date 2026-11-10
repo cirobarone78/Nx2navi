@@ -22,6 +22,7 @@
 
 #include "cfg.h"
 #include "coop.h"
+#include "coop_offer.h"
 #include "coop_state.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -588,6 +589,37 @@ static void probe_pos_counter(void) {
     printf("coop-probe: POS counter: a pose sent again or older is dropped, also 35000 back; another session starts again; "
            "a pose forged 30000 ahead held the sender's own out %lld ms (%d poses)%s\n", waited, held,
            forged_again ? "; a forger that keeps sending holds them out again, while it lasts" : "");
+}
+
+// Whose puppet a game shows (coop_offer_shown, which the game publishes for coop_puppet.c): only a member identified
+// by a key this player accepted under the name it signs now. Not one that never said who it is, nor one whose session
+// two keys dispute (both show as not heard in the offer), nor one with a key not accepted, nor one removed, nor an
+// accepted key that now signs another name.
+static int pos_accepted(const char *key, void *user) {
+    (void)user;
+    return !strcmp(key, "a11c-e000-0000-0001") || !strcmp(key, "c4r0-0000-0000-0003") || !strcmp(key, "da7e-0000-0000-0004");
+}
+
+static void probe_puppet_shown(void) {
+    CoopOffer o;
+    memset(&o, 0, sizeof o);
+    struct { int id, heard, removed; const char *key, *accepted_as; } m[] = {
+        {1, 1, 0, "a11c-e000-0000-0001", ""},       // accepted and identified: shown
+        {2, 0, 0, "", ""},                          // never said who it is, or disputed between two keys
+        {3, 1, 0, "b0b0-0000-0000-0002", ""},       // identified, its key not accepted
+        {4, 1, 1, "c4r0-0000-0000-0003", ""},       // accepted, then removed by the maker
+        {5, 1, 0, "da7e-0000-0000-0004", "Dave"},   // a key accepted as Dave, now under another name
+    };
+    for (size_t i = 0; i < sizeof m / sizeof *m; i++) {
+        CoopOfferMember *e = &o.member[o.n++];
+        e->id = m[i].id, e->heard = m[i].heard, e->removed = m[i].removed;
+        snprintf(e->key, sizeof e->key, "%s", m[i].key);
+        snprintf(e->accepted_as, sizeof e->accepted_as, "%s", m[i].accepted_as);
+    }
+    uint32_t shown = coop_offer_shown(&o, pos_accepted, NULL);
+    CHECK(shown == 1u << 1, "puppets: shown for members %#x, not only for member 1, accepted and identified (2 not "
+                            "identified, 3 not accepted, 4 removed, 5 accepted under another name)", shown);
+    printf("coop-probe: puppets: shown only for a member accepted and identified (members %#x of 1 to 5)\n", shown);
 }
 
 // ---- 3a. a relay of this file
@@ -1517,6 +1549,7 @@ int probe_coop(void) {
     probe_vectors();
     probe_fuzz();
     probe_pos_counter();
+    probe_puppet_shown();
     fails += probe_coop_sync();   // 4. progress sync (coop_sync_probe.c)
     probe_stop_order();
     probe_sessions();

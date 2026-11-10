@@ -36,3 +36,10 @@ int coop_game_contributors(CoopContributor *out, int max);
 // This game holds the key that signs the room's rules (it made the room, in this start of the game or an earlier one):
 // its removals and pool resets act.
 int coop_game_is_maker(void);
+// The members whose puppets this game shows (coop_puppet.c), one bit per member id: identified (heard, so not disputed
+// between two keys), not removed, and with a key this player accepted under the name it signs now (no accepted_as).
+// A member the player has not accepted, or who is not identified, shows no puppet. accepted(key fingerprint, user): 1
+// when this player accepted that key. Kept apart from the game so that --probe-coop checks it (coop_proto.c).
+uint32_t coop_offer_shown(const CoopOffer *o, int (*accepted)(const char *key, void *user), void *user);
+// The same, as the coop thread last published it (0 outside a room).
+uint32_t coop_game_shown(void);

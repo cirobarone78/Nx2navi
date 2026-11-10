@@ -1,6 +1,7 @@
 // The co-op wire format (coop_proto.h): room secrets and their keys, HMAC tags, the datagram header, the client and
 // relay messages and the sealed player messages. Pure functions on bytes.
 #include "coop_proto.h"
+#include "coop_offer.h"   // coop_offer_shown: who the puppets show
 
 #include <string.h>
 
@@ -492,4 +493,15 @@ int coop_pos_fresh(CoopPosSeen *s, uint64_t session, uint32_t pseq, uint64_t now
     if (!again && pseq <= s->last) return 0;
     s->any = 1, s->session = session, s->last = pseq, s->at_ms = now_ms;
     return again ? 2 : 1;
+}
+
+uint32_t coop_offer_shown(const CoopOffer *o, int (*accepted)(const char *key, void *user), void *user) {
+    uint32_t shown = 0;
+    for (int i = 0; i < o->n && i < COOP_MAX_MEMBERS; i++) {
+        const CoopOfferMember *m = &o->member[i];
+        if (m->id >= 1 && m->id <= COOP_MAX_MEMBERS && m->heard && !m->removed && !m->accepted_as[0] && m->key[0] &&
+            accepted(m->key, user))
+            shown |= 1u << m->id;
+    }
+    return shown;
 }

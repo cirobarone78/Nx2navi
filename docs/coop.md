@@ -16,7 +16,8 @@ Read this before you join a room.
   the other players (each by the name and the key fingerprint their game signed), the room's rules and the key that
   signs them; the tab asks you to accept, and the log gives the room's offer a number: `put coop_accept = 1a2b3c4d
   into nx2navi.ini [coop] while the game runs`. Accept on the tab or do that. Until then your game takes nothing from
-  the room. You accept players by
+  the room, and with `NX2NAVI_COOP_PUPPETS=1` it shows no player's puppet either: a puppet shows only for a player
+  whose key you accepted and who is identified. You accept players by
   their keys, not their names: a new player, a player whose game restarted, a removed player who comes back, or a
   second player with a name you know is a new offer, and so are a key you accepted that now carries another name (it
   is accepted under the name it had when you accepted it), other rules, rules signed by another key, and another
@@ -29,7 +30,9 @@ Read this before you join a room.
 - **Your game takes values only from players you accepted.** What a player you did not accept sends is not kept, not
   passed on and never applied, also after that player leaves or is removed. Every message that can change your save is
   signed by the player who sent it, so this holds also against someone who knows the room's secret and runs the relay,
-  or sends from its address on your network: they can make no message in another player's name that your game acts on.
+  or sends from its address on your network: they can make no message in another player's name that changes your save.
+  What they can make is a pose (with puppets on), which moves or hides that player's puppet and nothing else ("Other
+  players in the world").
   For story flags and items acceptance is passed along: a player you accepted hands on what they took from the players
   *they* accepted, so a stranger someone else let in reaches you through them. Pools are not passed along: your game
   counts in a pool only what you and the players you accepted brought, picked up and spent, and joins the pools only
@@ -100,7 +103,7 @@ Read this before you join a room.
 | Who | Sees | Cannot |
 |---|---|---|
 | The relay's operator, and anyone on the network path | that a room exists (a random id and the locator, a value derived from the secret that does not give the secret back), the players' names, their IP addresses, when and how much they send | read, change or make any message between the players; learn the secret; change anyone's save or the room's rules (moving the relay's maker mark changes nothing for a player who accepted). It can drop, delay and send again what a player sent; a player takes one again only as "Replay" below says. With puppets on, after holding a player's datagrams back for 3 s it can send that player's recorded poses again and make the puppet walk an old path while it keeps doing so ("Other players in the world"); nothing else follows from it |
-| Someone who knows the secret and runs the relay, or sends from its address on your network | all of the above, and every message of the room | make a section, identity, pool record or set of rules in another player's name that a game acts on (each is signed by its maker); change your save other than through a player you accepted, or the rules of a player who accepted. It can also: send a member's messages again (see "Replay": within the last 64 they are refused, but four older ones in a row let it send the member's whole present session again); seal a message in a member's name with a counter far ahead, which costs a player that member's next three messages, each time it does so (one after every three of the member's keeps them out while it keeps sending); send rosters, or identities of another key for a member's session, that keep players from being identified or the room from being accepted while it keeps sending and up to 10 s after; send sections and digests in a member's name that use up what a player checks and takes from that member (128 signatures and 48 KB a second), which delays that member's own while it keeps sending; send digests in a member's name with sums of its choosing (see the sync messages); and, to a player who has not accepted the room yet, make every member's digest carry rules of a key of its own (a member does not sign its digest, only the rules in it are signed, by whoever made them): with no maker in the room, or one it controls, that player's game shows those rules and their key in the offer, so compare that key with the maker's before you accept (step 3 below). None of that changes a save, and none of it lasts longer than said once it stops |
+| Someone who knows the secret and runs the relay, or sends from its address on your network | all of the above, and every message of the room | make a section, identity, pool record or set of rules in another player's name that a game acts on (each is signed by its maker); change your save other than through a player you accepted, or the rules of a player who accepted. It can also: send a member's messages again (see "Replay": within the last 64 they are refused, but four older ones in a row let it send the member's whole present session again); seal a message in a member's name with a counter far ahead, which costs a player that member's next three messages, each time it does so (one after every three of the member's keeps them out while it keeps sending); with puppets on, send poses in a member's name (they are not signed), which move that member's puppet or hide it while it keeps sending, one every 3 s being enough ("Other players in the world"); send rosters, or identities of another key for a member's session, that keep players from being identified or the room from being accepted while it keeps sending and up to 10 s after; send sections and digests in a member's name that use up what a player checks and takes from that member (128 signatures and 48 KB a second), which delays that member's own while it keeps sending; send digests in a member's name with sums of its choosing (see the sync messages); and, to a player who has not accepted the room yet, make every member's digest carry rules of a key of its own (a member does not sign its digest, only the rules in it are signed, by whoever made them): with no maker in the room, or one it controls, that player's game shows those rules and their key in the offer, so compare that key with the maker's before you accept (step 3 below). None of that changes a save, and none of it lasts longer than said once it stops |
 | The other players in the room | your name, your progress (what the rules share), your messages, and with `NX2NAVI_COOP_PUPPETS=1` where your Link is (area, position, animation) | your IP address (the relay forwards everything), your account or profile (the id the relay knows you by is random for each start of the game and never shown to them) |
 | Your log and "Copy system info" | the room's first three characters and the offer's number; system info shows that `coop_room`, `coop_server`, `coop_name` and `coop_accept` are set, not their values | the secret, the relay's address (it appears only with `NX2NAVI_TRACE=coop`) |
 
@@ -511,7 +514,9 @@ it sends; a POS with a name that is not printable ASCII or a number that is not 
 see where your Link is, and it shows each other player whose Link is in the same area as a puppet
 (`runtime/coop_puppet.c`): an actor made from the pause menu's Link with Link's world animations (`CoopPuppet_Child` /
 `_Adult`, files made at start while co-op is on, `runtime/coop_puppet_files.c`), put at that player's pose of about
-100 ms ago and playing his animation; it goes when he leaves the area or the room or is not heard for 3 s. A pose is
+100 ms ago and playing his animation, but only for a player whose key you accepted and who is identified (not one
+you have not accepted, one that never said who it is, one whose session two keys dispute, or one removed); it goes
+when he leaves the area or the room, is not heard for 3 s, or is no longer accepted and identified. A pose is
 taken only above the last one taken from the same player in the same session, so a pose sent again or recorded earlier
 (see "Replay") does not move a puppet back while that player's own poses keep arriving. Once none was taken for 3 s,
 the next pose is taken whatever its counter: so the relay, or anyone who can hold a player's datagrams back for 3 s and
@@ -592,7 +597,8 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   middle.
 - `ocarina --probe-coop`: the sockets, the codec and its cryptography (known answers, a sealed message that does not
   open when changed or sent by another), a fuzz of every parser, the puppets' POS counter (a pose sent again, one
-  recorded 35000 poses earlier, another session in the same member number, one forged far ahead), and two sessions in
+  recorded 35000 poses earlier, another session in the same member number, one forged far ahead), whose puppets a game
+  shows (only members accepted and identified), and two sessions in
   one process that make and join a
   room, exchange messages, take garbage and forgeries from a hostile relay (a changed message, one it sealed itself,
   a replay after a rejoin, lies while a player connects), lose the relay and find each other again, and in which the

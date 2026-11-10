@@ -200,6 +200,7 @@ static struct {
     int pub_ncontrib;
     uint64_t pub_contrib_at;        // when the contributors were published (at most every 500 ms; 0: at the next step)
     uint32_t want_accept;           // an offer number the menu accepted (atomic)
+    uint32_t pub_shown;             // the members whose puppets are shown (coop_offer_shown; atomic)
     // the maker's remedies the menu asked for, each with when (ms; 0 none): a request the coop thread did not take
     // within 2 s (co-op went off meanwhile) is dropped, so that it never acts in a later room
     uint64_t want_reset;            // atomic
@@ -609,20 +610,30 @@ static void say_accepted(const CoopOffer *o, const char *how) {
     (void)o;
 }
 
-// What the menu reads (G.lock held): the offer offer_update settled on, whether this game is the maker, and the
-// contributors at most every 500 ms.
+// A key this player accepted (coop_offer_shown's question), G.lock held.
+static int key_accepted(const char *key, void *eng) {
+    uint64_t kid;
+    return coop_sync_key_parse(key, &kid) && coop_sync_accepted_key(eng, kid);
+}
+
+// What the menu and the puppets read (G.lock held): the offer offer_update settled on, whether this game is the maker,
+// the members whose puppets are shown, and the contributors at most every 500 ms.
 static void publish(const CoopOffer *o, int has, uint64_t now) {
     int maker = coop_sync_is_maker(G.eng), fresh = !G.pub_contrib_at || now - G.pub_contrib_at >= 500;
     CoopContributor c[PUB_CONTRIBUTORS];
     int n = fresh ? coop_sync_contributors(G.eng, c, PUB_CONTRIBUTORS) : 0;
+    __atomic_store_n(&G.pub_shown, coop_offer_shown(o, key_accepted, G.eng), __ATOMIC_RELEASE);
     plat_mutex_lock(&G.pub_lock);
     G.pub = *o, G.pub_has = has, G.pub_maker = maker;
     if (fresh) memcpy(G.pub_contrib, c, sizeof *c * (size_t)n), G.pub_ncontrib = n, G.pub_contrib_at = now;
     plat_mutex_unlock(&G.pub_lock);
 }
 
+uint32_t coop_game_shown(void) { return __atomic_load_n(&G.pub_shown, __ATOMIC_ACQUIRE); }
+
 // No engine (co-op off, or between rooms): nothing to read.
 static void publish_none(void) {
+    __atomic_store_n(&G.pub_shown, 0, __ATOMIC_RELEASE);
     plat_mutex_lock(&G.pub_lock);
     if (G.pub_has || G.pub.n || G.pub_ncontrib || G.pub_maker)
         memset(&G.pub, 0, sizeof G.pub), G.pub_has = G.pub_maker = G.pub_ncontrib = 0, G.pub_contrib_at = 0;
