@@ -81,3 +81,6 @@ desktop.ini
 
 # Agent task worktrees (tools/worktree.py)
 /.worktrees/
+
+# The release folder (tools/make_release.py): nx2navi_xlate.exe with its id file, hactool, ninja and the DLLs
+/bin/
