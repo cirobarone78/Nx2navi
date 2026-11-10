@@ -599,6 +599,8 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   that joins only once accepted; and the sixth review's: digests in a member's name whose charter does not check out,
   a changed copy of a member's digest and of the maker's charter sent first, another key's identity for a member's
   session sent first, and a reset's carry with a player who comes after it and with a removal in the same charter;
+  and the seventh review's: a key the player accepted in another member's place under that member's name, and a relay
+  restart that hands the players other numbers;
   and a randomised run (a few seeds by default; `NX2NAVI_COOP_ADVERSARY=first:count` runs those seeds alone,
   `NX2NAVI_COOP_ADVERSARY_TRACE=1` prints its events and the engines' lines) of hostile members who hold the secret,
   admitted or not, and of an attacker with the secret and no accepted key who forges senders and rosters, replays

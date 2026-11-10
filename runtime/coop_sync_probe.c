@@ -2855,7 +2855,10 @@ static int adv_run(uint64_t seed) {
                          !x ? "not in its room" : x->heard ? "another key holds its place" : "a roster, a replay or a forged digest ended or keeps that session");
             if (k != g && ignored >> a->h[k].id & 1) ADV_FAIL(a, "at the end: game %d ignores game %d", g + 1, k + 1);
         }
-        if (rg.epoch != r0.epoch) ADV_FAIL(a, "at the end: game %d holds the maker's charter of epoch %u, the maker %u", g + 1, rg.epoch, r0.epoch);
+        uint64_t signer = 0;
+        coop_sync_key_parse(o.maker_key, &signer);
+        if (rg.epoch != r0.epoch || signer != a->hkid[0])
+            ADV_FAIL(a, "at the end: game %d holds the charter of epoch %u signed by %s, not the maker's of epoch %u", g + 1, rg.epoch, o.maker_key, r0.epoch);
         if (!coop_sync_open(a->h[g].eng)) ADV_FAIL(a, "at the end: game %d's room is not open to it (accepted %d, unidentified %d)", g + 1, o.accepted, o.unidentified);
     }
     int64_t v[ADV_POOLS][ADV_H];
