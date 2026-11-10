@@ -1324,8 +1324,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
         ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
-    # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one
-    ld.append('-Wl,--Map=' + (cache_dir / 'ocarina.map').as_posix())
+    # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one.
+    # -Xlinker passes the path as one argument; -Wl, would cut it at every comma of the game folder's path (issue #470)
+    ld += ['-Xlinker', '--Map=' + (cache_dir / 'ocarina.map').as_posix()]
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
