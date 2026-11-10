@@ -75,7 +75,8 @@ static const char *const known[] = {
     "COOP_PROGRESS", "COOP_ITEMS", "COOP_SONGS", "COOP_QUEST", "COOP_KEYS", "COOP_RUPEES", "COOP_AMMO",   // the room's rules (coop_game.c)
     "COOP_TEST_SET",   // test: sets flags by hash at given frames (coop_game.c); no menu row
     "COOP_ACCEPT",     // accepts a co-op room's members and rules before anything of it is applied (coop_game.c)
-    "COOP_REMOVE",     // the room's maker removes the member of this id (coop.c); no menu row yet
+    "COOP_REMOVE",     // the room's maker removes a member: its id (coop.c), or a key's fingerprint (coop_game.c); no menu row yet
+    "COOP_RESET_POOLS",   // the room's maker resets the pools when it changes to a value other than 0 (coop_game.c); no menu row yet
 };
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).

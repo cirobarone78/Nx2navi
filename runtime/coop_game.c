@@ -163,8 +163,17 @@ static struct {
     char first_rooms[8][COOP_SECRET_TEXT + 1];   // rooms whose first copy of the save was made in this start
     unsigned nfirst;
     uint32_t logged;                // the offer last logged
+    int logged_unid, said_disagree; // and its unidentified members; the members' rules differed (logged)
     int said_always;
     int open;                       // the current offer is accepted and the copy exists: the game thread applies
+
+    // the maker's key for a room (the coop thread's): the room it was looked up for, and whether one is kept
+    char key_code[COOP_SECRET_TEXT + 1];
+    uint8_t room_key[32];
+    int has_room_key, said_random;
+    // the maker's remedies by setting (coop_remove = a key's fingerprint, coop_reset_pools): the values last acted on
+    char remove_seen[32], reset_seen[32];
+    uint64_t spent_seen, spent_at;  // the contributors' spends last logged for the maker, and when
 } G;
 
 #define TRACE_ON (rt_trace & RT_TRACE_COOP)
@@ -437,11 +446,12 @@ static int ensure_engine(void) {
     G.self_id = coop_client_id();
     CoopSync *e = coop_sync_new(G.self_id, 0);   // the schema is the table's, once a save is played (bind)
     if (!e) return 0;
-    uint8_t key[16 + 32] = {0};   // the index's key, and the seed of this start's identities and offer numbers
-    if (!plat_random(key, sizeof key)) {
-        uint64_t t = plat_now_ns() ^ G.self_id;
-        memcpy(key, &t, sizeof t);
-        memcpy(key + 16, &G.self_id, sizeof G.self_id);
+    uint8_t key[16 + 32];   // the index's key, and the seed of this start's identities and offer numbers
+    if (!plat_random(key, sizeof key)) {   // a seed others could guess would let them sign as this player: no co-op
+        coop_sync_free(e);
+        if (!G.said_random) rt_log("coop: sync: the system's random source failed; progress sync stays off");
+        G.said_random = 1;
+        return 0;
     }
     coop_sync_index_key(e, key);
     coop_sync_seed(e, key + 16);
@@ -465,21 +475,51 @@ static void on_message(int from, const uint8_t *bytes, size_t n, void *user) {
     plat_mutex_unlock(&G.lock);
 }
 
+// The maker's key for the room of code (32 random bytes) in <profile>/coop-keys, so that a maker whose game started
+// again signs the room's rules and removals with the same key. The file is named by a hash of the room's secret, and
+// the key is mixed with the secret before use (coop_state.c), so the file alone signs nothing; with the secret, whoever
+// can read the profile folder can act as the room's maker, as whoever can write it can change the save. make: a room
+// this session made gets one when it has none. 1 and the key in key when there is one.
+static int room_key(const char *code, int make, uint8_t key[32]) {
+    uint8_t h[8];
+    coop_blake2b(h, sizeof h, NULL, 0, code, strlen(code));
+    char rel[64], path[1200], dir[1200];
+    snprintf(rel, sizeof rel, "coop-keys/%02x%02x%02x%02x%02x%02x%02x%02x.key", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    if (!fs_profile_path(rel, path, sizeof path) || !fs_profile_path("coop-keys", dir, sizeof dir)) return 0;
+    uint64_t n = 0;
+    uint8_t *b = plat_file_read(path, &n);
+    int ok = b && n == 32;
+    if (ok) memcpy(key, b, 32);
+    free(b);
+    if (ok || !make || !plat_random(key, 32)) return ok;
+    plat_file_mkdir_p(dir);
+    if (!plat_file_write_atomic(path, key, 32)) {
+        rt_log("coop: sync: the room's key could not be kept in %s; a restart of this game ends its say over the room's rules", dir);
+        return 1;
+    }
+    rt_log("coop: sync: the key this game signs the room's rules with is kept in %s (with the room's secret it acts as the room's maker)", dir);
+    return 1;
+}
+
 static void on_view(const CoopView *v, void *user) {
     (void)user;
     int ids[COOP_MAX_MEMBERS], n = 0;
     uint64_t sessions[COOP_MAX_MEMBERS];
-    const char *self_name = "";
     int in_room = v->state == COOP_JOINED || v->state == COOP_RECONNECTING;
     for (int i = 0; in_room && i < v->n; i++) {
-        if (v->member[i].id == v->self) self_name = v->member[i].name;
         sessions[n] = v->member[i].session;
         ids[n++] = v->member[i].id;
+    }
+    if (in_room && (strcmp(G.key_code, v->code) || (v->made && !G.has_room_key))) {   // the file once per room, outside the lock
+        snprintf(G.key_code, sizeof G.key_code, "%s", v->code);
+        G.has_room_key = room_key(v->code, v->made, G.room_key);
     }
     plat_mutex_lock(&G.lock);
     G.view = *v;
     if (G.eng) {
-        coop_sync_name(G.eng, self_name);
+        coop_sync_name(G.eng, v->name);   // the player's own name, signed: the relay's roster may say another
+        if (in_room && G.has_room_key) coop_sync_room_seed(G.eng, v->code, G.room_key);
+        if (!in_room && v->room_lost) coop_sync_room_lost(G.eng);
         coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, sessions, n, in_room ? v->maker : 0, plat_now_ms());
         CoopRules mine;
         read_rules(&mine);
@@ -534,9 +574,9 @@ static void offer_update(uint64_t now) {
         say_accepted(&o, always ? "coop_accept = always" : "coop_accept names its number");
         offer_of(&o, now);
     }
-    if (o.token && !o.accepted && o.token != G.logged) {
+    if (o.token && !o.accepted && (o.token != G.logged || o.unidentified != G.logged_unid)) {
         int again = G.logged != 0;
-        G.logged = o.token;
+        G.logged = o.token, G.logged_unid = o.unidentified;
         char who[COOP_MAX_MEMBERS * 96] = "", rules[200];
         size_t at = 0;
         for (int i = 0; i < o.n && at < sizeof who; i++) {
@@ -550,9 +590,21 @@ static void offer_update(uint64_t now) {
                           : again ? "the room changed (a member, the rules or the key that signs them)" : "a room to accept",
                o.n ? who : "nobody else", rules, o.maker_key);
         if (o.maker_moved) rt_log("coop: sync: the relay names another member as the maker than the one whose key signs the rules; the signed rules stay");
-        rt_log("coop: sync: nothing from the room is applied to this game until its offer %08x is accepted in the menu (or "
-               "NX2NAVI_COOP_ACCEPT=always is in the environment); the save is copied to coop-backup in the profile folder first", o.token);
+        if (o.disagree)
+            rt_log("coop: sync: members carry rules signed by different keys: before accepting, compare the key that signs these rules with the "
+                   "maker's, by voice or chat");
+        if (o.unidentified)
+            rt_log("coop: sync: %d member(s) in the room never said who they are: the room cannot be accepted while they are in it (the maker "
+                   "can remove them, or everyone moves to a new room)", o.unidentified);
+        else
+            rt_log("coop: sync: nothing from the room is applied to this game until you accept it: put coop_accept = %08x into nx2navi.ini "
+                   "[coop] while the game runs (the number is new at each start of the game and changes with the room); the save is copied "
+                   "to coop-backup in the profile folder first", o.token);
     }
+    if (!o.token && o.disagree && !G.said_disagree)
+        rt_log("coop: sync: the members carry rules signed by different keys, so this game takes no rules and applies nothing; ask the "
+               "room's maker which key is theirs");
+    G.said_disagree = !o.token && o.disagree;
     __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
 }
 
@@ -579,8 +631,32 @@ int coop_game_reset_pools(void) {
     plat_mutex_lock(&G.lock);
     int ok = G.eng && coop_sync_reset_pools(G.eng);
     plat_mutex_unlock(&G.lock);
-    if (ok) rt_log("coop: sync: the pools are reset: every game drops their records and joins them again with what it holds");
+    if (ok) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
+    else rt_log("coop: sync: only the room's maker resets the pools");
     return ok;
+}
+
+// The maker removes a key (G.lock held): a member that left, or one in the room.
+static int remove_key(const char *fingerprint) {
+    uint64_t kid;
+    int ok = G.eng && coop_sync_key_parse(fingerprint, &kid) && coop_sync_remove_key(G.eng, kid);
+    if (ok) rt_log("coop: sync: key %s removed: every game drops it and its pool records, and ignores it from now on", fingerprint);
+    else rt_log("coop: sync: key %s was not removed: only the room's maker removes, and only a key the room knows", fingerprint);
+    return ok;
+}
+
+int coop_game_remove_key(const char *fingerprint) {
+    plat_mutex_lock(&G.lock);
+    int ok = remove_key(fingerprint);
+    plat_mutex_unlock(&G.lock);
+    return ok;
+}
+
+int coop_game_contributors(CoopContributor *out, int max) {
+    plat_mutex_lock(&G.lock);
+    int n = G.eng ? coop_sync_contributors(G.eng, out, max) : 0;
+    plat_mutex_unlock(&G.lock);
+    return n;
 }
 
 // coop_remove_member's hook (coop.h): the maker's removal, signed, so that every game drops that identity.
@@ -591,6 +667,24 @@ static int on_remove(int member, void *user) {
     plat_mutex_unlock(&G.lock);
     if (ok) rt_log("coop: sync: member %d removed: every game drops its identity and its pool records", member);
     return ok;
+}
+
+// For the maker: the pool contributors that are not in the room and spent more than they brought, when that changed
+// (at most every 10 s), with the setting that removes each (G.lock held).
+static void say_spenders(uint64_t now) {
+    if (now - G.spent_at < 10000 || !coop_sync_is_maker(G.eng)) return;
+    CoopContributor c[24];
+    int n = coop_sync_contributors(G.eng, c, 24);
+    uint64_t h = 0;
+    for (int i = 0; i < n; i++)
+        if (!c[i].member && !c[i].removed && (c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0))
+            for (int k = 0; k < 3; k++) h = (h ^ (uint64_t)c[i].spent[k] ^ (uint64_t)c[i].key[k * 5]) * 0x100000001b3ull;
+    if (h == G.spent_seen) return;
+    G.spent_seen = h, G.spent_at = now;
+    for (int i = 0; h && i < n; i++)
+        if (!c[i].member && !c[i].removed && (c[i].spent[0] > 0 || c[i].spent[1] > 0 || c[i].spent[2] > 0))
+            rt_log("coop: sync: key %s, not in the room, spent %lld keys, %lld rupees and %lld ammunition beyond what it brought; "
+                   "coop_remove = %s gives them back", c[i].key, (long long)c[i].spent[0], (long long)c[i].spent[1], (long long)c[i].spent[2], c[i].key);
 }
 
 // The copy of the save an accepted room waits for, on the coop thread without G.lock (it takes a while). The first
@@ -628,13 +722,22 @@ static void on_tick(uint64_t now, void *user) {
         plat_mutex_unlock(&G.lock);
         return;
     }
-    if (v != G.cfg_seen_net) {   // a rule setting changed: the room's maker passes it on
+    if (v != G.cfg_seen_net) {   // a setting changed: the room's maker passes the rules on, and acts on its remedies
         G.cfg_seen_net = v;
-        CoopView view;
-        coop_view_get(&view);
         CoopRules mine;
         read_rules(&mine);
-        coop_sync_settings(G.eng, &mine, (view.state == COOP_JOINED || view.state == COOP_RECONNECTING) && view.made);
+        coop_sync_settings(G.eng, &mine, (G.view.state == COOP_JOINED || G.view.state == COOP_RECONNECTING) && G.view.made);
+        // coop_remove = a key's fingerprint (a member id is coop.c's), coop_reset_pools = any new value: until the menu
+        // has rows for them, the maker reaches both from nx2navi.ini while the game runs
+        const char *rm = cfg_value("NX2NAVI_COOP_REMOVE"), *rp = cfg_value("NX2NAVI_COOP_RESET_POOLS");
+        uint64_t kid;
+        if (strcmp(rm, G.remove_seen) && coop_sync_key_parse(rm, &kid)) remove_key(rm);
+        snprintf(G.remove_seen, sizeof G.remove_seen, "%s", rm);
+        if (strcmp(rp, G.reset_seen) && *rp && strcmp(rp, "0")) {
+            if (coop_sync_reset_pools(G.eng)) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
+            else rt_log("coop: sync: coop_reset_pools: only the room's maker resets the pools");
+        }
+        snprintf(G.reset_seen, sizeof G.reset_seen, "%s", rp);
     }
     coop_sync_tick(G.eng, now, send_fn, NULL);
     CoopRules r;
@@ -660,6 +763,7 @@ static void on_tick(uint64_t now, void *user) {
             if (ign >> id & 1 && !(G.ignored_seen >> id & 1))
                 rt_log("coop: sync: member %d sent values this game does not take; nothing more is taken from it while it stays in the room", id);
         G.rejected_seen = st.rejected, G.ignored_seen = ign;
+        say_spenders(now);
     }
     plat_mutex_unlock(&G.lock);
 }

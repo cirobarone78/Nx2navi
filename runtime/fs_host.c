@@ -580,6 +580,11 @@ void fs_save_flush(void) {
     plat_mutex_unlock(&pend_lock);
 }
 
+int fs_profile_path(const char *rel, char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return *profile && snprintf(out, cap, "%s/%s", profile, rel) < (int)cap;
+}
+
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
     char root[1100];
     if (cap) out[0] = 0;

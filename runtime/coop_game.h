@@ -19,11 +19,19 @@ void coop_present(Cpu *c);
 // its offer and a copy of the save was made (<profile>/coop-backup/<time>/, docs/coop.md; the first copy for a room is
 // "first-<time>" and is never pruned). An accepted offer stays accepted while every member is an identity accepted,
 // the rules and the key that signs them stay the same and the same save is played; anything else is a new offer, and
-// nothing more is applied until that one is accepted. The offer's number is random for each start of the game. The
-// COOP_ACCEPT setting accepts every offer with "always" (from the environment only) or one offer by its number; the
-// menu calls coop_game_accept.
+// nothing more is applied until that one is accepted. A member in the room that never identified itself keeps the room
+// unaccepted. The offer's number is random for each start of the game. The COOP_ACCEPT setting accepts one offer by its
+// number (the log shows it) or, from the environment only, every offer with "always"; a menu calls coop_game_accept.
 int coop_game_offer(CoopOffer *out);   // 1 when there is an offer
 int coop_game_accept(uint32_t token);  // 1 when token is the current offer's, which is accepted from now on
-// The room's maker (its game holds the key that signs the rules) resets the pools: every game drops their records and
-// joins them again with what it holds. 1 when done. A removal is coop_remove_member (coop.h).
+// The room's maker (its game holds the key that signs the rules, kept in the profile across restarts) resets the pools:
+// every game joins them again with what they held for the players in the room. 1 when done. The setting
+// COOP_RESET_POOLS does it too (when it changes to a value other than 0).
 int coop_game_reset_pools(void);
+// The room's maker removes a key by its fingerprint (xxxx-xxxx-xxxx-xxxx, as the offer and the log show it), also of a
+// member that left: every game drops it and its pool records. 1 when done. The setting COOP_REMOVE takes a fingerprint
+// too; a member in the room by its id is coop_remove_member (coop.h).
+int coop_game_remove_key(const char *fingerprint);
+// The identities the pools admit and what each spent beyond what it brought (coop_state.h): whom the maker would remove
+// after a drain. Their count (at most max).
+int coop_game_contributors(CoopContributor *out, int max);

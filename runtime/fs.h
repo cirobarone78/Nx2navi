@@ -82,3 +82,6 @@ const char *fs_save_import_done(void);                     // the backup of the 
 // (empty when nothing is saved yet: nothing to copy), 0 when it could not be made (logged). Slow (the whole save): not
 // on the game's thread.
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap);
+// <profile>/rel into out: a file of the profile folder beside the saves (the co-op maker's room keys). 0 when there is
+// no profile folder or the path does not fit.
+int fs_profile_path(const char *rel, char *out, size_t cap);
