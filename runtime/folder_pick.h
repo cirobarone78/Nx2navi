@@ -1,6 +1,6 @@
 // The host's own folder and file dialogs, for menu pages that point at a folder (the Amiibo tab) or a file (a shared
 // save's zip, the Game tab), and the player's Downloads folder: folder_pick_win.cpp with Win32, folder_pick_sdl.c with
-// SDL. The menu has no text entry, so a folder is chosen here or by walking the page's list.
+// SDL. A folder is chosen here or by walking the page's list, not typed.
 #pragma once
 #include <stddef.h>
 

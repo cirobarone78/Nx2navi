@@ -69,6 +69,18 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
         if (!menu_is_open()) return 0;
         if (ImGuiKey k = key_of(w)) menu_event_key(k, m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
         return 0;   // F11 and the system keys keep working
+    case WM_CHAR: {   // UTF-16 units (TranslateMessage); a character outside the BMP comes as a surrogate pair
+        static unsigned high;
+        unsigned c = (unsigned)w;
+        if (c >= 0xd800 && c < 0xdc00) {
+            high = c;
+            return 0;
+        }
+        if (c >= 0xdc00 && c < 0xe000) c = high ? 0x10000 + ((high - 0xd800) << 10) + (c - 0xdc00) : 0;
+        high = 0;
+        if (menu_is_open() && c >= 0x20 && c != 0x7f) menu_event_char(c);
+        return 0;
+    }
     case WM_MOUSEMOVE:
         if (menu_is_open()) menu_event_mouse_pos((float)GET_X_LPARAM(l), (float)GET_Y_LPARAM(l));
         return 0;
