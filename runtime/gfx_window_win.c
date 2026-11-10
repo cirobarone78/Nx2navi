@@ -53,6 +53,7 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
 #define WM_APP_SETTINGS (WM_APP + 1)
 #define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, retried at the first activation
 #define WM_APP_TEXT_INPUT (WM_APP + 3)   // the menu's text field takes text (wParam 1) or no longer (0)
+#define WM_APP_PASTE (WM_APP + 4)        // the menu's Paste: the clipboard's text, read on the window thread
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
 
@@ -196,6 +197,10 @@ void gfx_window_request_close(void) {
 // the window thread, which owns the window's input context.
 void gfx_window_text_input(int on) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TEXT_INPUT, (WPARAM)(on != 0), 0);
+}
+
+void gfx_window_paste(void) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_PASTE, 0, 0);
 }
 
 // ---- refresh rate of the window's monitor (NX2NAVI_FPS_LIMIT=display), measured when the window opens, lands on another
@@ -509,6 +514,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w) ImmAssociateContextEx(h, NULL, IACE_DEFAULT);
         else ImmAssociateContext(h, NULL);
         return 0;
+    case WM_APP_PASTE: {
+        char text[256];
+        plat_clipboard_get(text, sizeof text);
+        menu_event_paste(text);
+        return 0;
+    }
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) gfx_window_mark_dirty();

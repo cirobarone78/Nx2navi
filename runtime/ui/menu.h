@@ -35,6 +35,9 @@ void menu_event_mouse_button(int button, int down);   // 0 left, 1 right, 2 midd
 void menu_event_wheel(float dx, float dy);
 void menu_event_focus(int focused);
 void menu_event_char(unsigned c);         // a character typed, a Unicode code point (a text field takes it)
+void menu_event_paste(const char *utf8);  // the clipboard's text gfx_window_paste read ("" none), on the window thread
+// The text the last gfx_window_paste brought, once: 1 and the text in out (cap bytes), 0 while none has arrived.
+int menu_paste_take(char *out, size_t cap);
 
 // ---- the overlay, drawn into the swapchain image after the game image (gfx_present.c, present lock held)
 typedef struct {
@@ -75,6 +78,7 @@ void gfx_window_request_close(void);      // as the window's close button: the p
 void gfx_window_request_restart(void);    // the same, then nx2navi.exe starts again with the same command line
 void gfx_window_text_input(int on);       // a menu text field is active (on) or no longer: the window delivers typed
                                           // characters to menu_event_char meanwhile, and a handheld shows its keyboard
+void gfx_window_paste(void);              // reads the clipboard on the window thread and hands it to menu_event_paste
 int gfx_window_monitor_size(int *w, int *h);   // pixels of the monitor the window is on; 0 when unknown
 double gfx_window_refresh_hz(void);            // its refresh rate (NX2NAVI_FPS_LIMIT=display); 0 when unknown
 unsigned gfx_window_dpi(void);                 // the window's DPI (96 at 100% display scale); any thread

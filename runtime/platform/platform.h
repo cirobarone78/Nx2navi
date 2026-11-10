@@ -446,8 +446,12 @@ int plat_is_wine(void);                                   // 1 when the Windows 
 // The file the process's stderr (the log) goes to, as a UTF-8 path; 0 when stderr is not a file (a console, a pipe).
 int plat_stderr_path(char *out, size_t cap);
 
-// ---- desktop: the in-game menu's "Copy system info" and "Open log folder"
+// ---- desktop: the in-game menu's "Copy system info", "Open log folder" and the Co-op tab's secret
 int plat_clipboard_set(const char *utf8);                 // replaces the clipboard's text; 1 on success
+// The clipboard's text as UTF-8 in out (cap bytes with the NUL; a longer text: "" on Windows, cut at a character
+// elsewhere); 1 when it had text. With SDL only on the window thread, as SDL asks: the menu goes through
+// gfx_window_paste (ui/menu.h).
+int plat_clipboard_get(char *out, size_t cap);
 int plat_open_folder(const char *path);                   // shows the folder in the file manager; 1 on success
 
 // ---- dynamic libraries: a library some machines lack (a GPU vendor's), loaded at run time. A bare name is searched

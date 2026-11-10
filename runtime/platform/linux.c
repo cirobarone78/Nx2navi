@@ -1820,6 +1820,22 @@ int plat_random(void *out, size_t n) {
 
 int plat_clipboard_set(const char *utf8) { return SDL_SetClipboardText(utf8); }
 
+int plat_clipboard_get(char *out, size_t cap) {
+    if (!cap) return 0;
+    out[0] = 0;
+    char *t = SDL_GetClipboardText();   // "" when there is none, never NULL but on failure
+    if (!t) return 0;
+    size_t n = strlen(t);
+    if (n >= cap) {   // cut where a character starts, not inside one
+        n = cap - 1;
+        while (n && ((unsigned char)t[n] & 0xc0) == 0x80) n--;
+    }
+    memcpy(out, t, n);
+    out[n] = 0;
+    SDL_free(t);
+    return n != 0;
+}
+
 static void reap_main(void *arg) {
     waitpid((pid_t)(intptr_t)arg, NULL, 0);
 }

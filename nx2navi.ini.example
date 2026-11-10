@@ -493,6 +493,7 @@
 [coop]
 # Co-op: your own game and save, with the other players' progress shared through a relay (docs/coop.md). Positions are
 # not shared yet: you do not see the other players in your world.
+# The menu's Co-op tab sets the name, the relay and the rules below, and makes, joins, accepts and leaves a room.
 # 0 = off: no thread work, no socket. Takes effect at once.
 # coop = 0
 # Your name for the other players, at most 24 bytes. Default: Player- and four random hex digits.
@@ -528,12 +529,12 @@
 # coop_ammo = own
 # Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
 # your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
-# offer with a number (eight hex digits, new at each start of the game); put that number here while the game runs to
-# accept that offer (this line as the file is now counts, before the one read at start). A new member, other rules or
-# another save loaded make a new offer with a new number. A member who never says who it is keeps the room from being
-# accepted. Your key pools count only you and the players you accepted, among those the room's maker lets use them.
-# Accepting every room (always) is taken from the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file,
-# so an ini someone hands you cannot accept a room for you.
+# offer with a number (eight hex digits, new at each start of the game); accept it on the menu's Co-op tab, or put that
+# number here while the game runs to accept that offer (this line as the file is now counts, before the one read at
+# start). A new member, other rules or another save loaded make a new offer with a new number. A member who never says
+# who it is keeps the room from being accepted. Your key pools count only you and the players you accepted, among those
+# the room's maker lets use them. Accepting every room (always) is taken from the environment only
+# (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a room for you.
 # coop_accept = ask
 # The room's maker, no menu row yet: coop_remove = a player's key fingerprint (xxxx-xxxx-xxxx-xxxx, as the log shows it
 # beside each member), in the room or after it left; every game drops that key and what it took from the pools. A member

@@ -1693,6 +1693,19 @@ int plat_clipboard_set(const char *utf8) {
     return ok;
 }
 
+int plat_clipboard_get(char *out, size_t cap) {
+    if (!cap) return 0;
+    out[0] = 0;
+    if (!OpenClipboard(NULL)) return 0;   // reading needs no owner window
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *w = h ? GlobalLock(h) : NULL;
+    int n = w ? WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) : 0;   // 0 when it does not fit
+    if (w) GlobalUnlock(h);
+    CloseClipboard();
+    if (n <= 0) out[0] = 0;
+    return out[0] != 0;
+}
+
 static DWORD WINAPI open_folder_main(void *arg) {
     ShellExecuteW(NULL, L"open", arg, NULL, NULL, SW_SHOWNORMAL);
     free(arg);

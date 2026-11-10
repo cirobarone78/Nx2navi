@@ -4,18 +4,19 @@ Each player runs their own game and save; the co-op layer connects the games of 
 game has no multiplayer of its own and its `nn::socket` stays offline: the layer is a host thread of the runtime
 (`runtime/coop.c`) with its own UDP socket.
 
-What exists so far: rooms, the relay, a sealed channel for messages between the players, and progress sync (below).
-Showing the other players in the world and the menu tab are not there yet; until the tab is, the settings below are in
-`nx2navi.ini` only, and you accept a room by putting the number the log shows into `coop_accept` while the game runs.
+What exists so far: rooms, the relay, a sealed channel for messages between the players, progress sync (below) and the
+menu's Co-op tab (below), which makes, joins, accepts and leaves a room. Showing the other players in the world is not
+there yet.
 
 ## What joining a room means for your save
 
 Read this before you join a room.
 
-- **Nothing from a room reaches your game until you accept it.** When you join, the log names the other players (each
-  by the name and the key fingerprint their game signed), the room's rules and the key that signs them, and gives the
-  room's offer a number: `put coop_accept = 1a2b3c4d into nx2navi.ini [coop] while the game runs`. Do that to accept
-  (the menu tab will do it once it exists). Until then your game takes nothing from the room. You accept players by
+- **Nothing from a room reaches your game until you accept it.** When you join, the menu's Co-op tab and the log name
+  the other players (each by the name and the key fingerprint their game signed), the room's rules and the key that
+  signs them; the tab asks you to accept, and the log gives the room's offer a number: `put coop_accept = 1a2b3c4d
+  into nx2navi.ini [coop] while the game runs`. Accept on the tab or do that. Until then your game takes nothing from
+  the room. You accept players by
   their keys, not their names: a new player, a player whose game restarted, a removed player who comes back, or a
   second player with a name you know is a new offer, and so are other rules, rules signed by another key, and another
   save loaded in the room; nothing more is taken until you accept that one too. A player in the room whose game never
@@ -91,6 +92,29 @@ Read this before you join a room.
    a new `save/<numbers>` of the same name.
 5. Start the game: every slot is as it was when you accepted the room. Progress made after that, in any slot, is in the
    folder you moved aside, not in the copy.
+
+## The menu's Co-op tab
+
+The menu (F1, or the pad's combo) has a Co-op tab, usable with the keyboard, the mouse and a pad.
+
+- **Not in a room:** your name and the relay's address (each row opens a field to type in; with a pad, A on the field
+  brings up the system's on-screen keyboard where it has one), Make a room, Join a room (a field for the secret, in any
+  case, with or without dashes, and a Paste button that takes the clipboard's text), a line that says what the layer is
+  doing or why it stopped (no answer from the relay, no room with that secret, refused), the rules of a room you make,
+  and the co-op switch. Make and Join turn co-op on when it is off.
+- **In a room:** while the room waits for your answer, who is in it and what its rules share, and Accept or not;
+  the players, with who made the room and how long ago each was last heard (the room's maker has Remove on each other
+  player's row); the room's secret, hidden until you press its row, and a row that copies it to the clipboard; the
+  rules (the maker changes them, everyone else reads them; a change is a new offer for everyone); Leave the room.
+- **Nothing is accepted, removed or left by accident.** Accept or not, Remove and Leave each open a window whose
+  cursor starts on the safe button (Not now, Cancel, Stay), whenever it opens; pressing the button that opened it again,
+  holding it, or a double tap lands there. A new player or other rules while the Accept window is open replace what it
+  shows and put the cursor back on Not now: Accept takes only the offer you read. The window says that your whole save
+  is copied to `coop-backup` first.
+- **While the menu is closed** a short note at the top of the screen says when a player joined or left the room and
+  when the room waits for your answer.
+- The name, the relay, the rules and the switch are settings (written to `nx2navi.ini` like every row); the secret is
+  not a setting, is not written to the log, and is shown only when you ask.
 
 ## Running a relay
 
@@ -415,16 +439,18 @@ a datagram: it may be lost or arrive out of order; a replay is refused), `coop_o
 them on the coop thread, `coop_on_view(fn, user)` reports the state and the roster (with each member's maker mark and
 whether its messages opened), `coop_view_get(&view)` copies them, `coop_command(COOP_CMD_CREATE | COOP_CMD_JOIN |
 COOP_CMD_LEAVE, secret)` drives the room, `coop_remove_member(id)` is the maker's removal (progress sync signs it
-through `coop_on_remove`). `runtime/coop_game.h`: `coop_game_offer(&offer)` and `coop_game_accept(number)` are the
-menu's way to show a room and accept it (`CoopOffer` in `runtime/coop_state.h`: each member's signed name, key
-fingerprint, whether it is identified or removed, how many members never identified (the room cannot be accepted
-while there are any), whether the members' rules disagree, the rules and the key that signs them, whether another save
-is played and whether the copy is made), `coop_game_reset_pools()` is the maker's pool reset,
-`coop_game_remove_key(fingerprint)` the maker's removal of a key (also of a player who left), and
+through `coop_on_remove`). `runtime/coop_offer.h` holds the menu's calls, none of which waits for the sync engine (what
+they read is a copy the coop thread publishes at each step, what they ask it carries out at its next step):
+`coop_game_offer(&offer)` and `coop_game_accept(number)` show a room and accept it (`CoopOffer` in
+`runtime/coop_state.h`: each member's signed name, key fingerprint, whether it is identified or removed, how many
+members never identified (the room cannot be accepted while there are any), whether the members' rules disagree, the
+rules and the key that signs them, whether another save is played and whether the copy is made),
+`coop_game_reset_pools()` is the maker's pool reset, `coop_game_remove_key(fingerprint)` the maker's removal of a key
+(also of a player who left; a member in the room with that key is removed at the relay too), and
 `coop_game_contributors()` lists the pools' contributors with what each took beyond what it brought, per pool and in
-the room or not (a player who used keys others found is among them). `CoopView.made`
-is this session's own creation of the room, `CoopView.name` the player's own name. The wire format is
-`runtime/coop_proto.h`. Progress sync uses `coop_on_tick(fn, user)` for its timers.
+the room or not (a player who used keys others found is among them). `CoopView.made` is this session's own creation of
+the room, `CoopView.name` the player's own name. The wire format is `runtime/coop_proto.h`. Progress sync uses
+`coop_on_tick(fn, user)` for its timers.
 
 ## Checks
 
@@ -458,3 +484,8 @@ is this session's own creation of the room, `CoopView.name` the player's own nam
   ahead, rosters that list another session again and again, a refusal for the network's joins, and a room that is not
   there. `ocarina --probe-fs` checks that the first copy
   of a save outlasts the rotation.
+- `python tests/coop_page_check.py`: the menu's Co-op tab without the game, driven with the keyboard's and the pad's
+  events: typing a name, a relay and a secret (Q and E are letters there, not tab keys), Make, Join with a wrong secret
+  and a pasted one, the offer accepted and declined, Remove, Leave, the maker's rules and the others' read-only ones;
+  Accept, Remove and Leave never act on a second press, a held button or a double tap, and a new offer under an open
+  Accept window puts the cursor back on Not now. Needs a C++ compiler only.
