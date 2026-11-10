@@ -985,7 +985,8 @@ typedef struct {
     CoopSess *sess;
     PlatThread *thread;
     volatile int stop;
-    volatile unsigned views, saw_reconnect;
+    volatile unsigned views, saw_reconnect;   // saw_reconnect: times the session went into RECONNECTING (rejoins)
+    int last_state;                           // the state of the last view (the view hook's thread only)
     volatile unsigned got, dups, byes, from_wrong;   // test messages received, delivered twice, BYEs, from a member other than the expected
     uint32_t seen[512];
     int expect_from;
@@ -1015,7 +1016,10 @@ static void on_bye(int from, const uint8_t *bytes, size_t n, void *user) {
 static void on_view_change(const CoopView *v, void *user) {
     Player *p = user;
     __atomic_add_fetch(&p->views, 1, __ATOMIC_RELAXED);
-    if (v->state == COOP_RECONNECTING) __atomic_add_fetch(&p->saw_reconnect, 1, __ATOMIC_RELAXED);
+    // a rejoin publishes a view at each change while it lasts (its status text, the roster): count the step into
+    // RECONNECTING, not every view in it
+    if (v->state == COOP_RECONNECTING && p->last_state != COOP_RECONNECTING) __atomic_add_fetch(&p->saw_reconnect, 1, __ATOMIC_RELAXED);
+    p->last_state = v->state;
 }
 
 static uint16_t free_port(void) {
