@@ -463,7 +463,7 @@ static void gpa_read_record(VkCommandBuffer cb, void *arg) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->layout, 0, 1, &r->set, 0, NULL);
     vkCmdPushConstants(cb, r->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof r->source, &r->source);
-    vk_mem_gpa_use(); // actual table use, including this second dispatch's reused descriptor set
+    vk_mem_gpa_use(1); // actual table use, including this second dispatch's reused descriptor set
     vkCmdDispatch(cb, 1, 1, 1);
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

@@ -1,0 +1,122 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1876,6 +1876,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         //   word 65552  second-level blocks of 4096 entries, one per 4 KiB page: the record of the buffer that holds
+         //               the page, 0 for none
+         //   words 3-4   the device address of a 4 KiB scratch buffer, where a twin write goes when the page has no twin
++        //   word 5      the word index of the page marks: 128 words per second-level block, a bit per page
++        //   word 6      the word index of the written-page list: a count, then a ring of 65536 entries, each the GPU
++        //               address >> 12 of a page a store or atomic marked first
+         //   records     four words each: the device address of the buffer the page's accesses use minus its GPU address,
+         //               then the same for the page's twin, the pool's imported buffer in guest memory when the first is
+         //               its VRAM mirror (low words first); the host never changes a record a page names, so a page entry
+@@ -1891,11 +1894,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         // GPU resets with one counts on from the same value in both.
+         private static SpvInstruction GetDeviceAddressPointer(CodeGenContext context, int binding, SpvInstruction low, SpvInstruction high)
+         {
+-            return GetDeviceAddressPointers(context, binding, low, high, out _);
++            return GetDeviceAddressPointers(context, binding, low, high, false, out _);
+         }
+ 
+-        // twinPointer: the guest copy of a mirrored page, else the scratch buffer.
+-        private static SpvInstruction GetDeviceAddressPointers(CodeGenContext context, int binding, SpvInstruction low, SpvInstruction high, out SpvInstruction twinPointer)
++        // twinPointer: the guest copy of a mirrored page, else the scratch buffer. write: a store or atomic, which marks
++        // its page first. Shadow storage keeps a pool in a buffer of its own, with no twin in guest memory, so the host
++        // learns from the marks which pages shaders write through the table and copies them back (runtime/vk_gpa.c,
++        // "Written pages"). A page marked before costs one load; the first store to mark it appends it to the list.
++        private static SpvInstruction GetDeviceAddressPointers(CodeGenContext context, int binding, SpvInstruction low, SpvInstruction high, bool write, out SpvInstruction twinPointer)
+         {
+             SpvInstruction u32 = context.TypeU32();
+             SpvInstruction u64 = context.TypeInt(64, 0);
+@@ -1934,6 +1940,38 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             SpvInstruction ptrType = context.TypePointer(StorageClass.PhysicalStorageBuffer, u32);
+             twinPointer = context.ConvertUToPtr(ptrType, context.Select(u64, hasTwin, twinDevice, scratch));
+ 
++            if (write)
++            {
++                SpvInstruction scope = U(1);   // device
++                SpvInstruction semantics = U(0);
++                SpvInstruction bit = context.ShiftLeftLogical(u32, U(1), context.BitwiseAnd(u32, page, U(31)));
++                SpvInstruction markIndex = context.IAdd(u32, Word(U(5)), context.IAdd(u32, context.IMul(u32, block, U(128)), context.ShiftRightLogical(u32, page, U(5))));
++                SpvInstruction markPtr = context.AccessChain(elemPtr, tableVar, zero, markIndex);
++                SpvInstruction unmarked = context.LogicalAnd(boolType, mapped, context.IEqual(boolType, context.BitwiseAnd(u32, context.Load(u32, markPtr), bit), U(0)));
++                SpvInstruction markLabel = context.Label(), appendLabel = context.Label(), appended = context.Label(), marked = context.Label();
++                context.SelectionMerge(marked, SelectionControlMask.MaskNone);
++                context.BranchConditional(unmarked, markLabel, marked);
++
++                context.AddLabel(markLabel);
++                SpvInstruction old = context.AtomicOr(u32, markPtr, scope, semantics, bit);
++                SpvInstruction first = context.IEqual(boolType, context.BitwiseAnd(u32, old, bit), U(0));
++                context.SelectionMerge(appended, SelectionControlMask.MaskNone);
++                context.BranchConditional(first, appendLabel, appended);
++
++                context.AddLabel(appendLabel);
++                SpvInstruction list = Word(U(6));
++                SpvInstruction n = context.AtomicIAdd(u32, context.AccessChain(elemPtr, tableVar, zero, list), scope, semantics, U(1));
++                SpvInstruction slot = context.IAdd(u32, list, context.IAdd(u32, U(1), context.BitwiseAnd(u32, n, U(0xffff))));
++                SpvInstruction gpuPage = context.BitwiseOr(u32, context.ShiftLeftLogical(u32, high, U(20)), context.ShiftRightLogical(u32, low, U(12)));
++                context.Store(context.AccessChain(elemPtr, tableVar, zero, slot), gpuPage);
++                context.Branch(appended);
++
++                context.AddLabel(appended);
++                context.Branch(marked);
++
++                context.AddLabel(marked);
++            }
++
+             return context.ConvertUToPtr(ptrType, address);
+         }
+ 
+@@ -1958,7 +1996,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             SpvInstruction u32 = context.TypeU32();
+             SpvInstruction low = context.Get(AggregateType.U32, operation.GetSource(1));
+             SpvInstruction high = context.Get(AggregateType.U32, operation.GetSource(2));
+-            SpvInstruction pointer = GetDeviceAddressPointers(context, binding, low, high, out SpvInstruction twin);
++            SpvInstruction pointer = GetDeviceAddressPointers(context, binding, low, high, isStore, out SpvInstruction twin);
+             StorageKind kind = operation.StorageKind;
+             int bits = kind is StorageKind.GlobalMemoryS8 or StorageKind.GlobalMemoryU8 ? 8
+                 : kind is StorageKind.GlobalMemoryS16 or StorageKind.GlobalMemoryU16 ? 16 : 32;
+@@ -2025,6 +2063,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     ((AstOperand)operation.GetSource(0)).Value,
+                     context.Get(AggregateType.U32, operation.GetSource(1)),
+                     context.Get(AggregateType.U32, operation.GetSource(2)),
++                    true,   // atomics write
+                     out twin);
+             }
+ 
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -340,12 +340,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             LinkedListNode<INode> node,
+             Operation operation)
+         {
++            // NX2NAVI: a store or atomic writes the table's page marks (CodeGen/Spirv/Instructions.cs
++            // GetDeviceAddressPointers), so its binding is a written one.
++            bool write = (operation.Inst & Instruction.Mask) == Instruction.Store || operation.Inst.IsAtomic();
+             if (!gpuAccessor.QueryHostSupportsBufferDeviceAddress() ||
+                 (operation.Inst & Instruction.FP32) != 0 ||
+                 (operation.Inst & Instruction.Mask) == Instruction.AtomicCompareAndSwap && operation.StorageKind != StorageKind.GlobalMemory ||
+                 operation.SourcesCount < 2 ||
+                 (operation.StorageKind != StorageKind.GlobalMemory && operation.Inst.IsAtomic()) ||
+-                !resourceManager.TryGetDeviceAddressTableBinding(out int binding))
++                !resourceManager.TryGetDeviceAddressTableBinding(write, out int binding))
+             {
+                 return false;
+             }
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -180,9 +180,12 @@ namespace Ryujinx.Graphics.Shader.Translation
+         // (NVN banks are 0-17, GlobalToStorage.PointerSlotFlag is 0x20); tools/xlate/Program.cs writes it as "table".
+         public const int DeviceAddressTableCbSlot = 0x40;
+ 
+-        public bool TryGetDeviceAddressTableBinding(out int binding)
++        // write: the program stores or does atomics through the table's pointers, which mark their pages in the table
++        // (CodeGen/Spirv/Instructions.cs GetDeviceAddressPointers). res.json's written flag on the table then tells the
++        // host that the program writes guest memory through it.
++        public bool TryGetDeviceAddressTableBinding(bool write, out int binding)
+         {
+-            if (!TryGetStorageBufferBinding(DeviceAddressTableCbSlot, 0, false, out binding))
++            if (!TryGetStorageBufferBinding(DeviceAddressTableCbSlot, 0, write, out binding))
+             {
+                 return false;
+             }

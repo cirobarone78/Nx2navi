@@ -327,9 +327,11 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb);
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
 void vk_mem_shadow_sync(void);
-// Actual GPA-table shader use in a recorded part, even when its descriptors are reused; prologue consumes the mark.
-void vk_mem_gpa_use(void);
-void vk_mem_gpa_sync(void);
+// Actual GPA-table shader use in a recorded part, even when its descriptors are reused (VkPipeInfo.gpa); the part's
+// prologue consumes the mark: vk_mem_gpa_sync copies the CPU's writes into the mapped pools and, under shadow storage,
+// sees to the pages shaders wrote through the table, which go back to guest memory at fence.
+void vk_mem_gpa_use(int how);
+void vk_mem_gpa_sync(uint64_t fence);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
 // The same for a GPU write into a VRAM mirror, which went back to guest memory with the submission: the texture checks
@@ -679,7 +681,7 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // a stage indexes the texture or sampler pool: bind set 2 (the pools)
-    int gpa;                               // a stage accesses guest pointers through the device address table
+    int gpa;                               // 1: a stage reads guest memory through the device address table; 3: also writes
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.

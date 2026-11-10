@@ -499,8 +499,8 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
 // part was recorded, sub_lock held; may move slots[].
 // First brings the shadow storage up to date with the CPU's writes, which needs no command buffer.
 static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
-    vk_mem_shadow_sync();   // shadow storage: the CPU's writes go in before the part is submitted
-    vk_mem_gpa_sync();      // GPA-only readers never resolved their source pools while recording
+    vk_mem_gpa_sync(fence);   // GPA-only readers never resolved their source pools; first: base copies of written pages
+    vk_mem_shadow_sync();     // shadow storage: the CPU's writes go in before the part is submitted
     if (!vk_mem_mirror_pending()) return VK_NULL_HANDLE;
     int i = claim_slot(c, fence);   // before reading slots: the claim may move it
     VkCommandBuffer cb = slots[i].cb;

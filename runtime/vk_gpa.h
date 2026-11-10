@@ -24,5 +24,8 @@ uint32_t vk_gpa_remap(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, 
 // The same without the twin: the pages name buf alone (a pool whose VRAM mirror is evicted goes back to its imported
 // buffer).
 uint32_t vk_gpa_remap_plain(uint64_t lo, uint64_t hi, uint32_t old_rec, VkBuffer buf, uint64_t buf_lo);
+// Replay: the pages shaders newly wrote through the table, as guest page addresses in *pages (valid until the next call);
+// returns their number (vk_gpa.c "Written pages").
+int vk_gpa_written_pages(const uint64_t **pages);
 void vk_gpa_report(void);
 void vk_gpa_shutdown(void);

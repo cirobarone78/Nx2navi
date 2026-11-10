@@ -9,6 +9,9 @@
 //   words 0-1    the device address of a zeroed 4 KiB buffer, which an address no page maps reads and writes instead
 //   word 2       the word index of the records (REC_WORD)
 //   words 3-4    the device address of a 4 KiB scratch buffer, where a twin write goes when its page has no twin
+//   word 5       MARK_WORD: the page marks, a bit per page, MARK_N words per L2 block ("Written pages" below)
+//   word 6       LIST_WORD: the written-page list, a count, then a ring of LIST_N entries, the GPU address >> 12 of each
+//                page whose mark a store or atomic set first
 //   words 16..   L1: 65536 entries, one per 16 MiB of the 40-bit GPU address space, the index of its L2 block (0: none)
 //   word 65552   L2 blocks of 4096 entries, one per 4 KiB page: the record of the buffer that holds the page (0: none)
 //   REC_WORD     records of four words: the buffer's device address minus the GPU address of its byte 0, then the same
@@ -36,7 +39,20 @@
 // NX2NAVI_GPA=0 turns the table off: the translator is told the host has no device addresses (those accesses read 0).
 // NX2NAVI_GPA_EMPTY=1 keeps it empty, so every access through it reads the zero buffer (diagnosis).
 // Actual shader use marks the submission part (vk_exec_draw.c bind_resources); its prologue syncs CPU-dirty pages of
-// GPA-mapped copied pools. GPU stores that bypass replay's written-range tracking remain a separate coherence boundary.
+// GPA-mapped copied pools (vk_memory.c vk_mem_gpa_sync).
+//
+// Written pages. Shadow storage keeps a pool in a host-visible buffer of its own, with no twin in guest memory: its record
+// names the shadow twice, a mirrored one's the mirror and the shadow. What shaders write through the table so stays in the
+// shadow, which the replay does not know, as it knows no addresses: the CPU never saw it, and the copy-in of a page the
+// CPU wrote put guest memory's stale bytes over it. In Kokiri Forest those were the culling passes' instance counts and
+// lists, in pools of 20 and 44 KiB the CPU rewrites other words of each frame: foliage and shadows flickered now and
+// then, and NX2NAVI_MEMORY=verify found about 4,800 such pages in 130 s. So a store or atomic through the table marks its
+// page (translator patch 0039), and the first to mark it appends it to the list. vk_gpa_written_pages hands the new
+// pages to the memory code, which keeps a base copy of each and copies the GPU's bytes back at the fence of every part
+// that ran a shader writing through the table (vk_memory.c gw_part). A mark stays set while its page stays mapped: a page
+// is reported once per mapping (vk_gpa_map clears its range's marks, block_take those of a block it hands to another
+// range). A page marked as its pool goes and another comes at its address may be reported for the new pool, which then
+// copies it back as well, at no harm.
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,7 +70,11 @@
 #define REC_WORD (L2_WORD + BLOCKS * L2_N)
 #define RECS 65536u                    // record 0 means none
 #define REC_WORDS 4u                   // words per record
-#define WORDS (REC_WORD + RECS * REC_WORDS)
+#define MARK_WORD (REC_WORD + RECS * REC_WORDS)
+#define MARK_N (L2_N / 32)             // mark words per L2 block
+#define LIST_WORD (MARK_WORD + BLOCKS * MARK_N)
+#define LIST_N 65536u                  // the ring's entries; the translator masks the count with LIST_N - 1
+#define WORDS (LIST_WORD + 1 + LIST_N)
 #define PAGE_SHIFT 12
 
 static struct {
@@ -74,6 +94,8 @@ static struct {
     uint32_t nrec;                     // records handed out, free ones aside
     uint32_t *free_recs, nfree;        // records whose fence completed
     uint64_t mapped_pages, maps, unmaps, refused;
+    uint32_t list_done, list_seen;     // written-page list entries handed out, the count last read (vk_gpa_written_pages)
+    uint64_t gw_pages, gw_lost;        // pages reported so far; reports a full ring lost (marks cleared again)
 } G;
 static PlatMutex gpa_lock = PLAT_MUTEX_INIT;
 
@@ -131,6 +153,7 @@ static int create(void) {
     }
     uint64_t z = vk_gpa_device_address(G.dummy), sc = vk_gpa_device_address(G.scratch);
     put(0, (uint32_t)z), put(1, (uint32_t)(z >> 32)), put(2, REC_WORD), put(3, (uint32_t)sc), put(4, (uint32_t)(sc >> 32));
+    put(5, MARK_WORD), put(6, LIST_WORD);
     G.nblocks = 1, G.nrec = 1;
     rt_log("vk_gpa: device address table on (%.1f MiB, %u blocks of 16 MiB, %u records)", WORDS * 4 / 1048576.0, BLOCKS, RECS);
     return 1;
@@ -156,8 +179,10 @@ static uint32_t block_take(uint32_t l1) {
     for (uint32_t b = 1; G.blk_waiting && b < G.nblocks && !blk; b++)
         if (G.blk_wait[b] && G.blk_l1[b] == l1) blk = b;
     if (blk) G.blk_wait[blk] = 0, G.blk_waiting--;   // its callback finds it in use (blk_free_cb)
-    else if (G.nfree_blk) blk = G.free_blks[--G.nfree_blk];
-    else if (G.nblocks < BLOCKS) blk = G.nblocks++;
+    else if (G.nfree_blk) {   // last used for another range: its marks are not this range's
+        blk = G.free_blks[--G.nfree_blk];
+        for (uint32_t i = 0; i < MARK_N; i++) put(MARK_WORD + blk * MARK_N + i, 0);
+    } else if (G.nblocks < BLOCKS) blk = G.nblocks++;
     else return 0;
     G.blk_l1[blk] = (uint16_t)l1;
     return blk;
@@ -268,10 +293,43 @@ uint32_t vk_gpa_map(uint64_t lo, uint64_t hi, VkBuffer buf, uint64_t buf_lo) {
             continue;
         }
         page_put(w, r);
+        // a new buffer's pages are reported again ("Written pages"); the words a range shares with its neighbours
+        // are cleared whole, which reports their marked pages once more
+        uint32_t e = w - L2_WORD;
+        if (p == p0 || !(e % 32)) put(MARK_WORD + e / L2_N * MARK_N + e % L2_N / 32, 0);
     }
     G.maps++;
     plat_mutex_unlock(&gpa_lock);
     return r;
+}
+
+// Replay: the pages a store or atomic through the table marked since the last call ("Written pages"), as guest
+// addresses; valid until the next call. An entry the count already covers but the GPU has not written yet (still 0)
+// ends the call there, and the next one goes on from it. More new pages than the ring holds lose the oldest: then every
+// mark is cleared, so each written page is reported again at its next write.
+int vk_gpa_written_pages(const uint64_t **pages) {
+    static uint64_t out[LIST_N];
+    *pages = out;
+    if (G.state <= 0) return 0;
+    int n = 0;
+    plat_mutex_lock(&gpa_lock);
+    vmaInvalidateAllocation(vk_ctx()->vma, G.alloc, (VkDeviceSize)LIST_WORD * 4, (VkDeviceSize)(1 + LIST_N) * 4);
+    uint32_t count = G.gpu[LIST_WORD];
+    G.list_seen = count;
+    if (count - G.list_done > LIST_N) {
+        if (!G.gw_lost++) rt_log("vk_gpa: more than %u new written pages at once: marks cleared, pages reported again", LIST_N);
+        for (uint32_t i = 0; i < BLOCKS * MARK_N; i++) put(MARK_WORD + i, 0);
+        G.list_done = count - LIST_N;
+    }
+    for (; G.list_done != count; G.list_done++) {
+        uint32_t slot = LIST_WORD + 1 + (G.list_done & (LIST_N - 1)), v = G.gpu[slot];
+        if (!v) break;
+        put(slot, 0);
+        out[n++] = (uint64_t)v << PAGE_SHIFT;
+    }
+    G.gw_pages += (uint64_t)n;
+    plat_mutex_unlock(&gpa_lock);
+    return n;
 }
 
 void vk_gpa_unmap(uint64_t lo, uint64_t hi, uint32_t rec, uint32_t (*cover)(uint64_t page_addr)) {
@@ -354,11 +412,13 @@ void vk_gpa_report(void) {
     if (G.state <= 0) return;
     plat_mutex_lock(&gpa_lock);
     rt_log("vk_gpa: %llu pages (%.0f MiB) mapped, %u of %u blocks in use (%u ever, %u waiting for the GPU, %llu given "
-           "back), %u records in use, %llu maps, %llu unmaps, %llu refused",
+           "back), %u records in use, %llu maps, %llu unmaps, %llu refused; written pages reported %llu (list count %u, "
+           "full rings %llu)",
            (unsigned long long)G.mapped_pages, G.mapped_pages * 4096.0 / 1048576.0,
            G.nblocks - 1 - G.nfree_blk - G.blk_waiting, BLOCKS - 1, G.nblocks - 1, G.blk_waiting,
            (unsigned long long)G.blk_returned, G.nrec - 1 - G.nfree, (unsigned long long)G.maps,
-           (unsigned long long)G.unmaps, (unsigned long long)G.refused);
+           (unsigned long long)G.unmaps, (unsigned long long)G.refused, (unsigned long long)G.gw_pages, G.list_seen,
+           (unsigned long long)G.gw_lost);
     plat_mutex_unlock(&gpa_lock);
 }
 

@@ -45,6 +45,10 @@ VkResult vmaCreateBuffer(VmaAllocator a, const VkBufferCreateInfo *bi, const Vma
     return VK_SUCCESS;
 }
 void vmaDestroyBuffer(VmaAllocator a, VkBuffer buf, VmaAllocation alloc) { (void)a, (void)buf; free(alloc); }
+VkResult vmaInvalidateAllocation(VmaAllocator a, VmaAllocation alloc, VkDeviceSize off, VkDeviceSize size) {
+    (void)a, (void)alloc, (void)off, (void)size;
+    return VK_SUCCESS;
+}
 
 // A buffer's device address: its handle far above the GPU addresses the tests map.
 static uint64_t dev_of(VkBuffer b) { return (uint64_t)(uintptr_t)b << 28; }
@@ -78,6 +82,18 @@ static uint64_t read_through(uint64_t addr, int twin) {   // the device address 
     if (!rec) return 0;
     const uint32_t *r = table + table[2] + rec * 4 + (twin ? 2 : 0);
     return ((uint64_t)r[0] | (uint64_t)r[1] << 32) + addr;
+}
+
+// A store through the table as translator patch 0039 marks its page: the mark word is read first, and the store that
+// sets the bit appends the page to the list.
+static void shader_store(uint64_t addr) {
+    uint32_t *t = (uint32_t *)table, blk = block_of(addr), page = (addr >> 12) & (L2_N - 1);
+    if (!blk || !t[L2_WORD + blk * L2_N + page]) return;
+    uint32_t *m = &t[t[5] + blk * L2_N / 32 + page / 32], bit = 1u << (page & 31);
+    if (*m & bit) return;
+    *m |= bit;
+    uint32_t n = t[t[6]]++;
+    t[t[6] + 1 + (n & 0xffff)] = (uint32_t)(addr >> 12);
 }
 
 static VkBuffer new_buf(void) { return (VkBuffer)(next_handle += 0x1000); }
@@ -200,6 +216,42 @@ int main(void) {
     vk_gpa_clear(o0, o1);
     CHECK(!block_of(o0), "a block cleared whole leaves L1");
     vk_gpa_unmap(o0, o1, ra, NULL);
+    gpu_done();
+
+    // written pages: each reported once while mapped, not when unmapped, again for a new buffer at the same address;
+    // an entry the count covers before the GPU wrote it waits; a full ring clears the marks, so pages come again
+    const uint64_t *wp;
+    uint64_t w0 = 0x3000000000ull;
+    VkBuffer bw = new_buf();
+    uint32_t rw = vk_gpa_map(w0, w0 + MiB, bw, w0);
+    shader_store(w0 + 0x2010), shader_store(w0 + 0x2fff), shader_store(w0 + 0x5000), shader_store(w0 + 2 * MiB);
+    int n = vk_gpa_written_pages(&wp);
+    CHECK(n == 2 && wp[0] == w0 + 0x2000 && wp[1] == w0 + 0x5000, "two written pages reported (%d)", n);
+    shader_store(w0 + 0x2000);
+    CHECK(!vk_gpa_written_pages(&wp), "a page marked before is not reported again");
+    vk_gpa_unmap(w0, w0 + MiB, rw, NULL);
+    gpu_done();
+    rw = vk_gpa_map(w0, w0 + MiB, bw, w0);
+    shader_store(w0 + 0x2000);
+    n = vk_gpa_written_pages(&wp);
+    CHECK(n == 1 && wp[0] == w0 + 0x2000, "a page of a new mapping is reported again (%d)", n);
+    uint32_t *t = (uint32_t *)table, list = t[6];
+    t[list]++;   // the count of a store whose entry the GPU has not written yet
+    CHECK(!vk_gpa_written_pages(&wp), "an entry not written yet is not reported");
+    t[list + 1 + ((t[list] - 1) & 0xffff)] = (uint32_t)((w0 + 0x7000) >> 12);
+    n = vk_gpa_written_pages(&wp);
+    CHECK(n == 1 && wp[0] == w0 + 0x7000, "the entry is reported once written (%d)", n);
+    vk_gpa_unmap(w0, w0 + MiB, rw, NULL);
+    gpu_done();
+    uint64_t big = 260 * MiB;
+    rw = vk_gpa_map(w0, w0 + big, bw, w0);
+    for (uint64_t a = w0; a < w0 + big; a += 4096) shader_store(a);
+    n = vk_gpa_written_pages(&wp);
+    CHECK(n == 65536 && wp[n - 1] == w0 + big - 4096, "a full ring keeps its newest entries (%d)", n);
+    shader_store(w0);
+    n = vk_gpa_written_pages(&wp);
+    CHECK(n == 1 && wp[0] == w0, "after a full ring a page is reported again (%d)", n);
+    vk_gpa_unmap(w0, w0 + big, rw, NULL);
     gpu_done();
 
     // every block in use at once: the next range is left out and said so once, the ranges after it and the mapped

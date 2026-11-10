@@ -246,9 +246,11 @@ writes come back at its fence. Pages both sides write keep a base copy, so each 
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
 reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
 Forest (1.1.1, RTX 4090) that cost about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms) while the pools shaders read
-through the device address table were not kept current and the foliage was missing. With them kept current (below) it
-is about 8 ms a frame: copy-in 3.4 ms (13 MiB) on the submitting thread, write-back 4.7 ms (7 MiB compared) at the
-fence, 26 ms frames against 18 ms with `NX2NAVI_SHADOW=0`. The copies hold about 5 GB. `NX2NAVI_SHADOW=1` turns it on
+through the device address table were not kept current and the foliage was missing. With them kept current (below) and
+the table's pools synced in every guest submission it was about 8 ms a frame: copy-in 3.4 ms (13 MiB) on the
+submitting thread, write-back 4.7 ms (7 MiB compared) at the fence, 26 ms frames against 18 ms with
+`NX2NAVI_SHADOW=0`. Syncing only the pools with new CPU writes cut the copy-in from 4.4 to 2.6 ms a frame on an RX 9070
+XT (RADV), at 35.6 fps against 28.3. The copies hold about 5 GB. `NX2NAVI_SHADOW=1` turns it on
 under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as well: the shadow copies are chosen for
 the measured cost above, not for a missing extension.
 Direct-import pinning can conservatively mark pages dirty again without a CPU write. Texture coherence probes compare
@@ -258,12 +260,20 @@ can follow pointers into either backing. Registration depends on the buffer, not
 shadow storage uses a VMA allocation. A later VRAM mirror remaps the record with the original buffer as its write twin;
 finalization unmaps the record first.
 
-A shader reading through the GPA table need not bind or resolve its pointed-to pool. Actual draw/dispatch resource use
-therefore marks each recorded part, even when descriptors are reused. Its submission prologue queries the mapped copied
-pools' shared write-watch snapshots, skips frozen regions and clean generations, and uploads only CPU-dirty pages into
-shadow storage and already-created VRAM mirrors. Shadow copies retain the pending GPU-written byte exclusions;
-mirror uploads stay ordered after previous GPU write-backs. This does not add written-range tracking or fence copyback
-for GPU stores made only through BDA pointers.
+A shader reading through the GPA table need not bind or resolve its pointed-to pool, so the replay marks each part
+whose draws or dispatches use the table, even when their descriptors are reused. Once per guest submission, its
+prologue queries the mapped copied pools' shared write-watch snapshots and copies the pages the CPU wrote into the
+shadows and VRAM mirrors of the pools that have any (`runtime/vk_memory.c` `vk_mem_gpa_sync`).
+
+Shaders also write through the table. For an imported pool with a VRAM mirror the table's twin carries those writes
+into guest memory too; a shadow pool has no twin there, so they stayed in the shadow: the CPU never saw them, and the
+copy-in of a page the CPU wrote put guest memory's stale bytes over them. In Kokiri Forest those were the culling
+passes' instance counts and lists, and foliage and shadows flickered now and then. So a store or atomic through the
+table marks its page (translator patch 0039, `runtime/vk_gpa.c` "Written pages"). The memory code keeps a base copy of
+each marked page of a shadow pool and copies the GPU's bytes back at the fence of every part that runs a shader writing
+through the table, as for a noted write. In Kokiri Forest that is 170 pages, copied back in one part per frame.
+`NX2NAVI_MEMORY=verify` found 4,760 pages in 30 million where guest memory lacked the GPU's bytes before, and 20 in 41
+million after.
 
 `--probe-vkmem` exercises that contract through the real GPA table and submission prologue: a shader must read
 `0x13579BDF`, then `0x2468ACE0` after an ordinary CPU write, without resolving, binding or flushing the source after that

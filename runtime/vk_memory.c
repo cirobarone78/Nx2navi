@@ -86,6 +86,10 @@ typedef struct PoolRec {
     // csb a power of two, page 0 an empty slot
     struct SBase { uint64_t page; uint8_t *base; } *sb;
     uint32_t nsb, csb;
+    // shadow_lock: the pages shaders wrote through the device address table (vk_gpa.c "Written pages"), each with a base
+    // copy; written back at the fence of every part that runs a shader writing through the table (gw_part)
+    uint64_t *gw;
+    int ngw, cgw;
     // NX2NAVI_TRACE=perf per-pool mirror traffic since the last mirror_pool_log, replay thread (the log reads and clears
     // them without a lock: a count lost to the race only blurs a diagnostic)
     uint64_t st_pages, st_flush, st_wb, st_merge;   // bytes: written pages and flush ranges copied up, GPU writes back
@@ -265,7 +269,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
-    free(r->sb);
+    free(r->sb), free(r->gw);
     free(r->pt);
     free(r);
 }
@@ -983,7 +987,9 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // - CPU -> shadow: right before each submit, vk_mem_shadow_sync queries explicitly resolved pools; vk_mem_gpa_sync also
 //   covers mapped copied pools when a recorded shader uses the table. Only pages newer than a pool's sgen are copied.
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
-//   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory.
+//   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory. Writes through the
+//   device address table have no address at record time: the shaders mark their pages, and those go back at the fences
+//   of the parts that write through the table (gw_part).
 // - Pages both write: a GPU write is noted with the whole range its binding names, and the CPU writes other fields of the
 //   same records meanwhile. Each page such a range covers keeps a base copy from its first note on, the bytes guest
 //   memory and the shadow last agreed on. A copy-in takes only the bytes where guest memory differs from the base (the
@@ -1002,6 +1008,7 @@ static int64_t s_live_n, s_live_bytes;            // shadow_lock
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
 static uint64_t s_wb_seen, s_wb_ticks;            // shadow_lock: bytes the fence write-backs compared, their time
 static uint64_t s_q_ticks;                        // shadow_lock: the copy-ins' write-watch queries
+static uint64_t s_gw_parts, s_gw_pages;           // shadow_lock: parts writing through the table, pages they copy back
 static int wb_no_reup(void);
 
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
@@ -1088,6 +1095,7 @@ static void sbase_free(PoolRec *r) {
     free(r->sb);
     s_sb_pages -= r->nsb;
     r->sb = NULL, r->nsb = r->csb = 0;
+    free(r->gw), r->gw = NULL, r->ngw = r->cgw = 0;
 }
 
 // 0xff in each byte of x that is not zero, 0 in the others.
@@ -1341,11 +1349,13 @@ static void shadow_log(uint64_t frame) {
     plat_mutex_lock(&shadow_lock);
     rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB; since the last: %llu pool syncs, %llu queries, %.1f MiB "
            "copied in (%llu untracked), %.2f ms (queries %.2f); %.1f MiB written back of %.1f MiB the GPU may have written, %.2f ms; %llu "
-           "pages the GPU writes keep a base copy",
+           "pages the GPU writes keep a base copy; %llu parts wrote through the device address table, %llu pages to copy back",
            (unsigned long long)frame, (long long)s_live_n, s_live_bytes / 1048576.0, (unsigned long long)s_syncs,
            (unsigned long long)s_queries, s_copied / 1048576.0, (unsigned long long)s_untracked, qpc_ms(s_ticks),
-           qpc_ms(s_q_ticks), s_wb_bytes / 1048576.0, s_wb_seen / 1048576.0, qpc_ms(s_wb_ticks), (unsigned long long)s_sb_pages);
+           qpc_ms(s_q_ticks), s_wb_bytes / 1048576.0, s_wb_seen / 1048576.0, qpc_ms(s_wb_ticks), (unsigned long long)s_sb_pages,
+           (unsigned long long)s_gw_parts, (unsigned long long)s_gw_pages);
     s_syncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_ticks = s_wb_seen = s_wb_ticks = s_q_ticks = 0;
+    s_gw_parts = s_gw_pages = 0;
     plat_mutex_unlock(&shadow_lock);
 }
 
@@ -1975,48 +1985,112 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
-// Replay / submit lock: mark actual shader use, not descriptor construction (which may be memoized).
+// Replay / submit lock: mark actual shader use, not descriptor construction (which may be memoized). 1: a shader reads
+// guest memory through the table; 2 as well: one writes through it (res.json's written flag on the table).
 static int gpa_part_used;
-void vk_mem_gpa_use(void) { gpa_part_used = 1; }
+static uint32_t gpa_epoch;   // the guest submission vk_mem_gpa_sync last copied in for: its snapshots are per submission
+void vk_mem_gpa_use(int how) { gpa_part_used |= how; }
 
 static int gpa_copied_pool(const PoolRec *r) {
     return r->kind == POOL_IMPORT && r->gpa_rec && (r->smap || r->mstate == MS_ON);
 }
 
-// The table's pointers can reach any mapped pool, without vk_mem_resolve ever seeing that pool. Query their shared
-// write-watch snapshots once per region/epoch, then copy only newer pages. Never allocate a mirror for a GPA reader.
-void vk_mem_gpa_sync(void) {
-    if (!gpa_part_used) return;
+// gen_lock held: r's shadow lacks a page the tables stamped after its generation, or a region of it is not watched.
+static int shadow_stale(const PoolRec *r, int cpu) {
+    const uint32_t *rmax = cpu ? creg_max : reg_max;
+    for (uint64_t k = r->import_lo >> SNAP_SHIFT; k <= (r->import_hi - 1) >> SNAP_SHIFT; k++)
+        if (snap_untracked[k] || rmax[k] > r->sgen) return 1;
+    return 0;
+}
+
+static void swb_run(uint64_t a, uint64_t b);
+typedef struct { int n; struct { uint64_t a, b; } r[]; } GwJob;
+
+static void gw_cb(void *arg) {   // completion thread
+    GwJob *j = arg;
+    for (int i = 0; i < j->n; i++) swb_run(j->r[i].a, j->r[i].b);
+    free(j);
+}
+
+// Shadow storage, a part that ran a shader writing through the table ("Written pages" in vk_gpa.c): the pages shaders
+// wrote through it before stay in the shadow alone. Each newly reported one gets a base copy, taken from guest memory,
+// the bytes both sides last agreed on as far as the CPU knows: the GPU's writes are only in the shadow. From then on a
+// copy-in moves only the CPU's bytes into it (merge_page), and the fence of this part and of every later one that runs
+// such a shader copies the GPU's bytes back into guest memory, as for a noted write (swb_run). A byte the CPU wrote
+// into such a page between its last copy-in and the report goes back to the shadow's older value once.
+// pool_lock (shared) and shadow_lock held.
+static void gw_part(uint64_t fence, const uint64_t *pg, int npg) {
+    for (int i = 0; i < npg; i++) {
+        const pidx_ent *e = pidx_find(&pool_index, pg[i], SB_PAGE);
+        PoolRec *r = e ? e->buf : NULL;
+        if (!r || !r->smap || pg[i] < r->import_lo || pg[i] + SB_PAGE > r->import_hi) continue;
+        int k = 0;
+        while (k < r->ngw && r->gw[k] != pg[i]) k++;
+        if (k < r->ngw) continue;
+        if (r->ngw == r->cgw) grow((void **)&r->gw, &r->cgw, sizeof *r->gw);
+        r->gw[r->ngw++] = pg[i];
+        if (!sbase_find(r, pg[i])) {
+            sbase_make(r, pg[i]);
+            memcpy(sbase_find(r, pg[i]), (const void *)(uintptr_t)pg[i], SB_PAGE);
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < pool_index.n; i++) n += ((PoolRec *)pool_index.e[i].buf)->ngw;
+    s_gw_parts++, s_gw_pages += (uint64_t)n;
+    if (!n) return;
+    GwJob *j = malloc(sizeof *j + sizeof j->r[0] * (size_t)n);
+    if (!j) rt_fatal("vk: out of memory");
+    j->n = 0;
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *r = pool_index.e[i].buf;
+        for (int k = 0; k < r->ngw; k++) j->r[j->n].a = r->gw[k], j->r[j->n++].b = r->gw[k] + SB_PAGE;
+    }
+    vk_completion_add(fence, gw_cb, j);
+}
+
+// The table's pointers can reach any mapped pool, without vk_mem_resolve ever seeing that pool: the submission's
+// prologue copies the CPU's writes into all of them. Their write-watch snapshots are queried once per region and guest
+// submission, and only pools with pages stamped after their copy's generation are synced: walking every mapped pool
+// in each submission was about 24,000 pool syncs a frame in Kokiri Forest. Never allocates a mirror for a GPA reader.
+void vk_mem_gpa_sync(uint64_t fence) {
+    int used = gpa_part_used;
     gpa_part_used = 0;
-    if (!shadow_on && !vk_mirror_on) return;
-    uint64_t t0 = qpc(), run0 = 0, run1 = 0;
+    if (!used || (!shadow_on && !vk_mirror_on)) return;
     uint32_t epoch = vk_texture_epoch();
+    const uint64_t *pg = NULL;
+    int npg = shadow_on && (used & 2) ? vk_gpa_written_pages(&pg) : 0;   // outside the memory locks
+    if (epoch == gpa_epoch && !(shadow_on && (used & 2))) return;
+    uint64_t t0 = qpc(), run0 = 0, run1 = 0;
     int have = 0, cpu = vk_mirror_on && wb_no_reup();   // as vk_mem_shadow_sync
     plat_mutex_lock_shared(&pool_lock);
     plat_mutex_lock(&shadow_lock);
-    plat_mutex_lock(&gen_lock);
-    for (int i = 0; i < pool_index.n; i++) {
-        const PoolRec *r = pool_index.e[i].buf;
-        if (!gpa_copied_pool(r)) continue;
-        uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
-        if (have && a <= run1 + 1) {
-            if (b > run1) run1 = b;
-        } else {
-            if (have) s_queries += snap_regions(run0, run1, epoch);
-            run0 = a, run1 = b, have = 1;
+    if (shadow_on && (used & 2)) gw_part(fence, pg, npg);   // the base copies before the copy-in below reaches them
+    if (epoch != gpa_epoch) {
+        gpa_epoch = epoch;
+        plat_mutex_lock(&gen_lock);
+        for (int i = 0; i < pool_index.n; i++) {
+            const PoolRec *r = pool_index.e[i].buf;
+            if (!gpa_copied_pool(r)) continue;
+            uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
+            if (have && a <= run1 + 1) {
+                if (b > run1) run1 = b;
+            } else {
+                if (have) s_queries += snap_regions(run0, run1, epoch);
+                run0 = a, run1 = b, have = 1;
+            }
         }
-    }
-    if (have) s_queries += snap_regions(run0, run1, epoch);
-    for (int i = 0; i < pool_index.n; i++) {
-        PoolRec *r = pool_index.e[i].buf;
-        if (gpa_copied_pool(r) && r->smap) shadow_sync_pool(r, epoch, cpu), s_syncs++;
-    }
-    plat_mutex_unlock(&gen_lock);
-    // shadow_copy retains pending GPU-written byte exclusions. Mirror uploads read that shadow (or direct import),
-    // and stay ordered after previous GPU write-backs by the existing prologue; none of the write-back paths change.
-    for (int i = 0; i < pool_index.n; i++) {
-        PoolRec *r = pool_index.e[i].buf;
-        if (gpa_copied_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+        if (have) s_queries += snap_regions(run0, run1, epoch);
+        for (int i = 0; i < pool_index.n; i++) {
+            PoolRec *r = pool_index.e[i].buf;
+            if (gpa_copied_pool(r) && r->smap && shadow_stale(r, cpu)) shadow_sync_pool(r, epoch, cpu), s_syncs++;
+        }
+        plat_mutex_unlock(&gen_lock);
+        // A mirror's sync reads the shadow (or the imported buffer) just brought up to date, after the GPU's earlier
+        // write-backs into it (the prologue orders them).
+        for (int i = 0; i < pool_index.n; i++) {
+            PoolRec *r = pool_index.e[i].buf;
+            if (gpa_copied_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+        }
     }
     s_ticks += qpc() - t0;
     plat_mutex_unlock(&shadow_lock);

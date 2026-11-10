@@ -2903,7 +2903,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     static VkDescSlot d[MAX_DESC];
     static VkBufferView bv[MAX_DESC];
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
-    if (info->gpa) vk_mem_gpa_use(); // before descriptor/memo early returns: the shader still reads the table
+    if (info->gpa) vk_mem_gpa_use(info->gpa); // before descriptor/memo early returns: the shader still uses the table
     bind_stats(info);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
     int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = B.res_valid;
@@ -3809,7 +3809,8 @@ static int mo_desc(VkExec *ex, const VkPipeInfo *info, MoDraw *q) {
             o->buffer = MQ.sup;
         } else if (b->kind == GFX_RES_UBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
-        } else if (b->kind == GFX_RES_SSBO && !(r->flags & 1)) {   // read only: instance data of foliage and such
+        } else if (b->kind == GFX_RES_SSBO && (!(r->flags & 1) || r->cbuf_slot == VK_GPA_CB_SLOT)) {
+            // read only: instance data of foliage and such; the table, whose written flag means its page marks
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, 0);
         } else if (b->kind == GFX_RES_TEX && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
             vk_texture_lock();
@@ -3894,7 +3895,7 @@ static void mo_emit(VkCommandBuffer cb) {
     for (int n = 0; n < MQ.n; p = &MQ.d[n++]) {
         const MoDraw *q = &MQ.d[n];
         const VkPipeInfo *info = q->info;
-        if (info->gpa) vk_mem_gpa_use(); // motion replays packed descriptors without bind_resources, possibly in a later part
+        if (info->gpa) vk_mem_gpa_use(info->gpa); // motion replays packed descriptors without bind_resources, possibly in a later part
         if (q->pipe != pipe) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, q->pipe), pipe = q->pipe, MO.e_pipe++;
         if (q->st != st) vk_pipeline_set_dynamic(cb, &MQ.st[q->st]), st = q->st, MO.e_dyn++;
         if (!p || memcmp(&q->v, &p->v, sizeof q->v)) vkCmdSetViewportWithCount(cb, 1, &q->v);
