@@ -96,6 +96,11 @@ processor can fill memory and swap until the kernel stops processes of the deskt
 On NVIDIA, start the game with `NX2NAVI_SHADOW=0` if the 3D world stays black while the HUD draws (issue #72). The
 profile, logs and settings are in the `--out` folder as on Windows.
 
+On NVIDIA the driver keeps the shaders it compiled in `nvidia-cache` beside `ocarina`, not in `~/.cache/nvidia`, where
+one run adds at most 1 GiB while the preparation at the end of the build makes about 1.5 GB. The game sets the folder
+and a limit of 8 GiB itself (`__GL_SHADER_DISK_CACHE_PATH` and `__GL_SHADER_DISK_CACHE_SIZE` in the environment take
+precedence). Deleting the folder costs one slow start; `./ocarina --warm-shaders` fills it again.
+
 `tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
 players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
@@ -108,7 +113,7 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
-- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
+- **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
   on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
   DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
   display's refresh rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the

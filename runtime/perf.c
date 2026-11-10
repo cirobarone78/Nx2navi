@@ -482,23 +482,48 @@ int rt_knob(const char *name, const char *def) {
 // render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
 // it with the A/B blocks. Off by default until measured here; the same rule
 // is reported to give +4-10% on an 8-core SMT CPU.
+//
+// NX2NAVI_CACHE_DIE=1, the default: on a processor whose dies have L3 caches of different sizes (AMD's two-die
+// X3D processors, 3D V-Cache on one die) the process runs on the die with the larger cache, so the guest cores, the
+// render thread and the recorder share one L3 and never cross dies. Windows' own placement of games on that die
+// (game mode with AMD's driver) depends on recognizing the exe as a game. 0 leaves the placement to the OS; "ab"
+// switches it with the A/B blocks. No change on one-die and Intel processors.
+//
+// The placement is set at start (perf_cpu_start, before the thread pools count the usable processors) and checked at
+// every present for the A/B switches. The rules narrow the processors the process was given (start /affinity, a
+// launcher's or a benchmark's pin), never widen them; with both off nothing is set.
+static int one_mode = -1, die_mode;
+static uint64_t cpu_all, cpu_one, cpu_die, cpu_applied;   // cpu_applied: the mask set last, 0 none
+
 static void cpu_placement(void) {
-    static int mode = -1, applied = -1;
-    static uint64_t all, one;
-    if (mode < 0) {
-        mode = rt_knob("ONE_PER_CORE", "0");
-        int cores = plat_cpu_cores(&all, &one);
-        if (mode && one && one != all)
-            rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(all),
-                   mode == 2 ? " in the B blocks" : "");
+    if (one_mode < 0) {
+        one_mode = rt_knob("ONE_PER_CORE", "0");
+        die_mode = rt_knob("CACHE_DIE", "1");
+        int cores = plat_cpu_cores(&cpu_all, &cpu_one);
+        uint32_t kb = 0;
+        cpu_die = plat_cpu_cache_die(&kb);
+        if (one_mode && cpu_one && cpu_one != cpu_all)
+            rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(cpu_all),
+                   one_mode == 2 ? " in the B blocks" : "");
         else
-            mode = 0;
+            one_mode = 0;
+        if (cpu_die && cpu_die != cpu_all)
+            rt_log("cpu: logical processors %#llx of %#llx share the largest L3 cache (%u MiB)%s",
+                   (unsigned long long)cpu_die, (unsigned long long)cpu_all, kb >> 10,
+                   !die_mode ? "; cache_die = 0: not used" : die_mode == 2 ? ": the process runs there in the B blocks"
+                                                                          : ": the process runs there");
+        if (!cpu_die || cpu_die == cpu_all) die_mode = 0;
     }
-    int on = RT_KNOB_ON(mode);
-    if (on == applied) return;
-    applied = on;
-    plat_process_affinity(on ? one : all);
+    uint64_t want = cpu_all;
+    if (RT_KNOB_ON(die_mode)) want &= cpu_die;
+    if (RT_KNOB_ON(one_mode)) want &= cpu_one;
+    if (!want) want = cpu_all;
+    if (want == (cpu_applied ? cpu_applied : cpu_all)) return;   // nothing new; never restricted: as it was given
+    cpu_applied = want;
+    if (!plat_process_affinity(want)) rt_log("cpu: could not move the process to logical processors %#llx", (unsigned long long)want);
 }
+
+void perf_cpu_start(void) { cpu_placement(); }
 
 // NX2NAVI_CRASH_FILTER_GUARD (default 1; 0 off): once a second, the crash report's last-chance exception filter is put
 // back if a DLL loaded after the start (a GPU driver, an overlay) set its own in its place. Without it, a fault in such

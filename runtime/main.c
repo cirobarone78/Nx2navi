@@ -8,9 +8,10 @@
 //                       show which device NX2NAVI_AUDIO_DEVICE picks; needs no game files
 //     --monitor VALUE   open the game window on one monitor: sets NX2NAVI_MONITOR before the settings are read, so it wins
 //                       over nx2navi.ini's `monitor =`. VALUE is auto (default), primary, a 1-based index as --list-monitors
-//                       prints it, or part of a GDI device name (DISPLAY3) or of a monitor's name, case-insensitive
-//     --list-monitors   print each monitor's index, GDI device name, name, desktop rectangle, primary flag and DPI;
-//                       needs no game files
+//                       prints it, or part of a monitor's name (on Windows also of its GDI device name, DISPLAY3),
+//                       case-insensitive. Wayland places a windowed window itself: only fullscreen opens on the monitor
+//     --list-monitors   print each monitor's index, name (on Windows also its GDI device name), desktop rectangle,
+//                       primary flag and DPI; needs no game files
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-mods      the mods folder scan, order and switches (mods.c); needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
@@ -19,7 +20,11 @@
 //     --probe-dpi       the process DPI awareness (per-monitor v2) and the primary monitor's size; no game files
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
+//     --probe-prewarm   the boot's pipeline stages from the caches next to the executable, the memory each leaves and
+//                       what a compute pipeline's first dispatch costs; skips without recorded shaders, runs no game
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
+//     --probe-zstd      host zstd streams (ov_zstd.c) on frames made here; needs no game files
+//     --probe-input     gamepad polls on a virtual gamepad, also while SDL's update takes long; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
 //     --boot            run the game to the first NVN call
 //     --seconds S       run the game (implies --boot's start-up) until the world clock (game time since the loaded
@@ -491,8 +496,8 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
-                    "--prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
+                    "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -544,6 +549,13 @@ int main(int argc, char **argv) {
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
     // costs a full tick. NX2NAVI_TIMER_1MS=0 keeps the default for comparison.
     if (cfg_bool("NX2NAVI_TIMER_1MS")) plat_timer_1ms();
+    // Before any thread pool counts the usable processors. Not in the shader preparation modes: they translate and
+    // build on every processor the process was given, and the placement (perf.c cpu_placement) is for the game's own
+    // threads, so narrowing them to one die would only make the preparation take longer.
+    int prepare = 0;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--warm-shaders")) prepare = 1;
+    if (!prepare) perf_cpu_start();
     {   // NX2NAVI_POWER_FULL=0 leaves Windows' power throttling of an unfocused window in place (A/B runs)
         const char *pf = cfg_get("NX2NAVI_POWER_FULL");
         if (!(pf && !strcmp(pf, "0"))) {
@@ -627,10 +639,13 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
+    if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
+    if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);
 }

@@ -18,6 +18,7 @@
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_gpa.h"
 #include "wb_merge_spv.h"
@@ -62,6 +63,9 @@ typedef struct PoolRec {
     VkBuffer mbuf;                     // MS_ON: device-local copy of [import_lo, import_hi), same offsets as buf
     VmaAllocation malloc_;
     uint32_t acc_sub;                  // replay: the last submission that synced the mirror (mirror_sync)
+    uint32_t pm_frame;                 // replay: the frame (pframe) of pm_cur
+    uint8_t pm_cur, pm_prev;           // replay: the places in their frame (vk_sub_in_frame, 7 the rest) of the submissions
+                                       // that synced it, in frame pm_frame and in the one before (NX2NAVI_PRESNAP_PLACE)
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
     uint32_t retry_sub;                // replay: a mirror refused for the VRAM budget is asked again from here, 0 never
     uint8_t asked_room;                // replay: its refusal already asked the textures for room (once until it gets one)
@@ -576,6 +580,7 @@ static void shadow_log(uint64_t frame);
 static int dead_pending(void);
 
 static void vram_log(uint64_t frame);
+static void outside_watch(uint64_t frame);
 
 static volatile uint64_t mirror_frame;   // the frame vk_mem_census last saw, for mirror_sync's log lines
 
@@ -583,6 +588,7 @@ void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
+    if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
         mirror_log(frame), shadow_log(frame);   // mirror_log also logs the write-watch line
@@ -1143,7 +1149,10 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
 }
 
 void vk_gpu_written(uint64_t addr, uint64_t size) { gpu_written(addr, size, 0); }
-void vk_gpu_written_back(uint64_t addr, uint64_t size) { gpu_written(addr, size, 1); }
+void vk_gpu_written_back(uint64_t addr, uint64_t size) {
+    gpu_written(addr, size, 1);
+    mem_probe(addr, size);   // NX2NAVI_WB_PROBE: the bytes are in guest memory now; note who reads them next
+}
 
 int vk_mem_mirrored(uint64_t addr, uint64_t size) {
     VkMemSpan sp;
@@ -1322,6 +1331,34 @@ enum { MR_BUDGET, MR_UNTRACKED, MR_OVERLAP, MR_ALLOC, MR_N };
 int vk_mirror_on;
 static int mirror_verify;
 static int mirror_gap = 2;             // pre-snap: hot pools at most this many 2 MiB regions apart share one query
+static uint32_t pframe;                // replay: frames begun (vk_mem_mirror_begin: a place not after the last one's)
+static int pplace = 99;                // replay: the place of the last submission vk_mem_mirror_begin saw
+
+// NX2NAVI_PRESNAP_PLACE=1 (default), 0, ab: a submission's pre-snap (vk_mem_mirror_begin) takes the write-watch
+// snapshots of the pools the submission at its place in the last frame synced, not those the submission before it
+// synced. In Kokiri Forest the frame's first submission (#0) and its fourth (#3) use no pool, and their pre-snaps
+// covered the pools of the submission before them, #5's and #2's: 36.8 queries over 282 MiB a frame, 0.23-0.31 ms; then
+// #2 and #5, whose submissions before them use no pool either, queried their pools one at a time at their first use,
+// 63.5 queries over 254 MiB.
+static int presnap_place(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("PRESNAP_PLACE", "1");
+    return RT_KNOB_ON(mode);
+}
+
+static int sub_place(void) { return vk_sub_in_frame >= 0 && vk_sub_in_frame < 7 ? vk_sub_in_frame : 7; }
+
+static void pm_note(PoolRec *r) {   // replay: r synced in the submission being recorded
+    if (r->pm_frame != pframe) {
+        r->pm_prev = r->pm_frame + 1 == pframe ? r->pm_cur : 0;
+        r->pm_cur = 0, r->pm_frame = pframe;
+    }
+    r->pm_cur |= (uint8_t)(1u << sub_place());
+}
+
+static uint8_t pm_last(const PoolRec *r) {   // the places that synced r in the last frame
+    return r->pm_frame == pframe ? r->pm_prev : r->pm_frame + 1 == pframe ? r->pm_cur : 0;
+}
 static PoolRec **mlist;                // pool_lock: mirrored pools by import_lo
 static int nm, mcap;
 static uint32_t msub;                  // replay: number of the submission being recorded
@@ -1703,6 +1740,7 @@ static void mirror_retire(void *arg) {
 static void mirror_sync(PoolRec *r) {
     uint64_t t0 = qpc();
     r->acc_sub = msub;
+    pm_note(r);
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     int excl = 0;
@@ -2185,9 +2223,12 @@ void vk_mem_mirror_begin(void) {
     plat_mutex_lock(&gen_lock);
     ww_ep++;
     uint64_t b0 = ww_bytes;
+    int pl = sub_place(), pp = presnap_place();
+    if (pl <= pplace) pframe++;   // a new frame, though its first submissions may have had nothing to record
+    pplace = pl;
     for (int i = 0; i < nm; i++) {
         const PoolRec *r = mlist[i];
-        if (r->acc_sub != prev) continue;
+        if (pp ? !(pm_last(r) >> pl & 1) : r->acc_sub != prev) continue;
         uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
         if (have && a <= run1 + 1 + (uint64_t)mirror_gap) {
             if (b > run1) run1 = b;
@@ -2325,6 +2366,8 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
     return j->n + 2;
 }
 
+int vk_mem_mirror_wb_pending(void) { return vk_mirror_on && (nsnl || nwbl); }
+
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
@@ -2332,6 +2375,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        vk_gpu_gap_note(VK_GAP_WB_MERGE, 0);
         int m = wb_merge_record(cb);
         if (!m) {   // no range list: copy them plainly
             for (int i = 0; i < nsnl; i++) range_add(&wbl, &nwbl, &cwbl, snl[i].r, snl[i].off, snl[i].size);
@@ -2352,6 +2396,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT);
         for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub;
+        vk_gpu_gap_note(VK_GAP_WB_COPY, 0);
         mrep.wb_ranges += (uint64_t)nwbl;
         rec += copy_ranges(cb, wbl, nwbl, 0, &mrep.wb_bytes, &mrep.wb_copies) + 2;
         mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -2421,6 +2466,7 @@ static void mirror_log(uint64_t frame) {
     ww_last = frame;
     uint64_t fz, ff, ft, fo;
     mem_freeze_stats(&fz, &ff, &ft, &fo);
+    mem_probe_report(frame);
     if (rt_trace & RT_TRACE_PERF)
         rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
                "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
@@ -2528,9 +2574,11 @@ static void heap_log(VkCtx *c, uint64_t frame, const VmaBudget *vb) {
     for (uint32_t t = 0; t < c->mem_props.memoryTypeCount && t < VK_MAX_MEMORY_TYPES && o < (int)sizeof line - 120; t++) {
         const VmaDetailedStatistics *d = &ts.memoryType[t];
         if (!d->statistics.blockCount) continue;
-        o += snprintf(line + o, sizeof line - (size_t)o, " type %u: %u blocks %.0f MiB, %u allocations %.0f MiB, largest %.1f MiB;", t,
-                      d->statistics.blockCount, d->statistics.blockBytes / M, d->statistics.allocationCount,
-                      d->statistics.allocationBytes / M, d->allocationSizeMax / M);
+        o += snprintf(line + o, sizeof line - (size_t)o,
+                      " type %u: %u blocks %.0f MiB, %u allocations %.0f MiB, largest %.1f MiB, %u free ranges (largest %.1f MiB);",
+                      t, d->statistics.blockCount, d->statistics.blockBytes / M, d->statistics.allocationCount,
+                      d->statistics.allocationBytes / M, d->allocationSizeMax / M, d->unusedRangeCount,
+                      d->unusedRangeCount ? d->unusedRangeSizeMax / M : 0.0);
     }
     rt_log("%s", line);
     // The address-space walk of the census (plat_mem_census, 100-240 ms of VirtualQuery) runs on its own thread, but
@@ -2569,6 +2617,118 @@ static void pool_census_log(uint64_t frame) {
            (unsigned long long)nn, nb / M, (unsigned long long)mn, mb / M, MIRROR_IDLE, (unsigned long long)in, ib / M);
 }
 
+// After the heap lines: the driver's figure for the device-local heaps split by what holds it. VMA's blocks hold the
+// textures with their own memory (live and released), the VRAM mirrors, the physical pools, the ASTC decoder's scratch,
+// the headroom's spare blocks (their anchors), everything else VMA placed, and the free space inside the blocks, which
+// the driver counts as used until a block empties. The rest of the driver's figure was never allocated through VMA:
+// the swapchain, DLSS and frame generation (Streamline), compiled pipelines and the driver's own memory; DLSS's share
+// as its statistics report it, when known.
+static void vram_use_log(VkCtx *c, uint64_t frame, const VmaBudget *vb, const VkTexCensus *t) {
+    uint64_t usage = 0, blocks = 0, allocs = 0, phys = 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    if (c->has_memory_budget) {
+        VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+        vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    }
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            usage += c->has_memory_budget ? bp.heapUsage[h] : vb[h].statistics.blockBytes,
+                blocks += vb[h].statistics.blockBytes, allocs += vb[h].statistics.allocationBytes;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < nphys; i++)
+        if (phys_list[i]->alloc) phys += phys_list[i]->size;
+    plat_mutex_unlock_shared(&pool_lock);
+    uint64_t mir = (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED), held = vk_headroom_held(),
+             scratch = vk_astc_scratch_bytes();
+    uint64_t known = t->bytes_live + t->bytes_released + mir + phys + held + scratch;
+    int64_t dlss = vk_dlaa_vram();
+    char ds[48] = "n/a";
+    if (dlss >= 0) snprintf(ds, sizeof ds, "%.0f MiB", dlss / 1048576.0);
+    const double M = 1048576.0;
+    rt_log("mem: vram by use frame %llu: in use %.0f MiB = VMA blocks %.0f MiB (textures %.0f, released textures %.0f, "
+           "VRAM mirrors %.0f, physical pools %.0f, ASTC scratch %.0f, headroom spare %.0f, other %.0f, free inside the "
+           "blocks %.0f) + outside VMA %.0f MiB (swapchain, DLSS and frame generation, pipelines, driver; DLSS reports %s)",
+           (unsigned long long)frame, usage / M, blocks / M, t->bytes_live / M, t->bytes_released / M, mir / M, phys / M,
+           scratch / M, held / M, allocs > known ? (allocs - known) / M : 0.0, blocks > allocs ? (blocks - allocs) / M : 0.0,
+           usage > blocks ? (usage - blocks) / M : 0.0, ds);
+}
+
+// With NX2NAVI_TRACE=perf every 60 frames: a line when the device-local memory VMA did not allocate (vram_use_log's
+// "outside VMA") moved by OUTSIDE_STEP or more since the last line, so the log places it beside what did it. In one
+// session it grew from 0.6 to 2.6 GiB at the title screen, in two steps of about 1 GiB while the boot's compute
+// pipelines were being built (vk_pipeline.c, stage library prebuild), and DLSS and frame generation add theirs when
+// they start.
+#define OUTSIDE_STEP (256ull << 20)
+static void outside_watch(uint64_t frame) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->has_memory_budget) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+    vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t usage = 0, blocks = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            usage += bp.heapUsage[h], blocks += vb[h].statistics.blockBytes;
+    uint64_t out = usage > blocks ? usage - blocks : 0;
+    static uint64_t last;
+    static int seen;
+    if (seen && (out > last ? out - last : last - out) < OUTSIDE_STEP) return;
+    const double M = 1048576.0;
+    rt_log("mem: frame %llu: device memory outside VMA (swapchain, DLSS and frame generation, pipelines, driver) %s%.0f "
+           "MiB (%s%.0f MiB)", (unsigned long long)frame, seen ? "now " : "", out / M, out >= last ? "+" : "-",
+           (out >= last ? out - last : last - out) / M);
+    last = out, seen = 1;
+}
+
+// The overlay's "game" figure beside the card's memory in use (perfmon.c, its sampling thread): what the driver
+// counts for this process on the device-local heaps, the same figure vram_use_log splits by use.
+float vk_mem_device_used_mb(void) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->has_memory_budget) return -1;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+    vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    uint64_t usage = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) usage += bp.heapUsage[h];
+    return (float)(usage / 1048576.0);
+}
+
+// One line per boot stage (vk_pipeline.c calls it after the pipeline cache load, the shader prewarm, the recorded
+// pipelines and the compute pipeline prebuild): the device-local memory in use, the part of it VMA did not allocate
+// (outside_watch's "outside VMA": pipelines and the driver's own, before the swapchain and the upscaler exist), and the
+// process's commit and working set. Subtracting two lines gives what a stage left behind: on an installed copy with
+// its prepared shader list the boot's compute pipelines alone held 2.3 GiB of device memory on an RTX 5090 (4,066
+// pipelines kept, 95 of them dispatched before the first village), which is what this line was added to place.
+void vk_mem_stage_log(const char *stage) {
+    VkCtx *c = vk_ctx();
+    double proc, used, limit;
+    float ram_used, ram_total, ws;
+    plat_commit_info(&proc, &used, &limit);
+    plat_mem_info(&ram_used, &ram_total, &ws);
+    const double M = 1048576.0;
+    uint64_t usage = 0, blocks = 0;
+    int budget = c && c->has_memory_budget;
+    if (budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+        vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+        VmaBudget vb[VK_MAX_MEMORY_HEAPS] = {0};
+        if (c->vma) vmaGetHeapBudgets(c->vma, vb);
+        for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                usage += bp.heapUsage[h], blocks += vb[h].statistics.blockBytes;
+    }
+    char dev[96] = "device memory unknown (no VK_EXT_memory_budget)";
+    if (budget)
+        snprintf(dev, sizeof dev, "device memory in use %.0f MiB, outside VMA %.0f MiB", usage / M,
+                 usage > blocks ? (usage - blocks) / M : 0.0);
+    rt_log("mem: boot stage, after %s: %s; process commit %.0f MB, working set %.0f MB; system commit %.0f of %.0f MB",
+           stage, dev, proc, (double)ws, used, limit);
+}
+
 // With NX2NAVI_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
 // VMA's blocks and allocations on the device-local heaps, texture entries with their own memory, the VRAM mirrors and
 // the objects waiting for their last submission to retire.
@@ -2594,6 +2754,7 @@ static void vram_log(uint64_t frame) {
     vk_texture_census_log(frame);
     pool_census_log(frame);
     heap_log(c, frame, vb);
+    vram_use_log(c, frame, vb, &t);
 }
 
 // Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
@@ -2756,7 +2917,18 @@ static void retire(VkCtx *c, int wait_all) {
     ninflight -= k;
 }
 
-static void collect_locked(VkCtx *c) {
+static void destroy_dead(VkCtx *c, const Dead *d) {
+    switch (d->kind) {
+    case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
+    case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
+    case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
+    case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
+    }
+}
+
+// The objects the GPU is done with: destroyed here (out != NULL: moved to *out, for the caller to destroy without
+// cmd_lock; *nout of them).
+static void collect_locked_out(VkCtx *c, Dead **out, int *nout, int *cout) {
     retire(c, 0);
     uint64_t tl = 0;
     if (c->timeline) vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
@@ -2770,15 +2942,14 @@ static void collect_locked(VkCtx *c) {
         }
         rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, d->handle, 1,
                          d->tl, tl);
-        switch (d->kind) {
-        case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
-        case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
-        case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
-        case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
-        }
+        if (!out) { destroy_dead(c, d); continue; }
+        if (*nout == *cout) grow((void **)out, cout, sizeof **out);
+        (*out)[(*nout)++] = *d;
     }
     ndead = k;
 }
+
+static void collect_locked(VkCtx *c) { collect_locked_out(c, NULL, NULL, NULL); }
 
 VkCommandBuffer vk_upload_begin(void) {
     plat_once(&cmd_once, cmd_init, NULL);
@@ -2946,7 +3117,13 @@ uint64_t vk_upload_flush(int wait) {
     }
     if (c && wait) {
         while (ninflight && done_seq < seq) {
-            vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            // a lost device ends the wait at once and leaves the fence unsignalled: retire would take nothing and this
+            // loop would spin for good, holding the upload lock, instead of the run ending with the device's report
+            VkResult w = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            if (w != VK_SUCCESS) {
+                vk_device_fault_report(w);
+                rt_fatal("vk: the wait for an upload failed (%d)", (int)w);
+            }
             retire(c, 0);
         }
     }
@@ -3007,13 +3184,20 @@ void vk_mem_note_submit(uint64_t timeline_value) {
     plat_rmutex_unlock(&cmd_lock);
 }
 
+// The objects go once cmd_lock is released: destroying an image and its memory takes up to milliseconds (the
+// collect's 0.3 slow ones a frame took a median 0.26-0.43 ms, up to 1.9 ms), and the replay's uploads
+// (vk_upload_begin) wait for cmd_lock.
 void vk_mem_collect(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     plat_once(&cmd_once, cmd_init, NULL);
+    Dead *out = NULL;
+    int nout = 0, cout = 0;
     plat_rmutex_lock(&cmd_lock);
-    collect_locked(c);
+    collect_locked_out(c, &out, &nout, &cout);
     plat_rmutex_unlock(&cmd_lock);
+    for (int i = 0; i < nout; i++) destroy_dead(c, &out[i]);
+    free(out);
 }
 
 void vk_mem_stats(VkMemStats *s) {

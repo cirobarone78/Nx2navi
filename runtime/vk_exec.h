@@ -137,8 +137,15 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+// vk_exec_draw.c, before a part of submission fence goes to the queue (vk_exec.c maybe_split): 1 when it may go. The
+// texture pool set it binds is then sealed and the next draw that needs the pools takes another; 0 when every other set
+// is bound by this submission's earlier parts, and the replay keeps recording into the same part.
+int vk_exec_pool_split(uint64_t fence);
 // vk_exec_draw.c: the vertex and fragment shader of the last draw recorded into this command buffer (NULL: none yet).
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs);
+// vk_exec_draw.c "pool marks": at the end of a submission that recorded work, after its closing barrier. Hands the
+// mark copies the GPU completed to vk_texture.c and, every few such submissions, copies the marks out and clears them.
+void vk_exec_pool_marks(VkExec *ex);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);
@@ -178,6 +185,10 @@ extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
 uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
+// The draws skipped since the last call because a shader or pipeline was still building (vk_exec_draw.c), and whether
+// a frame lacking them would be held back at its present (vk_backend.c frame_hold).
+uint32_t vk_exec_pending_draws_take(void);
+int vk_frame_hold_left(void);
 
 // NX2NAVI_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage
 // images are copied out and written as PNGs to NX2NAVI_DUMP_DIR (default "dump"), with passes.txt (targets, pipelines,

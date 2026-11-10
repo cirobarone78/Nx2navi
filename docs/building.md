@@ -94,6 +94,13 @@ of them.
    .venv\Scripts\python tools\build_game.py --version <ver>
    ```
 
+   The runtime's own shaders (upscaling, HDR, texture decode and the like) are in the repository as source only:
+   GLSL and SPIR-V assembly in `runtime\shaders\`, and two small ones assembled by `tools\make_dlaa_mask.py` and
+   `tools\make_mvobj_fs.py`. `build_game.py` compiles them into `runtime\<name>_spv.h` (git ignores these) before it
+   compiles the runtime, with `glslc`, `spirv-as` and `spirv-val` from the `shaderc` and `spirv-tools` packages above,
+   and again whenever a source changed. `python tools\build_shaders.py` does that step alone; `--check` only reports
+   the headers that are missing or stale.
+
    `--cpu v2` targets x86-64-v2 (SSE4.2, no AVX2/FMA) for older CPUs; the default `v3` needs AVX2. The v2 build links
    `runtime/fma.c`, a correctly rounded software fma the FP lowering needs, and runs slower. Inline assembly,
    target attributes and intrinsics are not bound by `-march`, so a v2 build runs `tools/check_isa.py` over the runtime
@@ -127,7 +134,21 @@ of them.
 
    Without this step the first launch compiles shaders and pipelines during play and stutters until the caches fill.
    The AMD driver keeps its pipeline cache per exe path and holds a limited amount: preparing another build folder can
-   evict this one's. `nx2navi.exe --warm-shaders` rebuilds it from the shader cache.
+   evict this one's. `nx2navi.exe --warm-shaders` rebuilds it from the shader cache. A driver update empties the
+   driver's cache too, and a change to what a stage library is built with gives every library another entry in it.
+   So an update that carries the prepared shaders over runs `--warm-shaders` (`tools/make_game.py`
+   `warm_driver_cache`: seconds while the libraries are there, minutes when they are not), and the game itself checks
+   at every start: it builds a sample of the prepared fragment libraries and, when their median time says the cache
+   is cold, builds the whole prepared list into the driver's cache again on idle-priority threads while it runs
+   (`runtime/vk_pipeline.c` `lw_start`, `NX2NAVI_LIB_WARM`; `shader-warm.txt` next to the caches says where that
+   stands). With the cache cold every pipeline a draw first needs compiles in play: on an RX 7900 XT a library took
+   93 ms (vertex) and 242 ms (fragment) on average against 0.3 and 0.6 ms from the cache, and a first walk through a
+   village skipped 11,180 draws and made 94 draws wait 5.5 s in all, against 1,605 skipped (1,473 of them in the
+   scene's first frames) and 60 ms of waits with the cache warm.
+   A frame that still lacks draws when it is presented is not shown: the previous picture stays on screen
+   (`runtime/vk_backend.c` `frame_hold`, `NX2NAVI_FRAME_HOLD_MS`, an allowance of 120 ms that fills again at an eighth
+   of the clock's rate). On a first walk through a village with nothing recorded, 21 of the 23 such frames were held
+   back; in a player's session a hit by a boulder had shown one black frame, its lighting pass skipped after 50 ms.
    When the driver's shader compiler crashes on a variant (NVIDIA 615.78.08 on an RTX 5080 does, issue #30),
    `prepare_shaders.py` runs the driver step again with `--warm-shaders`, up to three times, without the variants the
    driver was building at the crash. `shader-prepare-skip.txt` next to the exe lists them with the GPU and driver
@@ -209,6 +230,14 @@ The probes open a window, so from an SSH session they need the desktop session's
 skipped: no graphics+compute+present queue family`: on Wayland `XDG_RUNTIME_DIR=/run/user/$(id -u)
 WAYLAND_DISPLAY=wayland-1 SDL_VIDEODRIVER=wayland` (the socket name is in `$XDG_RUNTIME_DIR`), on X11 `DISPLAY=:0`.
 
+NVIDIA's Linux driver compiles into a disk cache of its own. A process adds at most `__GL_SHADER_DISK_CACHE_SIZE` to it
+(1 GiB by default; at a start the files after the first are deleted while the folder is over that size), and the default
+folder, `~/.cache/nvidia`, is shared with every program. `--prepare-shaders` of game 1.1.1 builds 42,142 variants, about
+1.5 GB: on the default limit about 30,700 of them were stored and the rest compiled again at their first draw in play.
+`runtime/vk_device.c` therefore points `__GL_SHADER_DISK_CACHE_PATH` at `nvidia-cache` beside `ocarina` and the size at
+8 GiB before the first Vulkan call, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV. The
+folder can be deleted; `ocarina --warm-shaders` fills it again.
+
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,
 re-protecting imported memory invalidates the driver's userptr buffer on every submit (about 1.3 ms per 16 MiB on
 amdgpu), and importing pins the pages, which drops their write protection. Each CPU-visible pool therefore gets a
@@ -224,7 +253,7 @@ The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the com
 
 Before a commit:
 
-- `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
+- `python tools/check_content.py --staged`: nothing game-derived and no compiled shader is staged. CI runs the same check;
   `git config core.hooksPath .githooks` runs it before each local commit.
 - `build\<ver>\nx2navi.exe --selftest`: layout, dispatch table and host-function registry, without game files.
 
@@ -236,6 +265,18 @@ With `--romfs <extracted RomFS folder>` it draws the game's interface textures a
 `tools/ui_textures.py <folder>` lists the textures there and dumps those matching `--match` to `build/ui-textures/`;
 both decode the game's files, so they run with `.venv-py314\Scripts\python` (`compression.zstd` and numpy). What they
 write is decoded game data: keep it under `build/`.
+
+A change to the shared save (`runtime/save_zip.c`, `runtime/save_share.c`, the save import in `runtime/fs_host.c`)
+passes `python tests\save_zip_check.py` and `python tests\save_share_check.py`. The first builds `save_zip.c` alone
+and checks its deflate, inflate, zip writer and reader against Python's zlib and zipfile both ways, and that the
+launcher imports a zip it wrote. The second builds `fs_host.c` and `save_share.c` with the rest of the runtime stubbed
+and runs each step as a start of the game on a profile it makes: the export, an import from a zip the launcher
+exported, its backup and swap at the next start, the zips it refuses and Cancel. No game files.
+
+A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarina_step`) passes
+`python tests\frame_step_check.py`, which builds `frame_rate.c` with the rest of the runtime stubbed and feeds it
+display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
+frame, uneven frame times one steady step, and game time follows the clock. No game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
@@ -252,16 +293,25 @@ change passes these, all run with `.venv`:
 | `tests\diff\func.py` | whole functions as the generator emits them, loops, jump tables and calls included (calls go to a stub that checks the registers at the call) | yes |
 | `tests\flags_check.py` | the function-local flag helpers of `runtime\cpu.h` against its packed ones | no |
 | `tests\ds3_check.py` | the DualShock 3 report decoding and output report of `runtime\input_ds3.c` | no |
+| `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, and blocks given back and taken again while pool addresses climb (no GPU; any Python) | no |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 
 A `--cpu v2` build passes the same differential tests with `--cflags=-march=x86-64-v2`; they compile `runtime/fma.c`
 too, so they check the software fma the v2 build links rather than the C runtime's.
 
+On NVIDIA Linux, `NX2NAVI_DLAA=1 ./ocarina --probe-vkdevice` logs NGX initialization and shutdown when available.
+
 Runtime probes, each a mode of `nx2navi.exe` (the list is at the top of `runtime/main.c`): `--probe-kernel`,
 `--probe-vkexec`, `--probe-nvn-tex` and `--probe-shader` cover most runtime changes. `--probe-shader` and the draw
 part of `--probe-vkexec` translate shaders of the census below: they look for `build/<ver>/shaders/jobs.json` of the
 exe's own version first, then of the other one.
+`--probe-vkmem` also checks CPU-backed texture uploads and rewrites, GPU-written texture aliases, and memory write watches.
+`--probe-prewarm` runs the boot's pipeline stages without the game, from the caches next to the exe (it skips when
+there are none): the pipeline cache load, the shader prewarm, the recorded pipelines and the compute pipeline prebuild,
+with a `mem: boot stage` log line after each that gives the device memory and the process commit so far. It then asks
+for compute pipelines the boot did not keep, as their first dispatch would, and prints what one costs. A change to what
+the boot builds or keeps (`runtime/vk_pipeline.c`: `prewarm_run`, `lb_compute`, the `compute-used.bin` record) passes it.
 
 Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader
 to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; failure groups go to `failures.txt`.

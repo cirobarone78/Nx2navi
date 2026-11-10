@@ -243,7 +243,27 @@ typedef enum {
     UI_MENU_CHEAT_CODE_DESC, UI_MENU_CHEAT_KEY_DESC /* "%s": the buttons */, UI_MENU_CHEAT_DATA_DESC,
     UI_MENU_CHEAT_MASTER, UI_MENU_CHEAT_MASTER_DESC, UI_MENU_CHEAT_RESTORE, UI_MENU_CHEAT_RESTORE_DESC,
     UI_MENU_CHEAT_REBUILD, UI_MENU_CHEAT_REBUILD_DESC, UI_MENU_CHEAT_UNSUPPORTED, UI_MENU_CHEAT_UNSUPPORTED_DESC,
-    UI_MENU_LAST_ID = UI_MENU_CHEAT_UNSUPPORTED_DESC,
+    // the Game tab's Saves group (ui/menu.cpp rows_saves, save_share.c): export the save into a zip, import a shared
+    // one at the next start. UI_MENU_SAVE_EXPORTED to UI_MENU_SAVE_E_UNSAFE are printf formats with at most one "%s"
+    // (a path, or the zip's NX2navi version and date)
+    UI_MENU_SAVES,
+    UI_MENU_SAVE_EXPORT, UI_MENU_SAVE_EXPORT_DESC, UI_MENU_SAVE_EXPORT_BUG, UI_MENU_SAVE_EXPORT_BUG_DESC,
+    UI_MENU_SAVE_IMPORT, UI_MENU_SAVE_IMPORT_DESC,
+    UI_MENU_SAVE_IMPORT_WAITING,     // the import row's value while an import waits for the next start
+    UI_MENU_SAVE_IMPORT_CANCEL, UI_MENU_SAVE_IMPORT_CANCEL_DESC,
+    UI_MENU_SAVE_BUSY,               // note on the rows while an export or import runs
+    UI_MENU_SAVE_EXPORTED,           // "%s": the zip's path
+    UI_MENU_SAVE_IMPORT_READY,       // "%s": "<NX2navi version>, <export date>" of the zip
+    UI_MENU_SAVE_IMPORT_CANCELLED,
+    UI_MENU_SAVE_IMPORTED,           // "%s": the folder the replaced save was copied to, at this start
+    UI_MENU_SAVE_IMPORTED_NEW,       // the same with no save to replace
+    UI_MENU_SAVE_E_NO_SAVE, UI_MENU_SAVE_E_READ_SAVE,
+    UI_MENU_SAVE_E_WRITE,            // "%s": the folder the zip could not be written into
+    UI_MENU_SAVE_E_READ,             // "%s" here and below: the zip
+    UI_MENU_SAVE_E_STAGE,
+    UI_MENU_SAVE_E_NOT_SAVE, UI_MENU_SAVE_E_OTHER_GAME, UI_MENU_SAVE_E_NEWER, UI_MENU_SAVE_E_DAMAGED,
+    UI_MENU_SAVE_E_UNSAFE,
+    UI_MENU_LAST_ID = UI_MENU_SAVE_E_UNSAFE,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total

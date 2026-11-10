@@ -115,12 +115,21 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   skipped as for a translation (`runtime/gfx_shader.c` `load_budget`). Opening a loose file is what costs (5.6 ms a
   pair the first time on Windows), so an update that carries the shaders over packs the cache once it holds 1,000
   loose translations (`tools/make_game.py` `PACK_LOOSE_MIN`).
+- Texture pool streaming: the bindless pool's refresh before each draw creates at most `pool_create_budget` entries,
+  and once a frame's refreshes have taken `pool_create_ms` (6 ms) none more until the next frame; the slots left keep
+  their stand-in, and the frame's later refreshes skip them (`runtime/vk_exec_draw.c` `pool_refill`). An area load
+  spreads over several frames instead of holding one for 200-400 ms.
 - Mesh and task shaders run as `VK_EXT_mesh_shader`; indirect mesh draws read NVN's `{count, first}` record through a
   ring of Vulkan `{x, y, z}` records filled on the GPU.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
   at a new state, an optimised pipeline replacing it from a background thread. A draw whose pipeline is not ready is
   skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Compute pipelines
-  are compiled outside the pipeline lock, and one compile serves every thread that needs it.
+  are compiled outside the pipeline lock, and one compile serves every thread that needs it. The boot builds the
+  pipeline of every compute shader play recorded or the shader preparation listed, but keeps only those of the shaders
+  dispatched most recently (`compute-used.bin`, `compute_keep`): the others go into the pipeline cache and are
+  destroyed, and their first dispatch creates them from it. A kept pipeline holds driver memory whether it is used or
+  not, and the list has thousands of compute shaders a session never dispatches (`runtime/vk_pipeline.c`, "compute
+  pipelines the boot keeps").
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
@@ -129,6 +138,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   holds the HDR picture relative to the HUD's white; the game's FSR 1 pass loses its output clamp; the present reads
   the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain.
   `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
+  The menu switches between off and `1` during a run: the splice, the HDR extensions and the settings in the support
+  buffer are there from the start whatever is set (`vk_hdr_armed`), the spliced tonemap returns the game's SDR result
+  while the swapchain is SDR, and a change of the setting makes the swapchain again in the other format
+  (`gfx_present.c` `window_settings_live`). Only `native` waits for a restart, as the game asks about the display
+  once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.

@@ -313,7 +313,11 @@ static int first_above(uint64_t a) {
 
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
     if (!U.on || !n) return 0;
-    int i = first_above(addr);
+    // Consecutive bindings mostly name the region the last one did: that one is tried before the binary search. The
+    // regions are sorted and disjoint, so the region that holds addr is the one first_above finds.
+    static int hint;
+    int i = hint;
+    if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
@@ -321,6 +325,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
     U.hits++;
+    hint = i;
     return 1;
 }
 
