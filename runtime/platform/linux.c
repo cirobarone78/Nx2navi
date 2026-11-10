@@ -2213,6 +2213,9 @@ int plat_commit_note(char *out, size_t cap) {
 // The cgroup's memory.current and MemAvailable count system memory only: a graphics card's own memory is in neither.
 int plat_commit_counts_vram(void) { return 0; }
 
+// Swap is not a page file Windows sizes; the limits plat_commit_info reads do not grow with it.
+int plat_page_file_managed(void) { return -1; }
+
 // ---- child processes
 
 struct PlatChild {

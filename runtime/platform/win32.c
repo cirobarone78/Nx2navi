@@ -1915,6 +1915,28 @@ int plat_commit_note(char *out, size_t cap) {
 // The driver charges the device memory it allocates to the system's commit.
 int plat_commit_counts_vram(void) { return 1; }
 
+// The PagingFiles value under Memory Management, one "<path> <initial MB> <maximum MB>" per page file: a path of
+// "?:\..." (System managed size on every drive) or no sizes or "0 0" (System managed size on that drive) leaves the
+// size to Windows. Read once; the setting takes effect only after a restart.
+int plat_page_file_managed(void) {
+    static int managed = -2;
+    if (managed != -2) return managed;
+    wchar_t v[2048];
+    DWORD size = sizeof v - sizeof(wchar_t) * 2;
+    int r = -1;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                     L"PagingFiles", RRF_RT_REG_MULTI_SZ, NULL, v, &size) == ERROR_SUCCESS) {
+        v[size / sizeof(wchar_t)] = v[size / sizeof(wchar_t) + 1] = 0;
+        for (wchar_t *e = v; *e; e += wcslen(e) + 1) {
+            wchar_t *sp = wcschr(e, L' ');
+            unsigned long lo = sp ? wcstoul(sp, &sp, 10) : 0, hi = sp ? wcstoul(sp, NULL, 10) : 0;
+            int own = e[0] == L'?' || (!lo && !hi);
+            r = own ? 1 : r < 0 ? 0 : r;
+        }
+    }
+    return managed = r;
+}
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
     *resident = *private_bytes = 0;

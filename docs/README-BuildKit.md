@@ -148,6 +148,10 @@ beside the game.
   driver keeps the prepared shaders' libraries in that cache, and a smaller limit drops the oldest as new ones come in
   (a 2048 MB cache could not hold them): every start then builds them again in the background, and play stutters, with
   some things missing for a few frames, until that is done. The log's `library warm` lines say when this happens.
+- With 16 GB of RAM, give Windows a fixed page file of at least 32 GB (System, About, Advanced system settings,
+  Performance Settings, Advanced, Virtual memory: Custom size, then restart). Windows counts the game's video memory
+  against RAM plus page file, and a page file Windows sizes itself grows too slowly for Hyrule Field: the game then
+  lets textures go and the ground can flash white or black. The log says `system commit low` when this happens.
 - **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Texture detail (Reduced and Low
   leave out the largest versions of the big surface textures so that the game fits the video memory of 6 and 8 GB
   cards; Automatic picks by the card), Upscaling (DLSS on NVIDIA RTX cards,

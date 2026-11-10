@@ -486,6 +486,9 @@ int plat_commit_note(char *out, size_t cap);
 // Whether a discrete GPU's own memory counts against that limit: on Windows the driver charges device memory to the
 // system's commit; Linux's limits count system memory only.
 int plat_commit_counts_vram(void);
+// Whether Windows sizes a page file by itself (System managed size): 1; 0 when every page file has a size set; -1
+// when unknown, there is none, or not Windows.
+int plat_page_file_managed(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);

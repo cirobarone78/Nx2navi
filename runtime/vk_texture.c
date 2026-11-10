@@ -1288,6 +1288,16 @@ static int commit_is_low(void) {
         rt_log("vk: system commit %s: %.0f of %.0f MB in use (this process %.0f MB); released textures kept %d, %.0f MiB "
                "of own memory%s", low ? "low" : "no longer low", used, limit, proc, nreleased, rel_bytes / 1048576.0,
                low ? ": dropping the stale ones" : "");
+        // A page file Windows sizes grows only slowly and by little, so the limit stays near the installed memory plus
+        // what the page file held at the boot: on a 16 GB PC with a 16 GB card it ran low in Hyrule Field at 32 GB,
+        // and textures gave way (white or black ground). A fixed page file of 32 GB or more raised the limit to 49 GB.
+        static int hinted;
+        if (low && !hinted && plat_page_file_managed() == 1) {
+            hinted = 1;
+            rt_log("vk: the page file is sized by Windows, which grows it only slowly: a fixed page file of at least "
+                   "32 GB keeps the system's commit from running low (System > About > Advanced system settings > "
+                   "Performance Settings > Advanced > Virtual memory > Change: Custom size, then restart Windows)");
+        }
     }
     sys_low = low;
     return commit_low = low || high;
