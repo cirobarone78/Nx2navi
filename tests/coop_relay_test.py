@@ -17,6 +17,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -688,6 +689,62 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(results, [1, 1, 1, cr.E_RATE, cr.E_RATE])   # one /24
         self.assertEqual(Client('other', ip='10.0.1.1').join(relay, 0, cr.INTENT_CREATE)[0][0], 1)
 
+    def ask(self, relay, c, now, intent=cr.INTENT_JOIN):
+        """One question of a session that waits for a room (coop.c): the same attempt's CONNECT, and at a challenge the
+        CONNECT with the cookie at once; the answer to it."""
+        out = parsed(relay.handle(c.connect(intent, c.cookie), c.addr, now))
+        if out and out[0][1].type == cr.T_CHALLENGE:
+            c.cookie = cr.parse_challenge(out[0][1].payload)[1]
+            out = parsed(relay.handle(c.connect(intent, c.cookie), c.addr, now))
+        return [dg for to, dg in out if to == c.addr][0]
+
+    def test_a_missing_room_costs_one_join_and_the_same_attempt_again_costs_nothing(self):
+        relay = cr.Relay(join_burst=3, join_rate=1 / 600)
+        secret = cr.random_secret()
+        b = Client('B', ip='10.5.0.1', secret=secret)
+        b.seq, b.nonce, b.cookie = 1, 5, bytes(16)
+        for t in range(40):   # the same attempt asked again and again, as a session that waits for the room
+            e = cr.parse_error(self.ask(relay, b, t).payload)
+            self.assertEqual(e[0], cr.E_NO_ROOM, f'question {t}: {e}')
+        self.assertEqual(relay.stats['repeats'], 39)
+        # two of the network's three joins are left: another attempt, and the room's maker on the same network
+        c = Client('C', ip='10.5.0.2', secret=secret)
+        self.assertEqual(c.join(relay, 41, cr.INTENT_JOIN)[0][0], cr.E_NO_ROOM)
+        self.assertEqual(Client('A', ip='10.5.0.3', secret=secret).join(relay, 42, cr.INTENT_CREATE)[0][0], 1)
+
+    def test_two_players_behind_one_address_wait_for_a_room_without_running_out_of_joins(self):
+        relay = cr.Relay()   # the limits a relay runs with: 20 joins, and one more every 3 s, per network
+        secret = cr.random_secret()
+        waiting = [Client('B', ip='192.0.2.7', secret=secret), Client('C', ip='192.0.2.7', secret=secret)]
+        for c in waiting:
+            c.seq, c.nonce, c.cookie = 1, random.getrandbits(64), bytes(16)
+        refused = []
+        for t in range(0, 600, 10):   # ten minutes, each asking every 10 s (coop.c's pace for a room that is not there)
+            for i, c in enumerate(waiting):
+                dg = self.ask(relay, c, t + i)
+                self.assertEqual(dg.type, cr.T_ERROR)
+                refused.append(cr.parse_error(dg.payload)[0])
+            relay.tick(t + 5)
+        self.assertEqual(set(refused), {cr.E_NO_ROOM}, f'{refused.count(cr.E_RATE)} of {len(refused)} questions refused for the budget')
+        a = Client('A', ip='192.0.2.7', secret=secret)   # the maker, behind the same address, makes the room
+        self.assertEqual(a.join(relay, 600, cr.INTENT_CREATE)[0][0], 1)
+        for i, c in enumerate(waiting):
+            self.assertEqual(self.ask(relay, c, 610 + i).type, cr.T_JOINED)
+
+    def test_a_flood_of_challenges_does_not_keep_a_member_from_rejoining(self):
+        relay = cr.Relay(challenge_rate=100)
+        (a, b), secret = self.room_of(2, relay=relay)
+        relay.tick(cr.SILENT_DROP + 1)   # a went silent and was dropped; its id waits for it
+        for i in range(2000):   # spoofed CONNECTs from many networks take the relay's challenges for this second
+            ip = f'10.{i >> 8 & 255}.{i & 255}.9'
+            relay.handle(Client(ip=ip).connect(cr.INTENT_CREATE), (ip, 5), cr.SILENT_DROP + 2)
+        a.addr = (a.addr[0], a.addr[1] + 1000)   # back from a new port (a new NAT mapping): a cookie first
+        a.seq, a.nonce = a.seq + 1, 12
+        out = parsed(relay.handle(a.connect(cr.INTENT_JOIN), a.addr, cr.SILENT_DROP + 2))
+        self.assertEqual([dg.type for to, dg in out], [cr.T_CHALLENGE])
+        flood = parsed(relay.handle(Client(ip='10.200.0.1').connect(cr.INTENT_CREATE), ('10.200.0.1', 5), cr.SILENT_DROP + 2))
+        self.assertEqual(flood, [])   # the flood's own share is spent
+
     def test_challenges_are_limited_per_network_so_one_cannot_lock_out_the_rest(self):
         relay = cr.Relay(challenge_rate=100, prefix_challenge_rate=10, prefix_challenge_burst=10)
         flood = sum(len(relay.handle(Client(ip=f'10.1.0.{i}').connect(cr.INTENT_CREATE), (f'10.1.0.{i}', 5), 0)) for i in range(200))
@@ -762,6 +819,28 @@ class RelayTest(unittest.TestCase):
             if t % 25 == 0:
                 relay.tick(now)
         self.assertGreaterEqual(got, 95, f'{got} of 100 forwarded beside 300 idle rooms')
+
+    def test_rooms_that_forward_to_nobody_do_not_shrink_the_share_of_a_busy_one(self):
+        relay = cr.Relay(egress_rate=80000, max_rooms=2000)
+        lonely = []
+        for i in range(300):   # rooms of one member each that send DATA nobody receives, each from a network of its own
+            c = Client(f'L{i}', ip=f'10.{100 + i // 250}.{i % 250}.1')
+            c.join(relay, 0, cr.INTENT_CREATE)
+            lonely.append(c)
+        q1, q2 = Client('Q1', ip='10.9.0.1'), Client('Q2', ip='10.9.1.1')
+        q1.join(relay, 0, cr.INTENT_CREATE)
+        q2.join(relay, 0, cr.INTENT_JOIN, q1.secret)
+        relay.tick(1)
+        got = 0
+        for t in range(100):   # one second: each lonely room sends every second, the busy one 200 bytes every 10 ms
+            now = 2 + t / 100
+            for c in lonely[t::100]:
+                for _ in range(3):
+                    c.send(relay, cr.T_DATA, bytes(100), dst=cr.DST_ALL, now=now)
+            got += len(q1.send(relay, cr.T_DATA, bytes(200), dst=q2.id, now=now)[0])
+            if t % 25 == 0:
+                relay.tick(now)
+        self.assertGreaterEqual(got, 95, f'{got} of 100 forwarded beside 300 rooms that send to nobody')
 
     def test_garbage_is_ignored(self):
         rnd = random.Random(7)
@@ -868,22 +947,36 @@ def free_udp_port():
 
 
 class Relay_proc:
-    """tools/coop_relay.py as a process on a fixed port, so that it can be stopped and started again."""
+    """tools/coop_relay.py as a process on a fixed port, so that it can be stopped and started again. Its log (with
+    where each network's joins went) is kept across restarts, for a failure's message."""
 
     def __init__(self, port):
-        self.port, self.p = port, None
+        self.port, self.p, self.log = port, None, []
+
+    def _read(self, out):
+        try:
+            for line in out:
+                self.log.append(line.rstrip())
+        except (OSError, ValueError):
+            pass   # closed by stop()
 
     def start(self):
-        self.p = subprocess.Popen([sys.executable, str(RELAY_PY), '--host', '127.0.0.1', '--port', str(self.port)],
+        self.p = subprocess.Popen([sys.executable, str(RELAY_PY), '--host', '127.0.0.1', '--port', str(self.port), '--log-joins', '--log-addrs'],
                                   stdout=subprocess.PIPE, text=True)
-        assert 'listening' in self.p.stdout.readline()
+        line = self.p.stdout.readline()
+        assert 'listening' in line
+        self.log.append(line.rstrip())
+        self.reader = threading.Thread(target=self._read, args=(self.p.stdout,), daemon=True)
+        self.reader.start()
 
     def stop(self):
         if self.p:
             self.p.kill()
             self.p.wait()
+            self.reader.join(5)
             self.p.stdout.close()
             self.p = None
+            self.log.append('(the relay stopped)')
 
 
 @unittest.skipUnless(EXE and Path(EXE).is_file(), 'set NX2NAVI_EXE to a built game executable to run --probe-coop')
@@ -919,8 +1012,9 @@ class ProbeTest(unittest.TestCase):
         text = '\n'.join(lines)
         if os.environ.get('COOP_TEST_VERBOSE'):
             print(text)
-        self.assertEqual(code, 0, text)
-        self.assertIn('coop-probe: passed', text)
+        relay_log = "\n--- the relay's log ---\n" + '\n'.join(relay.log[-300:])
+        self.assertEqual(code, 0, text + relay_log)
+        self.assertIn('coop-probe: passed', text, relay_log)
         self.assertIn('restart', text)
 
     def test_probe_without_loss(self):

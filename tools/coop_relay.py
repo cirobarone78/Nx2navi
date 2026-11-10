@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NX2navi co-op relay: forwards datagrams between the players of a room (up to 8), nothing else. Standard library only.
 
-Usage: python tools/coop_relay.py [--host 0.0.0.0] [--port 24680] [--log-addrs] [--max-rooms 1000]
+Usage: python tools/coop_relay.py [--host 0.0.0.0] [--port 24680] [--log-addrs] [--log-joins] [--max-rooms 1000]
 
 The game's co-op layer (runtime/coop.c) talks to it over UDP; any player can run one on a machine the others can reach
 (forward the UDP port on a router) and put its address into the game's coop_server setting. docs/coop.md describes the
@@ -30,8 +30,11 @@ was in the room before is refused: the players' games bind a member's signed ide
 
 Limits: per member (datagrams and bytes, a forwarded datagram counted once for each receiver), per network (/24 for
 IPv4, /48 for IPv6: challenges, joins, rooms made; at most MAX_NETWORKS of them are tracked), per room (an equal share
-of the bytes the relay forwards among the rooms that forwarded in the last ACTIVE seconds), and for the whole relay
-(challenges, bytes sent).
+of the bytes the relay forwards among the rooms that forwarded to someone in the last ACTIVE seconds), and for the
+whole relay (challenges, with a share set aside for members that rejoin with their token, and bytes sent). A join
+attempt costs its network one join, whatever the answer; the same attempt sent again (the same client, address and
+CONNECT sequence) while the answer would be the same refusal is answered from memory without a charge, so a player
+who waits for a room that is not there yet costs one join per attempt, not one per question.
 """
 from __future__ import annotations
 
@@ -78,7 +81,9 @@ ROSTER_EVERY = 5      # the roster is sent again this often: a lost update repai
 ROSTER_AGAIN = (0.25, 0.75)   # and after a change, again this long after it: three chances against loss, as in coop.c's CONNECT bursts
 MAX_NETWORKS = 4096   # networks whose challenge or join budget is tracked at once; a budget that is full again is forgotten
 SESSIONS_KEPT = 4096  # sessions a room remembers having seen, so that none is taken twice (the oldest forgotten first)
-ACTIVE = 2           # a room that forwarded within this many seconds shares the forwarding budget; an idle one does not
+ACTIVE = 2           # a room that forwarded to someone within this many seconds shares the forwarding budget
+FAILED_KEPT = 4096   # join attempts whose refusal is remembered, so that the same attempt again costs nothing
+FAILED_TTL = 120     # and for this long (a cookie lasts one to two minutes)
 
 
 def normalize_secret(text):
@@ -346,14 +351,16 @@ class Relay:
     def __init__(self, max_rooms=1000, log=None, log_addrs=False, secret=None,
                  pkt_rate=200, pkt_burst=400, byte_rate=65536, byte_burst=131072, join_rate=1 / 3, join_burst=20,
                  challenge_rate=5000, prefix_challenge_rate=20, prefix_challenge_burst=40, rooms_per_prefix=8,
-                 egress_rate=8 << 20):
+                 egress_rate=8 << 20, rejoin_challenge_rate=1000, log_joins=False):
         self.max_rooms = max_rooms
         self.log_fn = log
         self.log_addrs = log_addrs
+        self.log_joins = log_joins
         self.secret = secret or secrets.token_bytes(32)
         self.limits = (pkt_rate, pkt_burst, byte_rate, byte_burst)
         self.join_limit = (join_rate, join_burst)
         self.challenge_rate = challenge_rate
+        self.rejoin_challenge_rate = rejoin_challenge_rate
         self.prefix_challenge = (prefix_challenge_rate, prefix_challenge_burst)
         self.rooms_per_prefix = rooms_per_prefix
         self.egress_rate = egress_rate
@@ -363,14 +370,16 @@ class Relay:
         self.join_buckets = {}       # network prefix -> Bucket
         self.challenge_buckets = {}  # network prefix -> Bucket
         self.prefix_rooms = {}       # network prefix -> rooms it made that are open
+        self.failed = {}       # (client id, address, CONNECT seq, locator) -> (reason, when): refusals of an attempt (oldest first)
         self.challenges = None
+        self.rejoin_challenges = None   # the share of challenges set aside for CONNECTs with a member's valid token
         self.egress = None
         self.next_prune = 0
+        self.rate_said = -10.0   # when the log last told of a join refused for the network's budget
         self.seq = 0
         self.stats = {k: 0 for k in ('rx', 'malformed', 'bad_tag', 'no_member', 'wrong_addr', 'rate_limited',
                                      'challenges', 'joins', 'rejoins', 'leaves', 'drops', 'forwarded', 'rooms_made',
-                                     'kicks', 'egress_limited')}
-
+                                     'kicks', 'egress_limited', 'repeats', 'join_charges')}
     # -- helpers
 
     def log(self, text):
@@ -424,10 +433,18 @@ class Relay:
 
     def prune(self, now):
         """Forgets the networks whose budgets are full again (as good as new): the tables hold only networks that sent
-        something in the last seconds."""
+        something in the last seconds. And the refusals older than FAILED_TTL."""
         for table in (self.join_buckets, self.challenge_buckets):
             for k in [k for k, b in table.items() if b.full(now)]:
                 del table[k]
+        for k in [k for k, (_, when) in self.failed.items() if now - when >= FAILED_TTL]:
+            del self.failed[k]
+
+    def note_join(self, net, bucket, what):
+        """With --log-joins, where a network's join budget went (the network itself only with --log-addrs)."""
+        if self.log_joins:
+            who = net if self.log_addrs else 'a network'
+            self.log(f'joins of {who}: {what}, {bucket.tokens:.1f} left' if bucket else f'joins of {who}: {what}')
 
     def bucket(self, table, key, rate, burst, now):
         """The budget of network key, or None when MAX_NETWORKS networks are tracked and none of them is done."""
@@ -440,9 +457,14 @@ class Relay:
             b = table[key] = Bucket(rate, burst, now)
         return b
 
-    def take_challenge(self, addr, now):
+    def take_challenge(self, addr, now, member=None):
         """A challenge (or an answer to another protocol version) for addr: the relay's budget first (a flood it refuses
-        leaves no state behind), then its network's."""
+        leaves no state behind), then its network's. A CONNECT that carries a member's valid token (a rejoin) takes from
+        a share set aside for those, which a flood without a token never reaches, and from that member's own budget."""
+        if member is not None:
+            if self.rejoin_challenges is None:
+                self.rejoin_challenges = Bucket(self.rejoin_challenge_rate, self.rejoin_challenge_rate, now)
+            return member.pkts.take(1, now) and self.rejoin_challenges.take(1, now)
         if self.challenges is None:
             self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
         self.challenges.refill(now)
@@ -452,8 +474,8 @@ class Relay:
         return mine is not None and mine.take(1, now) and self.challenges.take(1, now)
 
     def share_egress(self, now):
-        """Each room's share of the forwarding budget: equal among the rooms that forwarded in the last ACTIVE seconds, so a
-        busy room cannot take what another needs and rooms that send nothing take nothing."""
+        """Each room's share of the forwarding budget: equal among the rooms that forwarded to someone in the last ACTIVE
+        seconds, so a busy room cannot take what another needs and rooms that send nothing (or to nobody) take nothing."""
         active = sum(1 for r in self.rooms.values() if r.forwarded_at is not None and now - r.forwarded_at < ACTIVE)
         share = self.egress_rate / max(1, active)
         for room in self.rooms.values():
@@ -539,6 +561,8 @@ class Relay:
             target = room.members.get(dg.dst)
             targets = [target] if target and target.live and target is not member else []
         # each copy counts against the sender (its byte budget already paid one) and against the relay's
+        if not targets:   # to nobody: nothing to forward, and the room does not count among those that share the budget
+            return []
         extra = len(data) * max(0, len(targets) - 1)
         if extra and not member.bytes.take(extra, now):
             self.stats['rate_limited'] += 1
@@ -583,7 +607,7 @@ class Relay:
         # someone who saw the member's CONNECT on the way would take its place
         if (rejoin is None or rejoin.addr != addr or rejoin.session != session) and not self.cookie_ok(addr, cookie, now):
             # not yet proven to receive at its address: only a challenge, and only if that is no larger than the request
-            if len(data) < CONNECT_MIN or not self.take_challenge(addr, now):
+            if len(data) < CONNECT_MIN or not self.take_challenge(addr, now, rejoin):
                 return []
             self.stats['challenges'] += 1
             return [(addr, pack(T_CHALLENGE, 0, 0, 0, self.next_seq(), pack_challenge(nonce, self.cookie(addr, int(now // 60))), key))]
@@ -595,30 +619,33 @@ class Relay:
             known[1].last_seen = now   # a CONNECT sent again because its answer was lost: the answer again
             return self.joined(known[0], known[1], nonce)
         net = prefix_of(addr)
+        refusal = self.refusal(intent, room, rejoin, cid, addr, session, net)
+        attempt = (cid, addr[:2], dg.seq, locator)
+        if refusal is not None and self.failed.get(attempt, (None,))[0] == refusal[0]:
+            # the same attempt again (an answer was lost, or it asks again for a room that is not there yet): the same
+            # answer, without a charge, so that waiting does not use up the network's joins
+            self.stats['repeats'] += 1
+            return self.error(addr, refusal[0], nonce, refusal[1], key)
         bucket = self.bucket(self.join_buckets, net, *self.join_limit, now)
         if bucket is None or not bucket.take(1, now):
             self.stats['rate_limited'] += 1
+            if self.log_joins or now - self.rate_said >= 10:   # a line every 10 s at most: a flood does not fill the log
+                self.rate_said = now
+                self.log(f'a join refused: too many joins from {net if self.log_addrs else "one network"} ({self.stats["rate_limited"]} so far)')
             return self.error(addr, E_RATE, nonce, 'too many joins, try again later', key)
+        self.stats['join_charges'] += 1
+        if refusal is not None:
+            self.failed.pop(attempt, None)
+            self.failed[attempt] = (refusal[0], now)
+            if len(self.failed) > FAILED_KEPT:
+                del self.failed[next(iter(self.failed))]
+            self.note_join(net, bucket, f'charged 1 for a refused attempt ({refusal[1]})')
+            return self.error(addr, refusal[0], nonce, refusal[1], key)
+        self.note_join(net, bucket, 'charged 1 for a ' + ('rejoin' if rejoin else 'join' if room else 'new room'))
         name = clean_name(raw_name) or b'Player'
         out = []
-        if intent == INTENT_JOIN:
-            if room is None:
-                bucket.take(2, now)   # a join of a room that is not there costs three
-                return self.error(addr, E_NO_ROOM, nonce, 'no such room', key)
-        elif room is not None and rejoin is None:
-            return self.error(addr, E_ROOM_EXISTS, nonce, 'a room with this secret is open', key)
-        elif room is None:
-            if len(self.rooms) >= self.max_rooms:
-                return self.error(addr, E_SERVER_FULL, nonce, 'server full', key)
-            if self.prefix_rooms.get(net, 0) >= self.rooms_per_prefix:
-                return self.error(addr, E_RATE, nonce, 'too many rooms from this network', key)
+        if room is None:
             room = self.make_room(locator, net, now)
-        if cid in room.banned or addr in room.banned:
-            return self.error(addr, E_REMOVED, nonce, 'removed by the room\'s maker', key)
-        if session in room.sessions and (rejoin is None or session != rejoin.session):
-            # a session is the member's identity to the others (their games bind its signature to it): one that was in
-            # the room before is someone else's, replayed
-            return self.error(addr, E_SESSION_USED, nonce, 'a session used in this room before', key)
         room.use_session(session)
         if known and known[0] is not room:
             out += self.leave(known[0], known[1], now, 'moved to another room')   # same address, new room: it left the old
@@ -653,6 +680,26 @@ class Relay:
         self.by_addr[addr[:2]] = (room, member)
         room.empty_since = None
         return out + self.joined(room, member, nonce) + self.roster_to_all(room, skip=member, changed_at=now)
+
+    def refusal(self, intent, room, rejoin, cid, addr, session, net):
+        """(reason, text) when this attempt is refused, None when it joins or makes the room; nothing is charged here."""
+        if intent == INTENT_JOIN and room is None:
+            return E_NO_ROOM, 'no such room'
+        if intent == INTENT_CREATE and room is not None and rejoin is None:
+            return E_ROOM_EXISTS, 'a room with this secret is open'
+        if room is None:
+            if len(self.rooms) >= self.max_rooms:
+                return E_SERVER_FULL, 'server full'
+            if self.prefix_rooms.get(net, 0) >= self.rooms_per_prefix:
+                return E_RATE, 'too many rooms from this network'
+            return None
+        if cid in room.banned or addr in room.banned:
+            return E_REMOVED, 'removed by the room\'s maker'
+        if session in room.sessions and (rejoin is None or session != rejoin.session):
+            # a session is the member's identity to the others (their games bind its signature to it): one that was in
+            # the room before is someone else's, replayed
+            return E_SESSION_USED, 'a session used in this room before'
+        return None
 
     def make_room(self, locator, prefix, now):
         rid = 0
@@ -771,12 +818,13 @@ def main():
     ap.add_argument('--log-addrs', action='store_true', help="write the players' addresses to the log (off by default)")
     ap.add_argument('--max-rooms', type=int, default=1000, help='rooms at most (default 1000)')
     ap.add_argument('--rooms-per-network', type=int, default=8, help='open rooms one /24 or /48 may make (default 8)')
+    ap.add_argument('--log-joins', action='store_true', help="write where each network's join budget goes to the log")
     a = ap.parse_args()
 
     def log(text):
         print(time.strftime('%H:%M:%S ') + text, flush=True)
 
-    relay = Relay(max_rooms=a.max_rooms, log=log, log_addrs=a.log_addrs, rooms_per_prefix=a.rooms_per_network)
+    relay = Relay(max_rooms=a.max_rooms, log=log, log_addrs=a.log_addrs, rooms_per_prefix=a.rooms_per_network, log_joins=a.log_joins)
     sock = open_socket(a.host, a.port)
     log(f'coop_relay: listening on {a.host}:{sock.getsockname()[1]}')
     try:
