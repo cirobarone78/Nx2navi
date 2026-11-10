@@ -84,6 +84,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Texture filtering",
     [UI_MENU_ANISO_DESC] = "Anisotropic filtering of surface textures: ground, roads and walls seen at a shallow angle stay sharp into the distance instead of blurring. Game: the level the game asks for, as on the Switch.",
     [UI_MENU_ANISO_GAME] = "Game",
+    [UI_MENU_TEX_DETAIL] = "Texture detail",
+    [UI_MENU_TEX_DETAIL_DESC] = "Sharpness of large surface textures. Reduced and Low leave out their largest versions, so that an area fits the video memory of 6 and 8 GB cards; only surfaces seen up close look softer. Automatic picks by the card's video memory.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Automatic: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Full", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduced", [UI_MENU_TEX_DETAIL_LOW] = "Low",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "How sharp FSR makes the picture. 0 turns it off.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "only with AMD FSR 1 or FSR 3.1",
@@ -252,8 +256,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PAD_LAYOUT_IN_USE] = "in use: %s",
     [UI_MENU_PROMPTS] = "Button prompts",
     [UI_MENU_PROMPTS_DESC] = "Which buttons the game's prompts show, in text, in the action prompt and on the "
-                             "ocarina's notes. Nintendo: the game's own. Xbox and PlayStation: that pad's buttons (LB, "
-                             "RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create), and A, B, X and Y as the "
+                             "ocarina's notes. Nintendo: the game's own. Xbox, PlayStation and Steam Deck: that pad's "
+                             "buttons (LB, RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create; the Deck's A, B, X, "
+                             "Y with L1, R1, L2, R2, Menu, View), and A, B, X and Y as the "
                              "button the layout above presses (with Nintendo (A right) the right button does A, so the "
                              "prompts for A show B, or circle). Keyboard and mouse: the key each button has (E, Ctrl, "
                              "Space, left click...), WASD for moving and the mouse for the camera. The prompt files "
@@ -262,7 +267,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                              "are part of the game's files, so a button you remap in Controls keeps its old prompt on "
                              "screen until the files are made again.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
     [UI_MENU_PROMPTS_MISSING] = "prompt files missing: tools/pad_prompts.py makes them",
     [UI_MENU_PROMPTS_FAILED] = "prompt files damaged: make them again with tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "prompts change after restart",
@@ -275,6 +281,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Restart the game now? Progress since your last save is lost.",
     [UI_MENU_QUIT_CONFIRM] = "Quit the game? Progress since your last save is lost.",
     [UI_MENU_RESTART_YES] = "Restart",
+    [UI_MENU_RESTART_COUNT] = "Restart (%d)",
     [UI_MENU_RESTART_SAVING] = "The game is saving: Restart is possible in a moment.",
     [UI_MENU_QUIT_SAVING] = "The game is saving: Quit is possible in a moment.",
     [UI_MENU_GROUP_STICKS] = "Analog sticks",
@@ -396,7 +403,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Lets a game thread interrupt another one on the same virtual core.",
     [UI_MENU_PREEMPT_OFF] = "Off", [UI_MENU_PREEMPT_ON] = "On", [UI_MENU_PREEMPT_INHERIT] = "Inheritance only",
     [UI_MENU_REPLAY_ASYNC] = "GPU frame prep on its own thread",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepares frames for the GPU on a separate thread instead of the game thread. Adds up to one frame of latency.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepares frames for the GPU on a separate thread instead of the game thread. Faster in heavy scenes, but can show a dark or flickering frame now and then, and adds up to one frame of latency.",
     [UI_MENU_TIMER_1MS] = "1 ms Windows timer",
     [UI_MENU_TIMER_1MS_DESC] = "Raises the system timer resolution to 1 ms for steadier frame pacing.",
     [UI_MENU_PIPE_WAIT] = "Waiting draw handling",
@@ -507,6 +514,37 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                    "now.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "not supported",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "This cheat cannot be used with this version of the game:",
+    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVE_EXPORT] = "Export save",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Writes your save (every slot) into one zip file in your Downloads folder, to give to "
+                                 "another player or attach to a bug report. It never holds your keys or game files.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Export save for a bug report",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "The same zip with this run's log and your settings (nx2navi.ini) added, which "
+                                     "show what happened and with which settings. Attach it to your bug report.",
+    [UI_MENU_SAVE_IMPORT] = "Import a save",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Choose a save someone shared (an NX2navi-save zip). It replaces your save, every slot, "
+                                 "at the next start: the game keeps your progress in memory and would write it back "
+                                 "over a save replaced now. Your current save is copied to the saves folder first.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "at next start",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancel the import",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Keeps your save as it is: the save waiting for the next start is dropped.",
+    [UI_MENU_SAVE_BUSY] = "working…",
+    [UI_MENU_SAVE_EXPORTED] = "Saved as %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "The save (NX2navi %s) loads at the next start: select Restart below. Your current "
+                                  "save is copied to the saves folder first.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Import cancelled; your save stays as it is.",
+    [UI_MENU_SAVE_IMPORTED] = "A shared save was imported at this start. Your old save is in %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "A shared save was imported at this start.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "There is no save to export yet: play until the game saves.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "A file of your save could not be read; try again in a moment.",
+    [UI_MENU_SAVE_E_WRITE] = "The zip could not be written into %s.",
+    [UI_MENU_SAVE_E_READ] = "%s could not be read.",
+    [UI_MENU_SAVE_E_STAGE] = "The save could not be prepared for the next start; the log says why.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s is not a save NX2navi exported.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s is a save of another game.",
+    [UI_MENU_SAVE_E_NEWER] = "%s was made by a newer NX2navi: update NX2navi first.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s is damaged: download it again.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
@@ -521,7 +559,20 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
+                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
+    [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
+    [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
+    [UI_MENU_FRAMEGEN_NEEDS_DLSS] = "choose a DLSS mode under Upscaling first",
+    [UI_MENU_FRAMEGEN_DESC_NONE] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1, and neither runs "
+                                   "here.",
+    [UI_MENU_FRAMEGEN_NEEDS_NONE] = "needs DLSS or FSR 3.1, which do not run here",
     [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
+    [UI_MENU_FG_MULT_DESC] = "Frames on screen for each frame the game draws with DLSS Frame Generation: 2x adds one "
+                             "generated frame, up to 6x on an RTX 50 card. Dynamic adds only the frames needed to "
+                             "reach your display's refresh rate. Changes take effect at once.",
+    [UI_MENU_FG_MULT_DYNAMIC] = "Dynamic",
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
                                    "the frames on screen, so the game draws the limit divided by this: set the limit "
@@ -597,6 +648,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Фильтрация текстур",
     [UI_MENU_ANISO_DESC] = "Анизотропная фильтрация текстур поверхностей: земля, дороги и стены под острым углом остаются чёткими вдали, а не размываются. Игра: уровень, который запрашивает игра, как на Switch.",
     [UI_MENU_ANISO_GAME] = "Игра",
+    [UI_MENU_TEX_DETAIL] = "Детализация текстур",
+    [UI_MENU_TEX_DETAIL_DESC] = "Чёткость больших текстур поверхностей. «Сниженная» и «Низкая» не загружают их самые крупные версии, чтобы область помещалась в видеопамять карт на 6 и 8 ГБ; мягче выглядят только поверхности вблизи. «Авто» выбирает по объёму видеопамяти.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Авто: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Полная", [UI_MENU_TEX_DETAIL_REDUCED] = "Сниженная", [UI_MENU_TEX_DETAIL_LOW] = "Низкая",
     [UI_MENU_SHARPNESS] = "Резкость FSR",
     [UI_MENU_SHARPNESS_DESC] = "Насколько FSR повышает резкость. 0 отключает.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "только с AMD FSR 1",
@@ -772,7 +827,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                              "перезапуска. Подсказки записаны в файлах игры, поэтому у кнопки, переназначенной на "
                              "вкладке управления, на экране остаётся прежняя подсказка, пока файлы не созданы заново.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
     [UI_MENU_PROMPTS_MISSING] = "нет файлов подсказок: их создаёт tools/pad_prompts.py",
     [UI_MENU_PROMPTS_FAILED] = "файлы подсказок повреждены: создайте их снова tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "подсказки сменятся после перезапуска",
@@ -785,6 +841,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Перезапустить игру сейчас? Прогресс после последнего сохранения будет потерян.",
     [UI_MENU_QUIT_CONFIRM] = "Выйти из игры? Прогресс после последнего сохранения будет потерян.",
     [UI_MENU_RESTART_YES] = "Перезапустить",
+    [UI_MENU_RESTART_COUNT] = "Перезапустить (%d)",
     [UI_MENU_RESTART_SAVING] = "Игра сохраняется: перезапуск будет доступен через мгновение.",
     [UI_MENU_QUIT_SAVING] = "Игра сохраняется: выход будет доступен через мгновение.",
     [UI_MENU_GROUP_STICKS] = "Стики",
@@ -908,7 +965,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Позволяет потоку игры прервать другой поток на том же виртуальном ядре.",
     [UI_MENU_PREEMPT_OFF] = "Выкл.", [UI_MENU_PREEMPT_ON] = "Вкл.", [UI_MENU_PREEMPT_INHERIT] = "Только наследование",
     [UI_MENU_REPLAY_ASYNC] = "Подготовка кадра для GPU в отдельном потоке",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Кадр для GPU готовится в отдельном потоке, а не в потоке игры. Добавляет до одного кадра задержки.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Кадр для GPU готовится в отдельном потоке, а не в потоке игры. Быстрее в тяжёлых сценах, но иногда может показать тёмный или мерцающий кадр и добавляет до одного кадра задержки.",
     [UI_MENU_TIMER_1MS] = "Таймер Windows 1 мс",
     [UI_MENU_TIMER_1MS_DESC] = "Повышает точность системного таймера до 1 мс для ровного темпа кадров.",
     [UI_MENU_PIPE_WAIT] = "Обработка ожидающих отрисовок",
@@ -1019,6 +1076,40 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                    "его при следующем запуске (несколько минут), или нажмите «Пересобрать игру сейчас».",
     [UI_MENU_CHEAT_UNSUPPORTED] = "не поддерживается",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Этот чит нельзя использовать с этой версией игры:",
+    [UI_MENU_SAVES] = "Сохранения",
+    [UI_MENU_SAVE_EXPORT] = "Экспорт сохранения",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Записывает ваше сохранение (все слоты) в один zip-файл в папке «Загрузки», чтобы "
+                                 "передать его другому игроку или приложить к сообщению об ошибке. Ключи и файлы игры "
+                                 "в него не попадают.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Экспорт для сообщения об ошибке",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "Тот же zip с журналом этого запуска и вашими настройками (nx2navi.ini): по ним "
+                                     "видно, что произошло и с какими настройками. Приложите его к сообщению об ошибке.",
+    [UI_MENU_SAVE_IMPORT] = "Импорт сохранения",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Выберите сохранение, которым с вами поделились (zip NX2navi-save). Оно заменит ваше "
+                                 "сохранение, все слоты, при следующем запуске: игра держит прогресс в памяти и "
+                                 "записала бы его поверх сохранения, заменённого сейчас. Текущее сохранение сначала "
+                                 "копируется в папку saves.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "при следующем запуске",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Отменить импорт",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Оставляет ваше сохранение как есть: сохранение, ждущее следующего запуска, "
+                                        "удаляется.",
+    [UI_MENU_SAVE_BUSY] = "выполняется…",
+    [UI_MENU_SAVE_EXPORTED] = "Сохранено: %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (NX2navi %s) загрузится при следующем запуске: выберите «Перезапустить» "
+                                  "внизу. Текущее сохранение сначала копируется в папку saves.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Импорт отменён, ваше сохранение не изменилось.",
+    [UI_MENU_SAVE_IMPORTED] = "При этом запуске импортировано сохранение. Прежнее сохранение лежит в %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "При этом запуске импортировано сохранение.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "Экспортировать пока нечего: играйте, пока игра не сохранится.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "Не удалось прочитать файл сохранения; попробуйте ещё раз чуть позже.",
+    [UI_MENU_SAVE_E_WRITE] = "Не удалось записать zip в %s.",
+    [UI_MENU_SAVE_E_READ] = "Не удалось прочитать %s.",
+    [UI_MENU_SAVE_E_STAGE] = "Не удалось подготовить сохранение к следующему запуску; причина указана в журнале.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s — не сохранение, экспортированное NX2navi.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s — сохранение другой игры.",
+    [UI_MENU_SAVE_E_NEWER] = "%s создан более новой версией NX2navi: сначала обновите NX2navi.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s повреждён: скачайте его заново.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
@@ -1263,7 +1354,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Deixa uma thread do jogo interromper outra no mesmo núcleo virtual.",
     [UI_MENU_PREEMPT_OFF] = "Desligado", [UI_MENU_PREEMPT_ON] = "Ligado", [UI_MENU_PREEMPT_INHERIT] = "Só herança",
     [UI_MENU_REPLAY_ASYNC] = "Preparo de quadro da GPU em thread própria",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepara os quadros para a GPU numa thread separada em vez da thread do jogo. Adiciona até um quadro de latência.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepara os quadros para a GPU numa thread separada em vez da thread do jogo. Mais rápido em cenas pesadas, mas pode mostrar um quadro escuro ou piscando de vez em quando, e adiciona até um quadro de latência.",
     [UI_MENU_TIMER_1MS] = "Timer do Windows de 1 ms",
     [UI_MENU_TIMER_1MS_DESC] = "Aumenta a resolução do timer do sistema para 1 ms, para um ritmo de quadros mais estável.",
     [UI_MENU_PIPE_WAIT] = "Tratamento de desenhos em espera",
@@ -1367,6 +1458,13 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                            "ângulo raso continuam nítidos ao longe em vez de borrar. Jogo: o nível que o jogo pede, "
                            "como no Switch.",
     [UI_MENU_ANISO_GAME] = "Jogo",
+    [UI_MENU_TEX_DETAIL] = "Detalhe das texturas",
+    [UI_MENU_TEX_DETAIL_DESC] = "Nitidez das texturas grandes de superfície. Reduzido e Baixo deixam de fora as versões "
+                                "maiores delas, para que uma área caiba na memória de vídeo de placas de 6 e 8 GB; só as "
+                                "superfícies vistas de perto ficam mais suaves. Automático escolhe pela memória de vídeo "
+                                "da placa.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Automático: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Completo", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduzido", [UI_MENU_TEX_DETAIL_LOW] = "Baixo",
     [UI_MENU_COLOR] = "Cor",
     [UI_MENU_COLOR_PRESET] = "Perfil de cor",
     [UI_MENU_COLOR_PRESET_DESC] = "Define os quatro valores abaixo. Vívido: mais contraste e saturação, sombras um "
@@ -1430,6 +1528,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Reiniciar o jogo agora? O progresso desde o último salvamento é perdido.",
     [UI_MENU_QUIT_CONFIRM] = "Sair do jogo? O progresso desde o último salvamento é perdido.",
     [UI_MENU_RESTART_YES] = "Reiniciar",
+    [UI_MENU_RESTART_COUNT] = "Reiniciar (%d)",
     [UI_MENU_RESTART_SAVING] = "O jogo está salvando: dá para reiniciar em um instante.",
     [UI_MENU_QUIT_SAVING] = "O jogo está salvando: dá para sair em um instante.",
     [UI_MENU_STICK_SENS] = "Velocidade da câmera (analógico)",
@@ -1526,6 +1625,40 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                    "Recompilar o jogo agora.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "não suportado",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Este cheat não pode ser usado com esta versão do jogo:",
+    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVE_EXPORT] = "Exportar save",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Grava seu save (todos os slots) em um arquivo zip na pasta Downloads, para passar a "
+                                 "outro jogador ou anexar a um relato de bug. Ele nunca contém suas chaves nem arquivos "
+                                 "do jogo.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Exportar para relato de bug",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "O mesmo zip com o log desta execução e suas configurações (nx2navi.ini), que "
+                                     "mostram o que aconteceu e com quais configurações. Anexe-o ao seu relato de bug.",
+    [UI_MENU_SAVE_IMPORT] = "Importar save",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Escolha um save que alguém compartilhou (um zip NX2navi-save). Ele substitui seu save, "
+                                 "todos os slots, na próxima inicialização: o jogo mantém seu progresso na memória e o "
+                                 "gravaria por cima de um save substituído agora. Seu save atual é copiado antes para a "
+                                 "pasta saves.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "na próxima inicialização",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancelar a importação",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Mantém seu save como está: o save que aguardava a próxima inicialização é "
+                                        "descartado.",
+    [UI_MENU_SAVE_BUSY] = "trabalhando…",
+    [UI_MENU_SAVE_EXPORTED] = "Salvo como %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "O save (NX2navi %s) é carregado na próxima inicialização: selecione Reiniciar abaixo. "
+                                  "Seu save atual é copiado antes para a pasta saves.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Importação cancelada; seu save continua como estava.",
+    [UI_MENU_SAVE_IMPORTED] = "Um save compartilhado foi importado nesta inicialização. Seu save anterior está em %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "Um save compartilhado foi importado nesta inicialização.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "Ainda não há save para exportar: jogue até o jogo salvar.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "Um arquivo do seu save não pôde ser lido; tente de novo daqui a pouco.",
+    [UI_MENU_SAVE_E_WRITE] = "Não foi possível gravar o zip em %s.",
+    [UI_MENU_SAVE_E_READ] = "Não foi possível ler %s.",
+    [UI_MENU_SAVE_E_STAGE] = "Não foi possível preparar o save para a próxima inicialização; o log diz o motivo.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s não é um save exportado pelo NX2navi.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s é um save de outro jogo.",
+    [UI_MENU_SAVE_E_NEWER] = "%s foi feito por um NX2navi mais novo: atualize o NX2navi primeiro.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s está danificado: baixe-o de novo.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
@@ -1865,7 +1998,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PREEMPT_ON] = "开",
     [UI_MENU_PREEMPT_INHERIT] = "仅继承",
     [UI_MENU_REPLAY_ASYNC] = "GPU 帧准备独立线程",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "在单独的线程而不是游戏线程上为 GPU 准备帧。"
+    [UI_MENU_REPLAY_ASYNC_DESC] = "在单独的线程而不是游戏线程上为 GPU 准备帧。在复杂场景中更快，但偶尔可能出现变暗或闪烁的画面。"
                                   "最多增加一帧延迟。",
     [UI_MENU_TIMER_1MS] = "1 ms Windows 计时器",
     [UI_MENU_TIMER_1MS_DESC] = "将系统计时器精度提高到 1 ms，使帧间隔更平稳。",
@@ -2012,6 +2145,10 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "纹理过滤",
     [UI_MENU_ANISO_DESC] = "表面纹理的各向异性过滤：以小角度看到的地面、道路和墙壁在远处依然清晰，而不会模糊。游戏：使用游戏请求的级别，与 Switch 上相同。",
     [UI_MENU_ANISO_GAME] = "游戏",
+    [UI_MENU_TEX_DETAIL] = "纹理细节",
+    [UI_MENU_TEX_DETAIL_DESC] = "大型表面纹理的清晰度。“降低”和“低”不加载它们最大的版本，使一个区域能放进 6 GB 和 8 GB 显卡的显存；只有近处的表面看起来略微柔和。“自动”根据显卡的显存选择。",
+    [UI_MENU_TEX_DETAIL_AUTO] = "自动：%s",
+    [UI_MENU_TEX_DETAIL_FULL] = "完整", [UI_MENU_TEX_DETAIL_REDUCED] = "降低", [UI_MENU_TEX_DETAIL_LOW] = "低",
     [UI_MENU_HDR_GROUP] = "HDR",
     [UI_MENU_HDR] = "HDR 输出",
     [UI_MENU_HDR_DESC] = "在 HDR 显示器上呈现更亮的高光。请先在 Windows 中开启 HDR。",
@@ -2050,6 +2187,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "现在重启游戏？上次存档之后的进度将会丢失。",
     [UI_MENU_QUIT_CONFIRM] = "退出游戏？上次存档之后的进度将会丢失。",
     [UI_MENU_RESTART_YES] = "重启",
+    [UI_MENU_RESTART_COUNT] = "重启（%d）",
     [UI_MENU_RESTART_SAVING] = "游戏正在存档：稍后即可重启。",
     [UI_MENU_QUIT_SAVING] = "游戏正在存档：稍后即可退出。",
     [UI_MENU_STICK_SENS] = "摇杆镜头速度",
@@ -2130,6 +2268,37 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_CHEAT_REBUILD_DESC] = "此金手指修改游戏代码，并且是在游戏构建后新增或修改的。游戏会在下次启动时把它构建进去（几分钟），也可以使用“立即重新构建游戏”。",
     [UI_MENU_CHEAT_UNSUPPORTED] = "不支持",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "此金手指不能用于此游戏版本：",
+    [UI_MENU_SAVES] = "存档",
+    [UI_MENU_SAVE_EXPORT] = "导出存档",
+    [UI_MENU_SAVE_EXPORT_DESC] = "将你的存档（所有存档位）写入“下载”文件夹中的一个 zip 文件，可分享给其他玩家或附在错误报告中。"
+                                 "其中不含你的密钥和游戏文件。",
+    [UI_MENU_SAVE_EXPORT_BUG] = "导出存档用于错误报告",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "同样的 zip，另附本次运行的日志和你的设置（nx2navi.ini），可看出发生了什么以及使用了哪些"
+                                     "设置。请将其附在错误报告中。",
+    [UI_MENU_SAVE_IMPORT] = "导入存档",
+    [UI_MENU_SAVE_IMPORT_DESC] = "选择别人分享的存档（NX2navi-save zip）。它会在下次启动时替换你的存档（所有存档位）：游戏"
+                                 "把进度保存在内存中，若现在替换，游戏会把进度写回并覆盖它。你当前的存档会先复制到 saves "
+                                 "文件夹。",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "下次启动时",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "取消导入",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "保留你的存档不变：丢弃等待下次启动的存档。",
+    [UI_MENU_SAVE_BUSY] = "处理中…",
+    [UI_MENU_SAVE_EXPORTED] = "已保存为 %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "该存档（NX2navi %s）将在下次启动时载入：请选择下方的“重启”。你当前的存档会先复制到 saves "
+                                  "文件夹。",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "已取消导入，你的存档保持不变。",
+    [UI_MENU_SAVE_IMPORTED] = "本次启动时已导入分享的存档。你原来的存档在 %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "本次启动时已导入分享的存档。",
+    [UI_MENU_SAVE_E_NO_SAVE] = "还没有可导出的存档：请先游玩直到游戏存档。",
+    [UI_MENU_SAVE_E_READ_SAVE] = "无法读取存档文件；请稍后再试。",
+    [UI_MENU_SAVE_E_WRITE] = "无法将 zip 写入 %s。",
+    [UI_MENU_SAVE_E_READ] = "无法读取 %s。",
+    [UI_MENU_SAVE_E_STAGE] = "无法为下次启动准备存档；原因见日志。",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s 不是 NX2navi 导出的存档。",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s 是其他游戏的存档。",
+    [UI_MENU_SAVE_E_NEWER] = "%s 由更新版本的 NX2navi 制作：请先更新 NX2navi。",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s 已损坏：请重新下载。",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",

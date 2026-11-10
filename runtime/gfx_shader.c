@@ -950,7 +950,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
 enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23,
-       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,
+       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_CONSTANT = 43, OP_VARIABLE = 59, OP_DECORATE = 71,
        DEC_BUILTIN = 11, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_INPUT = 1, SC_OUTPUT = 3, EM_LOCAL_SIZE = 17 };
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (translated modules stay
@@ -961,11 +961,11 @@ static void reflect_spirv(GfxShader *s) {
     s->local[0] = s->local[1] = s->local[2] = 1;
     if (n < 5) return;
     uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
-    // per id: location + 1 (0 = none), component flag, scalar/vector description of types, pointee of pointers
+    // per id: location + 1 (0 = none), component flag, scalar/vector type and array span, pointer target, constant value
     int32_t *loc = calloc(bound, sizeof *loc);
-    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1);
-    uint32_t *pointee = calloc(bound, sizeof *pointee);
-    if (!loc || !packed || !ttype || !tcomps || !pointee) goto out;
+    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1), *tlocs = calloc(bound, 1);
+    uint32_t *pointee = calloc(bound, sizeof *pointee), *value = calloc(bound, sizeof *value);
+    if (!loc || !packed || !ttype || !tcomps || !tlocs || !pointee || !value) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) break;
@@ -977,13 +977,17 @@ static void reflect_spirv(GfxShader *s) {
             if (a[1] == DEC_LOCATION) loc[id] = (int32_t)a[2] + 1;
             else if (a[1] == DEC_COMPONENT) packed[id] = 1;
         } else if (op == OP_TYPE_INT && len >= 4 && id < bound) {
-            ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1;
+            ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1, tlocs[id] = 1;
         } else if (op == OP_TYPE_FLOAT && len >= 3 && id < bound) {
-            ttype[id] = GFX_TYPE_FLOAT, tcomps[id] = 1;
+            ttype[id] = GFX_TYPE_FLOAT, tcomps[id] = 1, tlocs[id] = 1;
         } else if (op == OP_TYPE_VECTOR && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2];
-        } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];   // element type (arrayed interface blocks)
+            ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2], tlocs[id] = 1;
+        } else if (op == OP_CONSTANT && len == 4 && a[1] < bound) {
+            value[a[1]] = a[2];
+        } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound && a[2] < bound) {
+            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];
+            uint64_t slots = (uint64_t)tlocs[a[1]] * value[a[2]];
+            tlocs[id] = (uint8_t)(slots < 32 ? slots : 32);   // the interface masks cover 32 locations
         } else if (op == OP_TYPE_POINTER && len >= 4 && id < bound) {
             pointee[id] = a[2];
         } else if (op == OP_VARIABLE && len >= 4) {
@@ -992,14 +996,20 @@ static void reflect_spirv(GfxShader *s) {
                 int l = loc[var] - 1;
                 uint32_t t = pointee[type] < bound ? pointee[type] : 0;
                 GfxShaderIo io = {ttype[t], tcomps[t] ? tcomps[t] : 4, packed[var]};
-                if (sc == SC_INPUT) s->in_mask |= 1u << l, s->in[l] = io;
-                else s->out_mask |= 1u << l, s->out[l] = io;
+                // VS -> FS arrays occupy every element's locations, even if only some elements are accessed.
+                // Other stages retain their existing reflection: mesh outputs have an outer per-vertex array.
+                uint32_t slots = ((s->stage == GFX_STAGE_VS && sc == SC_OUTPUT) ||
+                                  (s->stage == GFX_STAGE_FS && sc == SC_INPUT)) && tlocs[t] ? tlocs[t] : 1;
+                for (uint32_t j = 0; j < slots && l + j < 32; j++) {
+                    if (sc == SC_INPUT) s->in_mask |= 1u << (l + j), s->in[l + j] = io;
+                    else s->out_mask |= 1u << (l + j), s->out[l + j] = io;
+                }
             }
         }
         i += len;
     }
 out:
-    free(loc), free(packed), free(ttype), free(tcomps), free(pointee);
+    free(loc), free(packed), free(ttype), free(tcomps), free(tlocs), free(pointee), free(value);
 }
 
 // Every gradient sample (OpImageSampleExplicitLod with Grad) whose two gradients are each built from two components gets
@@ -1066,6 +1076,101 @@ out:
     free(cc);
 }
 
+// Texture detail (vk_texture.c, "texture detail") makes large material textures without their top mip levels, which a
+// shader that samples with normalised coordinates cannot tell. One that reads texels by position can, and so can one
+// that works with the size or the level count. This finds the sampled textures a module reads so and sets
+// GfxShaderRes.exact on their bindings; the replay then binds such a texture whole (vk_exec_draw.c tex_info_full):
+//  - OpImageFetch;
+//  - OpImageQuerySize and OpImageQueryLevels;
+//  - OpImageQuerySizeLod, unless the image is arrayed and every use of the result is an OpCompositeExtract of
+//    component 2, the layer count: the translator clamps the layer of an array sample to it, and no level changes it.
+// The image of each read is followed back to its variable through the loads, access chains, OpSampledImage and OpImage
+// the translator emits. A read that leads to no variable marks every texture of the module. One that leads into the
+// texture pool array (a bindless handle picks the texture, so no binding names it) cannot be acted on and is logged:
+// none of the 44,081 shaders prepared for game 1.1.1 has one.
+static volatile int32_t n_exact_shaders;
+uint32_t gfx_shader_exact_seen(void) { return (uint32_t)__atomic_load_n(&n_exact_shaders, __ATOMIC_RELAXED); }
+
+static void reflect_exact(GfxShader *s) {
+    enum { X_FUNCTION = 54, X_TYPE_IMAGE = 25, X_TYPE_SAMPLED_IMAGE = 27, X_LOAD = 61, X_ACCESS_CHAIN = 65,
+           X_IN_BOUNDS_ACCESS_CHAIN = 66, X_COMPOSITE_EXTRACT = 81, X_COPY_OBJECT = 83, X_SAMPLED_IMAGE = 86, X_FETCH = 95,
+           X_IMAGE = 100, X_QUERY_SIZE_LOD = 103, X_QUERY_SIZE = 104, X_QUERY_LEVELS = 106, X_DEC_BINDING = 33 };
+    static volatile int32_t n_pool_logged;
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words, fn = 0;
+    if (!s->nres[GFX_RES_TEX] || n < 5) return;
+    int any = 0;   // nine shaders in ten have no such read: they cost this walk over the instruction headers
+    for (uint64_t i = 5; i < n && !any;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len) break;
+        any = op == X_FETCH || op == X_QUERY_SIZE || op == X_QUERY_LEVELS || op == X_QUERY_SIZE_LOD;
+        i += len;
+    }
+    if (!any) return;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    // per id: a type's or variable's image is arrayed; a variable's Binding + 1; the variable a value comes from; the
+    // variable a pending size query read (+ 1); and per variable whether it is read exactly
+    uint8_t *arrayed = calloc(bound, 1), *need = calloc(bound, 1);
+    uint32_t *bind = calloc(bound, sizeof *bind), *org = calloc(bound, sizeof *org), *query = calloc(bound, sizeof *query);
+    int all = 0, queries = 0;
+    if (!arrayed || !need || !bind || !org || !query) goto out;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        const uint32_t *a = w + i;
+        if (op == X_FUNCTION && !fn) fn = i;
+        #define ID(x) ((x) < bound)
+        if (op == OP_DECORATE && len >= 4 && ID(a[1]) && a[2] == X_DEC_BINDING) bind[a[1]] = a[3] + 1;
+        else if (op == X_TYPE_IMAGE && len >= 9 && ID(a[1])) arrayed[a[1]] = a[5] != 0;
+        else if (op == X_TYPE_SAMPLED_IMAGE && len >= 3 && ID(a[1]) && ID(a[2])) arrayed[a[1]] = arrayed[a[2]];
+        else if (op == OP_TYPE_ARRAY && len >= 4 && ID(a[1]) && ID(a[2])) arrayed[a[1]] = arrayed[a[2]];
+        else if (op == OP_TYPE_POINTER && len >= 4 && ID(a[1]) && ID(a[3])) arrayed[a[1]] = arrayed[a[3]];
+        else if (op == OP_VARIABLE && len >= 4 && ID(a[1]) && ID(a[2])) {
+            arrayed[a[2]] = arrayed[a[1]];
+            if (bind[a[2]]) org[a[2]] = a[2];
+        } else if ((op == X_ACCESS_CHAIN || op == X_IN_BOUNDS_ACCESS_CHAIN || op == X_LOAD || op == X_COPY_OBJECT ||
+                    op == X_SAMPLED_IMAGE || op == X_IMAGE) && len >= 4 && ID(a[2]) && ID(a[3])) {
+            org[a[2]] = org[a[3]];
+        } else if ((op == X_FETCH || op == X_QUERY_SIZE || op == X_QUERY_LEVELS || op == X_QUERY_SIZE_LOD) && len >= 4) {
+            uint32_t var = ID(a[3]) ? org[a[3]] : 0;
+            if (!var) all = 1;
+            else if (op == X_QUERY_SIZE_LOD && arrayed[var] && ID(a[2])) query[a[2]] = var + 1, queries++;
+            else need[var] = 1;
+        }
+        #undef ID
+        i += len;
+    }
+    // every use of a pending size query: anything but the layer count makes its texture exact. Any word that equals
+    // the result's id counts as a use, so a literal that happens to equal it errs towards exact.
+    for (uint64_t i = fn; queries && fn && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        int layer_count = op == X_COMPOSITE_EXTRACT && len == 5 && w[i + 4] == 2;
+        int defines = op == X_QUERY_SIZE_LOD && len >= 4;
+        for (uint32_t j = 1; j < len; j++) {
+            uint32_t x = w[i + j];
+            if (x >= bound || !query[x]) continue;
+            if ((defines && j == 2) || (layer_count && j == 3)) continue;
+            need[query[x] - 1] = 1;
+        }
+        i += len;
+    }
+    int pooled = 0, some = 0;
+    for (int k = 0; k < s->nres[GFX_RES_TEX]; k++) {
+        GfxShaderRes *r = &s->res[GFX_RES_TEX][k];
+        int hit = 0;
+        for (uint32_t id = 0; id < bound && !hit; id++) hit = need[id] && bind[id] == (uint32_t)r->binding + 1;
+        if (r->pool) pooled |= hit;
+        else r->exact = (uint8_t)(hit || all), some |= r->exact;
+    }
+    if (some) plat_inc32(&n_exact_shaders);
+    if (pooled && plat_inc32(&n_pool_logged) <= 4)
+        rt_log("gfx_shader: a shader reads a texture of the bindless pool by texel position or uses its size; with "
+               "texture_detail below full such a texture may be read at the wrong level (vk_texture.c, texture detail)");
+out:
+    free(arrayed), free(need), free(bind), free(org), free(query);
+}
+
 static void reflect_stage(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
@@ -1086,6 +1191,7 @@ static void reflect(GfxShader *s) {
         json_objects(js, kinds[k], add_res, s, k);
     }
     reflect_spirv(s);
+    reflect_exact(s);
     patch_txd_transpose(s);
 }
 

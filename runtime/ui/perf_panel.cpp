@@ -93,7 +93,9 @@ void machine_and_frames(const PerfPanel *p, float scale) {
     label(UI_MENU_OV_VRAM);
     cell(UI_MENU_OV_FMT_GB, gb(s.vram_used_mb));
     cell(UI_MENU_OV_FMT_GB_OF, gb(s.vram_total_mb));
-    cell(UI_MENU_OV_FMT_MHZ, s.gpu_clock_mhz);
+    // the card's figure counts every program on it: this game's own share beside it, the clock where that is unknown
+    if (s.vram_game_mb >= 0) cell(UI_MENU_OV_GAME_GB, gb(s.vram_game_mb));
+    else cell(UI_MENU_OV_FMT_MHZ, s.gpu_clock_mhz);
     label(UI_MENU_OV_CPU);
     cell(UI_MENU_OV_FMT_PCT, s.cpu_total_pct);
     cell(UI_MENU_OV_FMT_TEMP, s.cpu_temp_c);

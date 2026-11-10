@@ -121,10 +121,13 @@ typedef struct {
     uint8_t pool;               // TEX: 1 the texture pool, 2 the sampler pool, indexed by bindless handles (set 2)
     uint16_t ptr;               // SSBO: 0, or 1 + the byte offset of this buffer's address inside the storage buffer that
                                 // cbuf_slot and handle name (a pointer table; the translator's patch 0022, res.json "ptr")
+    uint8_t exact;              // TEX: the module fetches its texels by position or uses its size or level count, so it
+                                // needs every level of the texture as the game made it (gfx_shader.c reflect_exact)
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
+uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);
@@ -145,6 +148,9 @@ typedef struct {
     uint64_t (*submit)(const uint64_t *handles, int n);    // replays; returns this submission's fence value
                                                            // (gfx_submit_queue names the game's queue)
     int  (*fence_wait)(uint64_t value, uint64_t timeout_ns);   // 1 reached; caller has given its core up
+    // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
+    // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
+    int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.

@@ -1,4 +1,4 @@
-"""Build Ocarina of Time (Switch 2, game 1.1.1) for Windows on the player's PC, from the player's own game files.
+"""Build Ocarina of Time (Switch 2, game 1.1.1) natively for Windows or Linux from the player's own game files.
 
     python -I tools/make_game.py --nup "C:\\path\\game.nup" --out "C:\\Games\\Ocarina"
     python -I tools/make_game.py --exefs "C:\\path\\exefs" --romfs "C:\\path\\romfs" --out "C:\\Games\\Ocarina"
@@ -20,7 +20,7 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
               (`ocarina.exe --prepare-shaders`); variants met in play with another bind state are still translated
               then, and the driver cache is per executable and is lost when the driver clears it
   7. prompts  only with button art in the kit (<kit>/prompt-art, tools/make_launcher.py and make_kit.py
-              --prompt-art): tools/pad_prompts.py draws the Xbox, PlayStation and keyboard and mouse button prompts
+              --prompt-art): tools/pad_prompts.py draws the Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts
               from it into <out>/romfs-patches-* (the Controls menu's Button prompts loads them), the keys as the
               bind_ lines of <out>/nx2navi.ini give them. Its key names everything it reads (the RomFS, the art, the
               tools, those lines), so it runs again only when one of them changed or a folder is gone, and running
@@ -47,10 +47,11 @@ version (fast_clang: the same objects, about a fifth faster).
 On Linux the same steps make <out>/ocarina with the clang, clang++ and lld on PATH and the system's libraries
 (Vulkan, SDL3, Opus, libvpx, dav1d, zstd; libstdc++ static, rpath $ORIGIN), as tools/build_game.py's Linux
 build does: the runtime's *_sdl.* and platform/linux.c take the place of its *_win.*, platform/win32.c and
-nx2navi.rc, and --msys is not used. README-BuildKit.md, "Linux", lists the packages.
+nx2navi.rc, and --msys is not used. VMA_INCLUDE can name the directory holding vk_mem_alloc.h; otherwise the
+system header or the pinned download is used. README-BuildKit.md, "Linux", lists the packages.
 
-Nothing is written outside --out (but for --make-runtime-lib DIR, which writes DIR). The game folder then holds
-only what this PC built from the player's files: never
+Game content is written only to --out; a downloaded VMA header is cached in toolchain/vma, and --make-runtime-lib
+writes DIR. The game folder holds only what this PC built from the player's files: never
 share it. Needs Python 3.10+ with numpy, lz4, zstandard and zbic (pip), with fonttools and pillow too when the kit has
 button art, and MSYS2 UCRT64's clang and libraries (README-BuildKit.md lists the commands). Delete <out>/build-cache
 afterwards to free about 5 GB; the next build then compiles everything again.
@@ -70,6 +71,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -363,11 +365,28 @@ def exefs_digest(out):
 
 # ---------------------------------------------------------------- romfs
 
+ROMFS_READ_AHEAD = 64 << 20   # total file bytes requested from workers in one group
+
+
+def romfs_read_groups(files):
+    group, buffered = [], 0
+    for entry in files:
+        size = entry[2]
+        ahead = size if size <= ROMFS_READ_AHEAD else 0   # the writer streams larger files
+        if buffered + ahead > ROMFS_READ_AHEAD or len(group) == 256:
+            yield group
+            group, buffered = [], 0
+        group.append(entry)
+        buffered += ahead
+    if group:
+        yield group
+
+
 def step_romfs(src, out, jobs):
     dst = out / 'romfs'
     dst.mkdir(parents=True, exist_ok=True)
-    files = sorted(src.romfs, key=lambda e: e[0].encode())
-    total = sum(src.romfs_size(ref) for _, ref in files)
+    files = sorted(((rel, ref, src.romfs_size(ref)) for rel, ref in src.romfs), key=lambda e: e[0].encode())
+    total = sum(size for _, _, size in files)
     free = shutil.disk_usage(dst).free
     if free < total + (1 << 30):
         fail(f'{dst} needs {total / 1e9:.1f} GB free for the RomFS image, it has {free / 1e9:.1f} GB')
@@ -377,28 +396,28 @@ def step_romfs(src, out, jobs):
     emit('progress', step='romfs', done=0, total=total, unit='bytes')
 
     def load(e):   # small files are read whole on a worker; big ones are streamed by the writer
-        rel, ref = e
-        return None if src.romfs_size(ref) > (64 << 20) else b''.join(src.romfs_chunks(ref))
+        _, ref, size = e
+        return None if size > ROMFS_READ_AHEAD else b''.join(src.romfs_chunks(ref))
 
     with open(part, 'wb', buffering=16 << 20) as img, concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        batch = 256
-        for start in range(0, len(files), batch):
-            group = files[start:start + batch]
-            for (rel, ref), data in zip(group, ex.map(load, group)):
+        for batch, group in enumerate(romfs_read_groups(files)):
+            for (rel, ref, size), data in zip(group, ex.map(load, group)):
                 pad = -pos % ALIGN
                 if pad:
                     img.write(b'\0' * pad)
                     h.update(b'\0' * pad)
                     pos += pad
-                size = src.romfs_size(ref)
-                entries.append({'path': rel, 'offset': pos, 'size': size})
+                offset = pos
                 for chunk in ((data,) if data is not None else src.romfs_chunks(ref)):
                     img.write(chunk)
                     h.update(chunk)
-                pos += size
+                    pos += len(chunk)
+                if pos - offset != size:
+                    fail(f'{rel} changed size while packing the RomFS: expected {size} bytes, read {pos - offset}')
+                entries.append({'path': rel, 'offset': offset, 'size': size})
                 done += size
             emit('progress', step='romfs', done=done, total=total, unit='bytes')
-            if start // batch % 40 == 0:
+            if batch % 40 == 0:
                 say(f'  RomFS {done / 1e9:5.1f} of {total / 1e9:.1f} GB, {time.time() - t0:.0f} s')
     part.replace(dst / 'romfs.bin')
     index = {'status': 'pass', 'romfs_size': pos, 'romfs_sha256': h.hexdigest(), 'files': entries}
@@ -514,23 +533,30 @@ def pe_imports(path):
 
 
 def copy_if_changed(src, dst):
-    """Copy src over dst unless dst already has its size and modification time. A file the running game holds open
-    cannot be replaced on Windows: that stops the build with a message instead of a traceback."""
+    """Atomically replace dst unless its contents match, even when source modification times are normalized.
+    A same-directory temporary copy preserves modes, replaces read-only files on POSIX and leaves dst intact on copy failure."""
+    dst = Path(dst)
     s = os.stat(src)
     try:
         d = os.stat(dst)
-        if d.st_size == s.st_size and int(d.st_mtime) == int(s.st_mtime):
+        if d.st_size == s.st_size and sha256_file(src) == sha256_file(dst):
             return False
     except FileNotFoundError:
         pass
     try:
-        shutil.copy2(src, dst)
+        with tempfile.TemporaryDirectory(dir=dst.parent, prefix='.nx2navi-copy-') as tmp:
+            replacement = Path(tmp) / dst.name
+            shutil.copy2(src, replacement)
+            os.replace(replacement, dst)
     except PermissionError:
-        fail(f'{dst} is in use: close the game and try again')
+        fail(f'cannot replace {dst}: close the game and check output-directory permissions')
     return True
 
 
 DLSS_DLL, DLSS_NOTICE = 'nvngx_dlss.dll', 'nvngx_dlss-NOTICE.txt'   # tools/dlss_pin.py, in the kit's bin/
+# The Linux library's name ends in the DLSS version (tools/dlss_pin.py): it is found by its prefix, as the runtime
+# finds it beside the game (runtime/resolution.c dlss_dll).
+DLSS_SO_PREFIX, DLSS_SO_NOTICE = 'libnvidia-ngx-dlss.so.', 'libnvidia-ngx-dlss-NOTICE.txt'
 # DLSS Frame Generation (runtime/vk_dlssg.c) loads these from beside the game: nx2navi_dlssg.dll (runtime/dlssg/,
 # tools/build_dlssg.py), NVIDIA Streamline's interposer and the plugins it uses, and NGX's frame generation library.
 # A release carries them with their licence texts in bin/dlssg/ (tools/make_launcher.py --dlssg); without the whole set
@@ -541,7 +567,7 @@ DLSSG_FILES = ('nx2navi_dlssg.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dl
 
 
 def notice_sha256(path):
-    """The sha256 line of a DLSS notice: the DLL a kit placed beside the game."""
+    """The sha256 line of a DLSS notice: the library a kit placed beside the game."""
     try:
         for line in path.read_text(encoding='utf-8').splitlines():
             if line.startswith('sha256 '):
@@ -551,22 +577,35 @@ def notice_sha256(path):
     return None
 
 
-def place_dlss(out):
+def dlss_files(folder, linux):
+    """The DLSS libraries in folder, by name: nvngx_dlss.dll, or on Linux every libnvidia-ngx-dlss.so.<version>."""
+    return sorted(p for p in folder.glob(DLSS_SO_PREFIX + '*' if linux else DLSS_DLL) if p.is_file())
+
+
+def place_dlss(out, linux=False):
     """NVIDIA's DLSS library from the kit's bin/ beside the game, where NGX loads it (runtime/vk_dlaa.c), with its
-    notice. A different nvngx_dlss.dll the player put there (another DLSS version) is kept; the one an earlier build
-    placed, named by the notice beside it, is replaced. Returns a line for the build's log when it kept the player's."""
-    src, dst, note = KIT / 'bin' / DLSS_DLL, out / DLSS_DLL, KIT / 'bin' / DLSS_NOTICE
-    if not src.is_file():
+    notice. A different library the player put there (another DLSS version) is kept; the one an earlier build placed,
+    named by the notice beside it, is replaced. linux: the Linux library, whose name carries the DLSS version, so a
+    kit with another version replaces the earlier build's file under its old name. Returns a line for the build's
+    log when it kept the player's."""
+    note_name = DLSS_SO_NOTICE if linux else DLSS_NOTICE
+    srcs, note = dlss_files(KIT / 'bin', linux), KIT / 'bin' / note_name
+    if not srcs:
         return None
-    if dst.is_file():
+    src = srcs[-1]
+    beside = dlss_files(out, linux)
+    for dst in beside:
         s, d = os.stat(src), os.stat(dst)
-        if d.st_size != s.st_size or int(d.st_mtime) != int(s.st_mtime):
+        if dst.name != src.name or d.st_size != s.st_size or int(d.st_mtime) != int(s.st_mtime):
             have = sha256_file(dst)
-            if have != notice_sha256(out / DLSS_NOTICE) and have != sha256_file(src):
-                return f"{DLSS_DLL} kept: the one already beside the game is not the kit's (another DLSS version)"
-    copy_if_changed(src, dst)
-    if note.is_file() and (not (out / DLSS_NOTICE).is_file() or (out / DLSS_NOTICE).read_bytes() != note.read_bytes()):
-        shutil.copy2(note, out / DLSS_NOTICE)   # by content: two versions' notices can share size and second
+            if have != notice_sha256(out / note_name) and have != sha256_file(src):
+                return f"{dst.name} kept: the one already beside the game is not the kit's (another DLSS version)"
+    copy_if_changed(src, out / src.name)
+    for dst in beside:
+        if not dst.samefile(out / src.name):   # another version's library, placed by an earlier build: replaced
+            dst.unlink()
+    if note.is_file() and (not (out / note_name).is_file() or (out / note_name).read_bytes() != note.read_bytes()):
+        shutil.copy2(note, out / note_name)   # by content: two versions' notices can share size and second
     return None
 
 
@@ -697,6 +736,14 @@ class ObjectCache:
     def forget(self, obj):
         self.entries.pop(obj.name, None)
 
+    def keep_only(self, names):
+        """Drops the entries of objects this build does not make (the runtime objects an earlier version compiled
+        here and a later one links prebuilt): they would stay as that version wrote them for good. The number dropped."""
+        gone = [n for n in self.entries if n not in names]
+        for n in gone:
+            del self.entries[n]
+        return len(gone)
+
     def adopt(self, obj, key, old_keys, old_kits=()):
         """Records obj under key when its entry has one of old_keys, the keys an earlier version gave the same compile,
         its object is there and every file it was compiled from reads as it did. A file in an earlier kit's folder
@@ -734,7 +781,7 @@ def compiler_ids(clang, env):
     size. The keys up to 0.6.0 held the file's modification time too, so a tool update that put the same compiler back
     made every object stale, a full compile of the game for nothing; that form is still made, to take those objects
     over (object_alts)."""
-    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env)
+    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env, errors='replace')
     st = os.stat(clang)
     return (sha256_bytes(f'{p.stdout}\n{st.st_size}'.encode()),
             sha256_bytes(f'{p.stdout}\n{st.st_size}\n{int(st.st_mtime)}'.encode()))
@@ -873,7 +920,7 @@ def per_install(src, tainted):
 
 
 def clang_version(clang, env):
-    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env)
+    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env, errors='replace')
     return (p.stdout.splitlines() or [''])[0].strip()
 
 
@@ -894,9 +941,23 @@ def cpu_level(clang, env):
     tell. The game runs on the PC that builds it, so it takes this CPU's level, as tools/build_game.py --cpu does by
     hand. Without one the lifted code would be generic x86-64: every fused multiply-add of the game a call to
     runtime/fma.c's software fma, and a level the differential tests do not cover."""
+    # Compiler wrappers can discard -march=native, even for this read-only host probe. Only the probe opts out:
+    # the actual compiles keep their environment and use the explicit, supported x86-64 level selected below.
+    probe_env = dict(env, NIX_ENFORCE_NO_NATIVE='0')
+    for name in env:
+        if name.startswith('NIX_ENFORCE_NO_NATIVE_'):
+            probe_env[name] = '0'
     p = subprocess.run([str(clang), '-march=native', '-E', '-dM', '-x', 'c', os.devnull], capture_output=True,
-                       text=True, env=env, errors='replace')
+                       text=True, env=probe_env, errors='replace')
     have = set(re.findall(r'^#define (__\w+) ', p.stdout, re.M)) if p.returncode == 0 else set()
+    level = 3 if CPU_V3 <= have else 2 if CPU_V2 <= have else 0
+    if level:
+        return level
+    # Where clang's own detection finds no level (a sandbox or a wrapper that hides the processor from it), Linux
+    # still names the processor's features in /proc/cpuinfo (cpu_flags). Only a level every listed feature proves is
+    # returned, so the lifted code never uses an instruction this processor lacks.
+    flags = cpu_flags()
+    have = {macro for flag, macro in CPUINFO_MACROS.items() if flags and flag in flags}
     return 3 if CPU_V3 <= have else 2 if CPU_V2 <= have else 0
 
 
@@ -950,12 +1011,11 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     dest.mkdir(parents=True, exist_ok=True)
     obj = Path(obj).resolve() if obj else dest / 'obj'
     obj.mkdir(parents=True, exist_ok=True)
-    clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
-    env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    clang, clangxx, env, vma = toolchain(msys)
     rt = KIT / 'runtime'
     tainted = per_install_names()
     srcs = [(p, obj / name) for p, name in runtime_sources() if not per_install(p, tainted)]
-    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(msys / 'include' / 'vma')]
+    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
     t0 = time.time()
     compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc), cache, jobs, env,
@@ -969,7 +1029,9 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     lib.unlink(missing_ok=True)
     rsp = dest / 'ar.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for _, o in srcs), encoding='utf-8')
-    ar = os.environ.get('NX2NAVI_AR') or str(msys / 'bin' / 'ar.exe')
+    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else shutil.which('ar'))
+    if not ar:
+        fail('ar is not on PATH: install binutils or set NX2NAVI_AR')
     if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
         fail('the runtime library could not be archived')
     meta = {'runtime': runtime_digest(), 'compiler': clang_version(clang, env),
@@ -1088,13 +1150,22 @@ def compile_resources(msys, rt, obj, env, lld=False):
 
 def toolchain(msys):
     """(clang, clang++, environment, the folder holding vk_mem_alloc.h): MSYS2 UCRT64's on Windows, the ones on PATH
-    elsewhere, with tools/build_game.py's VMA lookup (the system's header, else the pinned one fetched into
-    toolchain/vma)."""
+    elsewhere. VMA_INCLUDE overrides tools/build_game.py's VMA lookup (the system's header, else the pinned one
+    fetched into toolchain/vma)."""
     if WIN:
         return (msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe',
                 dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', '')), msys / 'include' / 'vma')
-    from build_game import vma_include
-    return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma_include()
+    for tool in ('clang', 'clang++', 'ld.lld'):
+        if not shutil.which(tool):
+            fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
+    if os.environ.get('VMA_INCLUDE'):
+        vma = Path(os.environ['VMA_INCLUDE'])
+        if not (vma / 'vk_mem_alloc.h').is_file():
+            fail(f'{vma / "vk_mem_alloc.h"} is missing: correct VMA_INCLUDE')
+    else:
+        from build_game import vma_include
+        vma = vma_include()
+    return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma
 
 
 def xlate_source():
@@ -1108,14 +1179,16 @@ def xlate_source():
 
 # The x86-64 level the lifted code was compiled for, beside the objects (lifted_level).
 LIFTED_BUILD = 'lifted-build.json'
+LIFTED_OBJECTS = ('main_', 'sdk_', 'subsdk0_')   # the objects of the lifted code, by the module their names start with
 
 
 def lifted_level(obj, now, update):
     """The x86-64 level to compile the lifted code for. A build from the game files takes this processor's (now). An
     update keeps the level the objects were compiled for, so that it compiles only what changed: the one recorded
-    (LIFTED_BUILD), else 0 (generic x86-64) when the cache is one of 0.5.0 or earlier, which compiled for no level and
-    whose entries name their files by sha256 alone. Never above this processor's: a game folder moved to an older PC is
-    compiled again for it."""
+    (LIFTED_BUILD), else 0 (generic x86-64) when the lifted objects are those of 0.5.0 or earlier, which compiled for no
+    level and whose entries name their files by sha256 alone. Only the lifted objects' entries say that: 0.5.0 also
+    compiled the runtime here, and those entries outlive it in a cache whose lifted code a later version compiled for
+    this processor. Never above this processor's: a game folder moved to an older PC is compiled again for it."""
     if not update:
         return now
     try:
@@ -1125,10 +1198,21 @@ def lifted_level(obj, now, update):
         pass
     try:
         entries = json.loads((obj / 'objects.json').read_text(encoding='utf-8'))
-        old = any(isinstance(rec, str) for e in entries.values() for rec in e.get('deps', {}).values())
+        old = any(isinstance(rec, str) for name, e in entries.items() if name.startswith(LIFTED_OBJECTS)
+                  for rec in e.get('deps', {}).values())
     except (OSError, ValueError, AttributeError):
         old = False
     return 0 if old else now
+
+
+def retune_due(obj, msys):
+    """Rebuild the Game (--rebuild --retune): whether the lifted code is recorded as compiled for another level than
+    this processor's, or for none (LIFTED_BUILD). The compile step then runs although its inputs are unchanged."""
+    clang, _, env, _ = toolchain(msys)
+    try:
+        return int(json.loads((obj / LIFTED_BUILD).read_text(encoding='utf-8'))['level']) != cpu_level(clang, env)
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
 
 
 def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
@@ -1139,6 +1223,17 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
+    # The runtime's own shaders are in the repository as source only: from a source checkout their headers are not
+    # there until they are built, and every runtime file that includes one would fail to compile. A kit carries them
+    # built and does not carry tools/build_shaders.py (nor the compilers it calls), so a kit build skips this step.
+    try:
+        import build_shaders
+    except ModuleNotFoundError:
+        build_shaders = None
+    stale = build_shaders.stale(rt) if build_shaders else []
+    if stale:
+        say(f'  compiling {len(stale)} of the runtime\'s own shaders (runtime/*_spv.h)')
+        build_shaders.build(rt, stale)
     clang, clangxx, env, vma = toolchain(msys)
     if not romfs_job:
         romfs_index(out, gen)
@@ -1214,6 +1309,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         for src, err in bad[:3]:
             print(f'--- {src}\n{err}', file=sys.stderr)
         fail(f'{len(bad)} files did not compile')
+    if cache.keep_only({o.name for _, o in srcs}):
+        cache.save()
     (obj / LIFTED_BUILD).write_text(json.dumps({'level': level}), encoding='utf-8')   # lifted_level reads it next update
 
     objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=(msys / 'bin' / 'ld.lld.exe').is_file())]
@@ -1261,7 +1358,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         copy_if_changed(xlate / name, out / name)
     if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
-    kept = place_dlss(out) if WIN else None   # NVIDIA DLSS (runtime/vk_dlaa.c): its library is a Windows DLL
+    kept = place_dlss(out, linux=not WIN)   # NVIDIA DLSS (runtime/vk_dlaa.c): this platform's library from the kit
     if kept:
         say(f'  {kept}')
     if WIN and place_dlssg(out):   # DLSS Frame Generation (runtime/vk_dlssg.c): Windows DLLs too
@@ -1350,30 +1447,12 @@ def shader_carry(out):
     return (out / 'shader-prepared.bin').is_file() and bool(cache_identities(out))
 
 
-def step_shaders(out, update=False):
-    """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start.
-    Its output is read as it comes: the counts nx2navi.exe prints become progress events, the other lines go on to
-    the log, and while nothing moves an event every few seconds keeps saying the step is running and for how long.
-    update: after a kit update the shaders prepared before stay in use and the game translates them again in the
-    background (shader_carry), so the update does not wait the minutes a full preparation takes."""
-    # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
-    # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
-    # has one: the compile step, which always runs first, stops a build without it.
-    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
-        if (d / XLATE_NAME).is_file():
-            note_cache_translator(out)
-            for name in (XLATE_NAME, 'nx2navi_xlate.id'):
-                copy_if_changed(d / name, out / name)
-            break
-    if update and shader_carry(out):
-        say('  the shaders prepared before this update stay in use; the game translates them again in the background')
-        if loose_shaders(out) >= PACK_LOOSE_MIN:
-            pack_shader_cache(out)
-        return
-    cmd = [sys.executable, '-u', str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
-           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                            errors='replace', bufsize=1)
+def shader_run(cmd, cwd=None):
+    """Runs a shader preparation command and returns its exit code. Its output is read as it comes: the counts
+    nx2navi.exe prints become progress events, the other lines go on to the log, and while nothing moves an event
+    every few seconds keeps saying the step is running and for how long."""
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding='utf-8', errors='replace', bufsize=1)
     t0 = time.monotonic()
     state = {'phase': None, 'done': 0, 'total': 0, 'moved': t0}
     lock = threading.Lock()
@@ -1413,6 +1492,56 @@ def step_shaders(out, update=False):
         proc.stdout.close()
         stop.set()
         beat.join()
+    return rc
+
+
+def warm_driver_cache(out):
+    """After an update that carries the shaders over: every prepared stage library is built into the graphics driver's
+    cache again (`nx2navi.exe --warm-shaders`). It takes seconds while the driver still has them. It takes minutes when
+    the update changed what a library is built with, which gives each one another entry in the driver's cache: without
+    this run every pipeline a draw first needed then compiled in play, which skipped that draw for some frames or made
+    it wait (on an RX 7900 XT 100 to 340 ms a library against 3 ms from the cache, after dynamic vertex input was
+    turned off for that driver). A run that fails is not an error of the build: the game checks the cache at every
+    start and warms it in the background itself (runtime/vk_pipeline.c lw_start)."""
+    exe = out / EXE_NAME
+    if not exe.is_file() or not (out / 'shader-prepared.bin').is_file():
+        return
+    say("  the prepared shaders are built into the graphics driver's cache again")
+    t0 = time.monotonic()
+    try:
+        rc = shader_run([str(exe), '--warm-shaders'], cwd=str(out))
+    except OSError as e:
+        rc = str(e)
+    if rc:
+        say(f'  that did not finish ({rc}); the game does it in the background while it runs')
+    else:
+        say(f"  driver's cache warm in {time.monotonic() - t0:.0f} s")
+
+
+def step_shaders(out, update=False):
+    """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start
+    (shader_run reports its progress).
+    update: after a kit update the shaders prepared before stay in use and the game translates them again in the
+    background (shader_carry), so the update does not wait the minutes a full preparation takes; the driver's cache
+    gets their stage libraries again (warm_driver_cache)."""
+    # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
+    # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
+    # has one: the compile step, which always runs first, stops a build without it.
+    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
+        if (d / XLATE_NAME).is_file():
+            note_cache_translator(out)
+            for name in (XLATE_NAME, 'nx2navi_xlate.id'):
+                copy_if_changed(d / name, out / name)
+            break
+    if update and shader_carry(out):
+        say('  the shaders prepared before this update stay in use; the game translates them again in the background')
+        if loose_shaders(out) >= PACK_LOOSE_MIN:
+            pack_shader_cache(out)
+        warm_driver_cache(out)
+        return
+    cmd = [sys.executable, '-u', str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
+           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
+    rc = shader_run(cmd)
     if rc:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
@@ -1476,7 +1605,7 @@ def bind_lines(out):
 def step_prompts(out):
     """The button prompts drawn from the kit's art into the game folder: tools/pad_prompts.py writes one overlay
     folder per style and layout (prompt_art.OVERLAYS), which runtime/romfs.c loads in place of the game's button font
-    and prompt textures when the Controls menu's Button prompts is Xbox, PlayStation or Keyboard and mouse. Its lines
+    and prompt textures when the Controls menu's Button prompts is Xbox, PlayStation, Steam Deck or Keyboard and mouse. Its lines
     go on to the log, each folder written is a progress event."""
     total = len(prompt_art.OVERLAYS)
     proc = subprocess.Popen(py_cmd(KIT / 'tools' / 'pad_prompts.py', '--art', prompt_art_dir(), '--game', out),
@@ -1502,10 +1631,25 @@ def step_prompts(out):
              'to retry this step')
 
 
+AWAKE = None   # keep_awake's systemd-inhibit process on Linux; dropping it would close the pipe and end the hold
+
+
 def keep_awake():
-    """Hold off sleep for this process's life (Windows): the build runs for many minutes with no input, and a PC that
-    sleeps in the middle stops the compiles. The hold ends with the process."""
+    """Hold off sleep for this process's life: the build runs for many minutes with no input, and a PC that sleeps in
+    the middle stops the compiles. The hold ends with the process. Only sleep: the screen may still blank and lock, as
+    with Windows' ES_SYSTEM_REQUIRED. Linux: systemd-inhibit takes a lock on sleep and keeps it while its `cat` reads
+    the pipe this process holds open, so the lock also goes when this process is killed. Without systemd-inhibit (or a
+    login manager to take the lock) nothing happens."""
+    global AWAKE
     if os.name != 'nt':
+        if AWAKE is None:
+            try:
+                AWAKE = subprocess.Popen(['systemd-inhibit', '--what=sleep', '--mode=block', '--who=NX2navi',
+                                          '--why=Building the game', 'cat'], stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         start_new_session=True)   # a Ctrl+C meant for the build leaves the lock
+            except OSError:
+                pass
         return
     try:
         import ctypes
@@ -1529,12 +1673,44 @@ def load_state(path):
     return state
 
 
+CPUINFO = Path('/proc/cpuinfo')
+# /proc/cpuinfo's names for the features of CPU_V2 and CPU_V3 (cpu_level's fallback)
+CPUINFO_MACROS = {'pni': '__SSE3__', 'ssse3': '__SSSE3__', 'sse4_1': '__SSE4_1__', 'sse4_2': '__SSE4_2__',
+                  'popcnt': '__POPCNT__', 'lahf_lm': '__LAHF_SAHF__', 'cx16': '__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16',
+                  'avx': '__AVX__', 'avx2': '__AVX2__', 'bmi1': '__BMI__', 'bmi2': '__BMI2__', 'f16c': '__F16C__',
+                  'fma': '__FMA__', 'abm': '__LZCNT__', 'movbe': '__MOVBE__', 'xsave': '__XSAVE__'}
+
+
+def cpu_flags():
+    """The features every logical processor has, as Linux lists them in /proc/cpuinfo (a feature is listed only when
+    the kernel runs with it); None where the file cannot be read or is not an x86 one (Windows, other processors).
+    One flags line per logical processor: a hybrid processor's cores can differ and the game runs on any of them, so
+    only what all of them have counts."""
+    if os.name == 'nt':
+        return None
+    try:
+        lines = CPUINFO.read_text(encoding='ascii', errors='replace').splitlines()
+    except OSError:
+        return None
+    flags = []
+    for line in lines:
+        key, _, rest = line.partition(':')
+        if key.strip() == 'flags':
+            flags.append(set(rest.split()))
+    return set.intersection(*flags) if flags else None   # no flags line: not x86 (its list is called Features)
+
+
 def cpu_tag():
-    """This processor's features the lifted code's level follows (cpu_level), as Windows reports them; part of the
+    """This processor's features the lifted code's level follows (cpu_level), as the system reports them: Windows
+    through IsProcessorFeaturePresent, Linux through the flags of /proc/cpuinfo (which lists a feature only when the
+    kernel runs with it). One digit each for SSE4.2, AVX2 and AVX-512F: '110' is AVX2 without AVX-512. Part of the
     compile key, so a game folder moved to a PC without them (or a new processor) is compiled again rather than kept
     with instructions the processor lacks. 'any' where it cannot be read."""
     if os.name != 'nt':
-        return 'any'
+        have = cpu_flags()
+        if have is None:
+            return 'any'
+        return ''.join('1' if f in have else '0' for f in ('sse4_2', 'avx2', 'avx512f'))
     try:
         import ctypes
         present = ctypes.windll.kernel32.IsProcessorFeaturePresent
@@ -1666,6 +1842,9 @@ def main():
     if reset:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}
     state['kit'] = kit_version()
+    if a.rebuild and a.retune and retune_due(cache / 'obj', msys):
+        # the compile step's key does not name the level: without this a finished compile reads as done before
+        state['steps'].pop('compile', None)
     keep_awake()
     t0 = time.time()
     romfs_job = None
@@ -1698,12 +1877,18 @@ def main():
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
 
+    def lift_gone(name):
+        # Keep Build Cache off (the launcher) deletes the lift and the objects after a build and keeps this state:
+        # the lift's key still matches then, and a compile step that runs would find no lifted code to compile
+        return (name == 'lift' and not (cache / 'lift' / 'layout.json').is_file()
+                and state['steps'].get('compile') != step_key('compile', src.identity, out))
+
     try:
         for name in STEPS:
             if name == 'prompts' and not prompt_art_dir():
                 say('prompts: none to draw, the kit has no button art')
                 emit('step', step=name, state='skip')
-            elif state['steps'].get(name) == step_key(name, src.identity, out):
+            elif state['steps'].get(name) == step_key(name, src.identity, out) and not lift_gone(name):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:

@@ -15,11 +15,19 @@ def grab_gdi(x, y, w, h, path):
     from ctypes import wintypes
     import numpy as np
     from . import art
-    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
-    user32.GetDC.restype = wintypes.HDC
-    gdi32.CreateCompatibleDC.restype = wintypes.HDC
-    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
-    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    # private handles with every argument typed: a handle is a pointer, and one above 2^31 passed as a plain int
+    # failed with "int too long to convert", so some screens went without their picture
+    user32, gdi32 = ctypes.WinDLL('user32'), ctypes.WinDLL('gdi32')
+    vp = ctypes.c_void_p
+    user32.GetDC.restype = gdi32.CreateCompatibleDC.restype = gdi32.CreateCompatibleBitmap.restype = vp
+    gdi32.SelectObject.restype = vp
+    user32.GetDC.argtypes = gdi32.CreateCompatibleDC.argtypes = gdi32.DeleteObject.argtypes = [vp]
+    gdi32.DeleteDC.argtypes = [vp]
+    user32.ReleaseDC.argtypes = gdi32.SelectObject.argtypes = [vp, vp]
+    gdi32.CreateCompatibleBitmap.argtypes = [vp, ctypes.c_int, ctypes.c_int]
+    gdi32.BitBlt.argtypes = [vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, vp, ctypes.c_int,
+                             ctypes.c_int, wintypes.DWORD]
+    gdi32.GetDIBits.argtypes = [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint]
     screen = user32.GetDC(None)
     mem = gdi32.CreateCompatibleDC(screen)
     bmp = gdi32.CreateCompatibleBitmap(screen, w, h)
@@ -163,10 +171,17 @@ def states(app):
         app.show('job')
 
     def import_saves():
-        app.release, app.message = None, ''
-        app.save_message = ('Save imported: 3 files from 0100000000010000. Your old save is in '
-                            'saves\\backup 2026-11-08 17.30.12.')
-        app.show('home', next(i for i, r in enumerate(app.rows_home()) if r.label == 'Import Saves'))
+        app.release, app.message, app.export_message = None, '', ''
+        app.save_message = ('Save imported from NX2navi-save-2026-11-09_17-30-05.zip (exported 2026-11-09 with NX2navi '
+                            '0.6.1). Your old save is in saves' + chr(92) + 'backup 2026-11-09 18.02.44.')
+        app.show('saves', next(i for i, r in enumerate(app.rows_saves()) if r.label == 'Import a Save'))
+
+    def export_save():
+        app.save_message = ''
+        app.export_message = ('Exported 14 files with the game' + chr(39) + 's log and settings to '
+                              + str(Path.home() / 'Downloads' / 'NX2navi-save-2026-11-09_17-30-05-bug-report.zip')
+                              + '.')
+        app.show('saves', 0)
 
     def update_staged():   # a release downloaded in the background, waiting for the game to be closed
         rel = fake_release(ahead_of(ctx.version))
@@ -175,10 +190,28 @@ def states(app):
         app.release, app.message = rel, ''
         app.show('home', 1)
 
+    def customize():
+        app.bg.ready = lambda release=None: None
+        app.release, app.message, app.look_message = None, '', ''
+        app.show('customize', 0)
+
+    def color_scheme():   # another colour scheme on the home screen, then the first one again
+        from . import art
+        was = s.get('theme')
+        s['theme'] = list(art.THEMES)[2]
+        app.apply_look()
+        app.show('home', 0)
+        s['theme'] = was
+
+    def restore_scheme():
+        app.apply_look()
+        app.show('home', 0)
+
     return [('1-first-run', first_run), ('2-installing', installing), ('3-home', home),
             ('4-update-ready', update_ready), ('5-updating', updating), ('6-settings', settings),
             ('7-build-failed', failed), ('8-uninstall', uninstall), ('9-import-saves', import_saves),
-            ('10-shaders', shaders), ('11-update-staged', update_staged)]
+            ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
+            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-first-scheme', restore_scheme)]
 
 
 def run(app, shots):

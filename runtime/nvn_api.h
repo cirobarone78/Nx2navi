@@ -42,6 +42,7 @@ typedef struct {                                           // NVNmappingRequest 
 _Static_assert(sizeof(nvn_mapping_t) == 0x28, "NVNmappingRequest stride");
 
 const pool_t *nvn_pool_find(uint64_t addr, uint64_t len);  // GPU-visible pool holding [addr, addr+len], NULL if none
+uint64_t nvn_prog_made_ns(uint64_t serial);                    // NX2NAVI_PROG_LEAD: when the program was made, 0 unknown
 uint64_t nvn_new_serial(void);                             // next tex_t / prog_t serial, from 1
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
@@ -56,6 +57,7 @@ void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the co
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);
 int gfx_replay_async(void);                                // 1: the back end replays submissions on its own thread
 uint64_t gfx_replayed_submits(void);                       // newest submit number (nvn_submit_count) replayed
+void gfx_event_signalling(const void *value, uint32_t to); // nvnEventSignal is about to write `to` into the event's value
 #define NVN_HANDLE_TEX(h) ((int)((h) & 0xfffff))           // combined texture handle = texture id | sampler id << 20
 #define NVN_HANDLE_SAMP(h) ((int)(((h) >> 20) & 0xfff))
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:
