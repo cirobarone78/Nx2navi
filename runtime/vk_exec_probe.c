@@ -984,6 +984,7 @@ int probe_vkexec(void) {
     if (!bad) bad = test_mirror(b, guest, &mirror_bytes);
     if (!bad) bad = test_empty_pool(b, guest);
     b->finish();
+    vk_sync_shutdown();   // drain callback-owned objects before their draw and query caches
     vk_pipeline_shutdown();   // the pipelines and the draw part's stand-ins go before the device
     vk_exec_draw_shutdown();
     vk_exec_xfer_shutdown();

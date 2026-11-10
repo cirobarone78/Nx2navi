@@ -621,7 +621,6 @@ void vk_backend_shutdown(void) {
     replay_drain(DR_FINISH);
     gfx_exit_log();
     vk_present_drain();
-    vk_sync_shutdown();
     vk_mem_shutdown();
     vk_shutdown();
 }

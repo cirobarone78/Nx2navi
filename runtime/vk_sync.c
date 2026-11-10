@@ -638,19 +638,40 @@ void vk_sync_finish(void) {
 
 void vk_sync_shutdown(void) {
     plat_mutex_lock(&start_lock);
+    VkCtx *c = vk_ctx();
+    if (started) vk_sync_finish();
+    else if (c) vk_upload_flush(1);   // memory-only probes can queue retirements without starting the worker
+    if (c) {
+        vk_queue_lock();
+        VkResult res = vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        if (res != VK_SUCCESS) {
+            vk_device_fault_report(res);
+            rt_fatal("vk: shutdown device wait failed (%d)", (int)res);
+        }
+    }
     if (started) {
-        vk_sync_finish();
         plat_mutex_lock(&st_lock);
         stop = 1;
         plat_cond_broadcast(&cv_work);
         plat_mutex_unlock(&st_lock);
         plat_thread_join(completion_thread);
         completion_thread = NULL;
-        plat_mutex_lock(&st_lock);
-        qhead = qn = 0;   // callbacks of values never submitted
+    }
+    // Replay and GPU work are drained. Retirements guarded by issued + 1 are safe even if that value was never
+    // submitted; run them while their GPA tables, pools and query objects still exist, without advancing the timeline.
+    plat_mutex_lock(&st_lock);
+    while (qn) {
+        Pending p = queue[qhead++];
+        qn--;
         plat_mutex_unlock(&st_lock);
+        p.fn(p.arg);
+        plat_mutex_lock(&st_lock);
+    }
+    qhead = 0;
+    plat_mutex_unlock(&st_lock);
+    if (started) {
         plat_mutex_lock(&sub_lock);
-        VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
         perf_gpu_stats = NULL;
         if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);

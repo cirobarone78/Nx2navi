@@ -412,7 +412,7 @@ void vk_mem_note_submit(uint64_t timeline_value);  // vk_sync.c: after each subm
 void vk_mem_collect(void);                         // frees what has completed
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
-void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every memory and texture object
+void vk_mem_shutdown(void);                        // before vk_shutdown: shuts down sync, frees every memory and texture object
 
 // Textures. Images are keyed by storage GPU address plus descriptor and stay in VK_IMAGE_LAYOUT_GENERAL. A mirrored
 // texture (CPU-written pool storage) is uploaded on first use and again when its storage pages were
@@ -543,7 +543,7 @@ int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done
-void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
+void vk_sync_shutdown(void);               // waits idle, stops the worker, drains retirements, frees command/query pools
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has
 // begun and ends. fence is the value this submission will signal. Returns the number of commands recorded into the
 // command buffer it holds at the end (0: that one stays empty and is not submitted). A weak vk_sync.c version accepts
@@ -555,6 +555,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
 VkCommandBuffer vk_sync_split(void);
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
+// Shutdown drains remaining retirements on its caller after device idle, before callback dependencies are destroyed.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
 // gfx_vulkan_backend (vk_backend.c): presents go to a present thread and run after the submissions made before them.
 void rdoc_init(void);                     // runtime/rdoc.c: NX2NAVI_RDOC debug capture; before vkCreateInstance
@@ -563,7 +564,7 @@ void rdoc_after_present(uint64_t frame);
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
 int vk_replay_async(void);                 // NX2NAVI_REPLAY_ASYNC (default 0): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
-void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
+void vk_backend_shutdown(void);            // presents, vk_mem_shutdown (including sync shutdown), then vk_shutdown
 
 // ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is

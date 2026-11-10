@@ -216,6 +216,10 @@ host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wro
 writes come back at its fence. In play that costs about 0.2 ms a frame and doubles the memory of those pools (about
 1.1 GB). `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Direct host imports wait for GPU work and completion callbacks, then release their
+buffer and imported memory before returning guest storage; shadow buffers, physical buffers and mirror records retain
+their existing deferred retirement. Shutdown waits for device idle and drains the completion queue before destroying
+the GPA table or memory pools, including retirements waiting for a next submission that was never issued.
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.

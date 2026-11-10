@@ -364,20 +364,34 @@ void vk_pool_fini(pool_t *p) {
     for (int i = 0; i < r->nvmaps; i++) vk_gpa_unmap(r->vmaps[i].lo, r->vmaps[i].hi, r->vmaps[i].rec, NULL);
     free(r->vmaps), r->vmaps = NULL, r->nvmaps = 0;
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
-    // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
-    // guest gets the storage back when this returns.
+    // Images cut from this range go first. Direct host imports must release their guest storage before Finalize returns,
+    // including pools read only through GPA (which never marks them used).
     vk_texture_range_gone(r->lo, r->size, r->alloc);
-    if (r->used && r->kind != POOL_VIRT) {
+    if ((r->mem || r->used) && r->kind != POOL_VIRT) {
         vk_upload_flush(1);
         vk_queue_lock();
-        vkQueueWaitIdle(c->gfx_queue);
+        VkResult res = vkQueueWaitIdle(c->gfx_queue);
         vk_queue_unlock();
+        if (res != VK_SUCCESS) {
+            vk_device_fault_report(res);
+            rt_fatal("vk: pool finalization queue wait failed (%d)", (int)res);
+        }
+    }
+    if (r->mem) {
+        // Replay was drained by the back end; the wait above also covered the flushed upload batches. Completion
+        // callbacks (notably mirror verification) may still read guest bytes, so drain those before releasing the import.
+        vk_sync_finish();
+        vkDestroyBuffer(c->device, r->buf, NULL);
+        vkFreeMemory(c->device, r->mem, NULL);
+        r->buf = VK_NULL_HANDLE;
+        r->mem = VK_NULL_HANDLE;
     }
     vk_mem_collect();
-    // A mirrored pool's record and buffers outlive the submission being recorded, whose sync copies and write-backs may
-    // name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be queued).
+    // Keep mirrored records and their device-local buffers until their completion callbacks have retired; a direct
+    // import's buffer and host-memory ownership were already released above.
     if (r->mbuf) mirror_retiring(r), vk_completion_add(vk_sync_issued() + 1, mirror_retire, r);
-    else if (r->gpa_rec && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);   // the queue was not drained
+    else if (r->gpa_rec && r->buf && !r->used)
+        vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);   // shadow storage: the queue was not drained
     // an unused physical pool may still be read through the virtual pages that mapped it (device addresses, which do not
     // mark it used): its buffer outlives the submission being recorded too
     else if (r->kind == POOL_PHYS && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);
@@ -3033,10 +3047,7 @@ void vk_mem_stats(VkMemStats *s) {
 void vk_mem_shutdown(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
-    vk_upload_flush(1);
-    vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
-    vk_queue_unlock();
+    vk_sync_shutdown();   // idle and drain callbacks before freeing the GPA table or any callback-owned pool
     vk_gpa_report();
     vk_gpa_shutdown();
     vk_texture_shutdown();
