@@ -163,3 +163,26 @@ void coop_sign(uint8_t sig[COOP_SIG_LEN], const uint8_t sk[COOP_SK_LEN], const v
 int coop_sign_check(const uint8_t sig[COOP_SIG_LEN], const uint8_t pk[COOP_PK_LEN], const void *msg, size_t n);   // 1: valid
 // BLAKE2b of msg keyed with key (klen at most 64, 0 for none), outlen bytes (1 to 64): the sync layer's derivations.
 void coop_blake2b(uint8_t *out, size_t outlen, const void *key, size_t klen, const void *msg, size_t n);
+
+// ---- POS (COOP_K_POS): where a player is and what Link plays, for the co-op puppets (coop_puppet.c), sent about 15
+// times a second as a sealed player message (above). The bytes after the kind, little endian: u8 version
+// (COOP_POS_VERSION), u16 pseq, u32 t_ms (the sender's clock), u8 flags, u8 area length (<= COOP_POS_TEXT) and the
+// area's name (the game's current-area text), f32 x y z, f32 yaw (radians, 0 facing +z), u8 slot count (<=
+// COOP_POS_SLOTS), per AS slot u8 node name length (<= COOP_POS_TEXT), the node's name, f32 frame. A parser takes
+// exactly one message of its version: another version is a later format this build cannot read. The names come from
+// another player's game and reach this one's log and its animation lookup, so a name with a byte outside printable
+// ASCII (0x20..0x7e) is refused, and so is a number that is not finite.
+#define COOP_POS_VERSION 1
+#define COOP_POS_TEXT 47
+#define COOP_POS_SLOTS 4
+enum { COOP_POS_ADULT = 1, COOP_POS_IN_WORLD = 2 };
+typedef struct {
+    uint16_t pseq;
+    uint32_t t_ms;
+    uint8_t flags, nslots;
+    char area[COOP_POS_TEXT + 1];
+    float pos[3], yaw;
+    struct { char node[COOP_POS_TEXT + 1]; float frame; } slot[COOP_POS_SLOTS];
+} CoopPos;
+size_t coop_pos_pack(uint8_t *out, size_t cap, const CoopPos *p);   // 0 when it does not fit cap
+int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out);

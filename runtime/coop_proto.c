@@ -412,3 +412,74 @@ int coop_sign_check(const uint8_t sig[COOP_SIG_LEN], const uint8_t pk[COOP_PK_LE
 void coop_blake2b(uint8_t *out, size_t outlen, const void *key, size_t klen, const void *msg, size_t n) {
     crypto_blake2b_keyed(out, outlen, key, klen, msg, n);
 }
+
+// ---- POS
+
+static void putf(uint8_t *p, float f) {
+    uint32_t v;
+    memcpy(&v, &f, 4);
+    put32(p, v);
+}
+
+// The f32 at p into *f; 0 when it is an infinity or a NaN (all exponent bits set), which a pose never holds.
+static int getf(const uint8_t *p, float *f) {
+    uint32_t v = get32(p);
+    memcpy(f, &v, 4);
+    return (v & 0x7f800000u) != 0x7f800000u;
+}
+
+// 1 when p[0..n) is printable ASCII: a POS's names reach the log and the game's animation lookup.
+static int printable(const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (p[i] < 0x20 || p[i] > 0x7e) return 0;
+    return 1;
+}
+
+size_t coop_pos_pack(uint8_t *out, size_t cap, const CoopPos *p) {
+    size_t alen = bounded_len(p->area, COOP_POS_TEXT), n = 9 + alen + 17;
+    int slots = p->nslots < COOP_POS_SLOTS ? p->nslots : COOP_POS_SLOTS;
+    for (int i = 0; i < slots; i++) n += 1 + bounded_len(p->slot[i].node, COOP_POS_TEXT) + 4;
+    if (cap < n) return 0;
+    out[0] = COOP_POS_VERSION;
+    put16(out + 1, p->pseq);
+    put32(out + 3, p->t_ms);
+    out[7] = p->flags, out[8] = (uint8_t)alen;
+    memcpy(out + 9, p->area, alen);
+    uint8_t *q = out + 9 + alen;
+    for (int k = 0; k < 3; k++) putf(q + 4 * k, p->pos[k]);
+    putf(q + 12, p->yaw);
+    q[16] = (uint8_t)slots, q += 17;
+    for (int i = 0; i < slots; i++) {
+        size_t len = bounded_len(p->slot[i].node, COOP_POS_TEXT);
+        q[0] = (uint8_t)len;
+        memcpy(q + 1, p->slot[i].node, len);
+        putf(q + 1 + len, p->slot[i].frame);
+        q += 1 + len + 4;
+    }
+    return n;
+}
+
+int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out) {
+    if (n < 9 || p[0] != COOP_POS_VERSION || p[8] > COOP_POS_TEXT || n < 9u + p[8] + 17 || !printable(p + 9, p[8]))
+        return 0;
+    CoopPos r;
+    memset(&r, 0, sizeof r);
+    r.pseq = (uint16_t)get16(p + 1), r.t_ms = get32(p + 3), r.flags = p[7];
+    memcpy(r.area, p + 9, p[8]);
+    size_t at = 9u + p[8];
+    int finite = 1;
+    for (int k = 0; k < 3; k++) finite &= getf(p + at + 4 * k, &r.pos[k]);
+    finite &= getf(p + at + 12, &r.yaw);
+    r.nslots = p[at + 16], at += 17;
+    if (!finite || r.nslots > COOP_POS_SLOTS) return 0;
+    for (int i = 0; i < r.nslots; i++) {
+        if (at >= n || p[at] > COOP_POS_TEXT || at + 1 + p[at] + 4 > n || !printable(p + at + 1, p[at]) ||
+            !getf(p + at + 1 + p[at], &r.slot[i].frame))
+            return 0;
+        memcpy(r.slot[i].node, p + at + 1, p[at]);
+        at += 1u + p[at] + 4;
+    }
+    if (at != n) return 0;
+    *out = r;
+    return 1;
+}

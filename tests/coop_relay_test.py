@@ -11,6 +11,7 @@ Run: python tests/coop_relay_test.py            (NX2NAVI_EXE=<game>/ocarina also
 """
 import hashlib
 import hmac
+import math
 import os
 import random
 import socket
@@ -48,6 +49,58 @@ def unhex(s):
     return b'' if s == '-' else bytes.fromhex(s)
 
 
+# ---- POS (player message kind 2, sealed as every player message): where a player is and what Link plays, for the co-op
+# puppets (runtime/coop_puppet.c). The relay forwards it unread, so its codec is here and in runtime/coop_proto.c only.
+# Little endian: u8 version (1), u16 pseq, u32 t_ms (the sender's clock), u8 flags (POS_ADULT, POS_IN_WORLD), u8 area
+# length (< 48) and the area's name, f32 x y z, f32 yaw (radians), u8 slot count (<= 4), per AS slot u8 node name
+# length (< 48), the name, f32 frame. Names are printable ASCII and numbers finite, else the message is refused.
+POS_VERSION = 1
+POS_ADULT, POS_IN_WORLD = 1, 2
+POS_TEXT_MAX, POS_SLOTS = 47, 4
+
+
+def pack_pos(pseq, t_ms, flags, area, xyz, yaw, slots):
+    out = struct.pack('<BHIBB', POS_VERSION, pseq, t_ms, flags, len(area)) + area + struct.pack('<4f', *xyz, yaw)
+    out += bytes([len(slots)])
+    for node, frame in slots:
+        out += bytes([len(node)]) + node + struct.pack('<f', frame)
+    return out
+
+
+def _printable(b):
+    return all(0x20 <= c <= 0x7e for c in b)
+
+
+def parse_pos(b):
+    """(pseq, t_ms, flags, area, (x, y, z), yaw, ((node, frame), ...)), or None unless b is exactly one POS of version 1."""
+    if len(b) < 9 or b[0] != POS_VERSION or b[8] > POS_TEXT_MAX or len(b) < 9 + b[8] + 17:
+        return None
+    pseq, t_ms, flags, alen = struct.unpack_from('<HIBB', b, 1)
+    area, at = b[9:9 + alen], 9 + alen
+    x, y, z, yaw = struct.unpack_from('<4f', b, at)
+    n, at = b[at + 16], at + 17
+    if n > POS_SLOTS or not _printable(area) or not all(map(math.isfinite, (x, y, z, yaw))):
+        return None
+    slots = []
+    for _ in range(n):
+        if at >= len(b) or b[at] > POS_TEXT_MAX or at + 1 + b[at] + 4 > len(b):
+            return None
+        node = b[at + 1:at + 1 + b[at]]
+        frame = struct.unpack_from('<f', b, at + 1 + len(node))[0]
+        if not _printable(node) or not math.isfinite(frame):
+            return None
+        slots.append((node, frame))
+        at += 1 + len(node) + 4
+    return (pseq, t_ms, flags, area, (x, y, z), yaw, tuple(slots)) if at == len(b) else None
+
+
+def pos_tokens(name, p):
+    """A pos vector line's tokens: name, the payload, then the fields (floats exact in f32, so repr reads back)."""
+    pseq, t_ms, flags, area, xyz, yaw, slots = parse_pos(p)
+    return ('pos', name, hx(p), pseq, t_ms, flags, hx(area), *[repr(v) for v in xyz], repr(yaw),
+            *[f'{hx(node)}:{frame!r}' for node, frame in slots])
+
+
 # ---- the byte vectors
 
 def build_vectors():
@@ -67,6 +120,8 @@ def build_vectors():
            '# connect|challenge|roster|joined|error|kick ...             one message payload: parse, check the fields, pack again',
            '# sealed <name> <secret> <src> <dst> <session> <counter> <kind> <message> <payload>   opens to kind and message, seals',
            '#                                                            to the same bytes',
+           '# pos <name> <payload> <pseq> <t_ms> <flags> <area> <x> <y> <z> <yaw> <node:frame>...   a POS (the message after its',
+           '#                                                            kind byte): parse, check the fields, pack again',
            '# reject <kind> <name> <bytes>                               parse must fail']
 
     def line(*tokens):
@@ -133,6 +188,14 @@ def build_vectors():
     line('kick', 'two', hx(cr.pack_kick(2, session)), 2, f'{session:016x}')
     for name, src, dst, sess, ctr, kind, msg, payload in SEALED:
         line('sealed', name, SECRET, src, dst, f'{sess:016x}', ctr, kind, msg, payload)
+    walk = pack_pos(7, 123456, POS_IN_WORLD, b'HyruleField', (1234.5, -56.25, 789.125), 1.5,
+                    [(b'Walk', 12.0), (b'Lower_Walk', 3.5)])
+    line(*pos_tokens('walk', walk))
+    line(*pos_tokens('adult-no-slots', pack_pos(65535, 0xFFFFFFFF, POS_ADULT | POS_IN_WORLD, b'ForestTemple',
+                                                (0.0, 0.0, -0.5), -3.0, [])))
+    line(*pos_tokens('loading', pack_pos(1, 2, 0, b'', (0.0, 0.0, 0.0), 0.0, [])))
+    line(*pos_tokens('long-names', pack_pos(9, 9, POS_IN_WORLD, b'a' * POS_TEXT_MAX, (1.0, 2.0, 3.0), 0.25,
+                                            [(b'n' * POS_TEXT_MAX, float(i)) for i in range(POS_SLOTS)])))
 
     zeros = bytes(16)
     ping = cr.pack(cr.T_PING, 0, 0, 0, 1, b'abcd')
@@ -155,6 +218,19 @@ def build_vectors():
         ('kick', 'long', bytes(10)),
         ('sealed', 'short', bytes([1]) + bytes(28)),
         ('sealed', 'version', bytes([2]) + bytes(40)),
+        ('pos', 'version-2', bytes([2]) + walk[1:]),
+        ('pos', 'cut', walk[:-1]),
+        ('pos', 'trailing', walk + b'x'),
+        ('pos', 'area-48', struct.pack('<BHIBB', 1, 0, 0, 0, 48) + bytes(48) + bytes(17)),
+        ('pos', 'slots-5', pack_pos(0, 0, 0, b'', (0.0, 0.0, 0.0), 0.0, [])[:-1] + bytes([5]) + bytes(25)),
+        ('pos', 'node-48', pack_pos(0, 0, 0, b'', (0.0, 0.0, 0.0), 0.0, [])[:-1] + bytes([1, 48]) + bytes(52)),
+        ('pos', 'area-newline', pack_pos(1, 2, POS_IN_WORLD, b'Hyrule\nField', (0.0, 0.0, 0.0), 0.0, [])),
+        ('pos', 'area-utf8', pack_pos(1, 2, POS_IN_WORLD, 'Zoë'.encode(), (0.0, 0.0, 0.0), 0.0, [])),
+        ('pos', 'node-nul', pack_pos(1, 2, POS_IN_WORLD, b'HyruleField', (0.0, 0.0, 0.0), 0.0, [(b'Wa\0k', 1.0)])),
+        ('pos', 'x-nan', pack_pos(1, 2, POS_IN_WORLD, b'HyruleField', (float('nan'), 0.0, 0.0), 0.0, [])),
+        ('pos', 'yaw-inf', pack_pos(1, 2, POS_IN_WORLD, b'HyruleField', (0.0, 0.0, 0.0), float('inf'), [])),
+        ('pos', 'frame-inf', pack_pos(1, 2, POS_IN_WORLD, b'HyruleField', (0.0, 0.0, 0.0), 0.0, [(b'Walk', float('-inf'))])),
+        ('pos', 'empty', b''),
     ]
     for kind, name, data in bad:
         line('reject', kind, name, hx(data))
@@ -282,11 +358,19 @@ class CodecTest(unittest.TestCase):
                 p = unhex(payload)   # the clear fields; the probe opens it
                 self.assertEqual((p[0], struct.unpack_from('<QI', p, 1), len(p)),
                                  (cr.ENV_V1, (int(sess, 16), int(ctr)), cr.ENV_HDR + cr.ENV_MAC + 1 + len(unhex(msg))), name)
+            elif kind == 'pos':
+                name, payload = t[0], unhex(t[1])
+                pseq, t_ms, flags, area, x, y, z, yaw = t[2:10]
+                want = (int(pseq), int(t_ms), int(flags), unhex(area), (float(x), float(y), float(z)), float(yaw),
+                        tuple((unhex(s.split(':')[0]), float(s.split(':')[1])) for s in t[10:]))
+                self.assertEqual(parse_pos(payload), want, name)
+                self.assertEqual(pack_pos(*want[:6], list(want[6])), payload, name)
             elif kind == 'reject':
                 what, data = t[0], unhex(t[2])
                 parsers = {'dgram': cr.parse, 'connect': cr.parse_connect, 'challenge': cr.parse_challenge, 'roster': cr.parse_roster,
                            'joined': cr.parse_joined, 'error': cr.parse_error, 'kick': cr.parse_kick,
-                           'sealed': lambda b: None if len(b) < cr.ENV_HDR + cr.ENV_MAC + 1 or b[0] != cr.ENV_V1 else b}
+                           'sealed': lambda b: None if len(b) < cr.ENV_HDR + cr.ENV_MAC + 1 or b[0] != cr.ENV_V1 else b,
+                           'pos': parse_pos}
                 self.assertIsNone(parsers[what](data), f'{what} {t[1]}')
             else:
                 self.fail(f'unknown vector line {kind}')

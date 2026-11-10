@@ -373,6 +373,30 @@ static void check_vector(const char *kind, char *rest, int line) {
               "vector sealed %s opens (line %d)", name, line);
         size_t k = coop_seal(c, sizeof c, mk, src, dst, hex64(t[3]), (uint32_t)strtoul(t[4], NULL, 0), kd, b, (size_t)mn);
         CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector sealed %s: seals to the same bytes (line %d)", name, line);
+    } else if (!strcmp(kind, "pos")) {
+        // pos <name> <payload> <pseq> <t_ms> <flags> <area hex|-> <x> <y> <z> <yaw> <node hex:frame>...
+        char *payload = next_token(&rest), *pseq = next_token(&rest), *t_ms = next_token(&rest), *flags = next_token(&rest);
+        char *area = next_token(&rest), *f[4];
+        for (int i = 0; i < 4; i++) f[i] = next_token(&rest);
+        int pn = unhex(payload, a, sizeof a), an = area ? unhex(area, b, COOP_POS_TEXT) : -1;
+        CoopPos p;
+        if (pn < 0 || an < 0 || !f[3]) FAIL_RET("vector pos %s does not parse (line %d)", name, line);
+        CHECK(coop_pos_parse(a, (size_t)pn, &p), "vector pos %s: parses (line %d)", name, line);
+        int ok = p.pseq == atoi(pseq) && p.t_ms == (uint32_t)strtoul(t_ms, NULL, 10) && p.flags == atoi(flags) &&
+                 strlen(p.area) == (size_t)an && !memcmp(p.area, b, (size_t)an) && p.pos[0] == strtof(f[0], NULL) &&
+                 p.pos[1] == strtof(f[1], NULL) && p.pos[2] == strtof(f[2], NULL) && p.yaw == strtof(f[3], NULL);
+        int ns = 0;
+        for (char *s; (s = next_token(&rest)); ns++) {
+            char *colon = strchr(s, ':');
+            if (!colon || ns >= COOP_POS_SLOTS) FAIL_RET("vector pos %s: bad slot %s (line %d)", name, s, line);
+            *colon = 0;
+            int nn = unhex(s, c, COOP_POS_TEXT);
+            ok &= nn >= 0 && strlen(p.slot[ns].node) == (size_t)nn && !memcmp(p.slot[ns].node, c, (size_t)nn) &&
+                  p.slot[ns].frame == strtof(colon + 1, NULL);
+        }
+        CHECK(ok && p.nslots == ns, "vector pos %s: fields (line %d)", name, line);
+        size_t k = coop_pos_pack(c, sizeof c, &p);
+        CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector pos %s: packs to the same bytes (line %d)", name, line);
     } else if (!strcmp(kind, "reject")) {
         char *what = name, *nm = next_token(&rest), *bytes = next_token(&rest);
         int n = unhex(bytes, a, sizeof a);
@@ -394,6 +418,7 @@ static void check_vector(const char *kind, char *rest, int line) {
         else if (!strcmp(what, "joined")) parsed = coop_joined_parse(a, (size_t)n, &j);
         else if (!strcmp(what, "error")) parsed = coop_error_parse(a, (size_t)n, &e);
         else if (!strcmp(what, "kick")) parsed = coop_kick_parse(a, (size_t)n, &u8, &u64);
+        else if (!strcmp(what, "pos")) parsed = coop_pos_parse(a, (size_t)n, &(CoopPos){0});
         else parsed = coop_envelope_peek(a, (size_t)n, &u64, &u32);
         CHECK(!parsed, "vector reject %s %s parses (line %d)", what, nm, line);
     } else {
@@ -435,8 +460,8 @@ static void probe_fuzz(void) {
     static uint8_t buf[1400], out[1400], opened[1400];
     uint8_t key[COOP_KEY_LEN], mk[COOP_MSG_KEY_LEN];
     coop_room_keys(ROOM_SECRET, key, mk);
-    uint8_t seeds[7][400];
-    size_t seed_len[7];
+    uint8_t seeds[8][400];
+    size_t seed_len[8];
     CoopRoster r = {.n = 2};
     r.m[0] = (CoopMemberInfo){1, COOP_FLAG_MAKER, 5, "Alice"}, r.m[1] = (CoopMemberInfo){2, 1, 6, "Bob"};
     uint8_t payload[400];
@@ -460,6 +485,10 @@ static void probe_fuzz(void) {
     h.type = COOP_T_PONG, seed_len[5] = coop_dgram_pack(seeds[5], sizeof seeds[5], &h, "abcd", 4, key);
     n = coop_kick_pack(payload, sizeof payload, 2, 6);
     h.type = COOP_T_KICK, seed_len[6] = coop_dgram_pack(seeds[6], sizeof seeds[6], &h, payload, n, key);
+    CoopPos pos = {.pseq = 7, .t_ms = 1000, .flags = COOP_POS_IN_WORLD, .area = "HyruleField", .pos = {1, 2, 3}, .nslots = 2,
+                   .slot = {{"Walk", 12}, {"Lower_Walk", 3.5f}}};
+    n = coop_pos_pack(payload, sizeof payload, &pos);   // a POS as the payload, so that changed copies reach its parser
+    h.type = COOP_T_DATA, seed_len[7] = coop_dgram_pack(seeds[7], sizeof seeds[7], &h, payload, n, key);
     long parsed = 0, tag_ok = 0, open_ok = 0;
     for (int it = 0; it < 400000; it++) {
         size_t len;
@@ -468,7 +497,7 @@ static void probe_fuzz(void) {
             len = rnd32() % 1300;
             for (size_t i = 0; i < len; i++) buf[i] = (uint8_t)(rnd32() % 5 ? rnd32() : 0);
         } else {           // a valid datagram with bytes changed, or cut short
-            int s = (int)(rnd32() % 7);
+            int s = (int)(rnd32() % 8);
             len = seed_len[s];
             memcpy(buf, seeds[s], len);
             for (unsigned k = rnd32() % 4; k && len; k--) buf[rnd32() % len] = (uint8_t)rnd32();
@@ -499,6 +528,9 @@ static void probe_fuzz(void) {
         coop_kick_parse(p, hh.len, &kind, &s64);
         coop_u32_parse(p, hh.len, &v);
         coop_envelope_peek(p, hh.len, &s64, &v);
+        CoopPos pp;   // a POS that parses packs to the same bytes: nothing in it is dropped or changed on the way in
+        if (coop_pos_parse(p, hh.len, &pp))
+            CHECK(coop_pos_pack(out, sizeof out, &pp) == hh.len && !memcmp(out, p, hh.len), "a POS that parses packs to other bytes");
         open_ok += coop_open(p, hh.len, mk, hh.src, hh.dst, &kind, opened, sizeof opened, &no);
         coop_name_clean(nameb, sizeof nameb, p, hh.len);
         char text[40];
