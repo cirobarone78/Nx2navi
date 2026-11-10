@@ -586,6 +586,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GAME_RES] = "Resolution",
     [UI_MENU_GAME_RES_DESC] = "Height of the game's picture. Higher is sharper but costs more GPU power.",
     [UI_MENU_GAME_RES_NATIVE] = "Native",
+    [UI_MENU_TAB_RESTORE] = "Restorations",
+    [UI_MENU_RESTORE_INTRO] = "Things the original game did that this release changed, each on its own. A change "
+                              "takes effect when the game starts next.",
+    [UI_MENU_RESTORE_APPLIED] = "in use (edits applied: %d)",
+    [UI_MENU_RESTORE_PARTLY] = "in use (edits applied: %d of %d, see the log)",
+    [UI_MENU_RESTORE_NONE] = "not in use: its game files differ, see the log",
     [UI_MENU_CHEATS_REBUILD] = "Rebuild the game now",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Some cheats change the game's code and are not built into it: they are new or "
                                     "edited, or their last rebuild failed or was cancelled. Closes the game; the setup "
@@ -1112,6 +1118,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
+    [UI_MENU_TAB_RESTORE] = "Восстановления",
+    [UI_MENU_RESTORE_INTRO] = "То, что было в оригинальной игре и изменено в этом издании, — каждое по отдельности. "
+                              "Изменение вступает в силу при следующем запуске игры.",
+    [UI_MENU_RESTORE_APPLIED] = "используется (применено правок: %d)",
+    [UI_MENU_RESTORE_PARTLY] = "используется (применено правок: %d из %d, см. журнал)",
+    [UI_MENU_RESTORE_NONE] = "не используется: файлы игры отличаются, см. журнал",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Некоторые читы меняют код игры и ещё не собраны в неё: они новые или изменены, "
                                     "либо прошлая пересборка не удалась или была отменена. Закрывает игру; установщик "
@@ -1661,6 +1673,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
+    [UI_MENU_TAB_RESTORE] = "Restaurações",
+    [UI_MENU_RESTORE_INTRO] = "Coisas que o jogo original fazia e que esta versão mudou, cada uma por si. Uma mudança "
+                              "vale a partir da próxima vez que o jogo iniciar.",
+    [UI_MENU_RESTORE_APPLIED] = "em uso (edições aplicadas: %d)",
+    [UI_MENU_RESTORE_PARTLY] = "em uso (edições aplicadas: %d de %d, veja o log)",
+    [UI_MENU_RESTORE_NONE] = "fora de uso: os arquivos do jogo são diferentes, veja o log",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Alguns cheats alteram o código do jogo e ainda não foram compilados nele: são "
                                     "novos ou editados, ou a última recompilação falhou ou foi cancelada. Fecha o "
@@ -2301,6 +2319,11 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
+    [UI_MENU_TAB_RESTORE] = "原版还原",
+    [UI_MENU_RESTORE_INTRO] = "原版游戏中有、而此版本改动了的内容，每项可单独开关。更改在下次启动游戏时生效。",
+    [UI_MENU_RESTORE_APPLIED] = "使用中（已应用 %d 处修改）",
+    [UI_MENU_RESTORE_PARTLY] = "使用中（已应用 %d / %d 处修改，见日志）",
+    [UI_MENU_RESTORE_NONE] = "未使用：游戏文件不同，见日志",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",
     [UI_MENU_CHEATS_REBUILD_DESC] = "有些金手指会修改游戏代码，但尚未构建进游戏：它们是新增或修改的，或上次重新构建失败或被取消。将关闭游戏；安装程序会把它们构建进去（几分钟）并重新启动游戏。上次存档之后的进度会丢失。",
     [UI_MENU_MODS_EXEFS_UNSUPPORTED] = "此模组修改游戏代码（exefs）的方式本移植无法应用，因此整个模组保持关闭。%s",

@@ -247,6 +247,12 @@ typedef enum {
     UI_MENU_CHEAT_CODE_DESC, UI_MENU_CHEAT_KEY_DESC /* "%s": the buttons */, UI_MENU_CHEAT_DATA_DESC,
     UI_MENU_CHEAT_MASTER, UI_MENU_CHEAT_MASTER_DESC, UI_MENU_CHEAT_RESTORE, UI_MENU_CHEAT_RESTORE_DESC,
     UI_MENU_CHEAT_REBUILD, UI_MENU_CHEAT_REBUILD_DESC, UI_MENU_CHEAT_UNSUPPORTED, UI_MENU_CHEAT_UNSUPPORTED_DESC,
+    // the Restorations tab (ui/restore_tab.cpp, restore.h): its name, the text above the rows and a row's note on what
+    // the start did with it; the restorations' own names and descriptions are English only (restore_<name>.c)
+    UI_MENU_TAB_RESTORE, UI_MENU_RESTORE_INTRO,
+    UI_MENU_RESTORE_APPLIED,   // "%d": the edits this start applied
+    UI_MENU_RESTORE_PARTLY,    // "%d" of "%d": this start applied only some of its edits
+    UI_MENU_RESTORE_NONE,      // this start applied none of its edits
     // the Game tab's Saves group (ui/menu.cpp rows_saves, save_share.c): export the save into a zip, import a shared
     // one at the next start. UI_MENU_SAVE_EXPORTED to UI_MENU_SAVE_E_UNSAFE are printf formats with at most one "%s"
     // (a path, or the zip's NX2navi version and date)

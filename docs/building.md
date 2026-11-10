@@ -322,6 +322,13 @@ A change to what the library warm logs when the driver's cache of stage librarie
 `runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
 the added text by GPU vendor and by why the cache was cold. No game files.
 
+A change to the restorations (`runtime/restore*.c`, `runtime/byml.c`, `runtime/sarc.c`)
+passes `python tests\restore_check.py`, which builds them with `restore.c`'s runtime calls stubbed and runs them on
+files it makes (no game files): the edits on a placement file and a pack, the BYML and SARC readers on every cut length
+of those files and on copies with bits flipped, and the switches (every one off: nothing read, served or logged); then
+`nx2navi.exe --probe-restore` on a build applies every declared restoration to the game's files as they are read,
+serves nothing and exits 1 when an edit is skipped.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 
