@@ -166,18 +166,19 @@ void coop_blake2b(uint8_t *out, size_t outlen, const void *key, size_t klen, con
 
 // ---- POS (COOP_K_POS): where a player is and what Link plays, for the co-op puppets (coop_puppet.c), sent about 15
 // times a second as a sealed player message (above). The bytes after the kind, little endian: u8 version
-// (COOP_POS_VERSION), u16 pseq, u32 t_ms (the sender's clock), u8 flags, u8 area length (<= COOP_POS_TEXT) and the
-// area's name (the game's current-area text), f32 x y z, f32 yaw (radians, 0 facing +z), u8 slot count (<=
-// COOP_POS_SLOTS), per AS slot u8 node name length (<= COOP_POS_TEXT), the node's name, f32 frame. A parser takes
-// exactly one message of its version: another version is a later format this build cannot read. The names come from
-// another player's game and reach this one's log and its animation lookup, so a name with a byte outside printable
-// ASCII (0x20..0x7e) is refused, and so is a number that is not finite.
-#define COOP_POS_VERSION 1
+// (COOP_POS_VERSION), u32 pseq (the sender's counter: one more for each POS it sends), u32 t_ms (the sender's clock), u8
+// flags, u8 area length (<= COOP_POS_TEXT) and the area's name (the game's current-area text), f32 x y z, f32 yaw
+// (radians, 0 facing +z), u8 slot count (<= COOP_POS_SLOTS), per AS slot u8 node name length (<= COOP_POS_TEXT), the
+// node's name, f32 frame. A parser takes exactly one message of its version: another version is another format this
+// build cannot read (version 1 had a u16 pseq). The names come from another player's game and reach this one's log and
+// its animation lookup, so a name with a byte outside printable ASCII (0x20..0x7e) is refused, and so is a number that
+// is not finite.
+#define COOP_POS_VERSION 2
 #define COOP_POS_TEXT 47
 #define COOP_POS_SLOTS 4
 enum { COOP_POS_ADULT = 1, COOP_POS_IN_WORLD = 2 };
 typedef struct {
-    uint16_t pseq;
+    uint32_t pseq;
     uint32_t t_ms;
     uint8_t flags, nslots;
     char area[COOP_POS_TEXT + 1];
@@ -186,3 +187,19 @@ typedef struct {
 } CoopPos;
 size_t coop_pos_pack(uint8_t *out, size_t cap, const CoopPos *p);   // 0 when it does not fit cap
 int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out);
+
+// The receiver's counter of one POS sender (coop.h: a handler is not called once only). A pose is taken only above the
+// last one taken from the same member id in the same session, so neither a pose sent again nor one recorded earlier
+// in the session moves the puppet back; the first pose of another session (another player given the id, or the member
+// back in a new session) starts the counter again. Someone with the room's secret can seal a POS in a member's name with
+// a counter far ahead, which would keep that member's own poses out for the session: once nothing was taken from the
+// sender for COOP_POS_QUIET_MS (its puppet is gone by then for want of poses), the next pose is taken whatever its
+// counter and starts the counter again. session: the one the roster lists for the member (CoopView). Returns 0 to drop
+// the pose, 1 to take it, 2 to take it and drop what was kept of the sender's earlier poses.
+#define COOP_POS_QUIET_MS 3000
+typedef struct {
+    uint64_t session, at_ms;    // the session of the last pose taken, and when it was taken
+    uint32_t last;              // its counter
+    int any;                    // a pose was taken
+} CoopPosSeen;
+int coop_pos_fresh(CoopPosSeen *s, uint64_t session, uint32_t pseq, uint64_t now_ms);

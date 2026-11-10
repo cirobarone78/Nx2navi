@@ -506,13 +506,19 @@ with whom and when, with names and addresses. None of that changes a save.
 
 Off by default. With `NX2NAVI_COOP_PUPPETS=1`, while the game is in a room with others, it sends where its Link is
 about 15 times a second as a sealed message (POS in `runtime/coop_proto.h`: the current area's name, child or adult,
-position, facing, and the node and frame each of Link's animation slots plays; a POS with a name that is not printable
-ASCII or a number that is not finite is dropped), so the other players see where your Link is, and it shows each other
-player whose Link is in the same area as a puppet (`runtime/coop_puppet.c`): an actor made from the pause menu's Link
-with Link's world animations (`CoopPuppet_Child` / `_Adult`, files made at start while co-op is on,
-`runtime/coop_puppet_files.c`), put at that player's pose of about 100 ms ago and playing his animation; it goes when
-he leaves the area or the room or is not heard for 3 s. Seen in two games on one PC: each makes the other's puppet,
-and the game that stood showed the other's Link walking off along the bridge. Still missing: the puppet's arms stay
+position, facing, and the node and frame each of Link's animation slots plays, with a counter one higher for each POS
+it sends; a POS with a name that is not printable ASCII or a number that is not finite is dropped), so the other players
+see where your Link is, and it shows each other player whose Link is in the same area as a puppet
+(`runtime/coop_puppet.c`): an actor made from the pause menu's Link with Link's world animations (`CoopPuppet_Child` /
+`_Adult`, files made at start while co-op is on, `runtime/coop_puppet_files.c`), put at that player's pose of about
+100 ms ago and playing his animation; it goes when he leaves the area or the room or is not heard for 3 s. A pose is
+taken only above the last one taken from the same player in the same session, so a pose sent again or recorded earlier
+(see "Replay") never moves a puppet back. A POS is sealed with the room's key but not signed: someone who knows the
+secret can send poses in a player's name and move that player's puppet while it keeps sending, and one with a counter
+far ahead keeps that player's own poses out until none was taken for 3 s (the puppet goes meanwhile). The counter came
+with POS version 2; a game reads only its own version, so a game of an earlier build and one of this build show no
+puppets of each other. Seen in two games on one PC: each makes the other's puppet, and the game that stood showed the
+other's Link walking off along the bridge. Still missing: the puppet's arms stay
 half raised where Link's hang down (what holds Link's arms is not found yet; the puppet gets the node and frame of his
 first four animation slots), and it wears no sword, shield or tunic; so the switch is off by default. With the switch
 or co-op off, or alone in a room, the game runs its original per-frame call and nothing of this is sent or logged.
@@ -577,7 +583,9 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   starts (with `--log-joins`, whose log a failure shows), with and without 30 % loss, and restarts that relay in the
   middle.
 - `ocarina --probe-coop`: the sockets, the codec and its cryptography (known answers, a sealed message that does not
-  open when changed or sent by another), a fuzz of every parser, and two sessions in one process that make and join a
+  open when changed or sent by another), a fuzz of every parser, the puppets' POS counter (a pose sent again, one
+  recorded 35000 poses earlier, another session in the same member number, one forged far ahead), and two sessions in
+  one process that make and join a
   room, exchange messages, take garbage and forgeries from a hostile relay (a changed message, one it sealed itself,
   a replay after a rejoin, lies while a player connects), lose the relay and find each other again, and in which the
   maker removes a player. Needs no window, GPU or game files. It runs its own small relay;

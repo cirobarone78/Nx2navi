@@ -435,17 +435,19 @@ static int printable(const uint8_t *p, size_t n) {
     return 1;
 }
 
+enum { POS_HEAD = 11 };   // version, pseq, t_ms, flags, area length
+
 size_t coop_pos_pack(uint8_t *out, size_t cap, const CoopPos *p) {
-    size_t alen = bounded_len(p->area, COOP_POS_TEXT), n = 9 + alen + 17;
+    size_t alen = bounded_len(p->area, COOP_POS_TEXT), n = POS_HEAD + alen + 17;
     int slots = p->nslots < COOP_POS_SLOTS ? p->nslots : COOP_POS_SLOTS;
     for (int i = 0; i < slots; i++) n += 1 + bounded_len(p->slot[i].node, COOP_POS_TEXT) + 4;
     if (cap < n) return 0;
     out[0] = COOP_POS_VERSION;
-    put16(out + 1, p->pseq);
-    put32(out + 3, p->t_ms);
-    out[7] = p->flags, out[8] = (uint8_t)alen;
-    memcpy(out + 9, p->area, alen);
-    uint8_t *q = out + 9 + alen;
+    put32(out + 1, p->pseq);
+    put32(out + 5, p->t_ms);
+    out[9] = p->flags, out[10] = (uint8_t)alen;
+    memcpy(out + POS_HEAD, p->area, alen);
+    uint8_t *q = out + POS_HEAD + alen;
     for (int k = 0; k < 3; k++) putf(q + 4 * k, p->pos[k]);
     putf(q + 12, p->yaw);
     q[16] = (uint8_t)slots, q += 17;
@@ -460,13 +462,14 @@ size_t coop_pos_pack(uint8_t *out, size_t cap, const CoopPos *p) {
 }
 
 int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out) {
-    if (n < 9 || p[0] != COOP_POS_VERSION || p[8] > COOP_POS_TEXT || n < 9u + p[8] + 17 || !printable(p + 9, p[8]))
+    if (n < POS_HEAD || p[0] != COOP_POS_VERSION || p[10] > COOP_POS_TEXT || n < POS_HEAD + p[10] + 17u ||
+        !printable(p + POS_HEAD, p[10]))
         return 0;
     CoopPos r;
     memset(&r, 0, sizeof r);
-    r.pseq = (uint16_t)get16(p + 1), r.t_ms = get32(p + 3), r.flags = p[7];
-    memcpy(r.area, p + 9, p[8]);
-    size_t at = 9u + p[8];
+    r.pseq = get32(p + 1), r.t_ms = get32(p + 5), r.flags = p[9];
+    memcpy(r.area, p + POS_HEAD, p[10]);
+    size_t at = POS_HEAD + (size_t)p[10];
     int finite = 1;
     for (int k = 0; k < 3; k++) finite &= getf(p + at + 4 * k, &r.pos[k]);
     finite &= getf(p + at + 12, &r.yaw);
@@ -482,4 +485,11 @@ int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out) {
     if (at != n) return 0;
     *out = r;
     return 1;
+}
+
+int coop_pos_fresh(CoopPosSeen *s, uint64_t session, uint32_t pseq, uint64_t now_ms) {
+    int again = !s->any || s->session != session || now_ms - s->at_ms >= COOP_POS_QUIET_MS;
+    if (!again && pseq <= s->last) return 0;
+    s->any = 1, s->session = session, s->last = pseq, s->at_ms = now_ms;
+    return again ? 2 : 1;
 }

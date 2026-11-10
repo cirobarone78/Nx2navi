@@ -51,16 +51,18 @@ def unhex(s):
 
 # ---- POS (player message kind 2, sealed as every player message): where a player is and what Link plays, for the co-op
 # puppets (runtime/coop_puppet.c). The relay forwards it unread, so its codec is here and in runtime/coop_proto.c only.
-# Little endian: u8 version (1), u16 pseq, u32 t_ms (the sender's clock), u8 flags (POS_ADULT, POS_IN_WORLD), u8 area
-# length (< 48) and the area's name, f32 x y z, f32 yaw (radians), u8 slot count (<= 4), per AS slot u8 node name
-# length (< 48), the name, f32 frame. Names are printable ASCII and numbers finite, else the message is refused.
-POS_VERSION = 1
+# Little endian: u8 version (2), u32 pseq (the sender's counter), u32 t_ms (the sender's clock), u8 flags (POS_ADULT,
+# POS_IN_WORLD), u8 area length (< 48) and the area's name, f32 x y z, f32 yaw (radians), u8 slot count (<= 4), per AS
+# slot u8 node name length (< 48), the name, f32 frame. Names are printable ASCII and numbers finite, else the message
+# is refused. Version 1 had a u16 pseq.
+POS_VERSION = 2
 POS_ADULT, POS_IN_WORLD = 1, 2
 POS_TEXT_MAX, POS_SLOTS = 47, 4
+POS_HEAD = 11
 
 
 def pack_pos(pseq, t_ms, flags, area, xyz, yaw, slots):
-    out = struct.pack('<BHIBB', POS_VERSION, pseq, t_ms, flags, len(area)) + area + struct.pack('<4f', *xyz, yaw)
+    out = struct.pack('<BIIBB', POS_VERSION, pseq, t_ms, flags, len(area)) + area + struct.pack('<4f', *xyz, yaw)
     out += bytes([len(slots)])
     for node, frame in slots:
         out += bytes([len(node)]) + node + struct.pack('<f', frame)
@@ -72,11 +74,11 @@ def _printable(b):
 
 
 def parse_pos(b):
-    """(pseq, t_ms, flags, area, (x, y, z), yaw, ((node, frame), ...)), or None unless b is exactly one POS of version 1."""
-    if len(b) < 9 or b[0] != POS_VERSION or b[8] > POS_TEXT_MAX or len(b) < 9 + b[8] + 17:
+    """(pseq, t_ms, flags, area, (x, y, z), yaw, ((node, frame), ...)), or None unless b is exactly one POS of version 2."""
+    if len(b) < POS_HEAD or b[0] != POS_VERSION or b[10] > POS_TEXT_MAX or len(b) < POS_HEAD + b[10] + 17:
         return None
-    pseq, t_ms, flags, alen = struct.unpack_from('<HIBB', b, 1)
-    area, at = b[9:9 + alen], 9 + alen
+    pseq, t_ms, flags, alen = struct.unpack_from('<IIBB', b, 1)
+    area, at = b[POS_HEAD:POS_HEAD + alen], POS_HEAD + alen
     x, y, z, yaw = struct.unpack_from('<4f', b, at)
     n, at = b[at + 16], at + 17
     if n > POS_SLOTS or not _printable(area) or not all(map(math.isfinite, (x, y, z, yaw))):
@@ -191,7 +193,7 @@ def build_vectors():
     walk = pack_pos(7, 123456, POS_IN_WORLD, b'HyruleField', (1234.5, -56.25, 789.125), 1.5,
                     [(b'Walk', 12.0), (b'Lower_Walk', 3.5)])
     line(*pos_tokens('walk', walk))
-    line(*pos_tokens('adult-no-slots', pack_pos(65535, 0xFFFFFFFF, POS_ADULT | POS_IN_WORLD, b'ForestTemple',
+    line(*pos_tokens('adult-no-slots', pack_pos(0xFFFFFFFF, 0xFFFFFFFF, POS_ADULT | POS_IN_WORLD, b'ForestTemple',
                                                 (0.0, 0.0, -0.5), -3.0, [])))
     line(*pos_tokens('loading', pack_pos(1, 2, 0, b'', (0.0, 0.0, 0.0), 0.0, [])))
     line(*pos_tokens('long-names', pack_pos(9, 9, POS_IN_WORLD, b'a' * POS_TEXT_MAX, (1.0, 2.0, 3.0), 0.25,
@@ -218,10 +220,10 @@ def build_vectors():
         ('kick', 'long', bytes(10)),
         ('sealed', 'short', bytes([1]) + bytes(28)),
         ('sealed', 'version', bytes([2]) + bytes(40)),
-        ('pos', 'version-2', bytes([2]) + walk[1:]),
+        ('pos', 'version-1', bytes([1]) + walk[1:]),
         ('pos', 'cut', walk[:-1]),
         ('pos', 'trailing', walk + b'x'),
-        ('pos', 'area-48', struct.pack('<BHIBB', 1, 0, 0, 0, 48) + bytes(48) + bytes(17)),
+        ('pos', 'area-48', struct.pack('<BIIBB', POS_VERSION, 0, 0, 0, 48) + bytes(48) + bytes(17)),
         ('pos', 'slots-5', pack_pos(0, 0, 0, b'', (0.0, 0.0, 0.0), 0.0, [])[:-1] + bytes([5]) + bytes(25)),
         ('pos', 'node-48', pack_pos(0, 0, 0, b'', (0.0, 0.0, 0.0), 0.0, [])[:-1] + bytes([1, 48]) + bytes(52)),
         ('pos', 'area-newline', pack_pos(1, 2, POS_IN_WORLD, b'Hyrule\nField', (0.0, 0.0, 0.0), 0.0, [])),

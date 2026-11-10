@@ -595,7 +595,9 @@ static void shadow(Cpu *c, uint64_t player) {
 // it is in a room with others; a pose received is kept with its arrival time (the coop thread), and every frame the
 // game thread shows each other player whose Link is in this Link's area as a puppet at his pose of about 100 ms ago,
 // between the two poses received around then (their senders' clocks put on ours by the smallest delay seen). A
-// puppet goes when its player leaves the area, the room or the world, or goes silent for 3 s.
+// puppet goes when its player leaves the area, the room or the world, or goes silent for 3 s. A pose counts only above
+// the last one taken from the same member in the same session (coop_pos_fresh): the session layer can deliver a
+// message again (coop.h), and an old pose must not move a puppet back.
 
 #define HIST 8
 #define SILENT_MS 3000
@@ -605,17 +607,19 @@ typedef struct {
     uint64_t recv_ms[HIST];
     int n, head;
     int32_t offset;         // our clock minus the sender's, the smallest seen (rising 1 ms a message so it follows)
+    CoopPosSeen seen;       // the sender's counter, per session
 } Remote;
 
 static struct {
-    PlatMutex lock;         // around r
+    PlatMutex lock;         // around r and session
     Remote r[COOP_MAX_MEMBERS + 1];
+    uint64_t session[COOP_MAX_MEMBERS + 1];   // each member's session, as the view lists it
     _Atomic int others;     // other members of the room this session is in (the view hook)
     _Atomic int self;
     _Atomic int alive;      // puppets the game thread holds
     // the game thread's
     Puppet puppet[COOP_MAX_MEMBERS + 1];
-    uint16_t pseq;
+    uint32_t pseq;
 } N;
 
 static void on_pos(int from, const uint8_t *bytes, size_t n, void *user) {
@@ -625,7 +629,9 @@ static void on_pos(int from, const uint8_t *bytes, size_t n, void *user) {
     uint64_t now = plat_now_ms();
     plat_mutex_lock(&N.lock);
     Remote *r = &N.r[from];
-    if (!r->n || (int16_t)(p.pseq - r->pose[r->head].pseq) > 0) {   // older and repeated poses are dropped
+    int fresh = coop_pos_fresh(&r->seen, N.session[from], p.pseq, now);
+    if (fresh == 2) r->n = 0;   // another session's poses, or ones from before a silence: not this sender's now
+    if (fresh) {   // a pose sent again or an older one is dropped
         int32_t off = (int32_t)((uint32_t)now - p.t_ms);
         r->offset = !r->n || off < r->offset ? off : r->offset + 1;
         r->head = (r->head + 1) % HIST;
@@ -640,11 +646,12 @@ static void on_view(const CoopView *v, void *user) {
     int others = v->state == COOP_JOINED && v->n > 1 ? v->n - 1 : 0;
     N.others = others;
     N.self = v->self;
-    if (!others) {   // a new room starts from nothing
-        plat_mutex_lock(&N.lock);
-        memset(N.r, 0, sizeof N.r);
-        plat_mutex_unlock(&N.lock);
-    }
+    plat_mutex_lock(&N.lock);
+    if (!others) memset(N.r, 0, sizeof N.r);   // a new room starts from nothing
+    memset(N.session, 0, sizeof N.session);
+    for (int i = 0; i < v->n; i++)
+        if (v->member[i].id >= 1 && v->member[i].id <= COOP_MAX_MEMBERS) N.session[v->member[i].id] = v->member[i].session;
+    plat_mutex_unlock(&N.lock);
 }
 
 static float lerp_angle(float a, float b, float t) {

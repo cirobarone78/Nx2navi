@@ -4,7 +4,7 @@
 // 2. The wire format (coop_proto.c): HMAC against known values, XChaCha20-Poly1305 against a known answer, sealing and
 //    opening (a changed byte, another sender or receiver, another key: nothing opens), the byte vectors of
 //    tests/coop_vectors.txt (the file named by NX2NAVI_COOP_VECTORS; the Python of tools/coop_relay.py is checked against
-//    the same file), and random bytes into every parser.
+//    the same file), random bytes into every parser, and the puppets' POS counter per sender and session.
 // 3. Two sessions (coop.c) in this process, Alice and Bob, through a relay: Alice makes a room of a secret, Bob joins it,
 //    they exchange messages both ways, are hit with garbage and forged datagrams from the relay's address (a changed tag,
 //    a message the relay sealed itself, a message of Bob's recorded before he joined again, answers with a wrong nonce
@@ -382,7 +382,7 @@ static void check_vector(const char *kind, char *rest, int line) {
         CoopPos p;
         if (pn < 0 || an < 0 || !f[3]) FAIL_RET("vector pos %s does not parse (line %d)", name, line);
         CHECK(coop_pos_parse(a, (size_t)pn, &p), "vector pos %s: parses (line %d)", name, line);
-        int ok = p.pseq == atoi(pseq) && p.t_ms == (uint32_t)strtoul(t_ms, NULL, 10) && p.flags == atoi(flags) &&
+        int ok = p.pseq == (uint32_t)strtoul(pseq, NULL, 10) && p.t_ms == (uint32_t)strtoul(t_ms, NULL, 10) && p.flags == atoi(flags) &&
                  strlen(p.area) == (size_t)an && !memcmp(p.area, b, (size_t)an) && p.pos[0] == strtof(f[0], NULL) &&
                  p.pos[1] == strtof(f[1], NULL) && p.pos[2] == strtof(f[2], NULL) && p.yaw == strtof(f[3], NULL);
         int ns = 0;
@@ -542,6 +542,52 @@ static void probe_fuzz(void) {
     CHECK(parsed > 1000, "the fuzz reached the payload parsers (%ld datagrams parsed)", parsed);
     CHECK(tag_ok < parsed, "a changed datagram's tag no longer verifies");
     printf("coop-probe: parser fuzz: 400000 inputs, %ld parsed as datagrams, %ld sealed messages opened (unchanged copies)\n", parsed, open_ok);
+}
+
+// The puppets' POS counter (coop_pos_fresh, coop_puppet.c's handler): the session layer can deliver a message again
+// (coop.h), so a pose sent again or recorded earlier in the session must not move a puppet back, also in a session long
+// enough for a 16-bit counter to wrap; the first poses of another session in the member id are taken whatever their
+// counter; and a pose forged far ahead keeps the sender's own out only until nothing was taken for COOP_POS_QUIET_MS.
+static void probe_pos_counter(void) {
+    CoopPosSeen s;
+    memset(&s, 0, sizeof s);
+    const uint64_t s1 = 0x5e55000000000001ull, s2 = 0x5e55000000000002ull;
+    uint64_t t = 1000;
+    int took = 0;
+    for (uint32_t c = 1; c <= 200; c++, t += 67) took += coop_pos_fresh(&s, s1, c, t) != 0;
+    CHECK(took == 200, "POS counter: of 200 poses of one session in order, %d are taken", took);
+    int again = coop_pos_fresh(&s, s1, 200, t), older = coop_pos_fresh(&s, s1, 150, t + 10);
+    CHECK(!again && !older, "POS counter: a pose sent again (%d) or an older one (%d) of the same session is taken", again, older);
+    // another session in member id 1 (another player given it, or the member back in a new session) starts lower
+    t += 67;
+    int first = coop_pos_fresh(&s, s2, 1, t), second = coop_pos_fresh(&s, s2, 2, t + 67);
+    CHECK(first && second, "POS counter: the first poses of another session in the same member id are not taken (%d %d)", first,
+          second);
+    // 40000 poses are 44 minutes at 15 a second: one recorded 35000 poses earlier stays older
+    t += 134;
+    int late = coop_pos_fresh(&s, s2, 40000, t), recorded = coop_pos_fresh(&s, s2, 5000, t + 67);
+    CHECK(late && !recorded, "POS counter: after pose 40000 of a session, its pose 5000 sent again is taken (%d %d)", late, recorded);
+    // a pose forged 30000 ahead (someone with the room's secret), then the sender's own every 67 ms
+    t += 134;
+    const uint64_t forged_at = t;
+    int forged = coop_pos_fresh(&s, s2, 70000, t), held = 0, back = 0;
+    uint64_t back_at = 0;
+    uint32_t c = 40001;
+    for (; c < 40001 + 15 * 6 && !back; c++) {
+        t += 67;
+        int f = coop_pos_fresh(&s, s2, c, t);
+        if (f) back = f, back_at = t;
+        else held++;
+    }
+    const long long waited = back ? (long long)(back_at - forged_at) : -1;   // -1: never taken again within 6 s
+    CHECK(forged && back == 2 && waited >= COOP_POS_QUIET_MS && waited < COOP_POS_QUIET_MS + 67,
+          "POS counter: after a pose forged 30000 ahead the sender's own are taken again %lld ms later (%d held out, start again "
+          "%d), not %d to %d ms later", waited, held, back, COOP_POS_QUIET_MS, COOP_POS_QUIET_MS + 66);
+    int next = coop_pos_fresh(&s, s2, c, t + 67), forged_again = coop_pos_fresh(&s, s2, 70000 - 1, t + 100) == 1;
+    CHECK(next == 1, "POS counter: the sender's next pose after that is not taken (%d)", next);
+    printf("coop-probe: POS counter: a pose sent again or older is dropped, also 35000 back; another session starts again; "
+           "a pose forged 30000 ahead held the sender's own out %lld ms (%d poses)%s\n", waited, held,
+           forged_again ? "; a forger that keeps sending holds them out again, while it lasts" : "");
 }
 
 // ---- 3a. a relay of this file
@@ -1436,6 +1482,7 @@ int probe_coop(void) {
     probe_server_parse();
     probe_vectors();
     probe_fuzz();
+    probe_pos_counter();
     fails += probe_coop_sync();   // 4. progress sync (coop_sync_probe.c)
     probe_stop_order();
     probe_sessions();
