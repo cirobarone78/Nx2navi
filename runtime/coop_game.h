@@ -3,6 +3,7 @@
 // game takes it as if the player had done it. Nothing is read or written while the game is on its title screen, loading
 // or changing scene; what arrives meanwhile waits. docs/coop.md says what is shared.
 #pragma once
+#include "coop_offer.h"
 #include "coop_proto.h"
 #include "coop_state.h"
 #include "host.h"
@@ -14,27 +15,8 @@ void coop_game_init(void);
 // one counter and returns.
 void coop_present(Cpu *c);
 
-// What joining the room means, for the player to accept: the engine's offer (coop_state.h: CoopOffer), with the
-// relay's names for members not identified yet. Nothing from a room is applied to the game before the player accepted
-// its offer and a copy of the save was made (<profile>/coop-backup/<time>/, docs/coop.md; the first copy for a room is
-// "first-<time>" and is never pruned). An accepted offer stays accepted while every member is an identity accepted,
-// the rules and the key that signs them stay the same and the same save is played; anything else is a new offer, and
-// nothing more is applied until that one is accepted. A member in the room that never identified itself keeps the room
-// unaccepted. The offer's number is random for each start of the game. The COOP_ACCEPT setting accepts one offer by its
-// number (the log shows it) or, from the environment only, every offer with "always"; a menu calls coop_game_accept.
-int coop_game_offer(CoopOffer *out);   // 1 when there is an offer
-int coop_game_accept(uint32_t token);  // 1 when token is the current offer's, which is accepted from now on
-// The room's maker (its game holds the key that signs the rules, kept in the profile across restarts) resets the pools:
-// every game joins them again with what they held for the players in the room. 1 when done. The setting
-// COOP_RESET_POOLS does it too (when it changes to a value other than 0).
-int coop_game_reset_pools(void);
-// The room's maker removes a key by its fingerprint (xxxx-xxxx-xxxx-xxxx, as the offer and the log show it), also of a
-// member that left: every game drops it and its pool records. 1 when done. The setting COOP_REMOVE takes a fingerprint
-// too; a member in the room by its id is coop_remove_member (coop.h).
-int coop_game_remove_key(const char *fingerprint);
-// The identities the pools admit and what each spent beyond what it brought (coop_state.h): whom the maker would remove
-// after a drain. Their count (at most max).
-int coop_game_contributors(CoopContributor *out, int max);
+// The offer the player accepts before anything of a room is applied, the maker's remedies and the pools' contributors:
+// coop_offer.h (coop_game_offer, coop_game_accept, coop_game_reset_pools, coop_game_remove_key, coop_game_contributors).
 // fs_host.c, at every RomFS file open on any thread: notes the start of the title screen, after which sync waits for a
 // save to be loaded. With COOP off it reads one value and returns.
 void coop_game_rom_open(const char *path);

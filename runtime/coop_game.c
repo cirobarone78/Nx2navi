@@ -128,6 +128,7 @@ static int hset_has(const HSet *s, uint32_t h) {
 }
 
 typedef struct { uint32_t hash; int32_t value; uint32_t frame; int done; } TestSet;
+enum { PUB_CONTRIBUTORS = 24 };   // the pools' contributors the menu is shown (the maker's log hint takes as many)
 
 static struct {
     // settings, re-read when cfg_version changes (the game thread's copy and the coop thread's)
@@ -187,6 +188,21 @@ static struct {
     uint64_t ini_at;
     int ini_primed;
     char ini_accept[32], ini_remove[32], ini_reset[32];
+
+    // what the menu reads and asks (coop_offer.h) without waiting for G.lock: copies the coop thread publishes at each
+    // step under pub_lock, which is held only for a copy, and requests the coop thread carries out at its next step
+    PlatMutex pub_lock;
+    CoopOffer pub;                  // the offer as offer_of gave it last (and its return value: pub_has)
+    int pub_has, pub_maker;         // pub_maker: this game holds the key that signs the rules (coop_sync_is_maker)
+    CoopContributor pub_contrib[PUB_CONTRIBUTORS];
+    int pub_ncontrib;
+    uint64_t pub_contrib_at;        // when the contributors were published (at most every 500 ms; 0: at the next step)
+    uint32_t want_accept;           // an offer number the menu accepted (atomic)
+    // the maker's remedies the menu asked for, each with when (ms; 0 none): a request the coop thread did not take
+    // within 2 s (co-op went off meanwhile) is dropped, so that it never acts in a later room
+    uint64_t want_reset;            // atomic
+    char want_remove[24];           // a key fingerprint, "" none (pub_lock, as want_remove_at)
+    uint64_t want_remove_at;
 } G;
 
 #define TRACE_ON (rt_trace & RT_TRACE_COOP)
@@ -591,15 +607,43 @@ static void say_accepted(const CoopOffer *o, const char *how) {
     (void)o;
 }
 
-// The offer of the room (the coop thread, G.lock held): accepted by the setting, logged when it changed and is not
-// accepted.
+// What the menu reads (G.lock held): the offer offer_update settled on, whether this game is the maker, and the
+// contributors at most every 500 ms.
+static void publish(const CoopOffer *o, int has, uint64_t now) {
+    int maker = coop_sync_is_maker(G.eng), fresh = !G.pub_contrib_at || now - G.pub_contrib_at >= 500;
+    CoopContributor c[PUB_CONTRIBUTORS];
+    int n = fresh ? coop_sync_contributors(G.eng, c, PUB_CONTRIBUTORS) : 0;
+    plat_mutex_lock(&G.pub_lock);
+    G.pub = *o, G.pub_has = has, G.pub_maker = maker;
+    if (fresh) memcpy(G.pub_contrib, c, sizeof *c * (size_t)n), G.pub_ncontrib = n, G.pub_contrib_at = now;
+    plat_mutex_unlock(&G.pub_lock);
+}
+
+// No engine (co-op off, or between rooms): nothing to read.
+static void publish_none(void) {
+    plat_mutex_lock(&G.pub_lock);
+    if (G.pub_has || G.pub.n || G.pub_ncontrib || G.pub_maker)
+        memset(&G.pub, 0, sizeof G.pub), G.pub_has = G.pub_maker = G.pub_ncontrib = 0, G.pub_contrib_at = 0;
+    plat_mutex_unlock(&G.pub_lock);
+}
+
+// The offer of the room (the coop thread, G.lock held): accepted by the menu or the setting, logged when it changed and
+// is not accepted, and published for the menu.
 static void offer_update(uint64_t now) {
     CoopOffer o;
     uint32_t number;
     int always = accept_setting(&number);
-    if (offer_of(&o, now) && !o.accepted && (always || number == o.token) && coop_sync_accept(G.eng, o.token)) {
-        say_accepted(&o, always ? "coop_accept = always" : "coop_accept names its number");
-        offer_of(&o, now);
+    // the menu's accept, of the offer it showed: taken only while that offer is still the room's
+    uint32_t menu = __atomic_exchange_n(&G.want_accept, 0, __ATOMIC_ACQ_REL);
+    int has = offer_of(&o, now);
+    const char *how = !has || o.accepted ? NULL
+                      : menu == o.token  ? "in the menu"
+                      : always           ? "coop_accept = always"
+                      : number == o.token ? "coop_accept names its number"
+                                          : NULL;
+    if (how && coop_sync_accept(G.eng, o.token)) {
+        say_accepted(&o, how);
+        has = offer_of(&o, now);
     }
     if (o.token && !o.accepted && (o.token != G.logged || o.unidentified != G.logged_unid)) {
         int again = G.logged != 0;
@@ -634,34 +678,44 @@ static void offer_update(uint64_t now) {
                "room's maker which key is theirs");
     G.said_disagree = !o.token && o.disagree;
     __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
+    publish(&o, has, now);
 }
 
 int coop_game_offer(CoopOffer *out) {
-    plat_mutex_lock(&G.lock);
-    int has = 0;
-    if (G.eng) has = offer_of(out, plat_now_ms());
-    else memset(out, 0, sizeof *out);
-    plat_mutex_unlock(&G.lock);
+    plat_mutex_lock(&G.pub_lock);
+    *out = G.pub;
+    int has = G.pub_has;
+    plat_mutex_unlock(&G.pub_lock);
     return has;
 }
 
 int coop_game_accept(uint32_t token) {
-    plat_mutex_lock(&G.lock);
-    CoopOffer o;
-    int ok = G.eng && coop_sync_offer(G.eng, &o, plat_now_ms()) && !o.accepted && coop_sync_accept(G.eng, token);
-    if (ok) say_accepted(&o, "in the menu");
-    if (G.eng) __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
-    plat_mutex_unlock(&G.lock);
-    return ok || (G.eng && o.token == token && o.accepted);
+    plat_mutex_lock(&G.pub_lock);
+    int same = token && G.pub_has && token == G.pub.token, done = same && G.pub.accepted;
+    int ok = same && !G.pub.accepted && !G.pub.unidentified;
+    plat_mutex_unlock(&G.pub_lock);
+    if (ok) __atomic_store_n(&G.want_accept, token, __ATOMIC_RELEASE);
+    return ok || done;
 }
 
-int coop_game_reset_pools(void) {
+// The maker's pool reset (the coop thread, without G.lock).
+static int reset_pools(void) {
     plat_mutex_lock(&G.lock);
     int ok = G.eng && coop_sync_reset_pools(G.eng);
+    G.pub_contrib_at = 0;
     plat_mutex_unlock(&G.lock);
     if (ok) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
     else rt_log("coop: sync: only the room's maker resets the pools");
     return ok;
+}
+
+int coop_game_reset_pools(void) {
+    plat_mutex_lock(&G.pub_lock);
+    int maker = G.pub_maker;
+    plat_mutex_unlock(&G.pub_lock);
+    if (maker) __atomic_store_n(&G.want_reset, plat_now_ms(), __ATOMIC_RELEASE);
+    else rt_log("coop: sync: only the room's maker resets the pools");
+    return maker;
 }
 
 // The maker removes a key (G.lock held): a member that left, or one in the room.
@@ -670,29 +724,32 @@ static int remove_key(const char *fingerprint) {
     int ok = G.eng && coop_sync_key_parse(fingerprint, &kid) && coop_sync_remove_key(G.eng, kid);
     if (ok) rt_log("coop: sync: key %s removed: every game drops it and its pool records, and ignores it from now on", fingerprint);
     else rt_log("coop: sync: key %s was not removed: only the room's maker removes, and only a key the room knows", fingerprint);
+    G.pub_contrib_at = 0;
     return ok;
 }
 
 int coop_game_remove_key(const char *fingerprint) {
-    plat_mutex_lock(&G.lock);
-    int ok = remove_key(fingerprint);
-    plat_mutex_unlock(&G.lock);
-    return ok;
+    uint64_t kid;
+    if (!fingerprint || !coop_sync_key_parse(fingerprint, &kid)) return 0;
+    plat_mutex_lock(&G.pub_lock);
+    int maker = G.pub_maker;
+    if (maker) snprintf(G.want_remove, sizeof G.want_remove, "%s", fingerprint), G.want_remove_at = plat_now_ms();
+    plat_mutex_unlock(&G.pub_lock);
+    if (!maker) rt_log("coop: sync: key %s was not removed: only the room's maker removes", fingerprint);
+    return maker;
 }
 
 int coop_game_contributors(CoopContributor *out, int max) {
-    plat_mutex_lock(&G.lock);
-    int n = G.eng ? coop_sync_contributors(G.eng, out, max) : 0;
-    plat_mutex_unlock(&G.lock);
-    return n;
+    plat_mutex_lock(&G.pub_lock);
+    int n = G.pub_ncontrib < max ? G.pub_ncontrib : max;
+    if (n > 0) memcpy(out, G.pub_contrib, sizeof *out * (size_t)n);
+    plat_mutex_unlock(&G.pub_lock);
+    return n > 0 ? n : 0;
 }
 
-// The maker's coop_remove (a key's fingerprint, which the log shows beside each member) and coop_reset_pools, and
-// coop_accept, from nx2navi.ini as it is now, once a second while in a room (on the coop thread, without G.lock: a
-// removal of a member in the room goes through coop_remove_member's hook). A reading that fails (an editor saving the
-// file, a lock) is skipped, not read as empty. A value acts once: when it comes back after a missed reading, or stays
-// in the file, it acts on nothing again (coop_reset_pools = 0 lets the next value act). A member number is not taken
-// from the file: numbers pass to other players as members come and go.
+// The maker's removal of a key by its fingerprint (the coop thread, without G.lock: a removal of a member in the room
+// goes through coop_remove_member's hook), from nx2navi.ini's coop_remove or the menu. A member in the room that holds
+// the key is removed at the relay too.
 static void remove_by_fingerprint(const char *fp) {
     uint64_t kid = 0, k;
     int member = 0;
@@ -704,8 +761,16 @@ static void remove_by_fingerprint(const char *fp) {
         if (o.member[i].heard && coop_sync_key_parse(o.member[i].key, &k) && k == kid) member = o.member[i].id;
     plat_mutex_unlock(&G.lock);
     if (member && coop_remove_member(member)) return;   // in the room: the relay removes it too
-    coop_game_remove_key(fp);
+    plat_mutex_lock(&G.lock);
+    remove_key(fp);
+    plat_mutex_unlock(&G.lock);
 }
+
+// The maker's coop_remove (a key's fingerprint, which the log shows beside each member) and coop_reset_pools, and
+// coop_accept, from nx2navi.ini as it is now, once a second while in a room (on the coop thread, without G.lock). A
+// reading that fails (an editor saving the file, a lock) is skipped, not read as empty. A value acts once: when it comes
+// back after a missed reading, or stays in the file, it acts on nothing again (coop_reset_pools = 0 lets the next value
+// act). A member number is not taken from the file: numbers pass to other players as members come and go.
 
 static void poll_ini(uint64_t now) {
     if (G.view.state != COOP_JOINED && G.view.state != COOP_RECONNECTING) return;   // no room: nothing to act on, nothing read
@@ -731,7 +796,7 @@ static void poll_ini(uint64_t now) {
     if (!strcmp(rp, "0")) snprintf(G.ini_reset, sizeof G.ini_reset, "0");
     else if (rp[0] && strcmp(rp, G.ini_reset)) {
         snprintf(G.ini_reset, sizeof G.ini_reset, "%s", rp);
-        if (primed) coop_game_reset_pools();
+        if (primed) reset_pools();
     }
 }
 
@@ -800,9 +865,19 @@ static void on_tick(uint64_t now, void *user) {
     unsigned v = cfg_version();
     make_snapshot();
     poll_ini(now);
+    // the maker's remedies the menu asked for since the last step
+    char asked[sizeof G.want_remove];
+    plat_mutex_lock(&G.pub_lock);
+    snprintf(asked, sizeof asked, "%s", now - G.want_remove_at < 2000 ? G.want_remove : "");
+    G.want_remove[0] = 0;
+    plat_mutex_unlock(&G.pub_lock);
+    if (asked[0]) remove_by_fingerprint(asked);
+    uint64_t reset_at = __atomic_exchange_n(&G.want_reset, 0, __ATOMIC_ACQ_REL);
+    if (reset_at && now - reset_at < 2000) reset_pools();
     plat_mutex_lock(&G.lock);
     if (!G.eng) {
         plat_mutex_unlock(&G.lock);
+        publish_none();
         return;
     }
     if (v != G.cfg_seen_net) {   // a setting changed: the room's maker passes the rules on, and acts on its remedies
@@ -862,6 +937,7 @@ static void on_tick(uint64_t now, void *user) {
 
 void coop_game_init(void) {
     plat_mutex_init(&G.lock);
+    plat_mutex_init(&G.pub_lock);
     G.cfg_seen = ~0u;
     coop_on_message(COOP_K_DIGEST, on_message, (void *)(uintptr_t)COOP_K_DIGEST);
     coop_on_message(COOP_K_SECTION, on_message, (void *)(uintptr_t)COOP_K_SECTION);
