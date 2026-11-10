@@ -71,7 +71,8 @@ void coop_sync_free(CoopSync *s);
 void coop_sync_trace(CoopSync *s, void (*fn)(void *user, const char *line), void *user);
 
 // ---- the room (the coop thread)
-// The room and who is in it: code "" when in none. A new code (or none) forgets the rules, the pools and the peers.
+// The room and who is in it: code "" when in none. A new code (or none) forgets the rules, the peers and everything
+// merged: nothing of one room reaches the next.
 // self: this player's member id; ids: every member's (self included).
 void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int n, uint64_t now_ms);
 // This player's own rule settings, and whether it made the room (its settings are the room's).
@@ -88,8 +89,8 @@ unsigned coop_sync_rules(const CoopSync *s, CoopRules *out);
 int coop_sync_caught_up(const CoopSync *s);
 
 // ---- the local game (the game thread)
-// Forget what the local game holds (another save was loaded): every flag counts as at its default until reported again,
-// every merged value is applied again, and pools bind again.
+// Another save was loaded: everything merged is forgotten (it holds the last save's progress), the pools bind again.
+// The game reports its flags again and the room sends what it holds, so the new save gets the room's state only.
 void coop_sync_rebind(CoopSync *s);
 // A flag's local value: 1 for a flag that differs from its default, a count for an item. Values only grow the merged state.
 void coop_sync_local(CoopSync *s, int cat, uint32_t hash, uint32_t value, uint64_t now_ms);

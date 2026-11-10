@@ -13,7 +13,9 @@
 //    member's, and the modes: items per player, the shared pools (two players spending at once, a cap, a debt paid back,
 //    a player who joins with more, a game that restarts), keys per player with progress per player, and a rule switched
 //    in the middle of a session (to shared: merges from then on; to per player: stops, keeps what it has).
-// 5. Random bytes into the receiver.
+// 5. Nothing merged survives a change of room or of save: a save loaded after leaving a room, the next room, and another
+//    save loaded in a room of one get none of what the last room and the last save had.
+// 6. Random bytes into the receiver.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -542,7 +544,55 @@ static void probe_keys(void) {
     printf("coop-probe: sync keys: a key picked up by one opens a door for the other, once, at 30 %% loss\n");
 }
 
-// ---- 5. hostile bytes
+// ---- 5. carry-over between rooms and saves
+
+static void reload_save(Game *g) {   // the game loads another save: every flag at its default, reported again
+    for (int k = 0; k < g->n; k++) g->f[k].value = 0, g->f[k].reported = 0, g->f[k].known = 0;
+    coop_sync_rebind(g->eng);
+}
+
+static void probe_carry_over(void) {
+    Net net = {0};
+    Game x, p, q;
+    game_init(&x, 1, 0x51);
+    game_init(&p, 2, 0x52);
+    game_init(&q, 3, 0x53);
+    defaults(&x, 1);
+    defaults(&p, 0);
+    for (int k = 0; k < 10; k++) x.f[k].value = 1;    // save X: progress flags 1..10
+    for (int k = 10; k < 20; k++) p.f[k].value = 1;   // P: 11..20
+    net.games[0] = &x, net.games[1] = &p, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "ROOMAA", 1000), 1000), 5000);
+    CHECK(value_of(&x, 11) == 1 && value_of(&p, 1) == 1, "carry-over: room A merged X and P");
+    // X leaves room A, loads save Y (only flag 31), and joins room B, which Q made (Q has flag 41)
+    net.present[1] = 0;
+    coop_sync_room(x.eng, "", 0, NULL, 0, now);
+    reload_save(&x);
+    x.f[30].value = 1;
+    q.f[40].value = 1;
+    defaults(&x, 0);
+    defaults(&q, 1);
+    net.games[2] = &q, net.present[2] = 1;
+    now = run(&net, (net_roster(&net, "ROOMBB", now), now), 6000);
+    int leaked = 0;
+    for (uint32_t h = 1; h <= 20; h++) leaked += value_of(&x, h) != 0 || value_of(&q, h) != 0;
+    CHECK(!leaked, "carry-over: %d flags of room A and save X reached save Y or room B", leaked);
+    CHECK(value_of(&q, 31) == 1 && value_of(&x, 41) == 1, "carry-over: room B merges Y and Q");
+    // in a room of its own, X loads save Z: nothing of Y reaches it
+    net.present[2] = 0;
+    defaults(&x, 1);
+    now = run(&net, (net_roster(&net, "ROOMCC", now), now), 3000);
+    reload_save(&x);
+    x.f[50].value = 1;
+    now = run(&net, now, 3000);
+    CHECK(value_of(&x, 31) == 0 && value_of(&x, 41) == 0 && value_of(&x, 51) == 1, "carry-over: save Z got nothing of save Y (%d %d)",
+          value_of(&x, 31), value_of(&x, 41));
+    game_free(&x), game_free(&p), game_free(&q);
+    free(net.q);
+    printf("coop-probe: sync carry-over: a new room and a new save start with nothing of the last ones\n");
+}
+
+// ---- 6. hostile bytes
 
 static void probe_sync_fuzz(void) {
     CoopSync *s = coop_sync_new(1, 0xC0FFEE);
@@ -582,6 +632,7 @@ int probe_coop_sync(void) {
     probe_rooms(30, 4, 0);
     probe_rules();
     probe_keys();
+    probe_carry_over();
     probe_sync_fuzz();
     return fails;
 }

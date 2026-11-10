@@ -316,6 +316,16 @@ static void push_local(CoopSync *s, int idx, uint64_t now) {
     s->push[s->push_tail++ % PUSH_SLOTS] = (Push){idx, 0, now, now};
 }
 
+// Forget every register, pool, queued push and apply (the allocations stay for reuse).
+static void drop_state(CoopSync *s) {
+    s->nregs = 0;
+    if (s->index) memset(s->index, 0, (size_t)s->index_cap * sizeof *s->index);
+    s->npools = 0;
+    s->push_head = s->push_tail = 0;
+    s->apply_head = s->apply_tail = 0;
+    memset(s->sums, 0, sizeof s->sums);
+}
+
 // ---- lifetime
 
 CoopSync *coop_sync_new(uint64_t self_id, uint32_t schema) {
@@ -409,12 +419,8 @@ void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int
         memset(s->peer, 0, sizeof s->peer);
         s->joined_at = now, s->originated_at = 0;
         s->rules_ver++;
-        // the pools of the last room are its own: what each counter shows now stays, the room's totals go
-        for (int i = 0; i < s->nregs; i++)
-            if (s->regs[i].kind != COOP_R_FLAG) s->regs[i].s = 0;
-        for (int i = 0; i < s->npools; i++) s->pools[i].bound = 0, s->pools[i].gains = s->pools[i].spends = 0;
-        s->push_head = s->push_tail = 0;
-        recompute_sums(s);
+        // everything merged belongs to the last room: nothing of it (flags, the save it came from) reaches the next one
+        drop_state(s);
         s->next_digest = now;
     }
     s->self = self;
@@ -653,13 +659,11 @@ void coop_sync_tick(CoopSync *s, uint64_t now, CoopSyncSendFn send, void *user) 
 // ---- the local game
 
 void coop_sync_rebind(CoopSync *s) {
-    for (int i = 0; i < s->nregs; i++) {
-        Reg *r = &s->regs[i];
-        if (r->kind != COOP_R_FLAG) continue;
-        r->l = 0, r->applied = 0;
-        flag_check(s, i);
-    }
-    for (int i = 0; i < s->npools; i++) s->pools[i].bound = 0, s->pools[i].have_local = 0;
+    // the merged state holds the last save's progress: forgotten, so that none of it reaches this save; the game
+    // reports its flags again and the room sends what it holds within a few digests
+    drop_state(s);
+    s->caught_up = 0;
+    s->digest_to |= 1;
 }
 
 void coop_sync_local(CoopSync *s, int cat, uint32_t hash, uint32_t value, uint64_t now) {
