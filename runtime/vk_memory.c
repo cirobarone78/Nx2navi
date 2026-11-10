@@ -1127,7 +1127,8 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
             mem_thaw(addr, size);
             static int bulk_write = -1;
             if (bulk_write < 0) {
-                bulk_write = cfg_bool("NX2NAVI_SHADOW_BULK_WRITE");
+                const char *setting = cfg_get("NX2NAVI_SHADOW_BULK_WRITE");
+                bulk_write = setting && *setting && strcmp(setting, "0") != 0;
                 if (bulk_write) rt_log("mem: shadow readback prepares write-watch pages in bulk");
             }
             if (bulk_write) plat_mem_prepare_write(addr, size);
