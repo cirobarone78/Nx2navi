@@ -275,11 +275,22 @@ static void net_roster(Net *net, const char *code, uint64_t now) {
         if (net->games[i] && net->present[i]) coop_sync_room(net->games[i]->eng, code, net->games[i]->id, ids, sessions, n, maker, now);
 }
 
+// NX2NAVI_COOP_ADVERSARY_TRACE set: the randomised test prints each event and the honest engines' lines about pools,
+// charters and identities, with the simulated time, so that a failing seed can be followed by hand.
+static int adv_trace_on;
+static uint64_t adv_trace_now;
+static void adv_trace_line(void *user, const char *line) {
+    if (strstr(line, "pool") || strstr(line, "keys") || strstr(line, "rupees") || strstr(line, "charter") || strstr(line, "identified") ||
+        strstr(line, "key") || strstr(line, "caught"))
+        fprintf(stderr, "[%llu] P%d %s\n", (unsigned long long)adv_trace_now, ((const Game *)user)->id, line);
+}
+
 // Run every present game for ms of simulated time in steps of step ms (8: the coop thread's step in a room, a frame on
 // the game side; the randomised runs take larger ones).
 static uint64_t run_by(Net *net, uint64_t now, unsigned ms, unsigned step) {
     for (unsigned t = 0; t < ms; t += step) {
         now += step;
+        adv_trace_now = now;
         for (int i = 0; i < MAX_PLAYERS; i++) {
             Game *g = net->games[i];
             if (!g || !net->present[i]) continue;
@@ -2017,24 +2028,31 @@ static void probe_h4_spent(void) {
 // relay's address. The hostile members send every signed record and flag the wire format allows, with extreme and
 // random values, charters signed with their own keys, and their own games' counters at the extremes. The attacker
 // sends sections in another member's name; rosters that leave a member out, list another session or an earlier one
-// for it, or list a member nobody is; and what the honest games sent before (their identities and sections, of their
-// session now or an earlier one) after a roster that lists the session it was sent in. All of it comes in a random
-// order with the honest players' joins, rejoins, saves loaded, keys picked up and used, and the maker's removals and
-// resets (a reset after the maker removed the hostile keys it admitted, as docs/coop.md says). At the end the hostile
-// members leave and the maker removes every key they used, or resets the pools (once or twice).
+// for it, or list a member nobody is; what the honest games sent before (their identities and sections, of their
+// session now or an earlier one) after a roster that lists the session it was sent in; and, from the sixth review on,
+// copies of an honest game's digest with the maker's charter far later or one mode changed, or with one byte of its
+// name changed after two rosters that make the victim meet it again, or of its section with a byte changed, all with
+// the genuine signature; and identities of its own key for an honest game's session (often right after that game joined
+// again). All of it comes in a random order with the honest players' joins, rejoins, leaving and coming back, saves
+// loaded (often, in one seed in five), keys picked up and used, and the maker's removals and resets (a reset after the
+// maker removed the hostile keys it admitted, as docs/coop.md says, one time in three in the same charter). At the end
+// the hostile members leave and the maker removes every key they used, or resets the pools (once or twice).
 //
-// The harness keeps a ledger of the pools of its own: what each honest game joined each pool with (its count, or the
-// carry of a reset, which the ledger works out itself), the honest records it had in view then, and the keys each
-// honest player picked up and used since. From that it works out by coop_state.h's rule what an honest pool holds with
-// no hostile record in it and no claim as a game wrote it, so a claim that absorbed a removed key's gains, or a carry
-// that kept a removed key's drain, shows as a pool below it. Invariants, printed with the seed when broken:
+// The harness keeps a ledger of the pools of its own: what each honest game joined each pool with (its count), the
+// carry of a reset (which the ledger works out itself, over the players the reset admits) as a claim made at the reset,
+// the honest records it had in view then, and the keys each honest player picked up and used since. From that it works
+// out by the rule docs/coop.md gives (the highest claim, every pickup, every use) what an honest pool holds with no
+// hostile record in it and no claim as a game wrote it, so a claim that absorbed a removed key's gains, or a carry that
+// kept a removed key's drain or absorbed a later pickup, shows as a pool below it. Invariants, printed with the seed
+// when broken:
 // - after every event: no honest game stores or shows a flag only the hostile members or the attacker sent unless it
-//   accepted a hostile key or (transitively, as documented) a player who did; nothing was applied while a game's room
-//   was not open to it; nothing lowered a flag;
+//   accepted a hostile key or the attacker's or (transitively, as documented) a player who did; nothing was applied
+//   while a game's room was not open to it; nothing lowered a flag;
 // - every tenth event, after a quiet 1.5 s and with the hostile members still there: a game whose pools count no
 //   hostile key, directly or through a player it accepted, holds at least what the ledger says;
-// - at the end: every honest game identifies the others and is open, and its pools are bound, hold at least what the
-//   ledger says, agree between the honest games and show what they hold.
+// - at the end: every honest game identifies the others by their own keys, ignores none of them, holds the maker's
+//   charter and is open, and its pools are bound, hold at least what the ledger says, agree between the honest games
+//   and show what they hold.
 
 enum { ADV_H = 3, ADV_M = 2, ADV_STARTS = 4, ADV_FLAG_LO = 251, ADV_FLAG_HI = 290, ADV_X = 7, ADV_POOLS = 3, ADV_LOG = 48 };
 static const uint32_t adv_pool_hash[ADV_POOLS] = {KEYS_FOREST, KEYS_WATER, RUPEE};
@@ -2046,7 +2064,7 @@ uint32_t coop_sync_pool_epoch(const CoopSync *s);
 
 typedef struct {   // an honest game's join of a pool, as the harness saw it
     int fresh;                     // its first in the pools' epoch
-    int64_t w;                     // what it joined with: its count, or the ledger's carry when larger
+    int64_t w;                     // what it joined with: its count (a reset's carry is the epoch's floor instead)
     int has[ADV_H];                // the honest records in its view just before (what their players picked up and used)
     int32_t vb[ADV_H];
     uint32_t vg[ADV_H], vs[ADV_H];
@@ -2057,12 +2075,15 @@ typedef struct {   // an honest game's joins, pickups and uses in one pools' epo
     int valid;
     AdvJoin j[8];                  // its joins (as coop_state.c keeps POOL_JOINS of them)
     int nj;
-    int64_t floor;                 // the claims of joins no longer kept, at the most they came to
+    int64_t floor;                 // the claims of joins no longer kept, at the most they came to, and a reset's carry
+    int carried;                   // the reset's carry was signed at once as the game's record: a claim made at the reset
     uint32_t gain, spend;          // its player's pickups and uses since its first join in the epoch, counted here
     int own;                       // its game's own record of the epoch as the game last signed it (ob, og, os): final
     int32_t ob;                    // once the game moved on to a later epoch
     uint32_t og, os;
 } AdvEpoch;
+
+typedef struct { int in; int64_t b, g, s; } AdvRow;   // an honest game's claim, gains and spends in one game's view
 
 typedef struct {
     AdvEpoch cur, past[4];         // the pools' epoch its game is in and the ones before, latest first: a game a reset
@@ -2070,7 +2091,8 @@ typedef struct {
     int32_t last;                  // its count at its last report (after what the pool handed it)
     AdvJoin pre;                   // the view before a report
     int has_carry, snap_ok;        // a reset's carry until the game joins; snap_ok: the game had the room's rules
-    int64_t carry, snap;           // snap: its pools by the ledger just before a message that may bring a reset
+    int64_t carry;
+    AdvRow snap[ADV_H];            // the honest records it held just before a message that may bring a reset
 } AdvLed;
 
 typedef struct Adv {
@@ -2082,14 +2104,15 @@ typedef struct Adv {
     uint64_t mkid[ADV_M * ADV_STARTS];   // every key a hostile member signed with
     int mgone[ADV_M * ADV_STARTS];       // the maker removed it
     int nmkid;
-    uint64_t hkid[ADV_H];
+    uint64_t hkid[ADV_H], xkid;    // the honest games' keys, and the attacker's
+    int reloads;                   // the honest players load another save often (the joins a pool remembers fill up)
     int rupees;                    // the maker pools rupees too
     uint32_t pool_epoch;           // the resets so far
     AdvLed led[ADV_H][ADV_POOLS];
     int fails;
 } Adv;
 
-static unsigned long long adv_forged, adv_rosters, adv_replays, adv_checks;   // what the runs did, for the summary
+static unsigned long long adv_forged, adv_rosters, adv_replays, adv_checks, adv_tampered, adv_impostors, adv_together;   // for the summary
 
 #define ADV_FAIL(a, ...)                                                                                                \
     do {                                                                                                               \
@@ -2142,59 +2165,95 @@ static AdvSum adv_sum(const int64_t *base, const int64_t *gain, const int64_t *s
 
 // The claim of one join of honest game h in pool p over the records in its view then that h counts now (a game makes its
 // claims again when what it counts changes), and what it adds as a gain instead (a first join that found the pool in
-// debt).
-static void adv_join_claim(const Adv *a, int h, int p, const AdvJoin *j, int64_t *claim, int64_t *debt) {
+// debt). keep: the honest games whose records count (a bit each; a reset's carry counts only those it admits).
+static void adv_join_claim(const Adv *a, int h, int p, const AdvJoin *j, unsigned keep, int64_t *claim, int64_t *debt) {
     int64_t b[ADV_H], g[ADV_H], s[ADV_H];
     int n = 0;
     for (int k = 0; k < ADV_H; k++)
-        if (j->has[k] && adv_counts(a, h, k)) b[n] = j->vb[k], g[n] = j->vg[k], s[n] = j->vs[k], n++;
+        if (j->has[k] && adv_counts(a, h, k) && keep >> k & 1) b[n] = j->vb[k], g[n] = j->vg[k], s[n] = j->vs[k], n++;
     AdvSum v = adv_sum(b, g, s, n, adv_lim(p));
     *claim = -(1 << 20), *debt = 0;
     if (v.value >= 0 || !n) *claim = adv_clamp(j->w - (n ? v.value - v.top : 0));
     else if (j->fresh && j->w > 0) *debt = j->w < 1 << 20 ? j->w : 1 << 20;
 }
 
-// Honest game h's claim in pool p in epoch e (the highest of its joins'), and its first join's gain in debt. 0 when it
-// did not join.
-static int adv_claim(const Adv *a, int h, int p, const AdvEpoch *e, int64_t *claim, int64_t *debt) {
+// Honest game h's claim in pool p in epoch e (the highest of its joins' and its carry), and its first join's gain in
+// debt. 0 when it did not join and signed no carry.
+static int adv_claim(const Adv *a, int h, int p, const AdvEpoch *e, unsigned keep, int64_t *claim, int64_t *debt) {
     *claim = e->floor, *debt = 0;
     for (int i = 0; i < e->nj; i++) {
         int64_t c, d;
-        adv_join_claim(a, h, p, &e->j[i], &c, &d);
+        adv_join_claim(a, h, p, &e->j[i], keep, &c, &d);
         if (c > *claim) *claim = c;
         *debt += d;
     }
-    return e->nj != 0;
+    return e->nj != 0 || e->carried;
 }
 
 // What pool p holds in honest game g's view by the ledger: the claims, pickups and uses in g's epoch of the honest games
-// it counts. held: only those whose record g holds as its owner last signed it in that epoch (a record still on its way
-// is lag, not damage; at the end every record has arrived). An owner that moved on to a later epoch signs nothing more
-// in this one, so its last record there is final and counts once it arrived. 0 when none counts.
-static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
-    int64_t b[ADV_H], gg[ADV_H], s[ADV_H], c, debt;
+// it counts, one row each. held: as g holds their records. One that g holds as its owner last signed it in that epoch
+// counts by the ledger's own claim, pickups and uses; an older one of the owner's (the newer is on its way, or is not
+// taken while the owner's identity is disputed) counts as g holds it, as signed then; none at all, not at all. At the
+// end every record has arrived. An owner that moved on to a later epoch signs nothing more in this one, so its last
+// record there is final. The rows that count.
+static int adv_rows(const Adv *a, int g, int p, int held, AdvRow rows[ADV_H]) {
+    int64_t c, debt;
     int n = 0;
     uint32_t ep = a->led[g][p].cur.ep;
     for (int h = 0; h < ADV_H; h++) {
         const AdvLed *L = &a->led[h][p];
         const AdvEpoch *e = L->cur.ep == ep ? &L->cur : NULL;
+        rows[h].in = 0;
         for (int i = 0; i < 4 && !e; i++) e = L->past[i].valid && L->past[i].ep == ep ? &L->past[i] : NULL;
-        if (!e || !adv_counts(a, g, h) || !adv_claim(a, h, p, e, &c, &debt)) continue;
+        if (!e || !adv_counts(a, g, h) || !adv_claim(a, h, p, e, 7, &c, &debt)) continue;
         int32_t rb;
         uint32_t rg, rs;
-        if (held && !(e->own && coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs) && rb == e->ob && rg == e->og && rs == e->os))
-            continue;
-        b[n] = c, gg[n] = (int64_t)e->gain + debt, s[n] = e->spend, n++;
+        if (held) {
+            if (!coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs)) continue;
+            if (!(e->own && rb == e->ob && rg == e->og && rs == e->os)) {
+                rows[h] = (AdvRow){1, rb, rg, rs}, n++;
+                continue;
+            }
+        }
+        rows[h] = (AdvRow){1, c, (int64_t)e->gain + debt, e->spend}, n++;
     }
-    if (n) *out = adv_sum(b, gg, s, n, adv_lim(p)).value;
+    return n;
+}
+
+// The pool's value over the rows that count, of the games in mask (a bit each); 0 when none counts.
+static int adv_rows_sum(const AdvRow rows[ADV_H], unsigned mask, int p, int64_t *out) {
+    int64_t b[ADV_H], g[ADV_H], s[ADV_H];
+    int n = 0;
+    for (int h = 0; h < ADV_H; h++)
+        if (rows[h].in && mask >> h & 1) b[n] = rows[h].b, g[n] = rows[h].g, s[n] = rows[h].s, n++;
+    if (n) *out = adv_sum(b, g, s, n, adv_lim(p)).value;
     return n != 0;
 }
 
+static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
+    AdvRow rows[ADV_H];
+    return adv_rows(a, g, p, held, rows) && adv_rows_sum(rows, 7, p, out);
+}
+
+// The honest games whose keys game k's charter admits to the pools (a bit each).
+static unsigned adv_admitted(const Adv *a, int k) {
+    CoopContributor c[32];
+    unsigned mask = 0;
+    int n = coop_sync_contributors(a->h[k].eng, c, 32);
+    for (int i = 0; i < n; i++) {
+        uint64_t kid = 0;
+        for (int h = 0; h < ADV_H; h++)
+            if (!c[i].removed && coop_sync_key_parse(c[i].key, &kid) && kid == a->hkid[h]) mask |= 1u << h;
+    }
+    return mask;
+}
+
 // Game k's pools' epoch as its engine has it: a reset that reached it starts a new record, with the carry the ledger
-// took just before the message that brought it (when the game had the room's rules then); one that waits keeps the
-// larger. And the game's own record of its epoch as its engine holds it now: the engine signs it again in a report,
-// and a claim made again at its next tick, also while the game reports nothing. The ledger looks before every message
-// that may bring a reset, so a record that a reset ends is kept as the game last signed it.
+// works out from the rows it held just before the message that brought it (when the game had the room's rules then):
+// those of the honest games the new charter admits, its own claim made again counting only them, as coop_state.c makes
+// it. One that waits keeps the larger. And the game's own record of its epoch as its engine holds it now: the engine
+// signs it again in a report, and a claim made again at its next tick, also while the game reports nothing. The ledger
+// looks before every message that may bring a reset, so a record that a reset ends is kept as the game last signed it.
 static void adv_led_epoch(Adv *a, int k, int p) {
     AdvLed *L = &a->led[k][p];
     uint32_t ep = coop_sync_pool_epoch(a->h[k].eng);
@@ -2203,8 +2262,23 @@ static void adv_led_epoch(Adv *a, int k, int p) {
         L->past[0] = L->cur;
         memset(&L->cur, 0, sizeof L->cur);
         L->cur.ep = ep, L->cur.valid = 1, L->cur.floor = -(1 << 20);
-        if (L->snap_ok && (!L->has_carry || L->snap > L->carry)) L->carry = L->snap;
-        L->has_carry |= L->snap_ok;
+        if (L->snap_ok) {
+            unsigned mask = adv_admitted(a, k);
+            int64_t c, debt, snap = 0;
+            if (L->snap[k].in && adv_claim(a, k, p, &L->past[0], mask, &c, &debt)) L->snap[k].b = c, L->snap[k].g = (int64_t)L->past[0].gain + debt;
+            adv_rows_sum(L->snap, mask, p, &snap);
+            if (!L->has_carry || snap > L->carry) L->carry = snap;
+            L->has_carry = 1;
+        }
+        // the rule docs/coop.md gives: a reset's carry is a claim made at the reset, and whatever anyone picks up after
+        // it comes on top. A game the reset admits signs it at once (its engine holds its own record of the new epoch
+        // before any join); one it does not admit claims it at its first join
+        int32_t ob;
+        uint32_t og, os;
+        if (L->has_carry && coop_sync_own_record(a->h[k].eng, adv_pool_hash[p], &ob, &og, &os)) {
+            L->cur.carried = 1, L->has_carry = 0;
+            if (L->carry > L->cur.floor) L->cur.floor = adv_clamp(L->carry);
+        }
     }
     L->cur.own = coop_sync_own_record(a->h[k].eng, adv_pool_hash[p], &L->cur.ob, &L->cur.og, &L->cur.os);
 }
@@ -2227,19 +2301,20 @@ static void adv_led_report(Adv *a, Game *g, const Flag *f, int was, int after) {
         int64_t d = (int64_t)f->value - L->last;
         if (d > 0) e->gain += (uint32_t)d;
         else e->spend += (uint32_t)-d;
-    } else if (!was && bound) {   // a join: with its count, or the carry when larger; every one is kept
+    } else if (!was && bound) {   // a join: with its count; every one is kept
         if (e->nj == 8) {
             int64_t c, d;
-            adv_join_claim(a, k, p, &e->j[1], &c, &d);
+            adv_join_claim(a, k, p, &e->j[1], 7, &c, &d);
             if (c > e->floor) e->floor = c;
             memmove(&e->j[1], &e->j[2], 6 * sizeof e->j[0]);
             e->nj--;
         }
         AdvJoin *j = &e->j[e->nj];
         *j = L->pre;
-        j->fresh = !e->nj++;
+        j->fresh = !e->nj && !e->carried;
+        e->nj++;
         j->w = f->value;
-        if (L->has_carry && L->carry > j->w) j->w = L->carry;
+        if (j->fresh && L->has_carry && L->carry > 0 && L->carry > e->floor) e->floor = adv_clamp(L->carry);   // a carry not signed at the reset
         L->has_carry = 0;
     }
     L->last = f->value;
@@ -2263,8 +2338,8 @@ static void adv_led_snap(Adv *a, const Game *g) {
     for (int p = 0; p < ADV_POOLS; p++) {
         for (int h = 0; h < ADV_H; h++) adv_led_epoch(a, h, p);
         AdvLed *L = &a->led[k][p];
-        L->snap = 0, L->snap_ok = r.epoch != 0;
-        if (L->snap_ok) adv_ledger(a, k, p, 1, &L->snap);
+        L->snap_ok = r.epoch != 0;
+        if (L->snap_ok) adv_rows(a, k, p, 1, L->snap);
     }
 }
 
@@ -2296,20 +2371,21 @@ static int adv_list(Adv *a, int *ids, uint64_t *sess, int *maker) {
     return n;
 }
 
-static int adv_hostile_kid(const Adv *a, uint64_t kid) {
-    for (int i = 0; i < a->nmkid; i++)
-        if (a->mkid[i] == kid) return 1;
+static int adv_honest_kid(const Adv *a, uint64_t kid) {
+    for (int k = 0; k < ADV_H; k++)
+        if (a->hkid[k] == kid) return 1;
     return 0;
 }
 
-// A player who checks who is in the room: accepts when every member is identified and honest (a removed one aside).
+// A player who checks who is in the room: accepts when every member is identified by the key of a player it knows (a
+// removed one aside), so neither a hostile member's key nor the attacker's in an honest member's place.
 static void adv_ask(Adv *a, Game *g) {
     CoopOffer o;
     if (!g->ask || !coop_sync_offer(g->eng, &o, a->now) || o.accepted || o.unidentified) return;
     for (int i = 0; i < o.n; i++) {
         uint64_t kid = 0;
         if (o.member[i].removed) continue;
-        if (!o.member[i].heard || !coop_sync_key_parse(o.member[i].key, &kid) || adv_hostile_kid(a, kid)) return;
+        if (!o.member[i].heard || !coop_sync_key_parse(o.member[i].key, &kid) || !adv_honest_kid(a, kid)) return;
     }
     coop_sync_accept(g->eng, o.token);
 }
@@ -2424,7 +2500,7 @@ static void adv_hostile_counters(Adv *a, int i) {   // its own game's counters a
 }
 
 static void adv_honest_event(Adv *a, Game *g) {
-    switch (adv_below(a, 8)) {
+    switch (a->reloads && adv_below(a, 2) ? 4 : adv_below(a, 8)) {
     case 0:
     case 1: {   // a key picked up or used
         Flag *f = flag_of(g, adv_below(a, 2) ? KEYS_FOREST : KEYS_WATER);
@@ -2511,18 +2587,102 @@ static void adv_replay(Adv *a) {
     if (forged) a->now = run_by(&a->net, a->now, 100 + adv_below(a, 1500), 16), adv_roster(a);
 }
 
+// Where the charter of digest d begins (after its identity and the byte that says it carries one); 0 when it has none.
+static size_t charter_at(const Packet *d) {
+    size_t at = 5 + COOP_PK_LEN + 8, nl = d->b[at];
+    at += 1 + nl + COOP_SIG_LEN;
+    return at < d->n && d->b[at] ? at + 1 : 0;
+}
+
+// The last message of a kind honest game s sent in its session now, from the log; NULL when there is none.
+static const Packet *adv_logged(const Adv *a, int s, uint8_t kind) {
+    const Packet *q = NULL;
+    unsigned have = a->net.log_n < ADV_LOG ? a->net.log_n : ADV_LOG;
+    for (unsigned t = 0; t < have; t++) {
+        const Packet *p = &a->net.log[(a->net.log_n - have + t) % ADV_LOG];
+        if (p->from == a->h[s].id && p->kind == kind && p->sess == a->h[s].session) q = p;
+    }
+    return q;
+}
+
+// What anyone with the room's secret can make of honest game s's genuine messages (the sixth review), to honest game k:
+// 40 copies of s's last digest with the maker's charter in it far later, its signature as it was; s's digest with one
+// byte of its name changed, after two rosters that make k meet s again; s's digest with one mode of its charter changed,
+// its signature as it was; or s's last section with one byte changed. Nothing of it may make k ignore s, keep s
+// unidentified at k, or keep the maker's charter from k once the genuine messages come.
+static void adv_tamper(Adv *a) {
+    int k = (int)adv_below(a, ADV_H), s = (int)adv_below(a, ADV_H), what = (int)adv_below(a, 4), ids[MAX_PLAYERS + 1], maker;
+    uint64_t sess[MAX_PLAYERS + 1];
+    if (k == s || !a->net.present[k] || !a->net.present[s]) return;
+    const Packet *q = adv_logged(a, s, what == 3 ? COOP_K_SECTION : COOP_K_DIGEST);
+    if (!q) return;
+    Packet d = *q;
+    size_t c = what == 3 ? 0 : charter_at(&d);
+    if (what == 3) {
+        if (d.n <= 6 + 8 + COOP_SIG_LEN) return;
+        d.b[6 + adv_below(a, (unsigned)(d.n - 6 - 8 - COOP_SIG_LEN))] ^= (uint8_t)(1 + adv_below(a, 255));
+    } else if (what == 1) {
+        if (!d.b[5 + COOP_PK_LEN + 8]) return;
+        d.b[5 + COOP_PK_LEN + 8 + 1] ^= 1;
+        int n = adv_list(a, ids, sess, &maker);
+        uint64_t real[MAX_PLAYERS + 1];
+        memcpy(real, sess, sizeof real);
+        for (int i = 0; i < n; i++)
+            if (ids[i] == a->h[s].id) sess[i] = adv_rnd(a) | 1;
+        coop_sync_room(a->h[k].eng, a->code, a->h[k].id, ids, sess, n, maker, a->now);
+        coop_sync_room(a->h[k].eng, a->code, a->h[k].id, ids, real, n, maker, a->now);
+    } else if (!c) {
+        return;
+    } else if (what == 0) {
+        d.b[c + 3] |= 0x40;   // the charter's epoch, 2^30 on
+    } else {
+        d.b[c + 5] ^= 1;      // one mode
+    }
+    for (int i = 0, copies = what ? 1 : 40; i < copies; i++) {
+        if (d.kind == COOP_K_DIGEST) adv_led_snap(a, &a->h[k]);
+        coop_sync_receive(a->h[k].eng, a->h[s].id, d.kind, d.b, d.n, a->now);
+    }
+    adv_tampered++;
+}
+
+// An identity of the attacker's own key for honest game s's session, at honest game k, often right after s joined the
+// room again (so before s's own identity reaches k), once or a few times a second or two apart: k takes s as neither
+// while both are presented, and as s by its own key once the attacker stops.
+static void adv_impostor(Adv *a) {
+    int k = (int)adv_below(a, ADV_H), s = (int)adv_below(a, ADV_H);
+    if (k == s || !a->net.present[k] || !a->net.present[s]) return;
+    if (adv_below(a, 2)) a->h[s].session = adv_rnd(a) | 1, adv_roster(a);
+    uint8_t seed[32], d[COOP_MAX_PAYLOAD];
+    char name[8];
+    game_key_seed(&a->x, a->code, seed);
+    snprintf(name, sizeof name, "P%d", a->h[s].id);
+    size_t n = make_digest(d, a->code, seed, a->h[s].id, a->h[s].session, name, strlen(name), 0, NULL, 0);
+    for (int i = 0, copies = 1 + (int)adv_below(a, 3); i < copies; i++) {
+        if (i) a->now = run_by(&a->net, a->now, 1000 + adv_below(a, 1500), 16);
+        if (!a->net.present[k]) break;
+        adv_led_snap(a, &a->h[k]);
+        coop_sync_receive(a->h[k].eng, a->h[s].id, COOP_K_DIGEST, d, n, a->now);
+    }
+    adv_impostors++;
+}
+
 // ---- the run
 
 // A pool reset as docs/coop.md says to make one: the maker removes the hostile keys it admitted first; then, after a
 // quiet moment in which the players who ask accept the room as it is now (a carry counts the keys a game counts when
-// the reset reaches it), the maker resets (sometimes twice).
+// the reset reaches it), the maker resets (sometimes twice). One time in three the removal and the reset leave in one
+// charter, as one save of nx2navi.ini with both lines makes them.
 static void adv_reset(Adv *a) {
+    int together = adv_below(a, 3) == 0;
     for (int j = 0; j < a->nmkid; j++)
         if (coop_sync_accepted_key(a->h[0].eng, a->mkid[j])) adv_remove(a, j);
-    a->now = run_by(&a->net, a->now, 1500, 16);
-    adv_ask_all(a);
-    a->now = run_by(&a->net, a->now, 500, 16);
-    adv_ask_all(a);
+    if (!together) {
+        a->now = run_by(&a->net, a->now, 1500, 16);
+        adv_ask_all(a);
+        a->now = run_by(&a->net, a->now, 500, 16);
+        adv_ask_all(a);
+    }
+    adv_together += (unsigned long long)together;
     adv_reset_pools(a);
     if (adv_below(a, 3) == 0) {
         a->now = run_by(&a->net, a->now, 300, 16);
@@ -2531,13 +2691,14 @@ static void adv_reset(Adv *a) {
 }
 
 static void adv_event(Adv *a) {
-    unsigned e = adv_below(a, 100);
+    unsigned e = adv_below(a, 112);
+    if (adv_trace_on) fprintf(stderr, "[%llu] event %u\n", (unsigned long long)a->now, e);
     int i = (int)adv_below(a, ADV_M), k = (int)adv_below(a, ADV_H);
     int there = a->m_live[i] && a->net.present[ADV_H + i];
     if (e < 22) {
         if (a->net.present[k]) adv_honest_event(a, &a->h[k]);
-    } else if (e < 28) {
-        if (!a->net.present[k]) a->net.present[k] = 1, adv_roster(a);
+    } else if (e < 28) {   // an honest player comes (back) into the room, in a new session
+        if (!a->net.present[k]) a->net.present[k] = 1, a->h[k].session = adv_rnd(a) | 1, adv_roster(a);
     } else if (e < 36) {
         adv_hostile_move(a, i);
     } else if (e < 44) {
@@ -2556,15 +2717,22 @@ static void adv_event(Adv *a) {
         adv_replay(a);
     } else if (e < 95) {
         if (a->nmkid) adv_remove(a, (int)adv_below(a, (unsigned)a->nmkid));
-    } else {
+    } else if (e < 100) {
         adv_reset(a);
+    } else if (e < 105) {
+        adv_tamper(a);
+    } else if (e < 109) {
+        adv_impostor(a);
+    } else if (k && a->net.present[k]) {   // an honest player other than the maker leaves the room for a while
+        a->net.present[k] = 0, adv_roster(a);
     }
 }
 
-// legit[g]: game g accepted a hostile key, or (transitively) accepted a player who did.
+// legit[g]: game g accepted a hostile key or the attacker's (a player who accepts everything can take the attacker's key
+// in another member's place before that member's own identity arrived), or (transitively) accepted a player who did.
 static void adv_legit(Adv *a, int legit[ADV_H]) {
     for (int g = 0; g < ADV_H; g++) {
-        legit[g] = 0;
+        legit[g] = coop_sync_accepted_key(a->h[g].eng, a->xkid);
         for (int j = 0; j < a->nmkid; j++) legit[g] |= coop_sync_accepted_key(a->h[g].eng, a->mkid[j]);
     }
     for (int changed = 1; changed;) {
@@ -2627,10 +2795,12 @@ static int adv_run(uint64_t seed) {
         flag_add(g, COOP_CAT_KEYS, KEYS_WATER, 0, -1);
         a->hkid[k] = game_kid(g, a->code);
         g->ledger = a;
+        if (adv_trace_on) coop_sync_trace(g->eng, adv_trace_line, g);
         a->net.games[k] = g;
     }
     int all_ask = seed % 4 == 3;   // nobody accepts the hostile members: the maker admits none of them
     a->rupees = (int)adv_below(a, 2);
+    a->reloads = seed % 5 == 4;   // one seed in five: many saves loaded, so a pool's remembered joins fill up
     settings(&a->h[0], 1, COOP_MODE_SHARED, COOP_MODE_POOL, a->rupees ? COOP_MODE_POOL : COOP_MODE_OWN, COOP_MODE_OWN, COOP_MODE_SHARED);
     defaults(&a->h[1], 0), defaults(&a->h[2], 0);
     a->h[0].ask = all_ask, a->h[1].ask = all_ask || adv_below(a, 2), a->h[2].ask = 1;
@@ -2639,6 +2809,7 @@ static int adv_run(uint64_t seed) {
     a->net.present[0] = 1;
     a->now = 1000;
     game_init(&a->x, ADV_X, 0x58000000ull + seed);   // the attacker's engine signs with its own key; it is in no roster
+    a->xkid = game_kid(&a->x, a->code);
     int xid = ADV_X;
     coop_sync_room(a->x.eng, a->code, ADV_X, &xid, NULL, 1, 0, a->now);
     adv_roster(a);
@@ -2673,12 +2844,18 @@ static int adv_run(uint64_t seed) {
     for (int g = 0; g < ADV_H; g++) {
         CoopOffer o;
         coop_sync_offer(a->h[g].eng, &o, a->now);
+        unsigned ignored = coop_sync_ignored(a->h[g].eng);
+        CoopRules rg, r0;
+        coop_sync_rules(a->h[g].eng, &rg), coop_sync_rules(a->h[0].eng, &r0);
         for (int k = 0; k < ADV_H; k++) {
             const CoopOfferMember *x = offer_member(&o, a->h[k].id);
-            if (k != g && !(x && x->heard))
-                ADV_FAIL(a, "at the end: game %d does not identify game %d in the session the relay lists for it (%s)", g + 1, k + 1,
-                         x ? "a roster or a replay ended that session for good" : "not in its room");
+            uint64_t kid = 0;
+            if (k != g && !(x && x->heard && coop_sync_key_parse(x->key, &kid) && kid == a->hkid[k]))
+                ADV_FAIL(a, "at the end: game %d does not identify game %d by its key in the session the relay lists for it (%s)", g + 1, k + 1,
+                         !x ? "not in its room" : x->heard ? "another key holds its place" : "a roster, a replay or a forged digest ended or keeps that session");
+            if (k != g && ignored >> a->h[k].id & 1) ADV_FAIL(a, "at the end: game %d ignores game %d", g + 1, k + 1);
         }
+        if (rg.epoch != r0.epoch) ADV_FAIL(a, "at the end: game %d holds the maker's charter of epoch %u, the maker %u", g + 1, rg.epoch, r0.epoch);
         if (!coop_sync_open(a->h[g].eng)) ADV_FAIL(a, "at the end: game %d's room is not open to it (accepted %d, unidentified %d)", g + 1, o.accepted, o.unidentified);
     }
     int64_t v[ADV_POOLS][ADV_H];
@@ -2708,14 +2885,16 @@ static int adv_run(uint64_t seed) {
 static void probe_adversary(void) {
     unsigned long long first = 1, count = 12;
     const char *e = getenv("NX2NAVI_COOP_ADVERSARY");
+    adv_trace_on = getenv("NX2NAVI_COOP_ADVERSARY_TRACE") != NULL;
     if (e && *e) sscanf(e, "%llu:%llu", &first, &count);
     unsigned failed = 0;
-    adv_forged = adv_rosters = adv_replays = adv_checks = 0;
+    adv_forged = adv_rosters = adv_replays = adv_checks = adv_tampered = adv_impostors = adv_together = 0;
     for (unsigned long long s = first; s < first + count; s++) failed += (unsigned)adv_run(s);
     fails += (int)failed;
     printf("coop-probe: sync adversary: %llu seeds from %llu, %u failed (hostile members who hold the secret, and an attacker with the "
-           "secret and no accepted key: %llu forged sections, %llu forged rosters, %llu replays; %llu pool checks against the ledger)\n",
-           count, first, failed, adv_forged, adv_rosters, adv_replays, adv_checks);
+           "secret and no accepted key: %llu forged sections, %llu forged rosters, %llu replays, %llu changed copies, %llu identities in "
+           "another's place; %llu removals and resets in one charter; %llu pool checks against the ledger)\n",
+           count, first, failed, adv_forged, adv_rosters, adv_replays, adv_tampered, adv_impostors, adv_together, adv_checks);
 }
 
 // ---- 11. the fifth review's findings
@@ -2978,13 +3157,6 @@ static void probe_h5_claim_at_title(void) {
 }
 
 // ---- 12. the sixth review's findings
-
-// Where the charter of digest d begins (after its identity and the byte that says it carries one); 0 when it has none.
-static size_t charter_at(const Packet *d) {
-    size_t at = 5 + COOP_PK_LEN + 8, nl = d->b[at];
-    at += 1 + nl + COOP_SIG_LEN;
-    return at < d->n && d->b[at] ? at + 1 : 0;
-}
 
 // Finding 2: a digest is not signed by its sender, so what fails in one is held against nobody, and a changed copy of
 // a genuine signature does not make the genuine one fail. (a) 40 digests in B's name, each with B's identity and the
