@@ -17,6 +17,7 @@
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
 //     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    host probes
 //     --probe-discord  the Rich Presence IPC exchange; skips without a Discord client; no game files
+//     --probe-coop      the co-op codec, two sessions through a relay on 127.0.0.1 (NX2NAVI_COOP_RELAY, else its own); no game files
 //     --probe-dpi       the process DPI awareness (per-monitor v2) and the primary monitor's size; no game files
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
@@ -514,7 +515,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
+                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | --probe-coop | "
                     "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
@@ -648,6 +649,7 @@ int main(int argc, char **argv) {
 #endif
     if (!strcmp(mode, "--probe-mods")) return probe_mods();
     if (!strcmp(mode, "--probe-discord")) return probe_discord();
+    if (!strcmp(mode, "--probe-coop")) return probe_coop();
     if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
     if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
     if (!strcmp(mode, "--probe-services")) return probe_services();

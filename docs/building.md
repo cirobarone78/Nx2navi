@@ -316,7 +316,8 @@ instead of timing one. No game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
-files); a change to the settings passes `nx2navi.exe --probe-cfg`.
+files); a change to the settings passes `nx2navi.exe --probe-cfg`; a change to the co-op layer (`runtime/coop*.c`,
+`tools/coop_relay.py`) passes `python tests\coop_relay_test.py` and `nx2navi.exe --probe-coop` ([coop.md](coop.md)).
 
 A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
 `runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks

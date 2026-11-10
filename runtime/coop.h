@@ -106,3 +106,5 @@ void coop_sess_configure(CoopSess *s, const CoopParams *p);
 void coop_sess_stop(CoopSess *s);
 // Waits at most ms for the stepping thread to have carried out a stop (or a configure with on = 0); 1 when it did.
 int coop_sess_wait_off(CoopSess *s, uint32_t ms);
+
+int probe_coop(void);   // coop_probe.c: --probe-coop
