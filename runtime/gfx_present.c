@@ -1087,7 +1087,7 @@ static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
 
 // The presenter and the images for the current swapchain (g_pl held). 0: frames go out the plain way.
 static int ng_ready(void) {
-    int want = vk_ngxfg_on() && !g_sc_hdr && !vk_fg_active() && !vk_dlssg_active();
+    int want = vk_ngxfg_on() && !vk_fg_active() && !vk_dlssg_active();
     if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
     if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
         if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
@@ -1180,9 +1180,8 @@ static int ng_record(VkCommandBuffer cb, VkImage dst, VkImageLayout *last, VkPip
                      VkImage hudless, int *set, int gen) {
     if (!ng.on) return -1;
     if (ng.fresh) {   // every image to GENERAL, once
-        NgImg *all[1 + 2 + 2 * NG_MAX];
+        NgImg *all[2 + 2 * NG_MAX];
         int k = 0;
-        all[k++] = &ng.bb;
         for (int s = 0; s < 2; s++) {
             all[k++] = &ng.real[s];
             for (int i = 0; i < NG_MAX; i++) all[k++] = &ng.out[s][i];
@@ -1340,7 +1339,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = ngp ? ng.bb.img : g_sc_img[idx];
-    sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
+    sync_barrier(cb, dst, ngp && !ng.fresh ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 ngp ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 ngp ? VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const int rect[4] = {cx, cy, cw, ch};
     int to[4];   // where the picture goes in the swapchain image: {x, y, w, h}

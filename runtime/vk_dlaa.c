@@ -1732,7 +1732,7 @@ int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage
     p_setf(p, "DLSSG.CameraFar", 1e8f);
     p_setf(p, "DLSSG.CameraFOV", c.fov_y);
     p_setf(p, "DLSSG.CameraAspectRatio", c.aspect);
-    p_setu(p, "DLSSG.ColorBuffersHDR", 0);
+    p_setu(p, "DLSSG.ColorBuffersHDR", vk_hdr_active() != 0);
     p_setu(p, "DLSSG.DepthInverted", 0);
     p_setu(p, "DLSSG.CameraMotionIncluded", 1);
     p_setu(p, "DLSSG.Reset", (unsigned)(reset || FG.reset));
