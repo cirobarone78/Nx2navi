@@ -80,7 +80,10 @@ const Restoration *restore_at(int i) {
     return i >= 0 && i < nlist ? list[i] : NULL;
 }
 
-static void var_of(const Restoration *r, char *out, size_t n) { snprintf(out, n, "NX2NAVI_RESTORE_%s", r->key); }
+static void var_of(const Restoration *r, char *out, size_t n) {
+    if (r->setting) snprintf(out, n, "%s", r->setting);
+    else snprintf(out, n, "NX2NAVI_RESTORE_%s", r->key);
+}
 
 int restore_on(const Restoration *r) {
     char var[128];

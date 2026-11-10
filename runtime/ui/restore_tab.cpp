@@ -17,6 +17,7 @@ extern "C" void tab_restore(float scale) {
     static char desc[1024], state[160], key[96];
     for (int i = 0, n = restore_count(); i < n; i++) {
         const Restoration *r = restore_at(i);
+        if (r->setting) continue;   // RESTORATION_FOR: another feature's files, switched by that feature's setting
         int applied, skipped;
         restore_started(r, &applied, &skipped);
         bool on = restore_on(r) != 0, started = applied + skipped > 0;

@@ -115,5 +115,10 @@ RESTORATION(name, "KEY", "Menu label", "One-line description for the menu.", edi
   goes where that order puts it.
 - Run `--probe-restore` on a game build: every edit of the new restoration should say what it did.
 
+Files another feature needs (the co-op puppets' actor pack and table rows) are declared with
+`RESTORATION_FOR(name, "KEY", "NX2NAVI_COOP", "Label", "One-line description.", edits);`: the same edits, applied at
+start while that setting is on instead of NX2NAVI_RESTORE_KEY, listed by `--probe-restore`, and no row in the
+Restorations tab.
+
 Not yet possible: removing a key or a pack member, adding dicts or array items other than table rows, editing logic
 graphs (`.ainb`), text (`Mals/`) or binary files (models, textures, collision).

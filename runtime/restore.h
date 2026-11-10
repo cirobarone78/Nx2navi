@@ -76,6 +76,9 @@ typedef struct {
     const char *desc;    // the menu's one-line description
     const RestoreEdit *edits;
     int nedits;
+    // RESTORATION_FOR: the whole setting that switches it ("NX2NAVI_COOP") in place of NX2NAVI_RESTORE_<key>; such a
+    // restoration is part of another feature and has no row in the Restorations tab. NULL: its own switch.
+    const char *setting;
 } Restoration;
 
 #define RESTORE_OBJ_(f, g, h, x, y, z) .file = f, .gyaml = g, .hash = h, .at = {x, y, z}
@@ -136,13 +139,19 @@ typedef struct {
 #define RESTORE_SECTION section("nx2navi_rst")
 #endif
 #define RESTORATION(id, key, name, desc, edits)                                                                   \
-    static const Restoration restore_##id = {key, name, desc, edits, (int)(sizeof edits / sizeof *edits)};         \
+    static const Restoration restore_##id = {key, name, desc, edits, (int)(sizeof edits / sizeof *edits), NULL};   \
+    __attribute__((used, RESTORE_SECTION)) static const Restoration *const restore_entry_##id = &restore_##id
+// File edits another feature needs while its setting is on (the co-op puppets' actor files while NX2NAVI_COOP is on):
+// applied at start as a restoration's are, listed by --probe-restore, not shown in the Restorations tab.
+#define RESTORATION_FOR(id, key, setting_, name, desc, edits)                                                     \
+    static const Restoration restore_##id = {key, name, desc, edits, (int)(sizeof edits / sizeof *edits),        \
+                                             setting_};                                                           \
     __attribute__((used, RESTORE_SECTION)) static const Restoration *const restore_entry_##id = &restore_##id
 
 // The declared restorations, sorted by key; NULL past the end.
 int restore_count(void);
 const Restoration *restore_at(int i);
-// 1 when its setting is on (NX2NAVI_RESTORE_<key> set and not "0"); restore_set writes it (the menu).
+// 1 when its setting is on (NX2NAVI_RESTORE_<key>, or RESTORATION_FOR's, set and not "0"); restore_set writes it.
 int restore_on(const Restoration *r);
 void restore_set(const Restoration *r, int on);
 // The edits of r this start applied and skipped; both 0 when it was off at start, or before the start applied them.
