@@ -12,7 +12,7 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
   3. romfs    every RomFS file, checked against the container's sha256, into one image -> <out>/romfs/romfs.bin and
               index.json (16-byte aligned, in the byte order of the paths). When the lift and the compile follow, it
               runs on a thread of its own beside them: only the RomFS index and romfs.c wait for the image
-  4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes
+  4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift
   5. compile  the lifted C and runtime/ with MSYS2's clang, linked into <out>/ocarina.exe; the MSYS2 DLLs it loads,
               the shader translator and romfs-index.bin beside it
   6. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
@@ -97,21 +97,6 @@ PROMPT_PACKAGES = {'zstandard': 'zstandard', 'fonttools': 'fontTools', 'pillow':
 PROMPTS_WRITTEN = re.compile(r'^.+: \d+ files, the font grew by -?\d+ bytes$')
 SCAN_CHECKED = re.compile(r'^checked (\d+) of (\d+)$')   # tools/romfs_check.py's progress lines
 
-# Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
-LIFT_FIXES = [
-    # nn::oe::SetupGpuErrorHandler (sdk+0x59a430) registers a system worker the host does not provide: GPU error
-    # reporting is not needed, so it returns at once.
-    ('sdk', 'void f_700579a430(Cpu *c) {\n    FN_ENTER(0x700579a430ull);\n',
-     'void f_700579a430(Cpu *c) {\n    c->x[0] = 0; return;   /* bring-up: GpuErrorHandler (make_game.py) */\n'
-     '    FN_ENTER(0x700579a430ull);\n'),
-    # The thread-start path loads TPIDR_EL0 from TLR+0x1F0 before the SDK stored its TLS there for a host-created
-    # thread: a zero slot keeps the TLS pointer the host seeded.
-    ('sdk', '    { uint64_t ea = c->x[19] + 0x1b8ull; ST64(ea, x8); }\n    x8 = (uint64_t)(c->tpidrro);\n'
-     '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n    c->tpidr = x8;\n',
-     '    { uint64_t ea = c->x[19] + 0x1b8ull; ST64(ea, x8); }\n    x8 = (uint64_t)(c->tpidrro);\n'
-     '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n'
-     '    if (x8) c->tpidr = x8;   /* zero slot: keep the host\'s TLS (make_game.py) */\n'),
-]
 WIN = os.name == 'nt'
 if WIN:
     LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
@@ -431,10 +416,9 @@ EMITTED = re.compile(r'emitted (\d+)/(\d+) chunks')
 
 
 def lift_digest():
-    """The lifter's code, the patch table and the bring-up fixes: what the lifted C depends on besides the ExeFS."""
-    h = hashlib.sha256(tree_digest(KIT / 'recomp', ('*.py', 'patches-v111.txt')).encode())
-    h.update(repr(LIFT_FIXES).encode())
-    return h.hexdigest()
+    """The lifter's code, with its bring-up fixes, and the patch table: what the lifted C depends on besides the
+    ExeFS."""
+    return hashlib.sha256(tree_digest(KIT / 'recomp', ('*.py', 'patches-v111.txt')).encode()).hexdigest()
 
 
 def step_lift(out, cache):
@@ -453,12 +437,6 @@ def step_lift(out, cache):
             emit('progress', step='lift', done=int(m.group(1)), total=int(m.group(2)), unit='chunks')
     if p.wait():
         fail('the code generator failed (see above)')
-    for mod, old, new in LIFT_FIXES:
-        hits = [p for p in sorted((lift / mod).glob('*.c')) if old in p.read_text(encoding='utf-8')]
-        if len(hits) != 1 or hits[0].read_text(encoding='utf-8').count(old) != 1:
-            fail(f'a bring-up fix found its anchor {len(hits)} times in the lifted {mod}, not once')
-        p = hits[0]
-        p.write_text(p.read_text(encoding='utf-8').replace(old, new), encoding='utf-8', newline='\n')
 
 
 # ---------------------------------------------------------------- compile

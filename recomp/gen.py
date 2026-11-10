@@ -51,6 +51,40 @@ from module import Module  # noqa: E402
 TERMINATORS = ('b', 'br', 'ret', 'trap')
 MUSTTAIL = '__attribute__((musttail)) return'
 
+# Bring-up fixes: guest code the host cannot serve as written, rewritten in the emitted C so every build of this
+# output gets the same code. They belong to one build of a module, named by its NSO build id: a module with another
+# id is left alone, and in the one named each fix's text must occur exactly once, or the lift fails (main()).
+# {module: (build id, [(name, the generated text, its replacement)])}
+BRINGUP_FIXES = {
+    'sdk': ('1643a838814f9c10c696f930ed681e7f', [   # the SDK of Ocarina of Time 1.1.1
+        # nn::oe::SetupGpuErrorHandler registers a system worker the host does not provide; GPU error reporting is
+        # not needed, so it reports success and returns before the registration aborts the applet's start.
+        ('SetupGpuErrorHandler returns at once',
+         'void f_700579a430(Cpu *c) {\n    FN_ENTER(0x700579a430ull);\n',
+         'void f_700579a430(Cpu *c) {\n    c->x[0] = 0; return;   /* bring-up: no system worker handler */\n'
+         '    FN_ENTER(0x700579a430ull);\n'),
+        # The thread-start path loads TPIDR_EL0 from TLR+0x1F0 before the SDK stored its TLS for a thread the host
+        # created: a zero slot keeps the TLS pointer the host seeded.
+        ('thread start keeps the host TLS',
+         '    { uint64_t ea = c->x[19] + 0x1b8ull; ST64(ea, x8); }\n    x8 = (uint64_t)(c->tpidrro);\n'
+         '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n    c->tpidr = x8;\n',
+         '    { uint64_t ea = c->x[19] + 0x1b8ull; ST64(ea, x8); }\n    x8 = (uint64_t)(c->tpidrro);\n'
+         '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n'
+         '    if (x8) c->tpidr = x8;   /* zero slot: keep the TLS the host seeded */\n'),
+    ]),
+}
+
+
+def bringup_fixes(name, path):
+    """The bring-up fixes of this module file: its BRINGUP_FIXES entry when the NSO build id (header +0x40) matches,
+    else none."""
+    entry = BRINGUP_FIXES.get(name)
+    if not entry:
+        return []
+    with open(path, 'rb') as f:
+        build_id = f.read(0x50)[0x40:0x50].hex()
+    return entry[1] if build_id == entry[0] else []
+
 # Estimated bytes of C per instruction, by class, for chunking (estimate_sizes()).
 # Least squares over every function of main, subsdk0 and sdk (1.2.1) gives 62 / 75 / 48 bytes per instruction, 38
 # per function and 4.5 per instruction of a function with a `br` (switches; the all-label fallback costs about 60
@@ -522,6 +556,15 @@ def chunk_text(name, number, emitter, fns):
             + '\n\n'.join(body) + '\n')
 
 
+def apply_bringup(fixes, text):
+    """The chunk text with the bring-up fixes applied, and how often each one's text occurred in it."""
+    hits = []
+    for _, old, new in fixes:
+        hits.append(text.count(old))
+        text = text.replace(old, new)
+    return text, hits
+
+
 def write_if_changed(path, text):
     """Returns True if the file was written. An unchanged file keeps its mtime, so the build skips it. A changed one
     is written under a temporary name and renamed into place, so a reader never sees it half written."""
@@ -565,6 +608,7 @@ def _worker_init(mods, starts, table, opts, jobs):
     _W['patches'] = table
     _W['opts'] = opts   # Emitter keyword arguments
     _W['emitters'] = {}
+    _W['fixes'] = {name: bringup_fixes(name, path) for name, (path, _) in mods.items()}
 
 
 def _emitter(name):
@@ -589,7 +633,7 @@ def _emit_chunk(task):
     e = _emitter(name)
     e.stats.clear()
     e.unsupported.clear()
-    text = chunk_text(name, number, e, fns)
+    text, fix_hits = apply_bringup(_W['fixes'][name], chunk_text(name, number, e, fns))
     error = None
     try:
         written = write_if_changed(Path(path), text)
@@ -597,7 +641,7 @@ def _emit_chunk(task):
         written, error = False, f'{path}: {ex}'
     return {'module': name, 'number': number, 'file': Path(path).name, 'functions': len(fns), 'bytes': len(text),
             'written': written, 'error': error, 'seconds': time.perf_counter() - t0, 'stats': dict(e.stats),
-            'unsupported': dict(e.unsupported)}
+            'unsupported': dict(e.unsupported), 'fix_hits': fix_hits}
 
 
 # ------------------------------------------------------------------------------------------------ driver
@@ -743,6 +787,16 @@ def main():
             jobs, why = smaller, 'after out of memory'
             done = {(r['module'], r['number']) for rs in results.values() for r in rs}
             pending = [t for t in pending if (t[0], t[1]) not in done]
+
+    for name in info:
+        fixes = bringup_fixes(name, paths[name][0])
+        if not fixes or args.limit:   # --limit emits part of the module, which may leave a fix's function out
+            continue
+        totals = [sum(r['fix_hits'][i] for r in results[name]) for i in range(len(fixes))]
+        missed = [f'"{fix[0]}" ({n} times)' for fix, n in zip(fixes, totals) if n != 1]
+        if missed:
+            raise SystemExit(f'{name}: a bring-up fix must find its text exactly once: {", ".join(missed)}')
+        print(f'{name}: {len(fixes)} bring-up fixes applied', file=sys.stderr, flush=True)
 
     for name, d in info.items():
         rs = sorted(results[name], key=lambda r: r['number'])
