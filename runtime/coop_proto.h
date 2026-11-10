@@ -152,3 +152,14 @@ int coop_envelope_peek(const uint8_t *p, size_t n, uint64_t *session, uint32_t *
 // Open: 1 and the kind and bytes (into out, cap at least n) when the tag is right for this key, src and dst.
 int coop_open(const uint8_t *p, size_t n, const uint8_t key[COOP_MSG_KEY_LEN], uint8_t src, uint8_t dst, uint8_t *kind,
               uint8_t *out, size_t cap, size_t *nout);
+
+// ---- signatures: EdDSA over Curve25519 with BLAKE2b (the library's crypto_eddsa). The room's message key cannot tell
+// one member from another, and the sync layer's state travels through every member, so what only one member may make
+// is signed with that member's key: its identity in the room, the maker's rules, and each pool contributor's counts
+// (coop_state.c). Every member can then pass them on, and nobody but the key's holder can make or change them.
+enum { COOP_PK_LEN = 32, COOP_SK_LEN = 64, COOP_SIG_LEN = 64 };
+void coop_sign_keypair(const uint8_t seed[32], uint8_t sk[COOP_SK_LEN], uint8_t pk[COOP_PK_LEN]);
+void coop_sign(uint8_t sig[COOP_SIG_LEN], const uint8_t sk[COOP_SK_LEN], const void *msg, size_t n);
+int coop_sign_check(const uint8_t sig[COOP_SIG_LEN], const uint8_t pk[COOP_PK_LEN], const void *msg, size_t n);   // 1: valid
+// BLAKE2b of msg keyed with key (klen at most 64, 0 for none), outlen bytes (1 to 64): the sync layer's derivations.
+void coop_blake2b(uint8_t *out, size_t outlen, const void *key, size_t klen, const void *msg, size_t n);

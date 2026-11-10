@@ -897,6 +897,7 @@ static void view_rebuild(CoopSess *s) {
         v->member[i].away = s->roster.m[i].flags & COOP_FLAG_AWAY ? 1 : 0;
         v->member[i].maker = s->roster.m[i].flags & COOP_FLAG_MAKER ? 1 : 0;
         if (v->member[i].maker) v->maker = v->member[i].id;
+        v->member[i].session = s->roster.m[i].session;
         copy_str(v->member[i].name, sizeof v->member[i].name, s->roster.m[i].name);
     }
     copy_str(v->status, sizeof v->status, s->status);
@@ -1154,7 +1155,7 @@ static void coop_main(void *arg) {
             }
             // the maker removes a member: COOP_REMOVE = its member id (until the menu has a row for it)
             const char *rm = cfg_get("NX2NAVI_COOP_REMOVE");
-            if (want && rm && *rm && strcmp(rm, removed)) coop_sess_remove(s, atoi(rm));
+            if (want && rm && *rm && strcmp(rm, removed)) coop_remove_member(atoi(rm));
             copy_str(removed, sizeof removed, rm);
             on = want;
         }
@@ -1184,9 +1185,24 @@ int coop_command(CoopCmd cmd, const char *secret) {
     return coop_sess_command(s, cmd, secret);
 }
 
+static CoopRemoveFn g_remove_fn;
+static void *g_remove_user;
+
+int coop_on_remove(CoopRemoveFn fn, void *user) {
+    g_remove_user = user;
+    __atomic_store_n(&g_remove_fn, fn, __ATOMIC_RELEASE);
+    return 1;
+}
+
 int coop_remove_member(int member) {
     CoopSess *s = process_session();
-    return s && coop_sess_remove(s, member);
+    if (!s) return 0;
+    CoopRemoveFn fn = __atomic_load_n(&g_remove_fn, __ATOMIC_ACQUIRE);
+    int signed_out = fn && fn(member, g_remove_user);
+    CoopView v;
+    coop_sess_view(s, &v);
+    int kicked = v.made && coop_sess_remove(s, member);   // the relay takes a removal only from the member it marks
+    return signed_out || kicked;
 }
 
 void coop_view_get(CoopView *out) {

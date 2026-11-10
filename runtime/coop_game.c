@@ -157,15 +157,13 @@ static struct {
     uint64_t checked_at;
 
     // the gate (G.lock; open is read by the game thread without it): nothing from a room is applied before the player
-    // accepted what the room is (its members and rules) and a copy of the save exists to go back to
-    char room[COOP_SECRET_TEXT + 1];   // the room of the acceptance and the copy, "" none
-    CoopOffer offer;                // the room as it is now
-    int accepted;                   // an offer of this room was accepted: acc_* hold it
-    char acc_names[COOP_MAX_MEMBERS * 2][COOP_NAME_MAX + 1];
-    int acc_n;
-    uint8_t acc_mode[COOP_CAT_N];
-    int snap, snap_wanted;          // the copy of the save: 0 none yet, 1 made (or nothing saved yet), -1 failed
+    // accepted what the room is (the engine's offer: identities, rules and their key, the save) and a copy of the save
+    // exists to go back to; coop_sync_take checks it again under the lock
+    CoopView view;                  // the last view (the relay's names of members not identified yet)
+    char first_rooms[8][COOP_SECRET_TEXT + 1];   // rooms whose first copy of the save was made in this start
+    unsigned nfirst;
     uint32_t logged;                // the offer last logged
+    int said_always;
     int open;                       // the current offer is accepted and the copy exists: the game thread applies
 } G;
 
@@ -439,12 +437,14 @@ static int ensure_engine(void) {
     G.self_id = coop_client_id();
     CoopSync *e = coop_sync_new(G.self_id, 0);   // the schema is the table's, once a save is played (bind)
     if (!e) return 0;
-    uint8_t key[16] = {0};
+    uint8_t key[16 + 32] = {0};   // the index's key, and the seed of this start's identities and offer numbers
     if (!plat_random(key, sizeof key)) {
-        uint64_t t = plat_now_ns();
+        uint64_t t = plat_now_ns() ^ G.self_id;
         memcpy(key, &t, sizeof t);
+        memcpy(key + 16, &G.self_id, sizeof G.self_id);
     }
     coop_sync_index_key(e, key);
+    coop_sync_seed(e, key + 16);
     coop_sync_limits(e, limit_fn, NULL);
     if (TRACE_ON) coop_sync_trace(e, trace_line, NULL);
     plat_mutex_lock(&G.lock);
@@ -468,11 +468,19 @@ static void on_message(int from, const uint8_t *bytes, size_t n, void *user) {
 static void on_view(const CoopView *v, void *user) {
     (void)user;
     int ids[COOP_MAX_MEMBERS], n = 0;
+    uint64_t sessions[COOP_MAX_MEMBERS];
+    const char *self_name = "";
     int in_room = v->state == COOP_JOINED || v->state == COOP_RECONNECTING;
-    for (int i = 0; in_room && i < v->n; i++) ids[n++] = v->member[i].id;
+    for (int i = 0; in_room && i < v->n; i++) {
+        if (v->member[i].id == v->self) self_name = v->member[i].name;
+        sessions[n] = v->member[i].session;
+        ids[n++] = v->member[i].id;
+    }
     plat_mutex_lock(&G.lock);
+    G.view = *v;
     if (G.eng) {
-        coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, n, in_room ? v->maker : 0, plat_now_ms());
+        coop_sync_name(G.eng, self_name);
+        coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, sessions, n, in_room ? v->maker : 0, plat_now_ms());
         CoopRules mine;
         read_rules(&mine);
         coop_sync_settings(G.eng, &mine, in_room && v->made);
@@ -482,116 +490,132 @@ static void on_view(const CoopView *v, void *user) {
 
 // ---- the gate
 
-static uint64_t fnv(uint64_t h, const void *p, size_t n) {
-    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 0x100000001b3ull;
-    return h;
-}
-
-// The current offer accepted: every member is one of the accepted names and the rules are the accepted ones.
-static int offer_accepted(const CoopOffer *o) {
-    if (!G.accepted || !o->token || memcmp(o->rules.mode, G.acc_mode, COOP_CAT_N)) return 0;
-    for (int i = 0; i < o->n; i++) {
-        int known = 0;
-        for (int k = 0; k < G.acc_n && !known; k++) known = !strcmp(G.acc_names[k], o->member[i].name);
-        if (!known) return 0;
+// coop_accept: "always" accepts every offer, but only from the environment, so an nx2navi.ini someone hands a player
+// cannot make their game take a room without asking. A number (hex) accepts that offer from any source: it is keyed
+// with a random value of this start of the game, so no file can hold it in advance. 1 for always, else 0 and the
+// number (0 none) in *number.
+static int accept_setting(uint32_t *number) {
+    const char *v = cfg_value("NX2NAVI_COOP_ACCEPT");
+    *number = 0;
+    if (!strcmp(v, "always")) {
+        if (cfg_from_env("NX2NAVI_COOP_ACCEPT")) return 1;
+        if (!G.said_always)
+            rt_log("coop: sync: coop_accept = always is taken from the environment only (NX2NAVI_COOP_ACCEPT); the nx2navi.ini line is ignored");
+        G.said_always = 1;
+        return 0;
     }
-    return 1;
+    char *end;
+    unsigned long n = strtoul(v, &end, 16);
+    if (*v && !*end) *number = (uint32_t)n;
+    return 0;
 }
 
-static void accept_locked(void) {
-    const CoopOffer *o = &G.offer;
-    if (!o->token) return;
-    if (!G.accepted) G.acc_n = 0;
-    for (int i = 0; i < o->n && G.acc_n < (int)(sizeof G.acc_names / sizeof G.acc_names[0]); i++)
-        snprintf(G.acc_names[G.acc_n++], sizeof G.acc_names[0], "%s", o->member[i].name);
-    memcpy(G.acc_mode, o->rules.mode, COOP_CAT_N);
-    G.accepted = 1;
-    G.offer.accepted = 1;
-    if (!G.snap) G.snap_wanted = 1;
-    rt_log("coop: sync: room accepted; %s", G.snap == 1 ? "values from it are applied" : "the save is copied first");
+// The engine's offer, with the relay's names for members not identified yet (G.lock held).
+static int offer_of(CoopOffer *o, uint64_t now) {
+    int has = coop_sync_offer(G.eng, o, now);
+    for (int i = 0; i < o->n; i++)
+        for (int k = 0; !o->member[i].name[0] && k < G.view.n; k++)
+            if (G.view.member[k].id == o->member[i].id) snprintf(o->member[i].name, sizeof o->member[i].name, "%s", G.view.member[k].name);
+    return has;
 }
 
-// The offer of the room in view (the coop thread, G.lock held), logged when it changed and is not accepted; the
-// COOP_ACCEPT setting accepts it ("always", or the offer's number).
-static void offer_update(const CoopView *v) {
-    int in_room = v->state == COOP_JOINED || v->state == COOP_RECONNECTING;
-    const char *code = in_room ? v->code : "";
-    if (strcmp(code, G.room)) {   // another room (or none): nothing accepted, no copy for it yet
-        snprintf(G.room, sizeof G.room, "%s", code);
-        G.accepted = 0, G.acc_n = 0, G.snap = 0, G.snap_wanted = 0, G.logged = 0;
-    }
+static void say_accepted(const CoopOffer *o, const char *how) {
+    rt_log("coop: sync: room accepted (%s); %s", how, coop_sync_copy_wanted(G.eng) ? "the save is copied first" : "values from it are applied");
+    (void)o;
+}
+
+// The offer of the room (the coop thread, G.lock held): accepted by the setting, logged when it changed and is not
+// accepted.
+static void offer_update(uint64_t now) {
     CoopOffer o;
-    memset(&o, 0, sizeof o);
-    CoopRules r;
-    coop_sync_rules(G.eng, &r);
-    if (in_room && r.epoch) {
-        o.rules = r;
-        uint64_t names = 0;
-        for (int i = 0; i < v->n; i++) {
-            if (v->member[i].id == v->self) continue;
-            o.member[o.n].id = v->member[i].id;
-            o.member[o.n].heard = v->member[i].heard_ms != UINT32_MAX;
-            o.member[o.n].maker = v->member[i].maker;
-            snprintf(o.member[o.n].name, sizeof o.member[o.n].name, "%s", v->member[i].name);
-            names += fnv(0xcbf29ce484222325ull, v->member[i].name, strlen(v->member[i].name));   // in any order
-            o.n++;
-        }
-        uint64_t h = fnv(0xcbf29ce484222325ull, code, strlen(code));
-        h = fnv(h, &names, sizeof names);
-        h = fnv(h, r.mode, COOP_CAT_N);
-        o.token = (uint32_t)(h ^ h >> 32) | 1;
+    uint32_t number;
+    int always = accept_setting(&number);
+    if (offer_of(&o, now) && !o.accepted && (always || number == o.token) && coop_sync_accept(G.eng, o.token)) {
+        say_accepted(&o, always ? "coop_accept = always" : "coop_accept names its number");
+        offer_of(&o, now);
     }
-    const char *setting = cfg_value("NX2NAVI_COOP_ACCEPT");
-    char mine[12];
-    snprintf(mine, sizeof mine, "%08x", o.token);
-    o.accepted = offer_accepted(&o);
-    G.offer = o;
-    if (o.token && !o.accepted && (!strcmp(setting, "always") || !strcmp(setting, mine))) accept_locked();
-    if (o.token && !G.offer.accepted && o.token != G.logged) {
+    if (o.token && !o.accepted && o.token != G.logged) {
+        int again = G.logged != 0;
         G.logged = o.token;
-        char who[COOP_MAX_MEMBERS * 48] = "", rules[200];
+        char who[COOP_MAX_MEMBERS * 96] = "", rules[200];
         size_t at = 0;
-        for (int i = 0; i < o.n && at < sizeof who; i++)
-            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d%s%s)", i ? ", " : "", o.member[i].name, o.member[i].id,
-                                   o.member[i].maker ? ", made the room" : "", o.member[i].heard ? "" : ", not heard from yet");
+        for (int i = 0; i < o.n && at < sizeof who; i++) {
+            const CoopOfferMember *m = &o.member[i];
+            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d, %s%s%s%s)", i ? ", " : "", m->name, m->id, m->heard ? "key " : "not identified",
+                                   m->key, m->maker ? ", signs the rules" : "", m->removed ? ", removed by the maker: ignored" : "");
+        }
         coop_rules_text(&o.rules, rules, sizeof rules);
-        rt_log("coop: sync: %s; in the room: %s; rules: %s", G.accepted ? "the room changed (a new member or other rules)" : "a room to accept",
-               o.n ? who : "nobody else", rules);
-        rt_log("coop: sync: nothing from the room is applied to this game until it is accepted: coop_accept = %s (or the menu); "
-               "the save is copied to coop-backup in the profile folder first", mine);
+        rt_log("coop: sync: %s; in the room: %s; rules: %s, signed by key %s",
+               o.new_save ? "another save is played in the room: it gets the room's progress, which holds what the last save brought"
+                          : again ? "the room changed (a member, the rules or the key that signs them)" : "a room to accept",
+               o.n ? who : "nobody else", rules, o.maker_key);
+        if (o.maker_moved) rt_log("coop: sync: the relay names another member as the maker than the one whose key signs the rules; the signed rules stay");
+        rt_log("coop: sync: nothing from the room is applied to this game until its offer %08x is accepted in the menu (or "
+               "NX2NAVI_COOP_ACCEPT=always is in the environment); the save is copied to coop-backup in the profile folder first", o.token);
     }
-    __atomic_store_n(&G.open, G.offer.accepted && G.snap == 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
 }
 
 int coop_game_offer(CoopOffer *out) {
     plat_mutex_lock(&G.lock);
-    *out = G.offer;
+    int has = 0;
+    if (G.eng) has = offer_of(out, plat_now_ms());
+    else memset(out, 0, sizeof *out);
     plat_mutex_unlock(&G.lock);
-    return out->token != 0;
+    return has;
 }
 
 int coop_game_accept(uint32_t token) {
     plat_mutex_lock(&G.lock);
-    int ok = token && token == G.offer.token;
-    if (ok && !G.offer.accepted) accept_locked();
+    CoopOffer o;
+    int ok = G.eng && coop_sync_offer(G.eng, &o, plat_now_ms()) && !o.accepted && coop_sync_accept(G.eng, token);
+    if (ok) say_accepted(&o, "in the menu");
+    if (G.eng) __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
     plat_mutex_unlock(&G.lock);
+    return ok || (G.eng && o.token == token && o.accepted);
+}
+
+int coop_game_reset_pools(void) {
+    plat_mutex_lock(&G.lock);
+    int ok = G.eng && coop_sync_reset_pools(G.eng);
+    plat_mutex_unlock(&G.lock);
+    if (ok) rt_log("coop: sync: the pools are reset: every game drops their records and joins them again with what it holds");
     return ok;
 }
 
-// The copy of the save an accepted room waits for, on the coop thread without G.lock (it takes a while).
+// coop_remove_member's hook (coop.h): the maker's removal, signed, so that every game drops that identity.
+static int on_remove(int member, void *user) {
+    (void)user;
+    plat_mutex_lock(&G.lock);
+    int ok = G.eng && coop_sync_remove(G.eng, member);
+    plat_mutex_unlock(&G.lock);
+    if (ok) rt_log("coop: sync: member %d removed: every game drops its identity and its pool records", member);
+    return ok;
+}
+
+// The copy of the save an accepted room waits for, on the coop thread without G.lock (it takes a while). The first
+// copy for a room in this start of the game is kept out of the rotation ("first-<time>"), so the save from before the
+// room outlasts the copies of later acceptances.
 static void make_snapshot(void) {
     plat_mutex_lock(&G.lock);
-    int want = G.snap_wanted;
-    G.snap_wanted = 0;
+    int want = G.eng && coop_sync_copy_wanted(G.eng);
+    char room[sizeof G.view.code];
+    snprintf(room, sizeof room, "%s", G.view.code);
+    int first = 1;
+    for (unsigned i = 0; i < G.nfirst && i < 8; i++) first &= strcmp(G.first_rooms[i], room) != 0;
     plat_mutex_unlock(&G.lock);
     if (!want) return;
     char path[1200];
-    int ok = fs_save_snapshot("coop-backup", 8, path, sizeof path);
-    if (ok && path[0]) rt_log("coop: sync: the save as it was before this room is in %s (docs/coop.md: going back)", path);
+    int ok = fs_save_snapshot("coop-backup", first ? "first-" : NULL, 8, path, sizeof path);
+    if (ok && path[0])
+        rt_log("coop: sync: the save as it was before this room%s is in %s (docs/coop.md: going back)%s", first ? "" : " was accepted again", path,
+               first ? "; it is kept until you delete it" : "");
     else if (ok) rt_log("coop: sync: nothing saved yet, so nothing to copy before this room");
     else rt_log("coop: sync: the save could not be copied; nothing from the room is applied");
     plat_mutex_lock(&G.lock);
-    if (G.accepted) G.snap = ok ? 1 : -1;   // still the same room (a change of room clears accepted)
+    coop_sync_copied(G.eng, ok);
+    if (ok && first) snprintf(G.first_rooms[G.nfirst++ % 8], sizeof G.first_rooms[0], "%s", room);
+    __atomic_store_n(&G.open, coop_sync_open(G.eng), __ATOMIC_RELEASE);
     plat_mutex_unlock(&G.lock);
 }
 
@@ -623,9 +647,7 @@ static void on_tick(uint64_t now, void *user) {
             rt_log("coop: sync: the room's rules: %s (from member %d)", text, r.maker);
         }
     }
-    CoopView view;
-    coop_view_get(&view);
-    offer_update(&view);
+    offer_update(now);
     if (now - G.checked_at >= 1000) {   // what the engine refused, once a second
         G.checked_at = now;
         CoopSyncStats st;
@@ -649,6 +671,7 @@ void coop_game_init(void) {
     coop_on_message(COOP_K_SECTION, on_message, (void *)(uintptr_t)COOP_K_SECTION);
     coop_on_view(on_view, NULL);
     coop_on_tick(on_tick, NULL);
+    coop_on_remove(on_remove, NULL);
 }
 
 // ---- the game thread

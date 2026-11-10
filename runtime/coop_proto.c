@@ -392,3 +392,23 @@ int coop_open(const uint8_t *p, size_t n, const uint8_t key[COOP_MSG_KEY_LEN], u
     crypto_wipe(plain, len);
     return 1;
 }
+
+// ---- signatures
+
+void coop_sign_keypair(const uint8_t seed[32], uint8_t sk[COOP_SK_LEN], uint8_t pk[COOP_PK_LEN]) {
+    uint8_t s[32];
+    memcpy(s, seed, sizeof s);   // the library wipes the seed it is given
+    crypto_eddsa_key_pair(sk, pk, s);
+}
+
+void coop_sign(uint8_t sig[COOP_SIG_LEN], const uint8_t sk[COOP_SK_LEN], const void *msg, size_t n) {
+    crypto_eddsa_sign(sig, sk, msg, n);
+}
+
+int coop_sign_check(const uint8_t sig[COOP_SIG_LEN], const uint8_t pk[COOP_PK_LEN], const void *msg, size_t n) {
+    return crypto_eddsa_check(sig, pk, msg, n) == 0;
+}
+
+void coop_blake2b(uint8_t *out, size_t outlen, const void *key, size_t klen, const void *msg, size_t n) {
+    crypto_blake2b_keyed(out, outlen, key, klen, msg, n);
+}

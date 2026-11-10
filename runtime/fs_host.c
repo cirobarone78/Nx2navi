@@ -580,7 +580,7 @@ void fs_save_flush(void) {
     plat_mutex_unlock(&pend_lock);
 }
 
-int fs_save_snapshot(const char *folder, int keep, char *out, size_t cap) {
+int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
     char root[1100];
     if (cap) out[0] = 0;
     if (!*profile || snprintf(root, sizeof root, "%s/%s", profile, folder) >= (int)sizeof root) return 0;
@@ -588,9 +588,11 @@ int fs_save_snapshot(const char *folder, int keep, char *out, size_t cap) {
     uint64_t ns = plat_unix_time_ns();
     struct tm t;
     plat_gmtime((int64_t)(ns / 1000000000u), &t);
-    char name[48];
-    int len = snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d-%03u", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                       t.tm_hour, t.tm_min, t.tm_sec, (unsigned)(ns / 1000000u % 1000u));
+    char name[64];
+    if (!prefix) prefix = "";
+    if (*prefix >= '0' && *prefix <= '9') return 0;   // a name that begins with a digit is one the pruning may take
+    int len = snprintf(name, sizeof name, "%.16s%04d%02d%02d-%02d%02d%02d-%03u", prefix, t.tm_year + 1900, t.tm_mon + 1,
+                       t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, (unsigned)(ns / 1000000u % 1000u));
     char *dst = join(root, name);
     for (unsigned k = 1; exists(dst) && k < 1000; k++) {   // two in one millisecond
         free(dst);
@@ -616,7 +618,7 @@ int fs_save_snapshot(const char *folder, int keep, char *out, size_t cap) {
     }
     if (cap) snprintf(out, cap, "%s", dst);
     free(dst);
-    Listing l;   // the newest keep copies stay; their names sort by time
+    Listing l;   // the newest keep copies stay; their names sort by time; a prefixed one is never pruned
     if (!list_dir(root, &l)) {
         qsort(l.e, (size_t)l.n, sizeof *l.e, listed_cmp);
         int dirs = 0;
@@ -2028,6 +2030,21 @@ static void probe_storage(void) {
           RES(S_ENTRY_TYPE, U(&type), U("save:/dir")) == FS_R_PATH_NOT_FOUND, "DeleteDirectoryRecursively");
     CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit after the changes");
     probe_save_tx(uid);
+
+    // copies of the save: the first one, prefixed, outlasts the rotation of the later ones
+    char first[PLAT_PATH_MAX], later[PLAT_PATH_MAX];
+    int copies = fs_save_snapshot("coop-backup", "first-", 3, first, sizeof first);
+    for (int i = 0; i < 6; i++) copies += fs_save_snapshot("coop-backup", NULL, 3, later, sizeof later);
+    char backup[PLAT_PATH_MAX * 3 + 96];
+    snprintf(backup, sizeof backup, "%s/coop-backup", dir);
+    Listing bl;
+    int dated = 0, prefixed = 0;
+    if (!list_dir(backup, &bl)) {
+        for (int i = 0; i < bl.n; i++) dated += bl.e[i].name[0] >= '0' && bl.e[i].name[0] <= '9', prefixed += !strncmp(bl.e[i].name, "first-", 6);
+        listing_free(bl.e, bl.n);
+    }
+    CHECK(copies == 7 && first[0] && exists(first) && prefixed == 1 && dated == 3,
+          "save copies: the first (prefixed) stays beside the newest 3 of 6 later ones (%d made, %d first, %d dated)", copies, prefixed, dated);
 
     // temporary and cache storage
     CHECK(RES(S_MOUNT_TEMP, U("temp")) == 0 && RES(S_CREATE_FILE, U("temp:/t.bin"), 4) == 0 && !fs_save_busy(),

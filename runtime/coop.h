@@ -27,8 +27,9 @@ typedef enum { COOP_CMD_CREATE = 1, COOP_CMD_JOIN, COOP_CMD_LEAVE } CoopCmd;
 typedef struct {
     uint8_t id;                 // member id 1..8
     uint8_t away;               // the relay has not heard from the member for a while
-    uint8_t maker;              // made the room (the relay says so): its rules are the room's, and it may remove members
+    uint8_t maker;              // made the room (the relay says so); the rules are the ones its key signs (coop_state.h)
     char name[COOP_NAME_MAX + 1];
+    uint64_t session;           // its session in the room, as the relay lists it (progress sync binds its identity to it)
     uint32_t heard_ms;          // milliseconds since the last message of this member that opened with the room's key;
                                 // UINT32_MAX never (a member the relay lists but that has not shown it knows the secret)
 } CoopPeer;
@@ -59,8 +60,14 @@ void coop_shutdown(void);
 // room of that secret, or of a new random one when it is NULL or empty (the view shows it: the player passes it on to
 // the others out of band). 1 when queued, 0 when the secret is not one or co-op is off. The outcome shows in coop_view_get.
 int coop_command(CoopCmd cmd, const char *secret);
-// The room's maker removes a member (its id): the relay drops it and refuses it again under that identity. 1 when sent.
+// The room's maker removes a member (its id): every game drops its identity (progress sync signs the removal with the
+// maker's key, coop_state.h), and when the relay names this player the maker, the relay drops the member and refuses
+// it again under that identity. 1 when either was done.
 int coop_remove_member(int member);
+// fn(member, user) when coop_remove_member is called, on the caller's thread, before the relay is asked: the layer that
+// signs removals (progress sync) registers here; 1 when it removed the member. One hook.
+typedef int (*CoopRemoveFn)(int member, void *user);
+int coop_on_remove(CoopRemoveFn fn, void *user);
 void coop_view_get(CoopView *out);
 // This player's id towards the relay: random for each start of the game, never sent to the other players.
 uint64_t coop_client_id(void);
