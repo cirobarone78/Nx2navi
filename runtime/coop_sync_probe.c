@@ -787,6 +787,33 @@ static void probe_takeover(void) {
     printf("coop-probe: sync rules takeover: a member's digest at epoch 2^32-1 changes nothing; the maker's changes still hold\n");
 }
 
+// Rupees pooled: A binds with 500 and spends them all, then B joins with 500, so B's base is 1000, above the counter's
+// limit of 999. That is honest: nobody ignores B, and B's progress still reaches A after a minute and a half.
+static void probe_honest_base(void) {
+    Net net = {0};
+    Game a, b;
+    game_init(&a, 1, 0x91), game_init(&b, 2, 0x92);
+    settings(&a, 1, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_SHARED);
+    settings(&b, 0, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_SHARED);
+    flag_of(&a, RUPEE)->cap = flag_of(&b, RUPEE)->cap = 999;
+    flag_of(&a, RUPEE)->value = 500;
+    flag_of(&b, RUPEE)->value = 500;
+    net.games[0] = &a, net.games[1] = &b, net.present[0] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "BASE01", 1000), 1000), 3000);
+    flag_of(&a, RUPEE)->value = 0;
+    now = run(&net, now, 3000);
+    net.present[1] = 1;
+    now = run(&net, (net_roster(&net, "BASE01", now), now), 90000);
+    b.f[40].value = 1;
+    now = run(&net, now, 3000);
+    CHECK(!(coop_sync_ignored(a.eng) >> 2 & 1) && value_of(&a, 41) == 1 && value_of(&a, RUPEE) == 500,
+          "an honest joiner whose pool base is above the counter's limit is not ignored (ignored %x, its flag %d, rupees %d)",
+          coop_sync_ignored(a.eng), value_of(&a, 41), value_of(&a, RUPEE));
+    game_free(&a), game_free(&b);
+    free(net.q);
+    printf("coop-probe: sync honest base: a pool base above the counter's limit after spends is taken, and its sender is not ignored\n");
+}
+
 // ---- 7. hostile bytes
 
 static uint32_t fuzz_limit(int cat, uint32_t hash, void *user) {
@@ -836,6 +863,7 @@ int probe_coop_sync(void) {
     probe_carry_over();
     probe_hostile();
     probe_takeover();
+    probe_honest_base();
     probe_sync_fuzz();
     return fails;
 }

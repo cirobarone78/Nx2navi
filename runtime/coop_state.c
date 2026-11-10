@@ -646,12 +646,14 @@ static void on_section(CoopSync *s, int from, const uint8_t *b, size_t n) {
         // checked before anything is stored or passed on: a hash this game shares in that category, a value it takes
         uint32_t max = limit_of(s, cat, hash);
         int isflag = kind == COOP_R_FLAG, contrib = kind == COOP_R_POOL_GAIN || kind == COOP_R_POOL_SPEND;
+        // a refused pool register does not count against its sender: an honest member passes on registers whose sum
+        // this game cannot check (a base above the counter's limit is honest after spends), so only flags tell
         if (isflag == coop_cat_is_pool(cat) || contrib == !who || !max) {
-            refuse(s, from, 1, "not a value this game shares", hash);
+            refuse(s, from, isflag, "not a value this game shares", hash);
             continue;
         }
-        if (isflag ? v > max : kind == COOP_R_POOL_BASE ? v && (base_decode(v) < -POOL_REG_MAX || base_decode(v) > (int64_t)max) : v > POOL_REG_MAX) {
-            refuse(s, from, 1, "a value out of range for", hash);
+        if (isflag ? v > max : kind == COOP_R_POOL_BASE ? v && (base_decode(v) < -POOL_REG_MAX || base_decode(v) > POOL_REG_MAX) : v > POOL_REG_MAX) {
+            refuse(s, from, isflag, "a value out of range for", hash);
             continue;
         }
         int idx = find_reg(s, kind, hash, who);
@@ -825,7 +827,8 @@ void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, in
         p->me = mix64(s->self_id ^ mix64(++s->bindings) ^ now << 20);
         int b = reg_get(s, COOP_R_POOL_BASE, cat, hash, 0);
         if (b < 0) return;
-        uint32_t want = base_encode((int64_t)value - (p->gains - p->spends));
+        int64_t claim = (int64_t)value - (p->gains - p->spends);
+        uint32_t want = base_encode(claim < -POOL_REG_MAX ? -POOL_REG_MAX : claim > POOL_REG_MAX ? POOL_REG_MAX : claim);
         if (want > s->regs[b].s) {
             reg_raise(s, b, want);
             push_local(s, b, now);
