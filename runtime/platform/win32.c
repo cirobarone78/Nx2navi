@@ -1,7 +1,10 @@
 // Windows implementation of platform.h: CreateThread, QueryPerformanceCounter, high-resolution waitable timers,
 // SRW locks and condition variables.
 #include <io.h>
+#include <limits.h>
 #include <stdio.h>
+#include <winsock2.h>   // before windows.h, which would otherwise pull in the old winsock.h
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
 #include <pdh.h>
@@ -2069,6 +2072,194 @@ void plat_ipc_close(PlatIpc *p) {
     if (!p) return;
     CloseHandle(p->h);
     free(p);
+}
+
+// ---- UDP sockets (platform.h): the co-op layer's transport. Winsock starts at the first call that needs it.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#define WSA_FLAG_NO_HANDLE_INHERIT 0x80
+#endif
+
+struct PlatUdp { SOCKET s; int v6; };
+
+static PlatOnce wsa_once = PLAT_ONCE_INIT;
+static int wsa_ok;
+
+static void wsa_start(void *arg) {
+    WSADATA d;
+    (void)arg;
+    wsa_ok = WSAStartup(MAKEWORD(2, 2), &d) == 0;
+}
+
+static int net_ready(void) {
+    plat_once(&wsa_once, wsa_start, NULL);
+    return wsa_ok;
+}
+
+static void addr_from_sockaddr(PlatAddr *out, const SOCKADDR_STORAGE *ss) {
+    uint8_t ip[16] = {0};
+    if (ss->ss_family == AF_INET6) {
+        const SOCKADDR_IN6 *a = (const SOCKADDR_IN6 *)ss;
+        memcpy(ip, &a->sin6_addr, 16);
+        plat_addr_set(out, ip, ntohs(a->sin6_port), a->sin6_scope_id);
+    } else {
+        const SOCKADDR_IN *a = (const SOCKADDR_IN *)ss;
+        ip[10] = ip[11] = 0xff;
+        memcpy(ip + 12, &a->sin_addr, 4);
+        plat_addr_set(out, ip, ntohs(a->sin_port), 0);
+    }
+}
+
+// The socket address of a for a socket of family v6 (1: AF_INET6, 0: AF_INET); 0 when an IPv4 socket cannot reach it.
+static int addr_to_sockaddr(const PlatAddr *a, int v6, SOCKADDR_STORAGE *ss, int *len) {
+    uint8_t ip[16];
+    uint32_t scope;
+    plat_addr_get(a, ip, &scope);
+    memset(ss, 0, sizeof *ss);
+    if (v6) {
+        SOCKADDR_IN6 *s = (SOCKADDR_IN6 *)ss;
+        s->sin6_family = AF_INET6;
+        s->sin6_port = htons(plat_addr_port(a));
+        s->sin6_scope_id = scope;
+        memcpy(&s->sin6_addr, ip, 16);
+        *len = (int)sizeof *s;
+        return 1;
+    }
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (memcmp(ip, mapped, sizeof mapped)) return 0;
+    SOCKADDR_IN *s = (SOCKADDR_IN *)ss;
+    s->sin_family = AF_INET;
+    s->sin_port = htons(plat_addr_port(a));
+    memcpy(&s->sin_addr, ip + 12, 4);
+    *len = (int)sizeof *s;
+    return 1;
+}
+
+int plat_net_resolve(const char *host, uint16_t port, PlatAddr *out) {
+    wchar_t whost[256];
+    if (!host || !*host || !net_ready() || !widen(host, whost, 256)) return 0;
+    ADDRINFOW hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM}, *res = NULL, *pick = NULL;
+    if (GetAddrInfoW(whost, NULL, &hints, &res) != 0) return 0;
+    for (ADDRINFOW *r = res; r; r = r->ai_next) {
+        if (r->ai_addrlen > sizeof(SOCKADDR_STORAGE) || (r->ai_family != AF_INET && r->ai_family != AF_INET6)) continue;
+        if (!pick || (r->ai_family == AF_INET && pick->ai_family != AF_INET)) pick = r;   // IPv4 first
+    }
+    int ok = pick != NULL;
+    if (ok) {
+        SOCKADDR_STORAGE ss;
+        memset(&ss, 0, sizeof ss);
+        memcpy(&ss, pick->ai_addr, pick->ai_addrlen);
+        addr_from_sockaddr(out, &ss);
+        uint8_t ip[16];
+        uint32_t scope;
+        plat_addr_get(out, ip, &scope);
+        plat_addr_set(out, ip, port, scope);
+    }
+    FreeAddrInfoW(res);
+    return ok;
+}
+
+// A non-blocking UDP socket of family af that no child process inherits, with Windows' report of an ICMP port-unreachable
+// as a failed receive (WSAECONNRESET on an unconnected socket) switched off: a peer that is gone is not an error here.
+static SOCKET udp_socket(int af) {
+    SOCKET s = WSASocketW(af, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+    if (s == INVALID_SOCKET) return s;
+    u_long nonblocking = 1;
+    BOOL report = FALSE;
+    DWORD got = 0;
+    if (ioctlsocket(s, FIONBIO, &nonblocking) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    WSAIoctl(s, SIO_UDP_CONNRESET, &report, sizeof report, NULL, 0, &got, NULL, NULL);
+    return s;
+}
+
+PlatUdp *plat_udp_open(uint16_t port, int dual_stack) {
+    if (!net_ready()) return NULL;
+    int v6 = dual_stack;
+    SOCKET s = v6 ? udp_socket(AF_INET6) : INVALID_SOCKET;
+    if (s != INVALID_SOCKET) {
+        DWORD only_v6 = 0;   // Windows defaults to IPv6 only
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&only_v6, sizeof only_v6);
+        SOCKADDR_IN6 a;
+        memset(&a, 0, sizeof a);   // in6addr_any
+        a.sin6_family = AF_INET6;
+        a.sin6_port = htons(port);
+        if (bind(s, (SOCKADDR *)&a, sizeof a) != 0) closesocket(s), s = INVALID_SOCKET;
+    }
+    if (s == INVALID_SOCKET) {   // IPv4 only, asked for or all the machine has
+        v6 = 0;
+        s = udp_socket(AF_INET);
+        if (s == INVALID_SOCKET) return NULL;
+        SOCKADDR_IN a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(s, (SOCKADDR *)&a, sizeof a) != 0) {
+            closesocket(s);
+            return NULL;
+        }
+    }
+    PlatUdp *u = malloc(sizeof *u);
+    if (!u) {
+        closesocket(s);
+        return NULL;
+    }
+    u->s = s, u->v6 = v6;
+    return u;
+}
+
+uint16_t plat_udp_port(const PlatUdp *u) {
+    SOCKADDR_STORAGE ss;
+    int len = (int)sizeof ss;
+    if (!u || getsockname(u->s, (SOCKADDR *)&ss, &len) != 0) return 0;
+    PlatAddr a;
+    addr_from_sockaddr(&a, &ss);
+    return plat_addr_port(&a);
+}
+
+int plat_udp_send(PlatUdp *u, const PlatAddr *to, const void *p, size_t n) {
+    SOCKADDR_STORAGE ss;
+    int len;
+    if (!u || n > 65507 || !addr_to_sockaddr(to, u->v6, &ss, &len)) return 0;
+    if (sendto(u->s, (const char *)p, (int)n, 0, (SOCKADDR *)&ss, len) != SOCKET_ERROR) return 1;
+    // a full buffer, a missing route or an ICMP error is a lost datagram; a datagram too long or a socket that is not
+    // ours to use can never be sent
+    int e = WSAGetLastError();
+    return e != WSAEMSGSIZE && e != WSAENOTSOCK && e != WSAEINVAL && e != WSAEAFNOSUPPORT;
+}
+
+int plat_udp_recv(PlatUdp *u, void *buf, size_t cap, PlatAddr *from, uint32_t ms) {
+    if (!u) return -1;
+    WSAPOLLFD pf = {.fd = u->s, .events = POLLRDNORM};
+    int r = WSAPoll(&pf, 1, ms > (uint32_t)INT_MAX ? INT_MAX : (int)ms);
+    if (r == SOCKET_ERROR) return WSAGetLastError() == WSAEINTR ? 0 : -1;
+    if (r == 0) return 0;
+    SOCKADDR_STORAGE ss;
+    int len = (int)sizeof ss;
+    int k = recvfrom(u->s, (char *)buf, cap > (size_t)INT_MAX ? INT_MAX : (int)cap, 0, (SOCKADDR *)&ss, &len);
+    if (k == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e == WSAEMSGSIZE) {   // longer than buf: Windows reports it as an error but has filled buf
+            k = cap > (size_t)INT_MAX ? INT_MAX : (int)cap;
+        } else {
+            return e == WSAEWOULDBLOCK || e == WSAEINTR || e == WSAECONNRESET || e == WSAENETRESET || e == WSAEHOSTUNREACH ||
+                           e == WSAENETUNREACH
+                       ? 0 : -1;
+        }
+    }
+    if (from) addr_from_sockaddr(from, &ss);
+    return k;
+}
+
+void plat_udp_close(PlatUdp *u) {
+    if (!u) return;
+    closesocket(u->s);
+    free(u);
 }
 
 

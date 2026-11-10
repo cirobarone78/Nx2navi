@@ -514,6 +514,34 @@ int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms);
 int plat_ipc_write(PlatIpc *p, const void *buf, size_t n);   // 1 when all n bytes were written, 0 the connection broke
 void plat_ipc_close(PlatIpc *p);
 
+// ---- UDP sockets: the co-op layer's transport (coop.c). One unconnected datagram socket per PlatUdp; who a datagram
+// came from is checked by the protocol, not by the OS. On Windows the first call of any of these starts Winsock.
+// A PlatAddr is an IPv6 address (an IPv4 one as ::ffff:a.b.c.d), the port and the scope id in the same layout on every
+// OS, so two equal addresses compare equal bytewise (plat_addr_eq) whichever way the OS reported them.
+typedef struct PlatUdp PlatUdp;
+typedef struct { uint8_t b[32]; } PlatAddr;
+// host (a name, or an IPv4 or IPv6 literal without brackets) and port into *out. Blocks while the resolver runs: call
+// it on a thread that may wait, never on the game's. An IPv4 answer is preferred over an IPv6 one. 1 on success.
+int plat_net_resolve(const char *host, uint16_t port, PlatAddr *out);
+// A non-blocking UDP socket bound to port (0: any free port) on every local address. dual_stack 1: IPv6 with IPv4 in the
+// same socket (IPv4 alone where the machine has no IPv6); 0: IPv4 only. NULL on failure.
+PlatUdp *plat_udp_open(uint16_t port, int dual_stack);
+uint16_t plat_udp_port(const PlatUdp *u);   // the port it is bound to; 0 on failure
+// One datagram to *to; never blocks. 1 when it was sent or the OS dropped it (a full send buffer, no route, an ICMP
+// error: a datagram may be lost anyway), 0 when it can never be sent (too long, an address the socket cannot reach).
+int plat_udp_send(PlatUdp *u, const PlatAddr *to, const void *p, size_t n);
+// The next datagram into buf, waiting at most ms for it; *from (may be NULL) gets its sender. Bytes received (a datagram
+// longer than cap is cut to cap), 0 when none came in time, -1 when the socket is unusable.
+int plat_udp_recv(PlatUdp *u, void *buf, size_t cap, PlatAddr *from, uint32_t ms);
+void plat_udp_close(PlatUdp *u);
+// Address helpers that need no OS (common.c); the back ends build addresses with plat_addr_set.
+void plat_addr_set(PlatAddr *a, const uint8_t ip[16], uint16_t port, uint32_t scope);
+void plat_addr_get(const PlatAddr *a, uint8_t ip[16], uint32_t *scope);
+uint16_t plat_addr_port(const PlatAddr *a);
+int plat_addr_eq(const PlatAddr *a, const PlatAddr *b);
+// "1.2.3.4:5" or "[::1]:5" ("%scope" after a link-local address) into out; its length, 0 when it does not fit cap.
+int plat_addr_str(const PlatAddr *a, char *out, size_t cap);
+
 // ---- restart: this program again, in a new process that starts once this one is gone
 // Starts this executable again with the same command line, environment and working folder, and no handle of this
 // process. 1 when it started; the caller then exits.
