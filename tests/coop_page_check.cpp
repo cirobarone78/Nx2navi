@@ -3,9 +3,13 @@
 // events the menu hands ImGui (menu.cpp drain_events and pad_events: a key's down and up, a held key's repeats as more
 // downs, a typed letter as its key and its character), the co-op layer and the settings answered here. Checks typing a
 // name, a relay and a secret with the letters that switch tabs elsewhere, Make, Join with a wrong secret and a pasted
-// one, the offer accepted and declined, a held or repeated confirm never accepting, removing or leaving, the maker's
-// rules and the others' read-only ones, Remove and Leave; with the keyboard and with the pad.
-// tests/coop_page_check.py builds and runs it; the exit status is the number of failed checks.
+// one, the offer accepted and declined, a held or repeated confirm never accepting, removing, resetting or leaving, the
+// maker's rules and the others' read-only ones, the maker's key to compare, a player not identified (Accept greyed,
+// Remove by member id only while the same session holds it), Remove by key, the pools' contributors and their reset,
+// the three warnings before the first Accept, the relay's states; with the keyboard and with the pad.
+// tests/coop_page_check.py builds and runs it; the exit status is the number of failed checks. COOP_PAGE_FAULT=1 puts
+// the cursor on each window's acting button as the window opens (Right, as a player would), a fault the checks must
+// catch.
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,9 +56,12 @@ static void settings_clear(void) {
 
 static CoopView g_fake;
 static CoopOffer g_fake_offer;
-static int n_create, n_join, n_leave, n_remove, last_remove, n_accept;
+static CoopContributor g_fake_contrib[8];
+static int g_fake_ncontrib;
+static bool g_fake_maker, g_fault;
+static int n_create, n_join, n_leave, n_remove, last_remove, n_accept, n_remove_key, n_reset;
 static uint32_t last_accept;
-static char last_join[64], g_clipboard[256], g_copied_text[64];
+static char last_join[64], g_clipboard[256], g_copied_text[64], last_remove_key[24];
 static bool g_paste_asked;
 
 extern "C" {
@@ -122,10 +129,22 @@ int coop_game_offer(CoopOffer *out) {
     *out = g_fake_offer;
     return out->token != 0;
 }
+// As the layer: refused while a member in the room has not said who they are.
 int coop_game_accept(uint32_t token) {
-    if (!token || token != g_fake_offer.token) return 0;
+    if (!token || token != g_fake_offer.token || g_fake_offer.unidentified) return 0;
     return n_accept++, last_accept = token, 1;
 }
+int coop_game_remove_key(const char *fingerprint) {
+    if (!g_fake_maker) return 0;
+    return n_remove_key++, snprintf(last_remove_key, sizeof last_remove_key, "%s", fingerprint), 1;
+}
+int coop_game_reset_pools(void) { return g_fake_maker ? (n_reset++, 1) : 0; }
+int coop_game_contributors(CoopContributor *out, int max) {
+    int n = g_fake_ncontrib < max ? g_fake_ncontrib : max;
+    memcpy(out, g_fake_contrib, sizeof *out * (size_t)n);
+    return n;
+}
+int coop_game_is_maker(void) { return g_fake_maker; }
 int plat_clipboard_set(const char *utf8) { return snprintf(g_copied_text, sizeof g_copied_text, "%s", utf8), 1; }
 void gfx_window_paste(void) { g_paste_asked = true; }
 int menu_paste_take(char *out, size_t cap) {
@@ -151,6 +170,9 @@ static int failures, n_tab_keys;
 
 static ImGuiTextBuffer g_text;   // the text the last frame drew with ImGui's text calls (lines, windows)
 
+static int g_fault_release;   // frames until the fault's Right comes up again; 0 none down
+static bool g_fault_due;      // a window opened: Right goes down once no item is held active (ImGui moves no cursor then)
+
 static void frame(void) {
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2(1280, 720);
@@ -163,6 +185,7 @@ static void frame(void) {
     opt_begin("##coop", 1);   // as menu.cpp tab_coop
     coop_rows(1);
     opt_end();
+    const bool fresh = g_page_new;
     coop_after_page(1);
     g_text.clear();
     g_text.append(GImGui->LogBuffer.c_str());
@@ -172,6 +195,14 @@ static void frame(void) {
     if (!keeps_keys && (ImGui::IsKeyPressed(ImGuiKey_E, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false))) n_tab_keys++;
     ImGui::End();
     ImGui::Render();
+    // the deliberate fault: a window that acts on the room opens with the cursor moved onto its acting button
+    if (g_fault_release && !--g_fault_release) io.AddKeyEvent(ImGuiKey_RightArrow, false);
+    if (g_fault && fresh && g_open && !field_page()) g_fault_due = true;
+    if (g_fault_due && !g_open) g_fault_due = false;
+    // ImGui moves no cursor while the key that opened the window is held or in the window's first frames
+    const bool held = ImGui::IsKeyDown(ImGuiKey_Enter) || ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) || GImGui->ActiveId;
+    if (g_fault_due && !fresh && !held && !g_fault_release)
+        io.AddKeyEvent(ImGuiKey_RightArrow, true), g_fault_release = 2, g_fault_due = false;
 }
 
 static void frames(int n) {
@@ -229,8 +260,9 @@ static ImGuiID window_id(const char *label) {
 
 static const char *nav_name(void) {
     static char out[64];
-    static const char *const labels[] = {"Not now##no", "Accept##yes", "Cancel##no", "Remove##yes", "Stay##no",
-                                         "Leave the room##yes", "OK##yes", "Join a room##yes", "Paste", "##coop_field"};
+    static const char *const labels[] = {"Not now##no", "Accept##yes", "Cancel##no", "Remove##yes", "Reset the pools##yes",
+                                         "Stay##no", "Leave the room##yes", "OK##yes", "Join a room##yes", "Paste",
+                                         "##coop_field"};
     for (const char *l : labels)
         if (GImGui->NavId && GImGui->NavId == window_id(l)) return l;
     snprintf(out, sizeof out, "%08x", GImGui->NavId);
@@ -256,8 +288,8 @@ static void close_window(void) {
 }
 
 static void counters_clear(void) {
-    n_create = n_join = n_leave = n_remove = n_accept = 0;
-    last_remove = 0, last_accept = 0, last_join[0] = 0, n_tab_keys = 0;
+    n_create = n_join = n_leave = n_remove = n_accept = n_remove_key = n_reset = 0;
+    last_remove = 0, last_accept = 0, last_join[0] = last_remove_key[0] = 0, n_tab_keys = 0;
 }
 
 // ---- the views the layer hands out
@@ -265,16 +297,28 @@ static void counters_clear(void) {
 static void member(CoopView &v, int id, const char *name, bool maker, uint32_t heard_ms) {
     CoopPeer &m = v.member[v.n++];
     memset(&m, 0, sizeof m);
-    m.id = (uint8_t)id, m.maker = maker, m.heard_ms = heard_ms;
+    m.id = (uint8_t)id, m.maker = maker, m.heard_ms = heard_ms, m.session = 0x5e550000u + (uint64_t)id;
     snprintf(m.name, sizeof m.name, "%s", name);
 }
 
 static void out_of_room(CoopState st, const char *status) {
     memset(&g_fake, 0, sizeof g_fake);
     memset(&g_fake_offer, 0, sizeof g_fake_offer);
+    g_fake_ncontrib = 0, g_fake_maker = false;
     g_fake.state = st;
     g_fake.version++;
     snprintf(g_fake.status, sizeof g_fake.status, "%s", status);
+}
+
+static const char kAliceKey[] = "a11c-e000-0000-0001", kBobKey[] = "b0b0-0000-0000-0002", kDaveKey[] = "da7e-0000-0000-0004";
+
+// An entry of the offer: the other member id, by the name and key its game signed (heard), or not identified.
+static void offer_member_add(int id, const char *name, const char *key, bool maker, bool heard) {
+    CoopOfferMember &m = g_fake_offer.member[g_fake_offer.n++];
+    memset(&m, 0, sizeof m);
+    m.id = id, m.maker = maker, m.heard = heard;
+    snprintf(m.name, sizeof m.name, "%s", name);   // the relay's name until heard (coop_game.c offer_of)
+    snprintf(m.key, sizeof m.key, "%s", heard ? key : "");
 }
 
 // Bob in Alice's room (Alice made it), or Alice in her own room with Bob; the offer waiting or not.
@@ -285,15 +329,27 @@ static void in_room_as(bool maker, uint32_t token, bool accepted) {
     member(g_fake, 1, "Alice", true, maker ? 0 : 1200);
     member(g_fake, 2, "Bob", false, maker ? 2300 : 0);
     g_fake.self = maker ? 1 : 2, g_fake.maker = 1, g_fake.made = maker;
+    snprintf(g_fake.name, sizeof g_fake.name, "%s", maker ? "Alice" : "Bob");
     g_fake.version++;
+    g_fake_maker = maker, g_fake_ncontrib = 0;
     memset(&g_fake_offer, 0, sizeof g_fake_offer);
     g_fake_offer.token = token, g_fake_offer.accepted = accepted, g_fake_offer.copy = accepted;
-    g_fake_offer.n = 1;
-    g_fake_offer.member[0].id = maker ? 2 : 1, g_fake_offer.member[0].maker = !maker, g_fake_offer.member[0].heard = 1;
-    snprintf(g_fake_offer.member[0].name, sizeof g_fake_offer.member[0].name, "%s", maker ? "Bob" : "Alice");
+    if (maker) offer_member_add(2, "Bob", kBobKey, false, true);
+    else offer_member_add(1, "Alice", kAliceKey, true, true);
+    snprintf(g_fake_offer.maker_key, sizeof g_fake_offer.maker_key, "%s", kAliceKey);
     coop_rules_default(&g_fake_offer.rules);
     g_fake_offer.rules.epoch = 1, g_fake_offer.rules.maker = 1;
 }
+
+// Carol in the room, who has not said who she is: her game never identified itself.
+static void carol_unidentified(void) {
+    member(g_fake, 3, "Carol", false, UINT32_MAX);
+    g_fake.version++;
+    offer_member_add(3, "Carol", "", false, false);
+    g_fake_offer.unidentified = 1;
+}
+
+static bool shows_text(const char *s) { return strstr(g_text.c_str(), s) != nullptr; }
 
 // ---- the checks
 
@@ -410,13 +466,18 @@ static void check_offer(const Input &in) {
     printf("%s offer:\n", in.name);
     in_room_as(false, 0x1234567u, false);
     counters_clear();
+    g_accepted_once = false;   // as at a start of the game: the warnings come before the first Accept
     frames(4);
     CHECK(shows(UI_MENU_COOP_OFFER_TRUST) == false && strstr(g_text.c_str(), "Alice (made the room)"),
           "the page does not name the room's members");
+    CHECK(shows_text(kAliceKey) && shows(UI_MENU_COOP_OFFER_COMPARE), "the page does not show the maker's key to compare");
+    CHECK(!shows(UI_MENU_COOP_POOLS) && !shows(UI_MENU_COOP_RESET), "a player who is not the maker sees the pools' remedies");
     // the row's press opens the window with the cursor on Not now; the same button again goes back
     press_row(in, "##coop_answer");
     CHECK(g_open && g_page == P_ACCEPT && !strcmp(nav_name(), "Not now##no"), "Accept window: cursor on %s", nav_name());
     CHECK(shows(UI_MENU_COOP_OFFER_COPY) && shows(UI_MENU_COOP_OFFER_TRUST), "the window does not say what accepting does");
+    CHECK(shows(UI_MENU_COOP_WARN_SAVE) && shows(UI_MENU_COOP_WARN_ROOM) && shows(UI_MENU_COOP_WARN_KEY) && shows_text(kAliceKey),
+          "the first Accept window lacks the three warnings or the maker's key");
     tap(in.act);
     CHECK(n_accept == 0 && !g_open, "Accept or not, act, act: %d accepts, window %d", n_accept, g_open);
     // held on the row through the window's opening, then held again in it
@@ -452,6 +513,15 @@ static void check_offer(const Input &in) {
     g_fake_offer.accepted = 1, g_fake_offer.copy = 1;
     frames(3);
     CHECK(shows(UI_MENU_COOP_ACCEPTED), "accepted: the page does not say so");
+    // a later offer (another player): the warnings were read before the first Accept, the key is still there
+    g_fake_offer.token = 0x7654322u, g_fake_offer.accepted = 0, g_fake_offer.copy = 0;
+    press_row(in, "##coop_answer");
+    CHECK(g_open && !shows(UI_MENU_COOP_WARN_SAVE) && shows_text(kAliceKey), "a later Accept window: warnings %d, key %d",
+          shows(UI_MENU_COOP_WARN_SAVE), shows_text(kAliceKey));
+    close_window();
+    printf("  the maker's key shown to compare; the three warnings before the first Accept only\n");
+    g_fake_offer.accepted = 1, g_fake_offer.copy = 1;
+    frames(3);
 
     // the rules of someone else's room: read only
     const char *before = cfg_value("NX2NAVI_COOP_RUPEES");
@@ -480,24 +550,91 @@ static void check_maker(const Input &in) {
     printf("  rupees -> %s; items stay %s while progress is shared\n", cfg_value("NX2NAVI_COOP_RUPEES"),
            cfg_value("NX2NAVI_COOP_ITEMS"));
 
-    // Remove: the cursor on Cancel; act again, held, back: nothing; right, act: removed
+    // Remove: the cursor on Cancel; act again, held, back: nothing; right, act: removed by its key
+    CHECK(shows_text(kAliceKey), "the maker's page does not show its own key to read out");
     press_row(in, "##coop_member2");
-    CHECK(g_open && g_page == P_REMOVE && !strcmp(nav_name(), "Cancel##no"), "Remove window: cursor on %s", nav_name());
+    CHECK(g_open && g_page == P_REMOVE && !strcmp(nav_name(), "Cancel##no") && shows_text(kBobKey),
+          "Remove window: cursor on %s, key shown %d", nav_name(), shows_text(kBobKey));
     tap(in.act);
-    CHECK(n_remove == 0 && !g_open, "Remove, act, act: %d removals", n_remove);
+    CHECK(n_remove + n_remove_key == 0 && !g_open, "Remove, act, act: %d removals", n_remove + n_remove_key);
     row("##coop_member2");
     hold(in.act, 120);
     if (!g_open) press_row(in, "##coop_member2");
     hold(in.act, 120);
-    CHECK(n_remove == 0, "act held on a player and in the window: %d removals", n_remove);
+    CHECK(n_remove + n_remove_key == 0, "act held on a player and in the window: %d removals", n_remove + n_remove_key);
     close_window();
     press_row(in, "##coop_member1");   // the maker's own row opens nothing
     CHECK(!g_open, "the maker's own row opened a window");
     press_row(in, "##coop_member2");
     tap(in.right);
     tap(in.act);
-    CHECK(n_remove == 1 && last_remove == 2, "Remove chosen: %d removals of %d", n_remove, last_remove);
-    printf("  Remove: act, act / held: none; right, act: %d removal of member %d\n", n_remove, last_remove);
+    CHECK(n_remove == 0 && n_remove_key == 1 && !strcmp(last_remove_key, kBobKey), "Remove chosen: %d by id, %d by key (%s)",
+          n_remove, n_remove_key, last_remove_key);
+    printf("  Remove: act, act / held: none; right, act: %d removal of key %s\n", n_remove_key, last_remove_key);
+
+    // a player who never said who they are: by member id, and only while the same session holds it
+    carol_unidentified();
+    frames(3);
+    CHECK(shows_text("Players in the room who have not said"), "the maker's page does not say Carol is not identified");
+    press_row(in, "##coop_member3");
+    CHECK(g_open && g_page == P_REMOVE && !strcmp(nav_name(), "Cancel##no") && shows(UI_MENU_COOP_NOT_IDENTIFIED),
+          "Remove Carol: cursor on %s, not identified said %d", nav_name(), shows(UI_MENU_COOP_NOT_IDENTIFIED));
+    tap(in.right);
+    g_fake.member[2].session++, g_fake.version++;   // Carol left and someone else got her id meanwhile
+    frames(3);
+    CHECK(n_remove == 0 && !g_open, "another session under the window: %d removals by id, window %d", n_remove, g_open);
+    press_row(in, "##coop_member3");
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_remove == 1 && last_remove == 3 && n_remove_key == 1, "Remove of a player not identified: %d by id (%d)", n_remove,
+          last_remove);
+    printf("  a player not identified: removed by id only while the same session holds it (%d removal)\n", n_remove);
+
+    // the pools: Dave, who left, took 3 keys beyond what he brought; Bob none; the maker's own row is left out
+    g_fake_ncontrib = 3;
+    memset(g_fake_contrib, 0, sizeof g_fake_contrib);
+    snprintf(g_fake_contrib[0].key, sizeof g_fake_contrib[0].key, "%s", kAliceKey), g_fake_contrib[0].self = 1;
+    g_fake_contrib[0].spent[0] = 9;
+    snprintf(g_fake_contrib[1].key, sizeof g_fake_contrib[1].key, "%s", kBobKey), g_fake_contrib[1].member = 2;
+    snprintf(g_fake_contrib[1].name, sizeof g_fake_contrib[1].name, "Bob");
+    snprintf(g_fake_contrib[2].key, sizeof g_fake_contrib[2].key, "%s", kDaveKey), g_fake_contrib[2].spent[0] = 3;
+    counters_clear();
+    frames(3);
+    char spent_row[48];
+    snprintf(spent_row, sizeof spent_row, "##coop_spent%s", kDaveKey);
+    CHECK(shows(UI_MENU_COOP_POOLS) && !shows(UI_MENU_COOP_SPENT_NONE), "the maker's pools list nobody who took more");
+    press_row(in, spent_row);
+    CHECK(g_open && g_page == P_REMOVE && !strcmp(nav_name(), "Cancel##no") && shows_text(kDaveKey) &&
+              shows(UI_MENU_COOP_NOT_IN_ROOM),
+          "Remove Dave's key: cursor on %s, key %d", nav_name(), shows_text(kDaveKey));
+    tap(in.act);
+    row(spent_row);
+    hold(in.act, 120);
+    if (!g_open) press_row(in, spent_row);
+    hold(in.act, 120);
+    CHECK(n_remove_key == 0, "act, act / held on Dave's key: %d removals", n_remove_key);
+    close_window();
+    press_row(in, spent_row);
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_remove_key == 1 && !strcmp(last_remove_key, kDaveKey), "Dave's key chosen: %d removals of %s", n_remove_key,
+          last_remove_key);
+    // Reset the pools: the cursor on Cancel; act again, held: nothing; right, act: reset
+    press_row(in, "##coop_reset");
+    CHECK(g_open && g_page == P_RESET && !strcmp(nav_name(), "Cancel##no"), "Reset window: cursor on %s", nav_name());
+    tap(in.act);
+    row("##coop_reset");
+    hold(in.act, 120);
+    if (!g_open) press_row(in, "##coop_reset");
+    hold(in.act, 120);
+    CHECK(n_reset == 0, "act, act / held on Reset the pools: %d resets", n_reset);
+    close_window();
+    press_row(in, "##coop_reset");
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_reset == 1 && !g_open, "Reset chosen: %d resets", n_reset);
+    printf("  pools: Dave's key removed (%d), act, act / held: nothing; Reset: %d\n", n_remove_key, n_reset);
+    g_fake_ncontrib = 0;
 
     // the secret: hidden until asked (its row's press shows it, a second hides it), copied on its row
     CHECK(!g_show_secret, "the secret shows unasked");
@@ -527,6 +664,47 @@ static void check_maker(const Input &in) {
     printf("  Leave: act, act / held: stays; right, act: %d leave\n", n_leave);
 }
 
+// A player in the room who never said who they are: the page names them and says why, the Accept window says it too
+// with Accept greyed (right does not reach it, act does nothing); once they are identified Accept works.
+static void check_unidentified(const Input &in) {
+    printf("%s not identified:\n", in.name);
+    in_room_as(false, 0x3333333u, false);
+    carol_unidentified();
+    counters_clear();
+    frames(4);
+    CHECK(shows(UI_MENU_COOP_NOT_IDENTIFIED) && shows_text("Carol (") && shows_text("Players in the room who have not said"),
+          "the page does not say Carol is not identified and why the room cannot be accepted");
+    press_row(in, "##coop_answer");
+    CHECK(g_open && !strcmp(nav_name(), "Not now##no") && shows_text("Players in the room who have not said"),
+          "Accept window with Carol not identified: cursor on %s", nav_name());
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_accept == 0, "right, act with a player not identified: %d accepts", n_accept);
+    close_window();
+    g_fake_offer.unidentified = 0, g_fake_offer.member[1].heard = 1;
+    snprintf(g_fake_offer.member[1].name, sizeof g_fake_offer.member[1].name, "Carol");
+    snprintf(g_fake_offer.member[1].key, sizeof g_fake_offer.member[1].key, "c4r0-0000-0000-0003");
+    g_fake_offer.token = 0x3333334u;
+    press_row(in, "##coop_answer");
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_accept == 1 && last_accept == 0x3333334u, "Carol identified, right, act: %d accepts", n_accept);
+    printf("  Accept greyed while Carol is not identified; 1 accept once she is\n");
+}
+
+// The relay's states the page says in words: its limit on joins from one network, and a room it lost.
+static void check_states(void) {
+    printf("relay states:\n");
+    out_of_room(COOP_CONNECTING, "too many joins from this network; trying again in a minute");
+    frames(3);
+    CHECK(shows(UI_MENU_COOP_JOIN_LIMIT), "the relay's join limit is not said");
+    in_room_as(false, 0x4444444u, true);
+    g_fake.state = COOP_RECONNECTING, g_fake.room_lost = 1, g_fake.version++;
+    frames(3);
+    CHECK(shows(UI_MENU_COOP_LOST), "a room the relay lost is not said");
+    printf("  the join limit and a lost room are said\n");
+}
+
 // The conversions of a printf format in order ("%s%u" for "heard %u s ago, %s"), "%%" left out.
 static void conversions(const char *f, char *out, size_t cap) {
     size_t k = 0;
@@ -548,7 +726,7 @@ static void conversions(const char *f, char *out, size_t cap) {
 // and named, not failed: they are not this page's.
 static void check_catalog(void) {
     static const char *const langs[] = {"en", "ru", "pt-BR", "zh-Hans"};
-    for (int id = UI_MENU_TAB_COOP; id <= UI_MENU_COOP_TOAST_OFFER; id++) {
+    for (int id = UI_MENU_TAB_COOP; id <= UI_MENU_COOP_NOT_ACCEPTED; id++) {
         char en[32], other[32];
         conversions(ui_text_in("en", (UiTextId)id), en, sizeof en);
         for (const char *l : langs) {
@@ -559,7 +737,7 @@ static void check_catalog(void) {
         }
     }
     printf("catalog: the %d co-op texts in en, ru, pt-BR and zh-Hans, with English's conversions\n",
-           UI_MENU_COOP_TOAST_OFFER - UI_MENU_TAB_COOP + 1);
+           UI_MENU_COOP_NOT_ACCEPTED - UI_MENU_TAB_COOP + 1);
     int gaps = 0;
     for (int id = UI_MENU_FIRST; id < UI_MENU_TAB_COOP; id++)
         for (const char *l : langs)
@@ -582,6 +760,8 @@ int main(void) {
     int w, h;
     io.Fonts->GetTexDataAsRGBA32(&px, &w, &h);
     frames(2);
+    g_fault = getenv("COOP_PAGE_FAULT") && atoi(getenv("COOP_PAGE_FAULT"));
+    if (g_fault) printf("deliberate fault: each window that acts on the room opens with Right pressed\n");
 
     check_fields_by_keyboard();
     check_join_by_pad();
@@ -589,6 +769,9 @@ int main(void) {
     check_offer(kPad);
     check_maker(kKeyboard);
     check_maker(kPad);
+    check_unidentified(kKeyboard);
+    check_unidentified(kPad);
+    check_states();
     check_catalog();
 
     ImGui::DestroyContext();

@@ -536,8 +536,9 @@
 # the room's maker lets use them. Accepting every room (always) is taken from the environment only
 # (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a room for you.
 # coop_accept = ask
-# The room's maker, no menu row yet: coop_remove = a player's key fingerprint (xxxx-xxxx-xxxx-xxxx, as the log shows it
-# beside each member), in the room or after it left; every game drops that key and what it took from the pools. A member
+# The room's maker (the Co-op tab's Remove and Reset the pools do the same): coop_remove = a player's key fingerprint
+# (xxxx-xxxx-xxxx-xxxx, as the log and the tab show it beside each member), in the room or after it left; every game
+# drops that key and what it took from the pools. A member
 # number here is not taken: numbers pass to other players as members come and go. coop_reset_pools = a new value (1,
 # then 2, or 0 and then 1 again): every game joins the pools again with what they held for the players in the room.
 # Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs

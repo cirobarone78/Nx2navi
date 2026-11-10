@@ -747,6 +747,13 @@ int coop_game_contributors(CoopContributor *out, int max) {
     return n > 0 ? n : 0;
 }
 
+int coop_game_is_maker(void) {
+    plat_mutex_lock(&G.pub_lock);
+    int maker = G.pub_maker;
+    plat_mutex_unlock(&G.pub_lock);
+    return maker;
+}
+
 // The maker's removal of a key by its fingerprint (the coop thread, without G.lock: a removal of a member in the room
 // goes through coop_remove_member's hook), from nx2navi.ini's coop_remove or the menu. A member in the room that holds
 // the key is removed at the relay too.
@@ -885,9 +892,9 @@ static void on_tick(uint64_t now, void *user) {
         CoopRules mine;
         read_rules(&mine);
         coop_sync_settings(G.eng, &mine, (G.view.state == COOP_JOINED || G.view.state == COOP_RECONNECTING) && G.view.made);
-        // coop_remove = a key's fingerprint (a member id is coop.c's), coop_reset_pools = any new value: until the menu
-        // has rows for them, the maker reaches both from nx2navi.ini while the game runs. The values at start are only
-        // noted: one left from an earlier session acts on nothing
+        // coop_remove = a key's fingerprint (a member id is coop.c's), coop_reset_pools = any new value, set from the
+        // environment or by the menu's test hook (the Co-op tab's rows ask coop_offer.h instead). The values at start
+        // are only noted: one left from an earlier session acts on nothing
         const char *rm = cfg_value("NX2NAVI_COOP_REMOVE"), *rp = cfg_value("NX2NAVI_COOP_RESET_POOLS");
         uint64_t kid;
         int primed = G.cfg_primed;

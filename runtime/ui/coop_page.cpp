@@ -4,9 +4,10 @@
 // rules, the co-op switch) are settings, through cfg like every row, and reach nx2navi.ini as theirs do; the room's
 // secret is never a setting, never logged, and shown only when asked.
 //
-// Every window that acts on the room (Accept, Remove, Leave) opens with the cursor on its safe button (Not now, Cancel,
-// Stay) whenever it opens, and its acting button has an ID of its own, so a second press of the button that opened it, a
-// held button's repeats or a double tap land on the safe one (the Saves tab's lesson: reports/Review-E finding 1).
+// Every window that acts on the room (Accept, Remove, Reset the pools, Leave) opens with the cursor on its safe button
+// (Not now, Cancel, Stay) whenever it opens, and its acting button has an ID of its own, so a second press of the button
+// that opened it, a held button's repeats or a double tap land on the safe one (the Saves tab's lesson: reports/Review-E
+// finding 1).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,8 +28,8 @@ extern "C" {
 #include "ui_text.h"
 }
 
-enum Page { P_NONE, P_NAME, P_SERVER, P_JOIN, P_ACCEPT, P_REMOVE, P_LEAVE };
-enum { FIELD_CAP = 160, PASTE_FRAMES = 120 };
+enum Page { P_NONE, P_NAME, P_SERVER, P_JOIN, P_ACCEPT, P_REMOVE, P_RESET, P_LEAVE };
+enum { FIELD_CAP = 160, PASTE_FRAMES = 120, CONTRIBUTORS = 24 };
 
 static bool g_open, g_window_shown, g_page_new, g_by_pad;
 static int g_page;
@@ -36,12 +37,20 @@ static char g_field[FIELD_CAP];          // the text of the window's field (a na
 static bool g_field_bad, g_paste_empty;  // the secret typed is not one; the clipboard had no text
 static int g_paste_wait;                 // frames left to wait for the clipboard's text (gfx_window_paste)
 static CoopOffer g_shown;                // the offer the Accept window shows (its number: g_shown.token)
-static int g_member;                     // the member the Remove window names
-static char g_member_name[COOP_NAME_MAX + 1];
+// The player the Remove window names: by the key's fingerprint when they have one (identified, or a pool contributor
+// not in the room), else by their member id while the same session holds it (a player who never said who they are)
+static int g_member;
+static uint64_t g_member_session;
+static char g_member_name[COOP_NAME_MAX + 1], g_member_key[20];
 static char g_return[48];                // the row the cursor goes back to when the window closes
 
 static CoopView g_view;                  // this frame's copies of the layer's state
 static CoopOffer g_offer;
+static CoopContributor g_contrib[CONTRIBUTORS];
+static int g_ncontrib;
+static bool g_maker;                     // this game holds the key that signs the room's rules (coop_game_is_maker)
+static bool g_accepted_once;             // an Accept went through in this start: the warnings were read before it
+static bool g_refused;                   // the last Accept was refused by the layer (the room changed meanwhile)
 static int g_layout = -1;                // the page's last kind: 0 not in a room, 1 reaching one, 2 in one
 static bool g_show_secret;
 static int g_msg = -1;                   // a line under the rows (UiTextId), -1 none
@@ -62,23 +71,38 @@ static bool in_room(const CoopView &v) { return v.state == COOP_JOINED || v.stat
 
 static void say(int text, bool warn) { g_msg = text, g_msg_warn = warn; }
 
-// ---- the co-op layer: every call the page makes to it. The page knows a member by the id the view gives, never by its
-// name; an offer's number and whether it is accepted are the layer's, and the page passes back only the number of the
-// offer it showed the player.
+// ---- the co-op layer: every call the page makes to it. The page knows a member by the id the view gives and, once it
+// said who it is, by its key's fingerprint, never by its name; an offer's number and whether it is accepted are the
+// layer's, and the page passes back only the number of the offer it showed the player. A removal goes by the key; only
+// a player who never said who they are goes by member id, checked against the session that held the id when the
+// window opened.
 
-// This frame's copies: the view (coop.h) and, in a room, the offer (coop_offer.h); outside a room no offer.
-static void layer_read(CoopView *v, CoopOffer *o) {
+// This frame's copies: the view (coop.h) and, in a room, the offer (coop_offer.h: without a number while there is none
+// to accept, with the members and whether their rules disagree all the same), the pools' contributors and whether this
+// game is the room's maker; outside a room none of them.
+static void layer_read(CoopView *v, CoopOffer *o, CoopContributor *c = nullptr, int *nc = nullptr, bool *maker = nullptr) {
     coop_view_get(v);
-    if (!coop_game_offer(o) || !in_room(*v)) memset(o, 0, sizeof *o);
+    coop_game_offer(o);
+    const bool room = in_room(*v);
+    if (!room) memset(o, 0, sizeof *o);
+    if (c) *nc = room ? coop_game_contributors(c, CONTRIBUTORS) : 0;
+    if (maker) *maker = room && coop_game_is_maker();
 }
 
 // Make (secret NULL: a new one), join (secret: canonical) or leave; false when the layer took nothing (co-op off).
 static bool layer_command(int cmd, const char *secret) { return coop_command((CoopCmd)cmd, secret) != 0; }
 
-static void layer_remove(int id) { coop_remove_member(id); }
+// The maker's removal of a key (also of a player who left; one in the room is removed at the relay too).
+static void layer_remove_key(const char *fingerprint) { coop_game_remove_key(fingerprint); }
 
-// Accepts the offer the player was shown, and no other: the layer refuses it when the room has changed meanwhile.
-static void layer_accept(const CoopOffer &shown) { coop_game_accept(shown.token); }
+// The maker's removal of a player who never said who they are, by member id.
+static void layer_remove_member(int id) { coop_remove_member(id); }
+
+static void layer_reset_pools(void) { coop_game_reset_pools(); }
+
+// Accepts the offer the player was shown, and no other: false when the layer refuses it (the room has changed
+// meanwhile, or a player in it has not said who they are).
+static bool layer_accept(const CoopOffer &shown) { return coop_game_accept(shown.token) != 0; }
 
 static bool layer_same_offer(const CoopOffer &a, const CoopOffer &b) { return a.token == b.token; }
 
@@ -136,26 +160,56 @@ static void open_field(int page, const char *initial, const char *ret) {
 
 static void open_accept(void) {
     g_shown = g_offer;
+    g_refused = false;
     open_window(P_ACCEPT, "##coop_answer");
 }
 
-static void open_remove(int id, const char *name) {
-    g_member = id;
+// The offer's entry for member id (its signed name, its key, whether it is identified or removed); NULL when none.
+static const CoopOfferMember *offer_member(const CoopOffer &o, int id) {
+    for (int i = 0; i < o.n; i++)
+        if (o.member[i].id == id) return &o.member[i];
+    return nullptr;
+}
+
+// The Remove window for a player: key, their key's fingerprint ("" for a player who never said who they are, who is
+// then removed by member id while session still holds it); id 0 for a contributor not in the room. ret: the row the
+// cursor goes back to.
+static void open_remove(int id, uint64_t session, const char *name, const char *key, const char *ret) {
+    g_member = id, g_member_session = session;
     snprintf(g_member_name, sizeof g_member_name, "%s", name);
-    char ret[32];
-    snprintf(ret, sizeof ret, "##coop_member%d", id);
+    snprintf(g_member_key, sizeof g_member_key, "%s", key);
     open_window(P_REMOVE, ret);
 }
 
-// "Alice (made the room), Bob" and the rules' categories by mode, as the offer and the Accept window say them.
+// The name a member is shown by: this player's own name, else the name its game signed once it said who it is, else
+// the relay's.
+static const char *member_name(const CoopPeer &m, const CoopOfferMember *om) {
+    if (m.id == g_view.self) return g_view.name[0] ? g_view.name : m.name;
+    return om && om->heard && om->name[0] ? om->name : m.name;
+}
+
+static void open_remove_member(const CoopPeer &m) {
+    const CoopOfferMember *om = offer_member(g_offer, m.id);
+    char ret[32];
+    snprintf(ret, sizeof ret, "##coop_member%d", m.id);
+    open_remove(m.id, m.session, member_name(m, om), om && om->heard ? om->key : "", ret);
+}
+
+// "Alice (made the room), Bob (not identified)" and the rules' categories by mode, as the offer and the Accept window
+// say them.
 static void offer_lines(const CoopOffer &o, char *who, size_t who_cap, char *shared, size_t shared_cap, char *pooled,
                         size_t pooled_cap) {
-    char names[COOP_MAX_MEMBERS * (COOP_NAME_MAX + 48)] = "";
+    char names[COOP_MAX_MEMBERS * (COOP_NAME_MAX + 96)] = "";
     size_t k = 0;
-    for (int i = 0; i < o.n && k < sizeof names; i++)
-        k += (size_t)snprintf(names + k, sizeof names - k, "%s%s%s%s%s", i ? ", " : "", o.member[i].name,
-                              o.member[i].maker ? " (" : "", o.member[i].maker ? menu_text(UI_MENU_COOP_MAKER) : "",
-                              o.member[i].maker ? ")" : "");
+    for (int i = 0; i < o.n && k < sizeof names; i++) {
+        const CoopOfferMember &m = o.member[i];
+        const char *note = m.removed ? menu_text(UI_MENU_COOP_REMOVED)
+                           : !m.heard ? menu_text(UI_MENU_COOP_NOT_IDENTIFIED)
+                           : m.maker  ? menu_text(UI_MENU_COOP_MAKER)
+                                      : "";
+        k += (size_t)snprintf(names + k, sizeof names - k, "%s%s%s%s%s", i ? ", " : "", m.name, *note ? " (" : "", note,
+                              *note ? ")" : "");
+    }
     snprintf(who, who_cap, menu_text(UI_MENU_COOP_OFFER_WHO), o.n ? names : menu_text(UI_MENU_COOP_OFFER_NOBODY));
     char s[256] = "", p[256] = "";
     size_t ks = 0, kp = 0;
@@ -224,6 +278,9 @@ static void status_line(void) {
         opt_text_str(line, strcmp(g_view.status, "you left the room") != 0);
         if (g_joining && strstr(g_view.status, "no such room")) opt_text(UI_MENU_COOP_NO_ROOM, true);
     }
+    // the relay's limit on joins from one network: the session waits a minute and tries again by itself
+    if (g_view.state != COOP_LEFT && strstr(g_view.status, "trying again in a minute")) opt_text(UI_MENU_COOP_JOIN_LIMIT, true);
+    if (in_room(g_view) && g_view.room_lost) opt_text(UI_MENU_COOP_LOST, true);
 }
 
 static void rows_out(void) {
@@ -255,37 +312,110 @@ static void rows_out(void) {
     opt_toggle("NX2NAVI_COOP", UI_MENU_COOP_ON, UI_MENU_COOP_ON_DESC);
 }
 
-static void rows_room(void) {
-    status_line();
-    const CoopOffer &o = g_offer;
+// The room's offer while the player has not accepted it: who, what is shared, the key that signs the rules (to compare
+// with the maker's), why it cannot be accepted yet, and the row that opens Accept or not. Members whose rules disagree
+// are said also while there is no offer.
+static void offer_rows(const CoopOffer &o) {
+    char line[640];
     if (o.token && !o.accepted) {
         opt_group(UI_MENU_COOP_OFFER);
-        char who[640], shared[320], pooled[320];
+        char who[1100], shared[320], pooled[320];
         offer_lines(o, who, sizeof who, shared, sizeof shared, pooled, sizeof pooled);
         opt_text_str(who, false);
         if (shared[0]) opt_text_str(shared, false);
         if (pooled[0]) opt_text_str(pooled, false);
+        if (o.new_save) opt_text(UI_MENU_COOP_NEW_SAVE);
+        if (o.maker_key[0] && !g_maker) {
+            snprintf(line, sizeof line, menu_text(UI_MENU_COOP_OFFER_KEY), o.maker_key);
+            opt_text_str(line, false);
+            opt_text(UI_MENU_COOP_OFFER_COMPARE);
+        }
+        if (o.disagree) opt_text(UI_MENU_COOP_DISAGREE, true);
+        if (o.unidentified) {
+            snprintf(line, sizeof line, menu_text(UI_MENU_COOP_UNIDENTIFIED), o.unidentified);
+            opt_text_str(line, true);
+        }
         if (opt_button("##coop_answer", UI_MENU_COOP_ANSWER, UI_MENU_COOP_ANSWER_DESC)) open_accept();
+    } else if (!o.token && o.disagree) {
+        opt_group(UI_MENU_COOP_OFFER);
+        opt_text(UI_MENU_COOP_DISAGREE, true);
     }
+}
+
+// The players in the room, by the name their game signed once it said who it is; each with its key or "not
+// identified". The maker sees its own key to read out to the others, and a Remove on every other row.
+static void player_rows(const CoopOffer &o) {
     opt_group(UI_MENU_COOP_PLAYERS);
+    if (g_maker && o.maker_key[0]) {
+        char line[640];
+        snprintf(line, sizeof line, menu_text(UI_MENU_COOP_MY_KEY), o.maker_key);
+        opt_text_str(line, false);
+    }
+    if (o.unidentified && (!o.token || o.accepted)) {   // else the offer above says it
+        char line[640];
+        snprintf(line, sizeof line, menu_text(UI_MENU_COOP_UNIDENTIFIED), o.unidentified);
+        opt_text_str(line, true);
+    }
     for (int i = 0; i < g_view.n; i++) {
         const CoopPeer &m = g_view.member[i];
-        const bool self = m.id == g_view.self, removable = g_view.made && !self;
-        char id[32], heard[64] = "", note[160], desc[UI_DESC_BYTES - 256];
+        const bool self = m.id == g_view.self, removable = g_maker && !self;
+        const CoopOfferMember *om = self ? nullptr : offer_member(o, m.id);
+        const char *name = member_name(m, om);
+        char id[32], heard[64] = "", key[64] = "", note[240], desc[UI_DESC_BYTES - 256];
         snprintf(id, sizeof id, "##coop_member%d", m.id);
         if (!self) {
             if (m.away) snprintf(heard, sizeof heard, "%s", menu_text(UI_MENU_COOP_AWAY));
             else if (m.heard_ms == UINT32_MAX) snprintf(heard, sizeof heard, "%s", menu_text(UI_MENU_COOP_NOT_HEARD));
             else snprintf(heard, sizeof heard, menu_text(UI_MENU_COOP_HEARD), (unsigned)(m.heard_ms / 1000));
         }
-        snprintf(note, sizeof note, "%s%s%s", m.maker ? menu_text(UI_MENU_COOP_MAKER) : "", m.maker && heard[0] ? "  ·  " : "",
-                 heard);
+        if (om && om->removed) snprintf(key, sizeof key, "%s", menu_text(UI_MENU_COOP_REMOVED));
+        else if (om && om->heard) snprintf(key, sizeof key, menu_text(UI_MENU_COOP_KEY), om->key);
+        else if (om) snprintf(key, sizeof key, "%s", menu_text(UI_MENU_COOP_NOT_IDENTIFIED));
+        size_t k = (size_t)snprintf(note, sizeof note, "%s", m.maker ? menu_text(UI_MENU_COOP_MAKER) : "");
+        const char *const parts[] = {heard, key};
+        for (const char *part : parts)
+            if (part[0] && k < sizeof note) k += (size_t)snprintf(note + k, sizeof note - k, "%s%s", k ? "  ·  " : "", part);
         snprintf(desc, sizeof desc, "%s%s%s", menu_text(UI_MENU_COOP_MEMBER_DESC), removable ? "\n\n" : "",
                  removable ? menu_text(UI_MENU_COOP_REMOVE_DESC) : "");
         const char *value = self ? menu_text(UI_MENU_COOP_YOU) : removable ? menu_text(UI_MENU_COOP_REMOVE) : "";
-        if (opt_text_row(id, m.name, value, note[0] ? note : nullptr, desc, false) == 2 && removable)
-            open_remove(m.id, m.name);
+        if (opt_text_row(id, name, value, note[0] ? note : nullptr, desc, false) == 2 && removable) open_remove_member(m);
     }
+}
+
+// For the maker: the keys that took more from the pools than they brought (in the room or not; a player who used keys
+// others found is among them), each with a Remove of its key, and the pool reset.
+static void pool_rows(void) {
+    if (!g_maker) return;
+    opt_group(UI_MENU_COOP_POOLS);
+    int listed = 0;
+    for (int i = 0; i < g_ncontrib; i++) {
+        const CoopContributor &c = g_contrib[i];
+        if (c.self || c.removed || !(c.spent[0] > 0 || c.spent[1] > 0 || c.spent[2] > 0)) continue;
+        char id[48], label[COOP_NAME_MAX + 64], key[64], spent[200], note[280];
+        snprintf(id, sizeof id, "##coop_spent%s", c.key);
+        snprintf(label, sizeof label, "%s", c.member && c.name[0] ? c.name : menu_text(UI_MENU_COOP_NOT_IN_ROOM));
+        snprintf(key, sizeof key, menu_text(UI_MENU_COOP_KEY), c.key);
+        snprintf(spent, sizeof spent, menu_text(UI_MENU_COOP_SPENT), (long long)c.spent[0], (long long)c.spent[1],
+                 (long long)c.spent[2]);
+        snprintf(note, sizeof note, "%s  ·  %s", key, spent);
+        if (opt_text_row(id, label, menu_text(UI_MENU_COOP_REMOVE), note, menu_text(UI_MENU_COOP_SPENT_DESC), false) == 2) {
+            uint64_t session = 0;
+            for (int j = 0; j < g_view.n; j++)
+                if (c.member && g_view.member[j].id == c.member) session = g_view.member[j].session;
+            open_remove(c.member, session, label, c.key, id);
+        }
+        listed++;
+    }
+    if (!listed) opt_text(UI_MENU_COOP_SPENT_NONE);
+    if (opt_button("##coop_reset", UI_MENU_COOP_RESET, UI_MENU_COOP_RESET_DESC)) open_window(P_RESET, "##coop_reset");
+}
+
+static void rows_room(void) {
+    status_line();
+    const CoopOffer &o = g_offer;
+    offer_rows(o);
+    player_rows(o);
+    pool_rows();
     opt_group(UI_MENU_COOP_SECRET);
     char shown[COOP_SECRET_TEXT + 1];
     snprintf(shown, sizeof shown, "%s", g_show_secret ? g_view.code : "******-******-******");
@@ -315,7 +445,7 @@ static void rows_room(void) {
 
 void coop_rows(float scale) {
     (void)scale;
-    layer_read(&g_view, &g_offer);
+    layer_read(&g_view, &g_offer, g_contrib, &g_ncontrib, &g_maker);
     pending_tick();
     // the page changes its rows when the player gets into a room, reaches for one or leaves it: the cursor goes to a row
     // of the new page whose press changes nothing at once (never Leave, Make or the secret)
@@ -449,58 +579,105 @@ static void field_window(bool fresh, float scale, float wrap, bool *close, bool 
     *close = true;
 }
 
-// The offer: who, what is shared, where the save is copied, and Not now (the cursor) / Accept. A new offer while the
-// window is open replaces the one shown and puts the cursor back on Not now: Accept takes only the offer the player read.
+// The offer: who, what is shared, the key that signs the rules, where the save is copied, before the first Accept of
+// this start the three warnings of docs/coop.md ("Before you join a room with strangers"), and Not now (the cursor) /
+// Accept. A new offer while the window is open replaces the one shown and puts the cursor back on Not now: Accept takes
+// only the offer the player read. While a player in the room has not said who they are, Accept is greyed and the window
+// says why (the layer would refuse it).
 static void accept_window(bool fresh, float scale, float wrap, bool *close, bool *back) {
     (void)wrap;
     if (!g_offer.token || g_offer.accepted) {   // gone, or accepted meanwhile (coop_accept)
         *close = true;
         return;
     }
-    if (!layer_same_offer(g_offer, g_shown)) g_shown = g_offer, fresh = true;
+    if (!layer_same_offer(g_offer, g_shown)) g_shown = g_offer, fresh = true, g_refused = false;
     gold(menu_text(UI_MENU_COOP_ACCEPT_CONFIRM));
-    char who[640], shared[320], pooled[320];
+    char who[1100], shared[320], pooled[320], line[640];
     offer_lines(g_shown, who, sizeof who, shared, sizeof shared, pooled, sizeof pooled);
     ImGui::TextUnformatted(who);
     if (shared[0]) ImGui::TextUnformatted(shared);
     if (pooled[0]) ImGui::TextUnformatted(pooled);
+    if (g_shown.new_save) ImGui::TextUnformatted(menu_text(UI_MENU_COOP_NEW_SAVE));
+    if (g_shown.maker_key[0] && !g_maker) {
+        snprintf(line, sizeof line, menu_text(UI_MENU_COOP_OFFER_KEY), g_shown.maker_key);
+        ImGui::TextUnformatted(line);
+        ImGui::TextUnformatted(menu_text(UI_MENU_COOP_OFFER_COMPARE));
+    }
+    if (g_offer.disagree) warn(menu_text(UI_MENU_COOP_DISAGREE));
     ImGui::Spacing();
     ImGui::TextUnformatted(menu_text(UI_MENU_COOP_OFFER_COPY));
     warn(menu_text(UI_MENU_COOP_OFFER_TRUST));
+    if (!g_accepted_once) {
+        ImGui::Spacing();
+        gold(menu_text(UI_MENU_COOP_WARNINGS));
+        ImGui::TextUnformatted(menu_text(UI_MENU_COOP_WARN_SAVE));
+        ImGui::TextUnformatted(menu_text(UI_MENU_COOP_WARN_ROOM));
+        ImGui::TextUnformatted(menu_text(UI_MENU_COOP_WARN_KEY));
+    }
+    const bool can = g_offer.unidentified == 0;
+    if (!can) {
+        snprintf(line, sizeof line, menu_text(UI_MENU_COOP_UNIDENTIFIED), g_offer.unidentified);
+        warn(line);
+    }
+    if (g_refused) warn(menu_text(UI_MENU_COOP_NOT_ACCEPTED));
     ImGui::Spacing();
-    const int r = two_buttons(menu_text(UI_MENU_COOP_NOT_NOW), menu_text(UI_MENU_COOP_ACCEPT), true, fresh, scale);
+    const int r = two_buttons(menu_text(UI_MENU_COOP_NOT_NOW), menu_text(UI_MENU_COOP_ACCEPT), can, fresh, scale);
     if (r == 1) *back = true;
-    if (r == 2) {
-        layer_accept(g_shown);
+    if (r == 2 && layer_accept(g_shown)) {
+        g_accepted_once = true;
         snprintf(g_return, sizeof g_return, "##coop_member%d", g_view.self);   // the Accept row goes with the offer
         *close = true;
+    } else if (r == 2) {
+        g_refused = true;
     }
 }
 
+// Remove: by the key's fingerprint when the player has one, which every game drops (also once the player left);
+// otherwise by member id, and only while the session that held the id when the window opened still holds it.
 static void remove_window(bool fresh, float scale, bool *close, bool *back) {
     bool there = false;
-    for (int i = 0; i < g_view.n; i++) there |= g_view.member[i].id == g_member;
-    if (!there || !g_view.made) {
+    for (int i = 0; i < g_view.n; i++)
+        there |= g_view.member[i].id == g_member && g_view.member[i].session == g_member_session;
+    if (!g_maker || (!g_member_key[0] && !there)) {
         *close = true;
         return;
     }
     char text[256];
-    snprintf(text, sizeof text, menu_text(UI_MENU_COOP_REMOVE_CONFIRM), g_member_name);
+    if (g_member_key[0]) snprintf(text, sizeof text, menu_text(UI_MENU_COOP_REMOVE_KEY_CONFIRM), g_member_name, g_member_key);
+    else snprintf(text, sizeof text, menu_text(UI_MENU_COOP_REMOVE_CONFIRM), g_member_name);
     gold(text);
+    if (!g_member_key[0]) ImGui::TextUnformatted(menu_text(UI_MENU_COOP_NOT_IDENTIFIED));
     ImGui::TextUnformatted(menu_text(UI_MENU_COOP_REMOVE_DESC));
     ImGui::Spacing();
     const int r = two_buttons(menu_text(UI_MENU_RESET_NO), menu_text(UI_MENU_COOP_REMOVE), true, fresh, scale);
     if (r == 1) *back = true;
     if (r == 2) {
-        layer_remove(g_member);
+        if (g_member_key[0]) layer_remove_key(g_member_key);
+        else layer_remove_member(g_member);
         snprintf(g_return, sizeof g_return, "##coop_member%d", g_view.self);
+        *close = true;
+    }
+}
+
+static void reset_window(bool fresh, float scale, bool *close, bool *back) {
+    if (!g_maker) {
+        *close = true;
+        return;
+    }
+    gold(menu_text(UI_MENU_COOP_RESET_CONFIRM));
+    ImGui::TextUnformatted(menu_text(UI_MENU_COOP_RESET_DESC));
+    ImGui::Spacing();
+    const int r = two_buttons(menu_text(UI_MENU_RESET_NO), menu_text(UI_MENU_COOP_RESET), true, fresh, scale);
+    if (r == 1) *back = true;
+    if (r == 2) {
+        layer_reset_pools();
         *close = true;
     }
 }
 
 static void leave_window(bool fresh, float scale, bool *close, bool *back) {
     gold(menu_text(UI_MENU_COOP_LEAVE_CONFIRM));
-    if (g_view.made) warn(menu_text(UI_MENU_COOP_LEAVE_MAKER));
+    if (g_maker) warn(menu_text(UI_MENU_COOP_LEAVE_MAKER));
     ImGui::Spacing();
     const int r = two_buttons(menu_text(UI_MENU_COOP_STAY), menu_text(UI_MENU_COOP_LEAVE), true, fresh, scale);
     if (r == 1) *back = true;
@@ -532,11 +709,12 @@ void coop_after_page(float scale) {
     const float wrap = ImGui::GetFontSize() * 30;
     bool close = false, back = false;
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap);
-    const bool leaves_room = g_page == P_ACCEPT || g_page == P_REMOVE || g_page == P_LEAVE;
+    const bool leaves_room = g_page == P_ACCEPT || g_page == P_REMOVE || g_page == P_RESET || g_page == P_LEAVE;
     if (leaves_room && !in_room(g_view)) close = true;   // the room ended under the window
     else if (field_page()) field_window(fresh, scale, wrap, &close, &back);
     else if (g_page == P_ACCEPT) accept_window(fresh, scale, wrap, &close, &back);
     else if (g_page == P_REMOVE) remove_window(fresh, scale, &close, &back);
+    else if (g_page == P_RESET) reset_window(fresh, scale, &close, &back);
     else if (g_page == P_LEAVE) leave_window(fresh, scale, &close, &back);
     else close = true;
     ImGui::PopTextWrapPos();
@@ -566,18 +744,19 @@ void coop_cancel(void) {
 
 int coop_test_set(const char *key, const char *value) {
     if (!strcmp(key, "NX2NAVI_COOP_PAGE")) {
-        layer_read(&g_view, &g_offer);
+        layer_read(&g_view, &g_offer, g_contrib, &g_ncontrib, &g_maker);
         if (!strcmp(value, "name")) open_field(P_NAME, cfg_value("NX2NAVI_COOP_NAME"), "NX2NAVI_COOP_NAME");
         else if (!strcmp(value, "server")) open_field(P_SERVER, cfg_value("NX2NAVI_COOP_SERVER"), "NX2NAVI_COOP_SERVER");
         else if (!strcmp(value, "join")) open_field(P_JOIN, "", "##coop_join");
         else if (!strcmp(value, "accept")) open_accept();
         else if (!strcmp(value, "leave")) open_window(P_LEAVE, "##coop_leave");
+        else if (!strcmp(value, "reset")) open_window(P_RESET, "##coop_reset");
         else if (!strncmp(value, "remove:", 7)) {
             const int id = atoi(value + 7);
-            const char *name = "";
-            for (int i = 0; i < g_view.n; i++)
-                if (g_view.member[i].id == id) name = g_view.member[i].name;
-            open_remove(id, name);
+            int i = 0;
+            while (i < g_view.n && g_view.member[i].id != id) i++;
+            if (i == g_view.n) return 0;
+            open_remove_member(g_view.member[i]);
         } else {
             return 0;
         }

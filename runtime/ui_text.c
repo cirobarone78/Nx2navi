@@ -584,9 +584,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_MEMBER_DESC] = "A player in the room. Heard: when a message of theirs last arrived sealed with the "
                                  "room's secret; a player not heard from yet has not shown that they know it.",
     [UI_MENU_COOP_REMOVE] = "Remove",
-    [UI_MENU_COOP_REMOVE_DESC] = "As the room's maker you can remove a player: the relay drops them and refuses them "
-                                 "again under the same identity. Someone who knows the secret can come back as a new "
-                                 "player, and everyone then gets a new offer to accept or not; to be sure, make a new room.",
+    [UI_MENU_COOP_REMOVE_DESC] = "As the room's maker you can remove a player by their key: every game drops that key and "
+                                 "gives back what it took from the pools, and the relay drops the player and refuses them "
+                                 "again. Someone who knows the secret can come back under a new key, and everyone then gets "
+                                 "a new offer to accept or not; to be sure, make a new room.",
     [UI_MENU_COOP_REMOVE_CONFIRM] = "Remove %s from the room?",
     [UI_MENU_COOP_SECRET_DESC] = "Anyone who has the secret can join the room: pass it on only to the players you invite, "
                                  "by voice or a private message. It shows only when you ask; hide it before you share your "
@@ -641,6 +642,45 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_STAY] = "Stay",
     [UI_MENU_COOP_TOAST_JOINED] = "%s joined the room", [UI_MENU_COOP_TOAST_LEFT] = "%s left the room",
     [UI_MENU_COOP_TOAST_OFFER] = "The co-op room waits for your answer in the menu's Co-op tab",
+    [UI_MENU_COOP_LOST] = "The relay lost the room; the game is getting back into it.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "The relay takes no more joins from your network for now; the game tries again in a minute.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "not identified", [UI_MENU_COOP_REMOVED] = "removed by the maker",
+    [UI_MENU_COOP_KEY] = "key %s",
+    [UI_MENU_COOP_OFFER_KEY] = "The rules are signed by key %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Before you accept, ask the room's maker to read you their key, by voice or chat, and "
+                                   "compare it with this one.",
+    [UI_MENU_COOP_MY_KEY] = "Your key, which signs this room's rules: %s. Read it to the others, by voice or chat, so that "
+                            "they can compare it before they accept.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Players in the room who have not said who they are: %d. Nobody can accept the room while "
+                                  "they are in it: the maker can remove them, or everyone moves to a new room.",
+    [UI_MENU_COOP_DISAGREE] = "The players carry rules signed by different keys: ask the room's maker which key is theirs "
+                              "before you accept.",
+    [UI_MENU_COOP_NEW_SAVE] = "Another save is played in this room: it gets the room's progress, which holds what the last "
+                              "save brought.",
+    [UI_MENU_COOP_WARNINGS] = "Before you join a room with strangers",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Keep a save you can go back to. Anyone you accept can set story flags in your save, and so "
+                               "can anyone they accepted; a player in your pools can empty a dungeon's small keys. No "
+                               "removal takes a flag back: the copy in coop-backup/first-<date and time> does.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Your acceptance is yours, the room is not. The players you accept pass on the flags of the "
+                               "players they accepted, and the maker alone decides who may use the pools. If anyone you do "
+                               "not know is in the room, do not accept: leave, and ask the maker for a new room.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Check the maker's key, and keep yours to yourself. Compare the key that signs the rules "
+                              "with the maker's, never start the game with settings or a script someone hands you, and "
+                              "never hand out a copy of your profile folder.",
+    [UI_MENU_COOP_POOLS] = "Pools",
+    [UI_MENU_COOP_SPENT] = "took %lld keys, %lld rupees, %lld ammunition beyond what it brought",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "not in the room",
+    [UI_MENU_COOP_SPENT_NONE] = "Nobody took more from the pools than they brought.",
+    [UI_MENU_COOP_SPENT_DESC] = "This key took more from the pools than it brought. A player who used keys others found is "
+                                "listed too; one nobody expected drained the pools. Removing the key gives back what it "
+                                "took, in every game, also after the player left.",
+    [UI_MENU_COOP_RESET] = "Reset the pools",
+    [UI_MENU_COOP_RESET_DESC] = "Every game joins the pools again with what it held for the players in the room. This "
+                                "recovers a pool that a player who left had emptied; flags stay as they are.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Reset the pools for everyone in the room?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remove %s, key %s, from the room?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Not accepted: the room changed or a player in it has not said who they are. Look at the "
+                                  "offer again.",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
@@ -1245,10 +1285,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_MEMBER_DESC] = "Игрок в комнате. «На связи»: когда последний раз пришло его сообщение, запечатанное "
                                  "секретом комнаты; игрок, который ещё не на связи, пока не показал, что знает секрет.",
     [UI_MENU_COOP_REMOVE] = "Удалить",
-    [UI_MENU_COOP_REMOVE_DESC] = "Как создатель комнаты вы можете удалить игрока: ретранслятор отключает его и не пускает "
-                                 "снова с тем же идентификатором. Тот, кто знает секрет, может вернуться как новый игрок, и "
-                                 "тогда все получат новое предложение, которое можно принять или нет; для надёжности "
-                                 "создайте новую комнату.",
+    [UI_MENU_COOP_REMOVE_DESC] = "Как создатель комнаты вы можете удалить игрока по его ключу: каждая игра отбрасывает этот "
+                                 "ключ и возвращает взятое им из запасов, а ретранслятор отключает игрока и больше не "
+                                 "пускает. Тот, кто знает секрет, может вернуться с новым ключом, и тогда все получат новое "
+                                 "предложение, которое можно принять или нет; для надёжности создайте новую комнату.",
     [UI_MENU_COOP_REMOVE_CONFIRM] = "Удалить %s из комнаты?",
     [UI_MENU_COOP_SECRET_DESC] = "Любой, у кого есть секрет, может войти в комнату: передавайте его только приглашённым "
                                  "игрокам, голосом или личным сообщением. Он показывается, только когда вы попросите; "
@@ -1306,6 +1346,45 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_STAY] = "Остаться",
     [UI_MENU_COOP_TOAST_JOINED] = "%s входит в комнату", [UI_MENU_COOP_TOAST_LEFT] = "%s покидает комнату",
     [UI_MENU_COOP_TOAST_OFFER] = "Комната кооператива ждёт вашего ответа во вкладке «Кооператив» меню",
+    [UI_MENU_COOP_LOST] = "Ретранслятор потерял комнату; игра возвращается в неё.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "Ретранслятор пока не принимает новых входов из вашей сети; игра попробует снова через минуту.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "не назвался", [UI_MENU_COOP_REMOVED] = "удалён создателем",
+    [UI_MENU_COOP_KEY] = "ключ %s",
+    [UI_MENU_COOP_OFFER_KEY] = "Правила подписаны ключом %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Прежде чем принять, попросите создателя комнаты прочитать вам свой ключ голосом или в "
+                                   "чате и сравните его с этим.",
+    [UI_MENU_COOP_MY_KEY] = "Ваш ключ, которым подписаны правила этой комнаты: %s. Прочитайте его остальным голосом или в "
+                            "чате, чтобы они могли сравнить его, прежде чем принять.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Игроков в комнате, которые не назвались: %d. Пока они в ней, никто не может принять "
+                                  "комнату: создатель может удалить их, или все переходят в новую комнату.",
+    [UI_MENU_COOP_DISAGREE] = "У игроков правила, подписанные разными ключами: прежде чем принять, спросите создателя "
+                              "комнаты, какой ключ его.",
+    [UI_MENU_COOP_NEW_SAVE] = "В этой комнате играют другое сохранение: оно получает прогресс комнаты, в котором есть то, "
+                              "что принесло прошлое сохранение.",
+    [UI_MENU_COOP_WARNINGS] = "Прежде чем войти в комнату с незнакомцами",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Держите сохранение, к которому можно вернуться. Любой, кого вы приняли, может ставить "
+                               "сюжетные флаги в вашем сохранении, как и любой, кого принял он; игрок в ваших запасах может "
+                               "опустошить малые ключи подземелья. Никакое удаление не возвращает флаг: это делает копия в "
+                               "coop-backup/first-<дата и время>.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Ваше согласие — ваше, комната — нет. Принятые вами игроки передают флаги тех, кого "
+                               "приняли они, а кто может пользоваться запасами, решает только создатель. Если в комнате "
+                               "есть кто-то незнакомый, не принимайте: выйдите и попросите у создателя новую комнату.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Сверьте ключ создателя и не отдавайте свой. Сравните ключ, которым подписаны правила, с "
+                              "ключом создателя, никогда не запускайте игру с настройками или скриптом, которые вам дали, "
+                              "и никому не отдавайте копию папки профиля.",
+    [UI_MENU_COOP_POOLS] = "Запасы",
+    [UI_MENU_COOP_SPENT] = "взял сверх принесённого: ключей %lld, рупий %lld, боеприпасов %lld",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "не в комнате",
+    [UI_MENU_COOP_SPENT_NONE] = "Никто не взял из запасов больше, чем принёс.",
+    [UI_MENU_COOP_SPENT_DESC] = "Этот ключ взял из запасов больше, чем принёс. Здесь и игрок, который пользовался ключами, "
+                                "найденными другими; тот, кого никто не ждал, опустошил запасы. Удаление ключа возвращает "
+                                "взятое во всех играх, и после ухода игрока тоже.",
+    [UI_MENU_COOP_RESET] = "Сбросить запасы",
+    [UI_MENU_COOP_RESET_DESC] = "Каждая игра заново входит в запасы с тем, что у неё было для игроков в комнате. Так "
+                                "восстанавливается запас, который опустошил ушедший игрок; флаги остаются как есть.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Сбросить запасы для всех в комнате?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Удалить %s (ключ %s) из комнаты?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Не принято: комната изменилась или кто-то в ней не назвался. Посмотрите предложение ещё раз.",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
@@ -1894,10 +1973,10 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_MEMBER_DESC] = "Um jogador da sala. Ouvido: quando chegou a última mensagem dele selada com o segredo da "
                                  "sala; um jogador ainda não ouvido não mostrou que o conhece.",
     [UI_MENU_COOP_REMOVE] = "Remover",
-    [UI_MENU_COOP_REMOVE_DESC] = "Como criador da sala, você pode remover um jogador: o relay o desconecta e o recusa de "
-                                 "novo com a mesma identidade. Quem conhece o segredo pode voltar como um novo jogador, e "
-                                 "todos então recebem uma nova oferta para aceitar ou não; para ter certeza, crie uma nova "
-                                 "sala.",
+    [UI_MENU_COOP_REMOVE_DESC] = "Como criador da sala, você pode remover um jogador pela chave dele: cada jogo descarta essa "
+                                 "chave e devolve o que ela pegou dos estoques, e o relay desconecta o jogador e o recusa de "
+                                 "novo. Quem conhece o segredo pode voltar com uma nova chave, e todos então recebem uma "
+                                 "nova oferta para aceitar ou não; para ter certeza, crie uma nova sala.",
     [UI_MENU_COOP_REMOVE_CONFIRM] = "Remover %s da sala?",
     [UI_MENU_COOP_SECRET_DESC] = "Qualquer pessoa com o segredo pode entrar na sala: passe-o só aos jogadores que convidar, "
                                  "por voz ou mensagem privada. Ele só aparece quando você pede; esconda-o antes de "
@@ -1957,6 +2036,45 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_STAY] = "Ficar",
     [UI_MENU_COOP_TOAST_JOINED] = "%s entrou na sala", [UI_MENU_COOP_TOAST_LEFT] = "%s saiu da sala",
     [UI_MENU_COOP_TOAST_OFFER] = "A sala cooperativa aguarda sua resposta na aba Cooperativo do menu",
+    [UI_MENU_COOP_LOST] = "O relay perdeu a sala; o jogo está voltando a ela.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "O relay não aceita mais entradas da sua rede por enquanto; o jogo tenta de novo em um minuto.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "não identificado", [UI_MENU_COOP_REMOVED] = "removido pelo criador",
+    [UI_MENU_COOP_KEY] = "chave %s",
+    [UI_MENU_COOP_OFFER_KEY] = "As regras são assinadas pela chave %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Antes de aceitar, peça ao criador da sala que leia a chave dele para você, por voz ou "
+                                   "chat, e compare-a com esta.",
+    [UI_MENU_COOP_MY_KEY] = "Sua chave, que assina as regras desta sala: %s. Leia-a para os outros, por voz ou chat, para "
+                            "que possam compará-la antes de aceitar.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Jogadores na sala que não disseram quem são: %d. Ninguém pode aceitar a sala enquanto eles "
+                                  "estiverem nela: o criador pode removê-los, ou todos vão para uma nova sala.",
+    [UI_MENU_COOP_DISAGREE] = "Os jogadores trazem regras assinadas por chaves diferentes: pergunte ao criador da sala qual "
+                              "chave é a dele antes de aceitar.",
+    [UI_MENU_COOP_NEW_SAVE] = "Outro save é jogado nesta sala: ele recebe o progresso da sala, que inclui o que o último "
+                              "save trouxe.",
+    [UI_MENU_COOP_WARNINGS] = "Antes de entrar em uma sala com desconhecidos",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Tenha um save para o qual possa voltar. Qualquer um que você aceitar pode definir flags da "
+                               "história no seu save, assim como quem essa pessoa aceitou; um jogador nos seus estoques pode "
+                               "esvaziar as chaves pequenas de uma masmorra. Nenhuma remoção desfaz uma flag: a cópia em "
+                               "coop-backup/first-<data e hora> desfaz.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Sua aceitação é sua, a sala não. Os jogadores que você aceita repassam as flags dos "
+                               "jogadores que eles aceitaram, e só o criador decide quem pode usar os estoques. Se houver "
+                               "alguém que você não conhece na sala, não aceite: saia e peça ao criador uma nova sala.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Confira a chave do criador e guarde a sua. Compare a chave que assina as regras com a do "
+                              "criador, nunca inicie o jogo com configurações ou um script que alguém lhe passou, e nunca "
+                              "entregue uma cópia da sua pasta de perfil.",
+    [UI_MENU_COOP_POOLS] = "Estoques",
+    [UI_MENU_COOP_SPENT] = "pegou além do que trouxe: %lld chaves, %lld rupias, %lld munições",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "fora da sala",
+    [UI_MENU_COOP_SPENT_NONE] = "Ninguém pegou dos estoques mais do que trouxe.",
+    [UI_MENU_COOP_SPENT_DESC] = "Esta chave pegou dos estoques mais do que trouxe. Um jogador que usou chaves que outros "
+                                "acharam também aparece; alguém que ninguém esperava esvaziou os estoques. Remover a chave "
+                                "devolve o que ela pegou, em todos os jogos, também depois que o jogador saiu.",
+    [UI_MENU_COOP_RESET] = "Redefinir os estoques",
+    [UI_MENU_COOP_RESET_DESC] = "Cada jogo entra de novo nos estoques com o que tinha para os jogadores na sala. Isso "
+                                "recupera um estoque que um jogador que saiu esvaziou; as flags ficam como estão.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Redefinir os estoques para todos na sala?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remover %s, chave %s, da sala?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Não aceito: a sala mudou ou alguém nela não disse quem é. Veja a oferta de novo.",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
@@ -2631,8 +2749,9 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_MEMBER_DESC] = "房间中的玩家。消息：其最近一条用房间密钥封装的消息到达的时间；尚无消息的玩家还没有证明"
                                  "自己知道密钥。",
     [UI_MENU_COOP_REMOVE] = "移除",
-    [UI_MENU_COOP_REMOVE_DESC] = "作为房主，你可以移除玩家：中继会断开对方，并拒绝其以同一身份再次进入。知道密钥的人可以"
-                                 "作为新玩家回来，届时所有人都会收到新的提议，可以接受或不接受；要确保安全，请创建新房间。",
+    [UI_MENU_COOP_REMOVE_DESC] = "作为房主，你可以按身份指纹移除玩家：每个游戏都会丢弃该身份并归还它从共用中取走的东西，"
+                                 "中继会断开该玩家并拒绝其再次进入。知道房间密钥的人可以换一个新身份回来，届时所有人都会"
+                                 "收到新的提议，可以接受或不接受；要确保安全，请创建新房间。",
     [UI_MENU_COOP_REMOVE_CONFIRM] = "将 %s 移出房间？",
     [UI_MENU_COOP_SECRET_DESC] = "任何拥有密钥的人都能加入房间：只通过口头或私信告诉受邀的玩家。只有在你要求时才显示；"
                                  "分享屏幕前请将其隐藏。中继永远不会知道它。",
@@ -2677,6 +2796,37 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_STAY] = "留下",
     [UI_MENU_COOP_TOAST_JOINED] = "%s 加入了房间", [UI_MENU_COOP_TOAST_LEFT] = "%s 离开了房间",
     [UI_MENU_COOP_TOAST_OFFER] = "合作房间正在菜单的“合作”页等待你的答复",
+    [UI_MENU_COOP_LOST] = "中继丢失了房间；游戏正在重新进入。",
+    [UI_MENU_COOP_JOIN_LIMIT] = "中继暂时不再接受来自你的网络的加入；游戏会在一分钟后重试。",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "未表明身份", [UI_MENU_COOP_REMOVED] = "已被房主移除",
+    [UI_MENU_COOP_KEY] = "身份指纹 %s",
+    [UI_MENU_COOP_OFFER_KEY] = "规则由身份指纹为 %s 的玩家签署。",
+    [UI_MENU_COOP_OFFER_COMPARE] = "接受之前，请房主通过语音或聊天把他的身份指纹读给你，并与这里的比对。",
+    [UI_MENU_COOP_MY_KEY] = "你的身份指纹（用于签署此房间的规则）：%s。请通过语音或聊天读给其他人，以便他们在接受前比对。",
+    [UI_MENU_COOP_UNIDENTIFIED] = "房间中未表明身份的玩家：%d。只要他们还在房间里，任何人都无法接受此房间：房主可以移除他们，"
+                                  "或者大家换到新房间。",
+    [UI_MENU_COOP_DISAGREE] = "玩家们携带的规则由不同的身份签署：接受之前，请向房主确认哪个身份指纹是他的。",
+    [UI_MENU_COOP_NEW_SAVE] = "此房间中正在玩另一个存档：它会得到房间的进度，其中包含上一个存档带来的内容。",
+    [UI_MENU_COOP_WARNINGS] = "与陌生人进入房间之前",
+    [UI_MENU_COOP_WARN_SAVE] = "1. 保留一个可以回退的存档。你接受的任何人都能在你的存档中设置剧情标记，他们接受的人也一样；"
+                               "共用中的玩家可以用光一个迷宫的小钥匙。移除玩家不会撤销标记：coop-backup/first-<日期和时间> "
+                               "中的副本才能。",
+    [UI_MENU_COOP_WARN_ROOM] = "2. 接受与否由你决定，房间却不由你决定。你接受的玩家会转交他们所接受的玩家的标记，而谁能使用"
+                               "共用只由房主决定。如果房间里有你不认识的人，不要接受：离开，并请房主开一个新房间。",
+    [UI_MENU_COOP_WARN_KEY] = "3. 核对房主的身份指纹，并保管好你自己的。把签署规则的身份指纹与房主的比对；绝不要用别人给你的"
+                              "设置或脚本启动游戏；绝不要交出你的配置文件夹的副本。",
+    [UI_MENU_COOP_POOLS] = "共用",
+    [UI_MENU_COOP_SPENT] = "超出所带来的部分取走了：%lld 把钥匙、%lld 卢比、%lld 份弹药",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "不在房间中",
+    [UI_MENU_COOP_SPENT_NONE] = "没有人从共用中取走的比带来的多。",
+    [UI_MENU_COOP_SPENT_DESC] = "这个身份从共用中取走的比带来的多。用了别人找到的钥匙的玩家也会列在这里；没人预料到的那个人"
+                                "掏空了共用。移除这个身份会在所有游戏中归还它取走的东西，玩家离开后也是如此。",
+    [UI_MENU_COOP_RESET] = "重置共用",
+    [UI_MENU_COOP_RESET_DESC] = "每个游戏都会带着它为房间中玩家保存的数量重新加入共用。这能恢复被已离开的玩家掏空的共用；"
+                                "标记保持不变。",
+    [UI_MENU_COOP_RESET_CONFIRM] = "为房间中的所有人重置共用？",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "将 %s（身份指纹 %s）移出房间？",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "未接受：房间已变化，或其中有玩家未表明身份。请重新查看提议。",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",

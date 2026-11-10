@@ -296,7 +296,19 @@ typedef enum {
     UI_MENU_COOP_SHARED, UI_MENU_COOP_OWN, UI_MENU_COOP_POOL,
     UI_MENU_COOP_LEAVE, UI_MENU_COOP_LEAVE_DESC, UI_MENU_COOP_LEAVE_CONFIRM, UI_MENU_COOP_LEAVE_MAKER, UI_MENU_COOP_STAY,
     UI_MENU_COOP_TOAST_JOINED, UI_MENU_COOP_TOAST_LEFT /* "%s": a name */, UI_MENU_COOP_TOAST_OFFER,
-    UI_MENU_LAST_ID = UI_MENU_COOP_TOAST_OFFER,
+    // what the hardened layer adds to the Co-op tab: the relay's states, keys and identification, the maker's key, the
+    // three warnings before the first Accept, the pools' contributors and the maker's reset
+    UI_MENU_COOP_LOST, UI_MENU_COOP_JOIN_LIMIT,
+    UI_MENU_COOP_NOT_IDENTIFIED, UI_MENU_COOP_REMOVED, UI_MENU_COOP_KEY /* "%s": a key's fingerprint */,
+    UI_MENU_COOP_OFFER_KEY /* "%s": a key's fingerprint */, UI_MENU_COOP_OFFER_COMPARE,
+    UI_MENU_COOP_MY_KEY /* "%s": a key's fingerprint */,
+    UI_MENU_COOP_UNIDENTIFIED /* "%d": players */, UI_MENU_COOP_DISAGREE, UI_MENU_COOP_NEW_SAVE,
+    UI_MENU_COOP_WARNINGS, UI_MENU_COOP_WARN_SAVE, UI_MENU_COOP_WARN_ROOM, UI_MENU_COOP_WARN_KEY,
+    UI_MENU_COOP_POOLS, UI_MENU_COOP_SPENT /* "%lld": keys, rupees, ammunition */, UI_MENU_COOP_NOT_IN_ROOM,
+    UI_MENU_COOP_SPENT_NONE, UI_MENU_COOP_SPENT_DESC,
+    UI_MENU_COOP_RESET, UI_MENU_COOP_RESET_DESC, UI_MENU_COOP_RESET_CONFIRM,
+    UI_MENU_COOP_REMOVE_KEY_CONFIRM /* "%s": the player's name, "%s": the key's fingerprint */, UI_MENU_COOP_NOT_ACCEPTED,
+    UI_MENU_LAST_ID = UI_MENU_COOP_NOT_ACCEPTED,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total

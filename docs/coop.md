@@ -55,9 +55,9 @@ Read this before you join a room.
   is made and that the maker passes on to the others (by voice, a chat message). The relay never learns it. Someone who
   sees your traffic on the network, or who runs the relay, cannot read the messages, change them, make new ones or
   guess the secret from them.
-- **Removing a player.** The room's maker can remove a player by their key's fingerprint, which the log shows beside
-  each member (`coop_remove = <fingerprint>` in `nx2navi.ini` while the game runs, while they are in the room or after
-  they left; the menu later): the maker's game signs the removal, every game drops that player's key and keeps it
+- **Removing a player.** The room's maker can remove a player by their key's fingerprint, which the log and the Co-op
+  tab show beside each member (Remove on the player's row of the tab, or `coop_remove = <fingerprint>` in `nx2navi.ini`
+  while the game runs; while they are in the room or after they left): the maker's game signs the removal, every game drops that player's key and keeps it
   dropped (their messages are ignored, their pool records dropped, so what they took from a pool comes back), and the
   relay drops them and refuses them again. A member number in the file is not taken, since numbers pass to other
   players as members come and go, and each value acts once, so a line left in the file or read again after a moment in
@@ -102,15 +102,25 @@ The menu (F1, or the pad's combo) has a Co-op tab, usable with the keyboard, the
   case, with or without dashes, and a Paste button that takes the clipboard's text), a line that says what the layer is
   doing or why it stopped (no answer from the relay, no room with that secret, refused), the rules of a room you make,
   and the co-op switch. Make and Join turn co-op on when it is off.
-- **In a room:** while the room waits for your answer, who is in it and what its rules share, and Accept or not;
-  the players, with who made the room and how long ago each was last heard (the room's maker has Remove on each other
-  player's row); the room's secret, hidden until you press its row, and a row that copies it to the clipboard; the
-  rules (the maker changes them, everyone else reads them; a change is a new offer for everyone); Leave the room.
-- **Nothing is accepted, removed or left by accident.** Accept or not, Remove and Leave each open a window whose
-  cursor starts on the safe button (Not now, Cancel, Stay), whenever it opens; pressing the button that opened it again,
-  holding it, or a double tap lands there. A new player or other rules while the Accept window is open replace what it
-  shows and put the cursor back on Not now: Accept takes only the offer you read. The window says that your whole save
-  is copied to `coop-backup` first.
+- **In a room:** while the room waits for your answer, who is in it (a player whose game has not said who it is is
+  marked "not identified"), what its rules share, the fingerprint of the key that signs the rules, to compare with the
+  one the maker reads out to you by voice or chat, and Accept or not; while any player is not identified the tab says
+  so and why the room cannot be accepted, and Accept is greyed. Then the players, with who made the room, how long ago
+  each was last heard and each one's key; the maker sees its own key to read out, and Remove on each other player's
+  row, which removes by the key (a player who never said who they are has no key and is removed by member number,
+  only while the same session still holds it). The maker also has a Pools group: every key that took more from the
+  pools than it brought, in the room or not, with what it took and a Remove of that key, and Reset the pools. Then the
+  room's secret, hidden until you press its row, and a row that copies it to the clipboard; the rules (the room's
+  creator changes them, everyone else reads them; a change is a new offer for everyone); Leave the room. The status
+  line says when the relay lost the room and the game is getting back into it, and when the relay takes no more joins
+  from your network and the game tries again in a minute.
+- **Nothing is accepted, removed, reset or left by accident.** Accept or not, Remove, Reset the pools and Leave each
+  open a window whose cursor starts on the safe button (Not now, Cancel, Stay), whenever it opens; only Right reaches
+  the acting button, and pressing the button that opened the window again, holding it, or a double tap lands on the
+  safe one. A new player or other rules while the Accept window is open replace what it shows and put the cursor back
+  on Not now: Accept takes only the offer you read. The window says that your whole save is copied to `coop-backup`
+  first, and before your first Accept in each start of the game it shows the three warnings of "Before you join a room
+  with strangers" below.
 - **While the menu is closed** a short note at the top of the screen says when a player joined or left the room and
   when the room waits for your answer.
 - The name, the relay, the rules and the switch are settings (written to `nx2navi.ini` like every row); the secret is
@@ -177,8 +187,8 @@ refused (it is not a join), so nobody can be put into a room they did not mean t
 | `coop_accept` | `ask` | `ask`: nothing from a room is applied until its offer is accepted; a number (the eight hex digits the log shows, random for each start of the game): accepts that offer, set while the game runs (the file's line as it is now counts before the one read at start); `always`, from the environment only (`NX2NAVI_COOP_ACCEPT=always`; an `nx2navi.ini` line is ignored): every room is accepted (the save is still copied first) |
 | `coop_auto` | `off` | `create` or `join` starts a session at launch (a join needs `coop_room`); no menu row |
 | `coop_room` | empty | the room secret of `coop_auto`; no menu row |
-| `coop_remove` | empty | the room's maker removes a player by its key's fingerprint (in the room or after it left; the relay drops it too while it is in the room); each value acts once; a member number is not taken from the file; no menu row yet |
-| `coop_reset_pools` | empty | the room's maker resets the pools when the value changes to a new one other than `0` (1, then 2; or 0, then 1 again); no menu row yet |
+| `coop_remove` | empty | the room's maker removes a player by its key's fingerprint (in the room or after it left; the relay drops it too while it is in the room); each value acts once; a member number is not taken from the file; the Co-op tab's Remove does the same |
+| `coop_reset_pools` | empty | the room's maker resets the pools when the value changes to a new one other than `0` (1, then 2; or 0, then 1 again); the Co-op tab's Reset the pools does the same |
 | `coop_drop` | `0` | test: percent of received datagrams thrown away; no menu row |
 | `coop_test_set` | empty | test, environment only (`NX2NAVI_COOP_TEST_SET`): `hash=value@frame,...` sets those flags (hash in hex) at those frames of play; an `nx2navi.ini` line is ignored |
 | `coop_progress` ... `coop_ammo` | see below | the rules of a room this player makes (Progress sync) |
@@ -486,6 +496,10 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   of a save outlasts the rotation.
 - `python tests/coop_page_check.py`: the menu's Co-op tab without the game, driven with the keyboard's and the pad's
   events: typing a name, a relay and a secret (Q and E are letters there, not tab keys), Make, Join with a wrong secret
-  and a pasted one, the offer accepted and declined, Remove, Leave, the maker's rules and the others' read-only ones;
-  Accept, Remove and Leave never act on a second press, a held button or a double tap, and a new offer under an open
-  Accept window puts the cursor back on Not now. Needs a C++ compiler only.
+  and a pasted one, the offer accepted and declined, the maker's key to compare, the three warnings before the first
+  Accept only, a player not identified (Accept greyed, removed by member number only while the same session holds
+  it), Remove by key, a pool contributor's key removed, Reset the pools, Leave, the relay's join limit and a lost room,
+  the maker's rules and the others' read-only ones; Accept, Remove, Reset and Leave never act on a second press, a held
+  button or a double tap, and a new offer under an open Accept window puts the cursor back on Not now. It then runs
+  again with a deliberate fault (each such window opens with the cursor moved onto its acting button) and passes only
+  when that run fails. Needs a C++ compiler only.

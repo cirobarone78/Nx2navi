@@ -33,3 +33,6 @@ int coop_game_remove_key(const char *fingerprint);
 // The identities the pools admit and what each took beyond what it brought, per pool (coop_state.h: CoopContributor):
 // whom the maker would remove after a drain. Their count (at most max), as published at most half a second ago.
 int coop_game_contributors(CoopContributor *out, int max);
+// This game holds the key that signs the room's rules (it made the room, in this start of the game or an earlier one):
+// its removals and pool resets act.
+int coop_game_is_maker(void);

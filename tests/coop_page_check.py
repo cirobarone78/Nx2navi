@@ -1,8 +1,12 @@
 """Build and run tests/coop_page_check.cpp: the menu's Co-op tab (runtime/ui/coop_page.cpp) without the game, driven with
 the key and pad events the menu hands Dear ImGui, the co-op layer answered by the test. Typing a name, a relay and a
 secret (with the letters that switch tabs elsewhere), Make, Join with a wrong secret and a pasted one, the room's offer
-accepted and declined, Remove and Leave; no confirmation acts on a repeated or held press, the maker changes a rule and
-the others cannot.
+accepted and declined, the maker's key, a player not identified, Remove by key, the pools' contributors and their
+reset, Leave; no confirmation acts on a repeated or held press, the maker changes a rule and the others cannot.
+
+Then the same checks again with a deliberate fault (COOP_PAGE_FAULT=1: each window that acts on the room opens with the
+cursor moved onto its acting button), which they must catch: the test passes only when the first run has no failed
+check and the second has some.
 
 Usage: coop_page_check.py   (needs clang++ or g++; no game files)
 """
@@ -39,7 +43,15 @@ def main():
     if subprocess.run([cxx, *objs, '-o', str(exe), '-lm']).returncode:
         sys.exit('the link failed')
     r = subprocess.run([str(exe)])
-    sys.exit(r.returncode)
+    if r.returncode:
+        sys.exit(r.returncode)
+    fault = subprocess.run([str(exe)], env={**os.environ, 'COOP_PAGE_FAULT': '1'}, capture_output=True, text=True)
+    fails = [line for line in fault.stdout.splitlines() if line.startswith('FAIL ')]
+    print(f'deliberate fault (the cursor moved onto the acting button as a window opens): {len(fails)} checks fail')
+    for line in fails[:3]:
+        print('  ' + line)
+    if not fails:
+        sys.exit('the deliberate fault went unnoticed')
 
 
 if __name__ == '__main__':
