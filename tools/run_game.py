@@ -186,19 +186,22 @@ def save_source(save, profile, scratch):
     return found, saves._one_slot(found), skip
 
 
-def profile_copy(dest, src, save=None, slot=None, skip=()):
+def profile_copy(dest, src, save=None, slot=None, skip=(), save_file=None):
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
     if save:
-        users = [d for d in (dest / 'save').iterdir() if d.is_dir()]
+        # the save goes into the save file the run plays: file n is profile/save-files/<n> (runtime/fs_host.c section
+        # "save files"); file 1, a name or none, the profile's own
+        root = dest / 'save-files' / save_file if save_file and save_file.isdigit() and save_file != '1' else dest
+        users = [d for d in (root / 'save').iterdir() if d.is_dir()] if (root / 'save').is_dir() else []
         if len(users) != 1:
-            sys.exit(f'run_game: expected one save directory in {dest / "save"}, found {len(users)}')
+            sys.exit(f'run_game: expected one save directory in {root / "save"}, found {len(users)}')
         target = users[0] / slot if slot else users[0]
         shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(save, target, ignore=lambda d, names: [n for n in names if Path(d) == Path(save) and n in skip])
         # a finished or interrupted commit in save-tx would be loaded in place of the save swapped in (fs_host.c)
-        shutil.rmtree(dest / 'save-tx', ignore_errors=True)
+        shutil.rmtree(root / 'save-tx', ignore_errors=True)
 
 
 def main():
@@ -207,6 +210,8 @@ def main():
     ap.add_argument('--save', help="the save to run: a backup's name in build/save-backup or the profile's save-backup, "
                                    "or a save folder or .zip from elsewhere (a crash report's zipped profile folder); "
                                    'default: the profile as it is')
+    ap.add_argument('--save-file', help="the save file to play (its number or name; the game's --save-file); --save "
+                                        'goes into it when it is a number')
     ap.add_argument('--script', type=Path, default=ROOT / 'tools' / 'input' / 'load_save.txt', help='NX2NAVI_INPUT_SCRIPT')
     ap.add_argument('--seconds', type=float, required=True,
                     help='game time to run: the run ends once the world clock (game time since the save loaded) passed '
@@ -235,7 +240,7 @@ def main():
                 time.sleep(10)
         prof = exe_dir / f'prof-{a.tag}'
         scratch = exe_dir / f'prof-{a.tag}.import'
-        profile_copy(prof, profile, *(save_source(a.save, profile, scratch) if a.save else ()))
+        profile_copy(prof, profile, *(save_source(a.save, profile, scratch) if a.save else ()), save_file=a.save_file)
         shutil.rmtree(scratch, ignore_errors=True)
 
         env = dict(os.environ, NX2NAVI_ASSUME_FOCUS='1', NX2NAVI_INPUT='none', NX2NAVI_INPUT_SCRIPT=str(a.script.resolve()))
@@ -245,6 +250,8 @@ def main():
             k, _, v = kv.partition('=')
             env[k] = v
         args = [str(exe), '--profile', str(prof), '--seconds', str(a.seconds)]
+        if a.save_file:
+            args += ['--save-file', a.save_file]
         if a.shot:
             args += ['--shot', str(a.shot.resolve())]
         try:

@@ -1,15 +1,15 @@
 """Build and run tests/save_share_check.c: the game's side of a shared save without the game. runtime/fs_host.c,
-save_share.c and save_zip.c with the rest of the runtime stubbed, each run of the program one start of the game on a
-profile folder made here:
+save_share.c, save_zip.c and save_summary.c with the rest of the runtime stubbed, each run of the program one start of
+the game on a profile folder made here:
 
 - export: the zip holds the save the game would load next (a finished commit waiting in save-tx before the committed
   save), its manifest as the launcher writes it (launcher/saves.py check_manifest takes it), no key file; with a bug
   report the log and nx2navi.ini; nothing saved yet is refused
-- import: zips the launcher exports wait in profile/save-import; at the next start the save the game would load goes
-  to saves/backup <time> beside the program, the import becomes the save (the finished commit it replaces too), and
-  the start says where the old save went; a second start changes nothing
+- import: zips the launcher exports wait in profile/save-import; at the next start the import becomes save file 2
+  (profile/save-files/2) and that start mounts it, while the save the game would have loaded stays as it was (a
+  finished commit waiting for it too); a second start changes nothing
 - refusals (no manifest, another game, a newer format, a path outside the save, a damaged member, no save files):
-  nothing waits and the save stays; Cancel drops a waiting import
+  nothing waits and the saves stay; Cancel drops a waiting import
 
 Usage: save_share_check.py   (Python 3.12 or later; no game files)
 """
@@ -56,10 +56,11 @@ def main():
     rt = ROOT / 'runtime'
     plat = ['platform/win32.c', 'platform/common.c'] if os.name == 'nt' else ['platform/linux.c', 'platform/common.c']
     libs = ['-lbcrypt', '-lwinmm', '-lpsapi', '-lshell32', '-lole32', '-luser32'] if os.name == 'nt' else \
-        ['-lpthread', '-ldl', '-lm']
+        ['-lpthread', '-ldl', '-lm', '-lSDL3']   # platform/linux.c's clipboard
     subprocess.check_call([compiler(), '-std=gnu11', '-O1', '-g', '-w', '-I', str(rt), str(ROOT / 'tests' /
                            'save_share_check.c'), *(str(rt / f) for f in ('fs_host.c', 'save_share.c', 'save_zip.c',
-                                                                           *plat)), '-o', str(exe), *libs], env=env)
+                                                                           'save_summary.c', *plat)),
+                           '-o', str(exe), *libs], env=env)
     bad = 0
 
     def check(ok, what):
@@ -138,23 +139,41 @@ def main():
     check(re.match(r'result 0 detail 0\.6\.2, \d{4}-\d\d-\d\d waiting 1$', line) is not None, f'import: {line}')
     check(tree(acct) == before, 'the save is unchanged until the next start')
     check(tree(profile / 'save-import') == shared_save, 'the import waits complete in profile/save-import')
-    # a finished commit made after the import (the game saved before the restart) is backed up and replaced too
+    # a finished commit made after the import (the game saved before the restart) stays the newest save of file 1
     late = profile / 'save-tx' / 'ready-0000000009'
     (late / 'option.sav').parent.mkdir(parents=True, exist_ok=True)
     (late / 'option.sav').write_bytes(b'saved after the import')
     line = run('start', profile)
-    m = re.match(r'done (.+) waiting 0$', line)
-    check(m is not None and Path(m.group(1)).parent == work / 'saves', f'start: {line}')
-    check(tree(acct) == shared_save, f'the import is the save: {sorted(tree(acct) or {})}')
-    if m:
-        backup = Path(m.group(1))
-        check(re.fullmatch(r'backup \d{4}-\d\d-\d\d \d\d\.\d\d\.\d\d', backup.name) is not None, backup.name)
-        check(tree(backup) == {'option.sav': b'saved after the import'}, f'the backup is the save the game would '
-              f'have loaded: {sorted(tree(backup) or {})}')
-    check(not (profile / 'save-import').exists() and not list((profile / 'save-tx').glob('ready-*')),
+    file2 = profile / 'save-files' / '2' / 'save' / ACCOUNT
+    check(line == 'done 2 waiting 0', f'start: {line}')
+    check(tree(file2) == shared_save, f'the import is save file 2: {sorted(tree(file2) or {})}')
+    check((profile / 'save-files' / 'current').read_text().strip() == '2', 'and the next start mounts it too')
+    check(tree(acct) == before and tree(late) == {'option.sav': b'saved after the import'},
+          'file 1 and its finished commit stay as they were')
+    check(not (profile / 'save-import').exists() and not list((profile / 'save-files').glob('.*')),
           'nothing waits after the start')
-    check(run('start', profile) == 'done  waiting 0', 'a second start imports nothing')
-    check(tree(acct) == shared_save, 'and keeps the imported save')
+    check(run('start', profile) == 'done 0 waiting 0', 'a second start imports nothing')
+    check(tree(file2) == shared_save and not (profile / 'save-files' / '3').exists(), 'and keeps the imported file')
+
+    # save-files a link to a folder (moved elsewhere on the same drive): the import still becomes a file, and a
+    # leftover of an unfinished New is still dropped at the start
+    linked = work / 'linked-profile'
+    for name, data in mine.items():
+        (linked / 'save' / ACCOUNT / name).parent.mkdir(parents=True, exist_ok=True)
+        (linked / 'save' / ACCOUNT / name).write_bytes(data)
+    elsewhere = work / 'elsewhere-save-files'
+    (elsewhere / '.new-7' / 'save').mkdir(parents=True)
+    try:
+        os.symlink(elsewhere, linked / 'save-files', target_is_directory=True)
+    except OSError as e:   # Windows without the right to make links
+        print(f'skipped the linked save-files check: {e}')
+    else:
+        line = run('import', linked, shared)
+        check(line.endswith('waiting 1'), f'import with save-files linked: {line}')
+        line = run('start', linked)
+        check(line == 'done 2 waiting 0' and tree(elsewhere / '2' / 'save' / ACCOUNT) == shared_save,
+              f'with save-files linked the import became file 2: {line}')
+        check(not (elsewhere / '.new-7').exists(), 'with save-files linked the start dropped an unfinished New')
 
     # refusals and Cancel
     def zip_of(name, members, manifest=True):
@@ -183,10 +202,11 @@ def main():
     for want, path in cases.items():
         line = run('import', profile, path)
         check(line.startswith(f'result {int(want)} ') and line.endswith('waiting 0'), f'{path.name}: {line}')
-    check(not (work / 'escape.sav').exists() and tree(acct) == shared_save, 'a refused zip changes nothing')
-    check(run('import', profile, shared).endswith('waiting 1'), 'import again')
-    check(run('cancel', profile) == 'result 0 waiting 0', 'cancel')
-    check(run('start', profile) == 'done  waiting 0' and tree(acct) == shared_save, 'a cancelled import stays out')
+    check(not (work / 'escape.sav').exists() and tree(file2) == shared_save and tree(acct) == before,
+          'a refused zip changes nothing')
+    check(run('cancel', profile, shared) == 'result 0 waiting 0', 'an import and its Cancel in one start')
+    check(run('start', profile) == 'done 0 waiting 0' and tree(file2) == shared_save and
+          not (profile / 'save-files' / '3').exists(), 'a cancelled import stays out')
 
     print('save_share_check:', 'FAILED' if bad else 'ok')
     return 1 if bad else 0

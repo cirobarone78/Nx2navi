@@ -287,12 +287,24 @@ With `--romfs <extracted RomFS folder>` it draws the game's interface textures a
 both decode the game's files, so they run with `.venv-py314\Scripts\python` (`compression.zstd` and numpy). What they
 write is decoded game data: keep it under `build/`.
 
+A change to the Saves tab's file window (`runtime/ui/saves_page.cpp`) passes `python tests\saves_page_check.py`: it
+builds the page with the menu's row and shape code and Dear ImGui (host clang++ or g++), drives it with the key events
+the menu hands ImGui, and checks that every confirmation opens with the cursor on Cancel and that A or Enter pressed
+again, B then A, A, or a held key with its repeats never deletes, restarts, copies or renames. No game files.
+
 A change to the shared save (`runtime/save_zip.c`, `runtime/save_share.c`, the save import in `runtime/fs_host.c`)
 passes `python tests\save_zip_check.py` and `python tests\save_share_check.py`. The first builds `save_zip.c` alone
 and checks its deflate, inflate, zip writer and reader against Python's zlib and zipfile both ways, and that the
 launcher imports a zip it wrote. The second builds `fs_host.c` and `save_share.c` with the rest of the runtime stubbed
 and runs each step as a start of the game on a profile it makes: the export, an import from a zip the launcher
-exported, its backup and swap at the next start, the zips it refuses and Cancel. No game files.
+exported becoming a save file of its own at the next start, the zips it refuses and Cancel. No game files.
+
+A change to the save files or the save transactions (`runtime/fs_host.c`) passes `nx2navi.exe --probe-fs`: in a
+temporary profile it commits, crashes at every step of a Commit, makes, copies, renames, picks and deletes save files
+(file 1 too) with, at every step of each in turn, a crash, a step that fails and a full disk, and a Delete of a file
+another program holds; makes an import a file; and checks that every file is as it was or wholly in its new place,
+that this is what the operation reported (the menu's "done" or "did not work") at once and after the next start, and
+that each file's commits and backups stay its own.
 
 A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarina_step`) passes
 `python tests\frame_step_check.py`, which builds `frame_rate.c` with the rest of the runtime stubbed and feeds it

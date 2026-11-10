@@ -477,6 +477,14 @@
 # it is none of them.
 # menu_lang = en
 
+[game]
+# The save file this start loads, by its number (1 is the profile's own save, profile/save) or its name, ASCII letters
+# in any case. Unset (default): the file picked last in the menu's Saves tab. While it is set, the menu cannot switch
+# files and cannot rename the file it names by its name; a name or number no file has stops the start with the list
+# of files (1 too, once file 1 is deleted and other files exist). The command line `--save-file <value>` sets it for
+# one run.
+# save_file = 1
+
 [discord]
 # Rich Presence: "Playing NX2navi" with the play time in your Discord status while the game runs, through the
 # local IPC of a running Discord client; without one it does nothing. 0 = off. The Game tab of the settings menu (F1)

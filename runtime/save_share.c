@@ -75,26 +75,6 @@ static int safe_rel(const char *rel) {
 
 int save_share_default_dir(char *out, size_t cap) { return folder_downloads(out, cap) || exe_dir(out, cap); }
 
-int save_share_backup_dir(char *out, size_t cap) {
-    char dir[PLAT_PATH_MAX], saves[PLAT_PATH_MAX + 8];
-    if (!exe_dir(dir, sizeof dir)) return 0;
-    snprintf(saves, sizeof saves, "%s/saves", dir);
-    plat_file_mkdir_p(saves);
-    struct tm t;
-    plat_local_time(&t);
-    char stamp[32];
-    snprintf(stamp, sizeof stamp, "%04d-%02d-%02d %02d.%02d.%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-             t.tm_hour, t.tm_min, t.tm_sec);
-    for (int k = 1; k < 100; k++) {
-        int n = k == 1 ? snprintf(out, cap, "%s/backup %s", saves, stamp)
-                       : snprintf(out, cap, "%s/backup %s (%d)", saves, stamp, k);
-        if (n < 0 || (size_t)n >= cap) break;
-        if (plat_fs_kind(out) == PLAT_FS_MISSING) return 1;
-    }
-    *out = 0;
-    return 0;
-}
-
 // ---- export
 typedef struct {
     SzWriter w;

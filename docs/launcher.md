@@ -257,8 +257,8 @@ runs. Keep Build Cache off deletes the lifted C and the objects (about 5 GB) aft
 ## Sharing a save
 
 A bug report from a place in the game the developer has not reached yet is quickest to reproduce with the reporter's
-save. Saves (home, under Game Folder; `launcher/saves.py`) and the Saves rows of the game's settings menu (Game tab;
-`runtime/save_share.c`) write and read the same zip.
+save. Saves (home, under Game Folder; `launcher/saves.py`) and the Share a save rows of the game's settings menu (Saves
+tab; `runtime/save_share.c`) write and read the same zip.
 
 **Export.** Export Save writes `NX2navi-save-<date>_<time>.zip` into the Downloads folder (Export To chooses another
 folder) and opens the folder with the zip selected, ready to drag into a bug report. With Add Log and Settings on (the
@@ -288,10 +288,48 @@ to `saves/backup <date time>` first. It refuses while the game runs. A zip taken
 The game's menu imports at the next start instead of at once: the game keeps its progress in memory and writes it back
 at its next save, over files replaced under it, and the save's working copy is made when the game mounts its save.
 Import a save checks the zip as the launcher does and puts its save in `profile/save-import`; the row then reads "at
-next start", and Cancel the import drops it. The next start (the menu's Restart, or quitting and starting again)
-copies the current save to `saves/backup <date time>` and makes the import the save before the game reads it
-(`runtime/fs_host.c` `import_pending`), and the menu says where the old save went. An import in the launcher replaces
-one still waiting from the menu.
+next start", and Cancel the import drops it. The next start (the menu's Restart, or quitting and starting again) makes
+the import a save file of its own and loads it, so no save is replaced (`runtime/fs_host.c` `import_pending`), and
+the menu says which file it became; with `save_file` set that start loads the file the setting names, and the import
+is listed as a file of its own. A start that cannot make the import a file (a full disk, a folder another program
+holds) leaves it in `profile/save-files/.import-<n>` for the next start, and the row still reads "at next start".
+While an import waits, Play this file asks first and its Restart is greyed out (the next start would load the import,
+not the file picked); Cancel the import drops it, also from `.import-<n>`. An import in the launcher replaces one
+still waiting from the menu, and one a start of the game cut short.
+
+## Save files
+
+The game's menu (Saves tab) keeps any number of save files, each a playthrough with its own six slots, journal and
+backups: New save file makes an empty one (the game starts a new adventure in it), and a file's row opens Play this
+file (a restart into it), Copy (its last save), Rename and Delete. Every confirmation opens with the cursor on Cancel.
+Delete moves a file to `profile/save-files/deleted`, where it stays at least 30 days (the newest three always). The
+profile's own save, `profile/save`, `profile/save-tx` and `profile/save-backup`, is file 1 and stays where it is; file
+n is `profile/save-files/<n>` with the same three folders and its name in `save-name.txt`, and
+`profile/save-files/current` holds the number of the file the next start loads. `save_file = <number or name>` in
+`nx2navi.ini`, or `--save-file` on the command line, picks the file at start instead; a number or name no file has
+stops the start with the list of files (`1` too, once file 1 is deleted and other files exist). While `save_file` is
+set the menu cannot switch files; the file it names by its name cannot be renamed, and no other file can be renamed
+to that name (the start takes the lowest file of a name, so that file would start instead). The launcher's export and
+import take the file the next start loads, by the game's rules: a link in `profile/save-files` (to a numbered folder)
+is no file, and a name counts as the game cleans it (control characters dropped, ASCII spaces trimmed, cut to 63
+bytes).
+
+The menu cannot bring a deleted file back; by hand, with the game closed:
+
+1. In `profile/save-files/deleted`, each deleted file is a folder named `<date>-<time>-<n>` (UTC, for example
+   `20261110-071502-4`), n the number it had, holding its `save`, `save-tx`, `save-backup` and `save-name.txt`.
+2. Move that folder into `profile/save-files` and rename it to a number from 2 up, without a leading zero, that no
+   folder there has (for example `20`).
+3. Start the game: the Saves tab lists it under its name again. A deleted file 1 comes back the same way, as a
+   numbered file.
+
+Leave folders whose names start with a dot alone (`.part-`, `.new-`, `.import-`): they are an operation in progress.
+The next start finishes a menu import and puts back or drops the rest. A Delete of file 1 moves its parts into
+`.part-<time>-1` and then renames that folder, which is the delete: until that rename, the next start puts the file
+back, also after a crash. A Delete that fails (a full disk, a file another program holds) says so, and the file is as
+it was then, or at the latest after the next start when a part could not go back at once (until then the menu does not
+list file 1). `profile/save-files` may be a link to a folder on the same drive; on another drive the delete of file 1
+and the menu's import fail (a folder cannot be renamed across drives): link the whole profile folder instead.
 
 ## Importing a save folder
 
@@ -303,10 +341,10 @@ at its top is one save slot: it replaces that slot (`slot_00` to `slot_05`, by t
 the rest of the current save stays. A folder with more than 4,000 files or 1 GB is refused as picked by mistake.
 
 The game keeps its save in `profile/save/<account>`, named after `profile/account.uid` (made as the game would when
-it never ran). The import copies the save the game would load now (a finished commit still waiting in
-`profile/save-tx`, else the account folder) to `saves/backup <date time>`, puts the new files in place and empties
-`profile/save-tx`, so the game loads the imported save. A save taken from the saves folder moves to
-`saves/imported <date time>`. It refuses while the game runs.
+it never ran), or in the save file the next start loads (Save files above). The import copies the save the game would
+load now (a finished commit still waiting in that file's `save-tx`, else the account folder) to
+`saves/backup <date time>`, puts the new files in place and empties that `save-tx`, so the game loads the imported
+save. A save taken from the saves folder moves to `saves/imported <date time>`. It refuses while the game runs.
 
 ## Downloads
 

@@ -2178,6 +2178,112 @@ class SavesTest(unittest.TestCase):
         self.assertEqual(len((fresh / 'profile' / 'account.uid').read_bytes()), 16)
         self.assertEqual(saves.account_dir(fresh), acct)
 
+    def test_the_save_file_in_use(self):
+        # runtime/fs_host.c section "save files": the profile folder is file 1, profile/save-files/<n> file n, and
+        # save-files/current (the menu's choice) or save_file in nx2navi.ini picks the one the next start loads
+        prof = self.game / 'profile'
+        one = saves.account_dir(self.game)
+        self.assertEqual(one.parent.parent, prof)
+        self.files(one, {'save.dat': b'one'})
+        three = prof / 'save-files' / '3' / 'save' / one.name
+        self.files(three, {'save.dat': b'three'})
+        self.files(prof / 'save-files' / '3', {'save-name.txt': b'Second run\n'})
+        self.assertEqual(saves.account_dir(self.game), one)             # no choice made: file 1
+        (prof / 'save-files' / 'current').write_text('3\n')
+        self.assertEqual(saves.account_dir(self.game), three)
+        self.files(prof / 'save-files' / '3' / 'save-tx', {'ready-2/save.dat': b'three newer'})
+        self.assertEqual(saves.find_save(self.game)[0], prof / 'save-files' / '3' / 'save-tx' / 'ready-2')
+        (self.game / 'nx2navi.ini').write_text('[game]\nsave_file = 1\n')
+        self.assertEqual(saves.account_dir(self.game), one)
+        (self.game / 'nx2navi.ini').write_text('save_file = SECOND RUN\n')
+        self.assertEqual(saves.account_dir(self.game), three)
+        (self.game / 'nx2navi.ini').write_text('save_file = 9\n')
+        with self.assertRaises(saves.SaveError):
+            saves.account_dir(self.game)
+
+    def test_the_save_file_in_its_edge_cases(self):
+        # runtime/fs_host.c file_next where the launcher once picked another file than the game
+        prof = self.game / 'profile'
+        one = saves.account_dir(self.game)   # makes the account
+        files = prof / 'save-files'
+        self.files(files / '3' / 'save' / one.name, {'save.dat': b'three'})
+        self.files(files / '4' / 'save' / one.name, {'save.dat': b'four'})
+        self.files(files / '4', {'save-name.txt': b'5\n'})
+        (self.game / 'nx2navi.ini').write_text('[game]\nsave_file = 5\n')
+        with self.assertRaises(saves.SaveError):   # a number names that number only: no file 5, the start stops
+            saves.account_dir(self.game)
+        (self.game / 'nx2navi.ini').write_text('')
+        (files / 'current').write_text('1\n')       # file 1 has neither its save nor its journal: the lowest file
+        self.assertEqual(saves.account_dir(self.game).parent.parent, files / '3')
+        self.files(prof / 'save' / ('c' * 32), {'save.dat': b'other'})   # another account's folder is not file 1
+        self.assertEqual(saves.account_dir(self.game).parent.parent, files / '3')
+        self.files(one, {'save.dat': b'one'})
+        self.assertEqual(saves.account_dir(self.game), one)
+        part = files / 'deleted' / '.part-20261110-010203-1'
+        self.files(part, {'save-name.txt': b'Hero'})   # a Delete of file 1 waits half done: not file 1
+        self.assertEqual(saves.account_dir(self.game).parent.parent, files / '3')
+        (self.game / 'nx2navi.ini').write_text('[game]\nsave_file = 1\n')
+        with self.assertRaises(saves.SaveError):   # save_file = 1 while file 1 is not there and others are: stops
+            saves.account_dir(self.game)
+        shutil.rmtree(part)
+        self.assertEqual(saves.account_dir(self.game), one)
+
+    def test_a_linked_numbered_folder_is_no_save_file(self):
+        # runtime/fs_host.c file_ids and file_exists count a folder only, not a link (a symbolic link or a junction) to
+        # one: with current = 3 and save-files/3 a link, the game loads file 1, so the launcher must too
+        prof = self.game / 'profile'
+        one = saves.account_dir(self.game)
+        self.files(one, {'save.dat': b'one'})
+        self.files(self.tmp / 'elsewhere' / 'save' / one.name, {'save.dat': b'linked'})
+        files = prof / 'save-files'
+        files.mkdir()
+        try:
+            (files / '3').symlink_to(self.tmp / 'elsewhere', target_is_directory=True)
+        except OSError:
+            self.skipTest('no right to make a link here')
+        (files / 'current').write_text('3\n')
+        self.assertEqual(saves.account_dir(self.game), one)
+        (self.game / 'nx2navi.ini').write_text('[game]\nsave_file = 3\n')
+        with self.assertRaises(saves.SaveError):   # no file 3 for the game: the start stops
+            saves.account_dir(self.game)
+
+    def test_a_save_file_name_as_the_game_cleans_it(self):
+        # runtime/fs_host.c name_clean: control characters and DEL dropped, the name cut to 63 bytes at a character
+        # boundary, ASCII spaces trimmed and no other space; save_file picks the file whose cleaned name it is
+        prof = self.game / 'profile'
+        one = saves.account_dir(self.game)
+        files = prof / 'save-files'
+        two = files / '2'
+        self.files(two / 'save' / one.name, {'save.dat': b'two'})
+        cases = [('  He\x7fro\t \n', 'Hero', None),
+                 ('Hero\u3000', 'Hero', saves.SaveError),          # a full-width space from an input method stays
+                 ('a' * 70, 'a' * 63, None),
+                 ('a' * 62 + '\u00e9', 'a' * 62, None),             # the cut splits é: all of it goes
+                 ('Forest\x00run', 'Forest', None)]
+        for stored, wanted, error in cases:
+            with self.subTest(stored=stored):
+                (two / 'save-name.txt').write_bytes(stored.encode('utf-8'))
+                (self.game / 'nx2navi.ini').write_text(f'[game]\nsave_file = {wanted}\n', encoding='utf-8')
+                if error:
+                    with self.assertRaises(error):
+                        saves.account_dir(self.game)
+                else:
+                    self.assertEqual(saves.account_dir(self.game).parent.parent, two)
+
+    def test_an_import_drops_a_menu_import_a_start_cut_short(self):
+        # the menu's import moved into save-files/.import-2 and current names 2, then the start was cut short: the
+        # next start would finish it and load file 2, so the launcher's newer import drops it, as it drops save-import
+        acct = saves.account_dir(self.game)
+        self.files(acct, {'save.dat': b'old'})
+        files = self.game / 'profile' / 'save-files'
+        self.files(files / '.import-2' / 'save' / acct.name, {'save.dat': b'menu'})
+        (files / 'current').write_text('2\n')
+        src = self.files(self.tmp / 'mine', {'save.dat': b'imported'})
+        saves.import_save(self.game, src, log=lambda m: None)
+        self.assertFalse((files / '.import-2').exists())
+        self.assertEqual((acct / 'save.dat').read_bytes(), b'imported')
+        self.assertEqual(saves.account_dir(self.game), acct)   # current names no file now: file 1, as the game picks
+
     def test_save_folders_found(self):
         plain = self.files(self.tmp / 'backup', {'save.dat': b'1', 'option.dat': b'2'})
         self.assertEqual(saves.find_save(plain)[0], plain)
@@ -2411,6 +2517,24 @@ class SaveShareTest(unittest.TestCase):
     def game_with_save(self, game, names=None):
         self.files(saves.account_dir(game), names or self.SAVE)
         return game
+
+    def test_export_and_import_take_the_save_file_in_use(self):
+        self.game_with_save(self.game)   # file 1
+        prof = self.game / 'profile'
+        one = saves.account_dir(self.game)
+        three = prof / 'save-files' / '3' / 'save' / one.name
+        mine = {'account.sav': b'a3', 'option.sav': b'o3', 'slot_01/progress.sav': b'p1 of file 3'}
+        self.files(three, mine)
+        (prof / 'save-files' / 'current').write_text('3\n')
+        r = saves.export_save(self.game, self.out, log=lambda m: None)
+        with zipfile.ZipFile(r['path']) as z:
+            got = {n[len(saves.SAVE_DIR):]: z.read(n) for n in z.namelist() if n.startswith(saves.SAVE_DIR)}
+        self.assertEqual(got, mine)
+        shared = self.zip_of({saves.SAVE_DIR + k: v for k, v in self.SAVE.items()})
+        saves.import_save(self.game, shared, log=lambda m: None)
+        self.assertEqual((three / 'slot_02' / 'progress.sav').read_bytes(), b'p2')   # file 3 has the import
+        self.assertEqual({p.relative_to(one).as_posix(): p.read_bytes() for p in one.rglob('*') if p.is_file()},
+                         self.SAVE)                                                   # and file 1 stays
 
     def zip_of(self, members, manifest=None):
         """A zip with members {name: bytes} and a manifest (export_save's keys unless given; None: none)."""

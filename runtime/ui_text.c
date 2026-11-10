@@ -514,27 +514,27 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                    "now.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "not supported",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "This cheat cannot be used with this version of the game:",
-    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVES] = "Share a save",
     [UI_MENU_SAVE_EXPORT] = "Export save",
-    [UI_MENU_SAVE_EXPORT_DESC] = "Writes your save (every slot) into one zip file in your Downloads folder, to give to "
-                                 "another player or attach to a bug report. It never holds your keys or game files.",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Writes the save file in use (every slot) into one zip file in your Downloads folder, "
+                                 "to give to another player or attach to a bug report. It never holds your keys or "
+                                 "game files.",
     [UI_MENU_SAVE_EXPORT_BUG] = "Export save for a bug report",
     [UI_MENU_SAVE_EXPORT_BUG_DESC] = "The same zip with this run's log and your settings (nx2navi.ini) added, which "
                                      "show what happened and with which settings. Attach it to your bug report.",
     [UI_MENU_SAVE_IMPORT] = "Import a save",
-    [UI_MENU_SAVE_IMPORT_DESC] = "Choose a save someone shared (an NX2navi-save zip). It replaces your save, every slot, "
-                                 "at the next start: the game keeps your progress in memory and would write it back "
-                                 "over a save replaced now. Your current save is copied to the saves folder first.",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Choose a save someone shared (an NX2navi-save zip). At the next start it becomes a "
+                                 "new save file and that start loads it: the game keeps your progress in memory, so a "
+                                 "save cannot change under it now. Your save files stay as they are.",
     [UI_MENU_SAVE_IMPORT_WAITING] = "at next start",
     [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancel the import",
-    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Keeps your save as it is: the save waiting for the next start is dropped.",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Drops the save waiting for the next start.",
     [UI_MENU_SAVE_BUSY] = "working…",
     [UI_MENU_SAVE_EXPORTED] = "Saved as %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "The save (NX2navi %s) loads at the next start: select Restart below. Your current "
-                                  "save is copied to the saves folder first.",
-    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Import cancelled; your save stays as it is.",
-    [UI_MENU_SAVE_IMPORTED] = "A shared save was imported at this start. Your old save is in %s",
-    [UI_MENU_SAVE_IMPORTED_NEW] = "A shared save was imported at this start.",
+    [UI_MENU_SAVE_IMPORT_READY] = "The save (NX2navi %s) becomes a new save file at the next start, which loads it: "
+                                  "select Restart below.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Import cancelled.",
+    [UI_MENU_SAVE_IMPORTED] = "A shared save was imported at this start: it is save file %d, and the game loaded it.",
     [UI_MENU_SAVE_E_NO_SAVE] = "There is no save to export yet: play until the game saves.",
     [UI_MENU_SAVE_E_READ_SAVE] = "A file of your save could not be read; try again in a moment.",
     [UI_MENU_SAVE_E_WRITE] = "The zip could not be written into %s.",
@@ -545,6 +545,43 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s was made by a newer NX2navi: update NX2navi first.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s is damaged: download it again.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
+    [UI_MENU_TAB_SAVES] = "Saves",
+    [UI_MENU_SAVE_FILES] = "Save files",
+    [UI_MENU_SAVE_FILE_DEFAULT] = "File %d",
+    [UI_MENU_SAVE_FILE_IN_USE] = "in use",
+    [UI_MENU_SAVE_FILE_NEXT] = "loads at next start",
+    [UI_MENU_SAVE_FILE_CHILD] = "Child",
+    [UI_MENU_SAVE_FILE_ADULT] = "Adult",
+    [UI_MENU_SAVE_FILE_HEARTS] = "%d hearts",
+    [UI_MENU_SAVE_FILE_EMPTY] = "not saved yet",
+    [UI_MENU_SAVE_FILE_SAVED] = "saved %s",
+    [UI_MENU_SAVE_FILE_DESC] = "A playthrough of its own, with its own six slots and backups. Select it to play it, "
+                               "copy, rename or delete it.",
+    [UI_MENU_SAVE_FILE_DESC_IN_USE] = "You are playing this file: the game saves into it.",
+    [UI_MENU_SAVE_FILE_NEW] = "New save file",
+    [UI_MENU_SAVE_FILE_NEW_DESC] = "Makes an empty save file. Play it and the game starts a new adventure in it; your "
+                                   "other files stay as they are.",
+    [UI_MENU_SAVE_FILE_PLAY] = "Play this file",
+    [UI_MENU_SAVE_FILE_COPY] = "Copy",
+    [UI_MENU_SAVE_FILE_RENAME] = "Rename",
+    [UI_MENU_SAVE_FILE_DELETE] = "Delete",
+    [UI_MENU_SAVE_FILE_BACK] = "Back",
+    [UI_MENU_SAVE_FILE_PLAY_CONFIRM] = "The game restarts and loads %s.\nProgress since the last save of %s is lost.",
+    [UI_MENU_SAVE_FILE_SET_BY] = "save_file = %s (nx2navi.ini or --save-file) picks the file at each start.",
+    [UI_MENU_SAVE_FILE_COPY_NOTE] = "The copy holds this file's last save: every slot, not what was played since.",
+    [UI_MENU_SAVE_FILE_NAME] = "Name",
+    [UI_MENU_SAVE_FILE_COPY_OF] = "%s (copy)",
+    [UI_MENU_SAVE_FILE_DELETE_CONFIRM] = "Delete %s?\nIt moves to save-files/deleted in the profile folder and is kept "
+                                         "there for at least 30 days.",
+    [UI_MENU_SAVE_FILE_DELETE_IN_USE] = "the file in use and the file the next start loads stay",
+    [UI_MENU_SAVE_FILE_IMPORT_WAITS] = "An imported save waits: the next start makes it a save file and loads it. To play "
+                                       "this file, cancel the import on this tab first.",
+    [UI_MENU_SAVE_FILE_MADE] = "Made %s.",
+    [UI_MENU_SAVE_FILE_RENAMED] = "Renamed.",
+    [UI_MENU_SAVE_FILE_DELETED] = "%s moved to the deleted files.",
+    [UI_MENU_SAVE_FILE_E_FAILED] = "That did not work; the log says why.",
+    [UI_MENU_SAVE_FILE_E_NAME_SET] = "Not renamed: save_file = %s picks the file with that name at each start. Choose "
+                                     "another name.",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
@@ -1076,30 +1113,28 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                    "его при следующем запуске (несколько минут), или нажмите «Пересобрать игру сейчас».",
     [UI_MENU_CHEAT_UNSUPPORTED] = "не поддерживается",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Этот чит нельзя использовать с этой версией игры:",
-    [UI_MENU_SAVES] = "Сохранения",
+    [UI_MENU_SAVES] = "Обмен сохранениями",
     [UI_MENU_SAVE_EXPORT] = "Экспорт сохранения",
-    [UI_MENU_SAVE_EXPORT_DESC] = "Записывает ваше сохранение (все слоты) в один zip-файл в папке «Загрузки», чтобы "
-                                 "передать его другому игроку или приложить к сообщению об ошибке. Ключи и файлы игры "
-                                 "в него не попадают.",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Записывает текущий файл сохранения (все слоты) в один zip-файл в папке «Загрузки», "
+                                 "чтобы передать его другому игроку или приложить к сообщению об ошибке. Ключи и файлы "
+                                 "игры в него не попадают.",
     [UI_MENU_SAVE_EXPORT_BUG] = "Экспорт для сообщения об ошибке",
     [UI_MENU_SAVE_EXPORT_BUG_DESC] = "Тот же zip с журналом этого запуска и вашими настройками (nx2navi.ini): по ним "
                                      "видно, что произошло и с какими настройками. Приложите его к сообщению об ошибке.",
     [UI_MENU_SAVE_IMPORT] = "Импорт сохранения",
-    [UI_MENU_SAVE_IMPORT_DESC] = "Выберите сохранение, которым с вами поделились (zip NX2navi-save). Оно заменит ваше "
-                                 "сохранение, все слоты, при следующем запуске: игра держит прогресс в памяти и "
-                                 "записала бы его поверх сохранения, заменённого сейчас. Текущее сохранение сначала "
-                                 "копируется в папку saves.",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Выберите сохранение, которым с вами поделились (zip NX2navi-save). При следующем "
+                                 "запуске оно станет новым файлом сохранения, и этот запуск его загрузит: игра держит "
+                                 "прогресс в памяти, поэтому сохранение нельзя менять под ней сейчас. Ваши файлы "
+                                 "сохранений не меняются.",
     [UI_MENU_SAVE_IMPORT_WAITING] = "при следующем запуске",
     [UI_MENU_SAVE_IMPORT_CANCEL] = "Отменить импорт",
-    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Оставляет ваше сохранение как есть: сохранение, ждущее следующего запуска, "
-                                        "удаляется.",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Удаляет сохранение, ждущее следующего запуска.",
     [UI_MENU_SAVE_BUSY] = "выполняется…",
     [UI_MENU_SAVE_EXPORTED] = "Сохранено: %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (NX2navi %s) загрузится при следующем запуске: выберите «Перезапустить» "
-                                  "внизу. Текущее сохранение сначала копируется в папку saves.",
-    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Импорт отменён, ваше сохранение не изменилось.",
-    [UI_MENU_SAVE_IMPORTED] = "При этом запуске импортировано сохранение. Прежнее сохранение лежит в %s",
-    [UI_MENU_SAVE_IMPORTED_NEW] = "При этом запуске импортировано сохранение.",
+    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (NX2navi %s) станет новым файлом сохранения при следующем запуске и "
+                                  "загрузится: выберите «Перезапустить» внизу.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Импорт отменён.",
+    [UI_MENU_SAVE_IMPORTED] = "При этом запуске импортировано сохранение: это файл сохранения %d, и игра его загрузила.",
     [UI_MENU_SAVE_E_NO_SAVE] = "Экспортировать пока нечего: играйте, пока игра не сохранится.",
     [UI_MENU_SAVE_E_READ_SAVE] = "Не удалось прочитать файл сохранения; попробуйте ещё раз чуть позже.",
     [UI_MENU_SAVE_E_WRITE] = "Не удалось записать zip в %s.",
@@ -1110,6 +1145,44 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s создан более новой версией NX2navi: сначала обновите NX2navi.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s повреждён: скачайте его заново.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
+    [UI_MENU_TAB_SAVES] = "Сохранения",
+    [UI_MENU_SAVE_FILES] = "Файлы сохранений",
+    [UI_MENU_SAVE_FILE_DEFAULT] = "Файл %d",
+    [UI_MENU_SAVE_FILE_IN_USE] = "используется",
+    [UI_MENU_SAVE_FILE_NEXT] = "загрузится при следующем запуске",
+    [UI_MENU_SAVE_FILE_CHILD] = "Ребёнок",
+    [UI_MENU_SAVE_FILE_ADULT] = "Взрослый",
+    [UI_MENU_SAVE_FILE_HEARTS] = "сердец: %d",
+    [UI_MENU_SAVE_FILE_EMPTY] = "ещё не сохранялся",
+    [UI_MENU_SAVE_FILE_SAVED] = "сохранён %s",
+    [UI_MENU_SAVE_FILE_DESC] = "Отдельное прохождение со своими шестью слотами и резервными копиями. Выберите его, "
+                               "чтобы играть в нём, скопировать, переименовать или удалить.",
+    [UI_MENU_SAVE_FILE_DESC_IN_USE] = "Вы играете в этом файле: игра сохраняется в него.",
+    [UI_MENU_SAVE_FILE_NEW] = "Новый файл сохранения",
+    [UI_MENU_SAVE_FILE_NEW_DESC] = "Создаёт пустой файл сохранения. Начните в нём игру, и игра начнёт новое "
+                                   "приключение; остальные файлы не меняются.",
+    [UI_MENU_SAVE_FILE_PLAY] = "Играть в этом файле",
+    [UI_MENU_SAVE_FILE_COPY] = "Копировать",
+    [UI_MENU_SAVE_FILE_RENAME] = "Переименовать",
+    [UI_MENU_SAVE_FILE_DELETE] = "Удалить",
+    [UI_MENU_SAVE_FILE_BACK] = "Назад",
+    [UI_MENU_SAVE_FILE_PLAY_CONFIRM] = "Игра перезапустится и загрузит «%s».\nПрогресс после последнего сохранения "
+                                       "«%s» будет потерян.",
+    [UI_MENU_SAVE_FILE_SET_BY] = "save_file = %s (nx2navi.ini или --save-file) выбирает файл при каждом запуске.",
+    [UI_MENU_SAVE_FILE_COPY_NOTE] = "В копии последнее сохранение этого файла: все слоты, без того, что сыграно после.",
+    [UI_MENU_SAVE_FILE_NAME] = "Название",
+    [UI_MENU_SAVE_FILE_COPY_OF] = "%s (копия)",
+    [UI_MENU_SAVE_FILE_DELETE_CONFIRM] = "Удалить «%s»?\nФайл перемещается в save-files/deleted в папке профиля и "
+                                         "хранится там не меньше 30 дней.",
+    [UI_MENU_SAVE_FILE_DELETE_IN_USE] = "текущий файл и файл следующего запуска не удаляются",
+    [UI_MENU_SAVE_FILE_IMPORT_WAITS] = "Ждёт импортированное сохранение: следующий запуск сделает его файлом сохранения "
+                                       "и загрузит. Чтобы играть в этот файл, сначала отмените импорт на этой вкладке.",
+    [UI_MENU_SAVE_FILE_MADE] = "Создан «%s».",
+    [UI_MENU_SAVE_FILE_RENAMED] = "Переименовано.",
+    [UI_MENU_SAVE_FILE_DELETED] = "«%s» перемещён в удалённые файлы.",
+    [UI_MENU_SAVE_FILE_E_FAILED] = "Не получилось; причина указана в журнале.",
+    [UI_MENU_SAVE_FILE_E_NAME_SET] = "Не переименовано: save_file = %s при каждом запуске выбирает файл с этим именем. "
+                                     "Выберите другое имя.",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
@@ -1625,30 +1698,29 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                    "Recompilar o jogo agora.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "não suportado",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Este cheat não pode ser usado com esta versão do jogo:",
-    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVES] = "Compartilhar save",
     [UI_MENU_SAVE_EXPORT] = "Exportar save",
-    [UI_MENU_SAVE_EXPORT_DESC] = "Grava seu save (todos os slots) em um arquivo zip na pasta Downloads, para passar a "
-                                 "outro jogador ou anexar a um relato de bug. Ele nunca contém suas chaves nem arquivos "
-                                 "do jogo.",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Grava o arquivo de save em uso (todos os slots) em um arquivo zip na pasta Downloads, "
+                                 "para passar a outro jogador ou anexar a um relato de bug. Ele nunca contém suas "
+                                 "chaves nem arquivos do jogo.",
     [UI_MENU_SAVE_EXPORT_BUG] = "Exportar para relato de bug",
     [UI_MENU_SAVE_EXPORT_BUG_DESC] = "O mesmo zip com o log desta execução e suas configurações (nx2navi.ini), que "
                                      "mostram o que aconteceu e com quais configurações. Anexe-o ao seu relato de bug.",
     [UI_MENU_SAVE_IMPORT] = "Importar save",
-    [UI_MENU_SAVE_IMPORT_DESC] = "Escolha um save que alguém compartilhou (um zip NX2navi-save). Ele substitui seu save, "
-                                 "todos os slots, na próxima inicialização: o jogo mantém seu progresso na memória e o "
-                                 "gravaria por cima de um save substituído agora. Seu save atual é copiado antes para a "
-                                 "pasta saves.",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Escolha um save que alguém compartilhou (um zip NX2navi-save). Na próxima "
+                                 "inicialização ele vira um novo arquivo de save, e essa inicialização o carrega: o jogo "
+                                 "mantém seu progresso na memória, então um save não pode mudar por baixo dele agora. "
+                                 "Seus arquivos de save continuam como estão.",
     [UI_MENU_SAVE_IMPORT_WAITING] = "na próxima inicialização",
     [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancelar a importação",
-    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Mantém seu save como está: o save que aguardava a próxima inicialização é "
-                                        "descartado.",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Descarta o save que aguardava a próxima inicialização.",
     [UI_MENU_SAVE_BUSY] = "trabalhando…",
     [UI_MENU_SAVE_EXPORTED] = "Salvo como %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "O save (NX2navi %s) é carregado na próxima inicialização: selecione Reiniciar abaixo. "
-                                  "Seu save atual é copiado antes para a pasta saves.",
-    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Importação cancelada; seu save continua como estava.",
-    [UI_MENU_SAVE_IMPORTED] = "Um save compartilhado foi importado nesta inicialização. Seu save anterior está em %s",
-    [UI_MENU_SAVE_IMPORTED_NEW] = "Um save compartilhado foi importado nesta inicialização.",
+    [UI_MENU_SAVE_IMPORT_READY] = "O save (NX2navi %s) vira um novo arquivo de save na próxima inicialização, que o "
+                                  "carrega: selecione Reiniciar abaixo.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Importação cancelada.",
+    [UI_MENU_SAVE_IMPORTED] = "Um save compartilhado foi importado nesta inicialização: é o arquivo de save %d, e o jogo "
+                              "o carregou.",
     [UI_MENU_SAVE_E_NO_SAVE] = "Ainda não há save para exportar: jogue até o jogo salvar.",
     [UI_MENU_SAVE_E_READ_SAVE] = "Um arquivo do seu save não pôde ser lido; tente de novo daqui a pouco.",
     [UI_MENU_SAVE_E_WRITE] = "Não foi possível gravar o zip em %s.",
@@ -1659,6 +1731,43 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s foi feito por um NX2navi mais novo: atualize o NX2navi primeiro.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s está danificado: baixe-o de novo.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
+    [UI_MENU_TAB_SAVES] = "Saves",
+    [UI_MENU_SAVE_FILES] = "Arquivos de save",
+    [UI_MENU_SAVE_FILE_DEFAULT] = "Arquivo %d",
+    [UI_MENU_SAVE_FILE_IN_USE] = "em uso",
+    [UI_MENU_SAVE_FILE_NEXT] = "carrega na próxima inicialização",
+    [UI_MENU_SAVE_FILE_CHILD] = "Criança",
+    [UI_MENU_SAVE_FILE_ADULT] = "Adulto",
+    [UI_MENU_SAVE_FILE_HEARTS] = "%d corações",
+    [UI_MENU_SAVE_FILE_EMPTY] = "ainda sem save",
+    [UI_MENU_SAVE_FILE_SAVED] = "salvo em %s",
+    [UI_MENU_SAVE_FILE_DESC] = "Uma jogatina própria, com seus próprios seis slots e backups. Selecione-o para jogar, "
+                               "copiar, renomear ou excluir.",
+    [UI_MENU_SAVE_FILE_DESC_IN_USE] = "Você está jogando este arquivo: o jogo salva nele.",
+    [UI_MENU_SAVE_FILE_NEW] = "Novo arquivo de save",
+    [UI_MENU_SAVE_FILE_NEW_DESC] = "Cria um arquivo de save vazio. Jogue nele e o jogo começa uma nova aventura; seus "
+                                   "outros arquivos continuam como estão.",
+    [UI_MENU_SAVE_FILE_PLAY] = "Jogar este arquivo",
+    [UI_MENU_SAVE_FILE_COPY] = "Copiar",
+    [UI_MENU_SAVE_FILE_RENAME] = "Renomear",
+    [UI_MENU_SAVE_FILE_DELETE] = "Excluir",
+    [UI_MENU_SAVE_FILE_BACK] = "Voltar",
+    [UI_MENU_SAVE_FILE_PLAY_CONFIRM] = "O jogo reinicia e carrega %s.\nO progresso desde o último save de %s é perdido.",
+    [UI_MENU_SAVE_FILE_SET_BY] = "save_file = %s (nx2navi.ini ou --save-file) escolhe o arquivo a cada inicialização.",
+    [UI_MENU_SAVE_FILE_COPY_NOTE] = "A cópia tem o último save deste arquivo: todos os slots, sem o que foi jogado depois.",
+    [UI_MENU_SAVE_FILE_NAME] = "Nome",
+    [UI_MENU_SAVE_FILE_COPY_OF] = "%s (cópia)",
+    [UI_MENU_SAVE_FILE_DELETE_CONFIRM] = "Excluir %s?\nEle vai para save-files/deleted na pasta do perfil e fica lá por "
+                                         "pelo menos 30 dias.",
+    [UI_MENU_SAVE_FILE_DELETE_IN_USE] = "o arquivo em uso e o da próxima inicialização ficam",
+    [UI_MENU_SAVE_FILE_IMPORT_WAITS] = "Um save importado está esperando: a próxima inicialização o torna um arquivo de "
+                                       "save e o carrega. Para jogar este arquivo, cancele antes a importação nesta aba.",
+    [UI_MENU_SAVE_FILE_MADE] = "%s criado.",
+    [UI_MENU_SAVE_FILE_RENAMED] = "Renomeado.",
+    [UI_MENU_SAVE_FILE_DELETED] = "%s foi para os arquivos excluídos.",
+    [UI_MENU_SAVE_FILE_E_FAILED] = "Não deu certo; o log diz o motivo.",
+    [UI_MENU_SAVE_FILE_E_NAME_SET] = "Não renomeado: save_file = %s escolhe o arquivo com esse nome a cada "
+                                     "inicialização. Escolha outro nome.",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
@@ -2268,27 +2377,24 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_CHEAT_REBUILD_DESC] = "此金手指修改游戏代码，并且是在游戏构建后新增或修改的。游戏会在下次启动时把它构建进去（几分钟），也可以使用“立即重新构建游戏”。",
     [UI_MENU_CHEAT_UNSUPPORTED] = "不支持",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "此金手指不能用于此游戏版本：",
-    [UI_MENU_SAVES] = "存档",
+    [UI_MENU_SAVES] = "分享存档",
     [UI_MENU_SAVE_EXPORT] = "导出存档",
-    [UI_MENU_SAVE_EXPORT_DESC] = "将你的存档（所有存档位）写入“下载”文件夹中的一个 zip 文件，可分享给其他玩家或附在错误报告中。"
-                                 "其中不含你的密钥和游戏文件。",
+    [UI_MENU_SAVE_EXPORT_DESC] = "将正在使用的存档文件（所有存档位）写入“下载”文件夹中的一个 zip 文件，可分享给其他玩家或附在"
+                                 "错误报告中。其中不含你的密钥和游戏文件。",
     [UI_MENU_SAVE_EXPORT_BUG] = "导出存档用于错误报告",
     [UI_MENU_SAVE_EXPORT_BUG_DESC] = "同样的 zip，另附本次运行的日志和你的设置（nx2navi.ini），可看出发生了什么以及使用了哪些"
                                      "设置。请将其附在错误报告中。",
     [UI_MENU_SAVE_IMPORT] = "导入存档",
-    [UI_MENU_SAVE_IMPORT_DESC] = "选择别人分享的存档（NX2navi-save zip）。它会在下次启动时替换你的存档（所有存档位）：游戏"
-                                 "把进度保存在内存中，若现在替换，游戏会把进度写回并覆盖它。你当前的存档会先复制到 saves "
-                                 "文件夹。",
+    [UI_MENU_SAVE_IMPORT_DESC] = "选择别人分享的存档（NX2navi-save zip）。它会在下次启动时成为一个新的存档文件，并由那次启动"
+                                 "载入：游戏把进度保存在内存中，所以现在不能在它之下更换存档。你的存档文件保持不变。",
     [UI_MENU_SAVE_IMPORT_WAITING] = "下次启动时",
     [UI_MENU_SAVE_IMPORT_CANCEL] = "取消导入",
-    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "保留你的存档不变：丢弃等待下次启动的存档。",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "丢弃等待下次启动的存档。",
     [UI_MENU_SAVE_BUSY] = "处理中…",
     [UI_MENU_SAVE_EXPORTED] = "已保存为 %s",
-    [UI_MENU_SAVE_IMPORT_READY] = "该存档（NX2navi %s）将在下次启动时载入：请选择下方的“重启”。你当前的存档会先复制到 saves "
-                                  "文件夹。",
-    [UI_MENU_SAVE_IMPORT_CANCELLED] = "已取消导入，你的存档保持不变。",
-    [UI_MENU_SAVE_IMPORTED] = "本次启动时已导入分享的存档。你原来的存档在 %s",
-    [UI_MENU_SAVE_IMPORTED_NEW] = "本次启动时已导入分享的存档。",
+    [UI_MENU_SAVE_IMPORT_READY] = "该存档（NX2navi %s）将在下次启动时成为新的存档文件并载入：请选择下方的“重启”。",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "已取消导入。",
+    [UI_MENU_SAVE_IMPORTED] = "本次启动时已导入分享的存档：它是存档文件 %d，游戏已载入它。",
     [UI_MENU_SAVE_E_NO_SAVE] = "还没有可导出的存档：请先游玩直到游戏存档。",
     [UI_MENU_SAVE_E_READ_SAVE] = "无法读取存档文件；请稍后再试。",
     [UI_MENU_SAVE_E_WRITE] = "无法将 zip 写入 %s。",
@@ -2299,6 +2405,38 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s 由更新版本的 NX2navi 制作：请先更新 NX2navi。",
     [UI_MENU_SAVE_E_DAMAGED] = "%s 已损坏：请重新下载。",
     [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
+    [UI_MENU_TAB_SAVES] = "存档",
+    [UI_MENU_SAVE_FILES] = "存档文件",
+    [UI_MENU_SAVE_FILE_DEFAULT] = "文件 %d",
+    [UI_MENU_SAVE_FILE_IN_USE] = "使用中",
+    [UI_MENU_SAVE_FILE_NEXT] = "下次启动时载入",
+    [UI_MENU_SAVE_FILE_CHILD] = "少年",
+    [UI_MENU_SAVE_FILE_ADULT] = "成年",
+    [UI_MENU_SAVE_FILE_HEARTS] = "%d 颗心",
+    [UI_MENU_SAVE_FILE_EMPTY] = "尚未存档",
+    [UI_MENU_SAVE_FILE_SAVED] = "存档于 %s",
+    [UI_MENU_SAVE_FILE_DESC] = "一段独立的游玩，有自己的六个存档位和备份。选择它即可游玩、复制、重命名或删除。",
+    [UI_MENU_SAVE_FILE_DESC_IN_USE] = "你正在游玩这个文件：游戏会存档到这里。",
+    [UI_MENU_SAVE_FILE_NEW] = "新建存档文件",
+    [UI_MENU_SAVE_FILE_NEW_DESC] = "新建一个空的存档文件。游玩它时，游戏会开始一段新的冒险；其他文件保持不变。",
+    [UI_MENU_SAVE_FILE_PLAY] = "游玩此文件",
+    [UI_MENU_SAVE_FILE_COPY] = "复制",
+    [UI_MENU_SAVE_FILE_RENAME] = "重命名",
+    [UI_MENU_SAVE_FILE_DELETE] = "删除",
+    [UI_MENU_SAVE_FILE_BACK] = "返回",
+    [UI_MENU_SAVE_FILE_PLAY_CONFIRM] = "游戏将重启并载入 %s。\n%s 上次存档之后的进度会丢失。",
+    [UI_MENU_SAVE_FILE_SET_BY] = "save_file = %s（nx2navi.ini 或 --save-file）会在每次启动时选定文件。",
+    [UI_MENU_SAVE_FILE_COPY_NOTE] = "副本包含此文件的最近一次存档：所有存档位，不含之后的游玩。",
+    [UI_MENU_SAVE_FILE_NAME] = "名称",
+    [UI_MENU_SAVE_FILE_COPY_OF] = "%s（副本）",
+    [UI_MENU_SAVE_FILE_DELETE_CONFIRM] = "删除 %s？\n它会移到配置文件夹中的 save-files/deleted，并至少保留 30 天。",
+    [UI_MENU_SAVE_FILE_DELETE_IN_USE] = "使用中的文件和下次启动的文件不能删除",
+    [UI_MENU_SAVE_FILE_IMPORT_WAITS] = "有一个导入的存档在等待：下次启动会把它变成一个存档文件并载入。要玩这个文件，请先在本页取消导入。",
+    [UI_MENU_SAVE_FILE_MADE] = "已创建 %s。",
+    [UI_MENU_SAVE_FILE_RENAMED] = "已重命名。",
+    [UI_MENU_SAVE_FILE_DELETED] = "%s 已移到已删除的文件中。",
+    [UI_MENU_SAVE_FILE_E_FAILED] = "操作失败；原因见日志。",
+    [UI_MENU_SAVE_FILE_E_NAME_SET] = "未重命名：save_file = %s 会在每次启动时选定使用该名称的文件。请换一个名称。",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",

@@ -247,9 +247,9 @@ typedef enum {
     UI_MENU_CHEAT_CODE_DESC, UI_MENU_CHEAT_KEY_DESC /* "%s": the buttons */, UI_MENU_CHEAT_DATA_DESC,
     UI_MENU_CHEAT_MASTER, UI_MENU_CHEAT_MASTER_DESC, UI_MENU_CHEAT_RESTORE, UI_MENU_CHEAT_RESTORE_DESC,
     UI_MENU_CHEAT_REBUILD, UI_MENU_CHEAT_REBUILD_DESC, UI_MENU_CHEAT_UNSUPPORTED, UI_MENU_CHEAT_UNSUPPORTED_DESC,
-    // the Game tab's Saves group (ui/menu.cpp rows_saves, save_share.c): export the save into a zip, import a shared
-    // one at the next start. UI_MENU_SAVE_EXPORTED to UI_MENU_SAVE_E_UNSAFE are printf formats with at most one "%s"
-    // (a path, or the zip's NX2navi version and date)
+    // the Saves tab (ui/menu.cpp tab_saves): its sharing group (rows_saves, save_share.c) exports the save file in use
+    // into a zip and imports a shared one as a new save file at the next start. UI_MENU_SAVE_EXPORTED to
+    // UI_MENU_SAVE_E_UNSAFE are printf formats with at most one "%s" (a path, or the zip's NX2navi version and date)
     UI_MENU_SAVES,
     UI_MENU_SAVE_EXPORT, UI_MENU_SAVE_EXPORT_DESC, UI_MENU_SAVE_EXPORT_BUG, UI_MENU_SAVE_EXPORT_BUG_DESC,
     UI_MENU_SAVE_IMPORT, UI_MENU_SAVE_IMPORT_DESC,
@@ -259,15 +259,40 @@ typedef enum {
     UI_MENU_SAVE_EXPORTED,           // "%s": the zip's path
     UI_MENU_SAVE_IMPORT_READY,       // "%s": "<NX2navi version>, <export date>" of the zip
     UI_MENU_SAVE_IMPORT_CANCELLED,
-    UI_MENU_SAVE_IMPORTED,           // "%s": the folder the replaced save was copied to, at this start
-    UI_MENU_SAVE_IMPORTED_NEW,       // the same with no save to replace
+    UI_MENU_SAVE_IMPORTED,           // "%d": the save file the import became at this start
     UI_MENU_SAVE_E_NO_SAVE, UI_MENU_SAVE_E_READ_SAVE,
     UI_MENU_SAVE_E_WRITE,            // "%s": the folder the zip could not be written into
     UI_MENU_SAVE_E_READ,             // "%s" here and below: the zip
     UI_MENU_SAVE_E_STAGE,
     UI_MENU_SAVE_E_NOT_SAVE, UI_MENU_SAVE_E_OTHER_GAME, UI_MENU_SAVE_E_NEWER, UI_MENU_SAVE_E_DAMAGED,
     UI_MENU_SAVE_E_UNSAFE,
-    UI_MENU_LAST_ID = UI_MENU_SAVE_E_UNSAFE,
+    // the Saves tab's save files (ui/saves_page.cpp, fs_host.c section "save files"): one row per playthrough, and a
+    // window per file with its actions
+    UI_MENU_TAB_SAVES, UI_MENU_SAVE_FILES,
+    UI_MENU_SAVE_FILE_DEFAULT,       // "%d": the name of a file the player has not named, its number
+    UI_MENU_SAVE_FILE_IN_USE,        // note under the file this run plays
+    UI_MENU_SAVE_FILE_NEXT,          // note under the file the next start loads
+    UI_MENU_SAVE_FILE_CHILD, UI_MENU_SAVE_FILE_ADULT,
+    UI_MENU_SAVE_FILE_HEARTS,        // "%d": hearts
+    UI_MENU_SAVE_FILE_EMPTY,         // the value of a file the game has not saved into yet
+    UI_MENU_SAVE_FILE_SAVED,         // "%s": the newest save's date and time
+    UI_MENU_SAVE_FILE_DESC,          // the description of a file's row, after its summary
+    UI_MENU_SAVE_FILE_DESC_IN_USE,   // added for the file in use
+    UI_MENU_SAVE_FILE_NEW, UI_MENU_SAVE_FILE_NEW_DESC,
+    UI_MENU_SAVE_FILE_PLAY, UI_MENU_SAVE_FILE_COPY, UI_MENU_SAVE_FILE_RENAME, UI_MENU_SAVE_FILE_DELETE,
+    UI_MENU_SAVE_FILE_BACK,
+    UI_MENU_SAVE_FILE_PLAY_CONFIRM,  // "%s": the file to play, "%s": the file in use
+    UI_MENU_SAVE_FILE_SET_BY,        // "%s": the value of save_file, which picks the file at each start
+    UI_MENU_SAVE_FILE_COPY_NOTE,     // over the name of a copy: what it holds
+    UI_MENU_SAVE_FILE_NAME,          // the label of the name field
+    UI_MENU_SAVE_FILE_COPY_OF,       // "%s": the default name of a copy of that file
+    UI_MENU_SAVE_FILE_DELETE_CONFIRM,   // "%s": the file
+    UI_MENU_SAVE_FILE_DELETE_IN_USE,    // why Delete is greyed out
+    UI_MENU_SAVE_FILE_IMPORT_WAITS,     // why Play this file's Restart is greyed out while a menu import waits
+    UI_MENU_SAVE_FILE_MADE,          // "%s": the new file
+    UI_MENU_SAVE_FILE_RENAMED, UI_MENU_SAVE_FILE_DELETED /* "%s": the file */, UI_MENU_SAVE_FILE_E_FAILED,
+    UI_MENU_SAVE_FILE_E_NAME_SET,   // "%s": save_file, which picks the file of the name a Rename was refused
+    UI_MENU_LAST_ID = UI_MENU_SAVE_FILE_E_NAME_SET,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total

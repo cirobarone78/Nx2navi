@@ -1,6 +1,7 @@
 ﻿// nx2navi.exe entry: reserves the guest address space, parses the command line and runs one mode.
 //
-//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] <mode>
+//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--save-file FILE]
+//               <mode>
 //     --audio-device VALUE   play the sound on one output device: sets NX2NAVI_AUDIO_DEVICE before the settings are read, so
 //                       it wins over nx2navi.ini's `audio_device =`. VALUE is default (the system default device),
 //                       a 1-based index as --list-audio-devices prints it (devices sorted by name), or part of a device name, case-insensitive
@@ -12,6 +13,9 @@
 //                       case-insensitive. Wayland places a windowed window itself: only fullscreen opens on the monitor
 //     --list-monitors   print each monitor's index, name (on Windows also its GDI device name), desktop rectangle,
 //                       primary flag and DPI; needs no game files
+//     --save-file FILE  play save file FILE this run: sets NX2NAVI_SAVE_FILE before the settings are read, so it wins
+//                       over nx2navi.ini's `save_file =` and the menu's choice. FILE is the file's number (1 is the
+//                       profile's own save) or its name, ASCII letters in any case; the start stops when no file has it
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-mods      the mods folder scan, order and switches (mods.c); needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
@@ -510,7 +514,7 @@ static int probe_crash(int null) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--save-file FILE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
@@ -609,6 +613,11 @@ int main(int argc, char **argv) {
             // spelling for "no monitor choice" on the command line.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
             cfg_setenv("NX2NAVI_MONITOR", argv[i]);
+        } else if (!strcmp(argv[i], "--save-file")) {
+            // NX2NAVI_SAVE_FILE as above: the save storage starts at the game's first mount (fs_host.c storage_init),
+            // and a menu Restart starts the process again with the same command line, so the file stays this one
+            if (++i == argc || !*argv[i]) return usage(argv[0]);
+            cfg_setenv("NX2NAVI_SAVE_FILE", argv[i]);
         } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);

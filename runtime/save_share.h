@@ -23,7 +23,8 @@ typedef enum {
 // Writes NX2navi-save-<local date>_<time>[-bug-report].zip into dir (made when missing); bug_report adds this run's
 // log and nx2navi.ini. path gets the zip's path. Never a key file.
 SaveShareResult save_share_export(const char *dir, int bug_report, char *path, size_t cap);
-// Checks the zip at zip_path (manifest, game, paths, sizes, CRCs) and stages its save for the next start. detail gets
+// Checks the zip at zip_path (manifest, game, paths, sizes, CRCs) and stages its save for the next start, which makes it
+// a save file of its own (fs_host.c import_pending). detail gets
 // "<NX2navi version>, <export date>" from its manifest ("?" for what it lacks).
 SaveShareResult save_share_import(const char *zip_path, char *detail, size_t cap);
 int save_share_pending(void);   // 1 while an import waits for the next start
@@ -31,9 +32,6 @@ int save_share_cancel(void);    // drops the waiting import; 0 on success
 // Where Export writes and Import's file dialog opens: the player's Downloads folder, else the game folder. 0 when
 // neither is known.
 int save_share_default_dir(char *out, size_t cap);
-// A new folder name <game folder>/saves/backup <local date> <time> (with " (2)" and up when taken), the saves folder
-// made; the folder itself is not. Where the launcher keeps the backups of its imports. 0 when it cannot be named.
-int save_share_backup_dir(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

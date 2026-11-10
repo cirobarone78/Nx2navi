@@ -7,6 +7,10 @@ no account yet; the import makes one as the game would. Saves are committed thro
 a finished commit (ready-<n>) is newer than save/<account>: an import clears that folder, so the game loads the
 imported save.
 
+The player may keep several save files (runtime/fs_host.c section "save files"): the profile folder holds file 1, and
+<game>/profile/save-files/<n>/ file n with the same save/<account>, save-tx and save-backup inside. Export and import
+work on the file the game's next start loads (file_root).
+
 <game>/saves is the player's side. Import Saves takes a save put there first (a shared save's zip, its files, or the
 folder that holds them); otherwise the player picks a zip or a folder. Before the save is replaced it is copied to
 saves/backup <time>, and a save taken from saves/ moves to saves/imported <time>, so nothing is lost and nothing is
@@ -35,6 +39,8 @@ import zipfile
 import zlib
 from pathlib import Path
 
+from . import gameini
+
 
 def _rmtree(path):
     """Delete a folder, read-only files in it too (shutil.rmtree stops at them on Windows); what still fails stays."""
@@ -58,8 +64,9 @@ To import a save, put it here and select Saves, then Import a Save, in the NX2na
 
 You can also select Import a Save and choose the zip or the folder instead.
 
-Before a save is imported, the game's current save is copied here into a folder named "backup" and the date. An
-imported save moves into a folder named "imported" and the date. The game itself keeps its save in profile\\save.
+An import replaces the save file the game loads next. Before that, its save is copied here into a folder named "backup"
+and the date. An imported save moves into a folder named "imported" and the date. The game itself keeps its save in
+profile\\save, and the other save files made in its menu in profile\\save-files.
 '''
 HEX32 = re.compile(r'^[0-9a-fA-F]{32}$')
 SLOT = re.compile(r'^slot_\d\d$')
@@ -106,7 +113,120 @@ def account_dir(game):
     if len(data) != 16 or data == bytes(16):
         raise SaveError(f'{f} is not an account file of the game')
     lo, hi = int.from_bytes(data[:8], 'little'), int.from_bytes(data[8:], 'little')
-    return prof / 'save' / f'{hi:016x}{lo:016x}'
+    try:
+        choice = gameini.get(game, 'SAVE_FILE') or None   # save_file in nx2navi.ini picks the file at each start
+    except OSError:
+        choice = None
+    return file_root(prof, choice) / 'save' / f'{hi:016x}{lo:016x}'
+
+
+def _ascii_lower(s):
+    return s.translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))
+
+
+def _name_clean(raw):
+    """runtime/fs_host.c name_clean on a name's bytes: control characters and DEL dropped, cut to 63 bytes
+    (FS_SAVE_NAME_MAX - 1) at a character boundary, then ASCII spaces trimmed at both ends."""
+    b = bytes(c for c in raw if c >= 0x20 and c != 0x7f)[:63]
+    lead = len(b)   # a character the cut split goes, from its first byte on
+    while lead and (b[lead - 1] & 0xc0) == 0x80:
+        lead -= 1
+    if lead:
+        c = b[lead - 1]
+        size = 1 if c < 0x80 else 4 if c >= 0xf0 else 3 if c >= 0xe0 else 2 if c >= 0xc0 else 1
+        if len(b) - (lead - 1) < size:
+            b = b[:lead - 1]
+    return b.strip(b' ')
+
+
+def _file_name(root):
+    """The name the player gave a save file, as runtime/fs_host.c file_name reads its save-name.txt: the first line
+    (up to a line end or a NUL byte), cleaned as the game cleans it; '' when none. Bytes that are no UTF-8 stay."""
+    try:
+        raw = (Path(root) / 'save-name.txt').read_bytes()
+    except OSError:
+        return ''
+    return _name_clean(re.split(rb'[\r\n\0]', raw, maxsplit=1)[0]).decode('utf-8', 'surrogateescape')
+
+
+_LINK_TAGS = (0xA000000C, 0xA0000003)   # IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT (a junction)
+
+
+def _plain_dir(path):
+    """A folder itself, not a symbolic link or a junction to one, as runtime/platform's plat_fs_kind tells them apart:
+    the game counts no link in save-files as a file. Any other reparse point (a cloud placeholder) is a folder."""
+    try:
+        st = Path(path).lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and getattr(st, 'st_reparse_tag', 0) not in _LINK_TAGS
+
+
+def _account_name(prof):
+    """The account folder's name the game uses on the profile folder (its account.uid), None when it has none."""
+    try:
+        data = (Path(prof) / 'account.uid').read_bytes()
+    except OSError:
+        return None
+    if len(data) != 16 or data == bytes(16):
+        return None
+    lo, hi = int.from_bytes(data[:8], 'little'), int.from_bytes(data[8:], 'little')
+    return f'{hi:016x}{lo:016x}'
+
+
+def _one_exists(prof, account):
+    """File 1 as runtime/fs_host.c file_exists sees it: its committed save (the account's folder; any account folder
+    when the profile has no account.uid) or its journal is there, and no Delete of it waits half done (a .part- folder
+    in save-files/deleted holding any of its name, save, journal or backups)."""
+    save = prof / 'save'
+    if account:
+        there = (save / account).exists()
+    else:
+        there = save.is_dir() and any(d.is_dir() and HEX32.match(d.name) for d in save.iterdir())
+    if not there and not (prof / 'save-tx').exists():
+        return False
+    deleted = prof / 'save-files' / 'deleted'
+    entries = ['save-name.txt', 'save-tx', 'save-backup'] + ([f'save/{account}'] if account else [])
+    for d in deleted.iterdir() if deleted.is_dir() else []:
+        if d.name.startswith('.part-') and any((d / e).exists() for e in entries):
+            return False
+    return True
+
+
+def file_root(profile, choice=None):
+    """The folder of the save file a start of the game on the profile folder mounts, as runtime/fs_host.c file_next
+    picks it: the file choice names (save_file in nx2navi.ini: "1", another number, which must be a file, or a file's
+    name), else the one profile/save-files/current names when it is there, else file 1 (the profile folder itself)
+    when it is there, else the lowest file, else file 1. SaveError when choice names no file: the game stops then."""
+    prof = Path(profile)
+    files = prof / 'save-files'
+    numbered = sorted(int(d.name) for d in files.iterdir()
+                      if re.fullmatch(r'[1-9]\d{0,5}', d.name) and int(d.name) >= 2 and _plain_dir(d)) \
+        if files.is_dir() else []
+    one = _one_exists(prof, _account_name(prof))
+
+    def number(text):   # fs_host.c: "1", or file_number's 2 to 999999 without a leading zero; 0 otherwise
+        return 1 if text == '1' else int(text) if re.fullmatch(r'[1-9]\d{0,5}', text) and int(text) >= 2 else 0
+
+    def root(n):
+        return prof if n == 1 else files / str(n)
+    if choice:
+        n = number(choice)
+        if (n == 1 and (one or not numbered)) or (n >= 2 and n in numbered):
+            return root(n)
+        if not n:   # a name: the files' names, not their numbers
+            for k in ([1] if one else []) + numbered:
+                if _file_name(root(k)) and _ascii_lower(_file_name(root(k))) == _ascii_lower(choice):
+                    return root(k)
+        raise SaveError(f'save_file = {choice} in nx2navi.ini names no save file of {prof}')
+    try:
+        current = (files / 'current').read_bytes()[:15].decode('utf-8', 'replace')
+    except OSError:
+        current = ''
+    cur = number(re.split(r'[\r\n ]', current)[0])
+    if (cur == 1 and one) or (cur >= 2 and cur in numbered):
+        return root(cur)
+    return prof if one or not numbered else root(numbered[0])
 
 
 def _fresh(folder, name):
@@ -126,7 +246,8 @@ def find_save(folder):
     p = Path(folder)
     if not p.is_dir():
         return None, ()
-    for base in (p / 'profile' / 'save', p / 'save'):   # another game folder, or its profile folder
+    for prof in (p / 'profile', p):   # another game folder, or its profile folder: the save file it plays
+        base = file_root(prof) / 'save'
         if base.is_dir():
             ready = _ready(base.parent / 'save-tx')   # a finished commit there is newer than its account folder
             if ready is not None and _has_file(ready):
@@ -206,8 +327,9 @@ def _ready(tx):
 
 def _newest(game, account):
     """The folder the game would load now, in the order of runtime/fs_host.c save_recover: a finished commit still
-    waiting in save-tx, else the account folder, else an interrupted commit's new save, else the save it replaced."""
-    tx = Path(game) / 'profile' / 'save-tx'
+    waiting in the save file's save-tx, else the account folder, else an interrupted commit's new save, else the save
+    it replaced."""
+    tx = Path(account).parent.parent / 'save-tx'
     for d in (_ready(tx), account, tx / 'new', tx / 'old'):
         if d is not None and d.is_dir():
             return d
@@ -283,7 +405,7 @@ def _replace(game, src, files, slot, stamp, log):
     if current is not None and _has_file(current):
         backup = _fresh(saves, f'backup {stamp}')
         shutil.copytree(current, backup)
-    tx = game / 'profile' / 'save-tx'
+    tx = account.parent.parent / 'save-tx'   # the journal of the save file account belongs to
     tx.mkdir(parents=True, exist_ok=True)
     stage = tx / 'import'
     shutil.rmtree(stage, ignore_errors=True)
@@ -337,12 +459,15 @@ def _replace(game, src, files, slot, stamp, log):
         raise
     if gone is not None:
         _rmtree(gone)
-    # A save the game's menu took for its next start would replace this one then: this import is the newer choice.
-    for name in (PENDING, PENDING + '.part'):
-        if (game / 'profile' / name).exists():
-            log(f'saves: the save import the game\'s menu left for its next start ({name}) is dropped; '
+    # A save the game's menu took for its next start would replace this one then: this import is the newer choice. So
+    # is an import of the menu a start cut short (save-files/.import-<n>), which the next start would finish and load
+    # (runtime/fs_host.c files_recover).
+    for p in [game / 'profile' / PENDING, game / 'profile' / (PENDING + '.part')] + \
+            sorted((game / 'profile' / 'save-files').glob('.import-*')):
+        if p.exists():
+            log(f'saves: the save import the game\'s menu left for its next start ({p.name}) is dropped; '
                 'this import replaces it')
-            _rmtree(game / 'profile' / name)
+            _rmtree(p)
     return account, backup
 
 

@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <wchar.h>
 
+#include "save_summary.h"
+
 // ---- nn::fs results
 #define FS_R_PATH_NOT_FOUND 0x202u
 #define FS_R_ALREADY_EXISTS 0x402u
@@ -64,15 +66,53 @@ int fs_save_busy(void);                                    // a save is being wr
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends
 // A shared save (save_share.c). fs_save_export: visit(ctx, path below the save with '/', bytes, size) for every file of
-// the save the game would load next, under the commit lock; visit returns 0 to fail. The number of files (0: no save
-// yet), -1 when one could not be read or visit failed.
+// the save the game would load next (the running save file's newest), under the commit lock; visit returns 0 to fail.
+// The number of files (0: no save yet), -1 when one could not be read or visit failed.
 typedef int (*FsSaveVisit)(void *ctx, const char *rel, const uint8_t *data, size_t n);
 int fs_save_export(FsSaveVisit visit, void *ctx);
-// The menu's import: count files (relative '/' paths, bytes) become <profile>/save-import, which the next start makes
-// the save, backing up the save it replaces; one waiting already is replaced. 0 on success.
+// The menu's import: count files (relative '/' paths, bytes) become <profile>/save-import, which the next start makes a
+// new save file and mounts; one waiting already is replaced. 0 on success.
 int fs_save_import_stage(int count, const char *const *rel, const uint8_t *const *data, const size_t *size);
-int fs_save_import_waiting(void);                          // 1 while an import waits for the next start (0 before
-                                                           // the first storage use)
-int fs_save_import_cancel(void);                           // drops it; 0 on success
-const char *fs_save_import_done(void);                     // the backup of the save an import replaced at this start,
-                                                           // "-" when there was none, "" when no import ran
+// 1 while an import waits for the next start: save-import, or a save-files/.import-<n> folder a start could not make a
+// file yet (0 before the first storage use). Cancel drops both; 0 on success.
+int fs_save_import_waiting(void);
+int fs_save_import_cancel(void);
+
+// Save files (fs_host.c section "save files"): any number of playthroughs, each a save with its own journal and
+// backups. File 1 is the profile's own save; the game mounts one file per run, picked at start. Any thread; the
+// operations do disk work (a copy reads and flushes a whole save) and belong off the present thread.
+#define FS_SAVE_NAME_MAX 64
+enum { FS_FILE_FAILED = -1, FS_FILE_GONE = -2, FS_FILE_IN_USE = -3, FS_FILE_NAME_SET = -4 };
+typedef struct {
+    int id;                         // 1: the profile's own save; 2 and up: <profile>/save-files/<id>
+    char name[FS_SAVE_NAME_MAX];    // UTF-8, as the player named it; "" unnamed
+    int running;                    // the file this run mounted
+    int next;                       // the file the next start mounts
+    int current;                    // the file save-files/current names (the menu's last choice; save_file may pick
+                                    // another): not deleted either
+    int named;                      // save_file names it by its name: not renamed, or the next start would stop
+    SaveSummary sum;                // its newest save at a glance
+} FsSaveFile;
+// Every file, by id; the count. More than max: the lowest, with the running file and the next start's kept in the list.
+int fs_save_files(FsSaveFile *out, int max);
+int fs_save_file_running(void);                            // the file this run mounted
+// A new file named name (control characters dropped, cut to FS_SAVE_NAME_MAX - 1 bytes), empty (the game starts a
+// new game in it) or with a copy of file from's newest save (from 0: empty); its id, else FS_FILE_*.
+int fs_save_file_new(const char *name, int from);
+// The number New would give a file now: one past the highest of every file, file in the making and deleted file kept,
+// so not always the highest listed plus one.
+int fs_save_file_next_id(void);
+// Gives file id the name name, cleaned as New's; 0, else FS_FILE_*: FS_FILE_IN_USE for the file save_file names by
+// its name (the next start would stop), FS_FILE_NAME_SET for a name save_file picks a file by, given to another file
+// (the start takes the lowest file of a name, so this one could start instead).
+int fs_save_file_rename(int id, const char *name);
+// The next start mounts file id (unless save_file names another); 0, else FS_FILE_*.
+int fs_save_file_choose(int id);
+// Moves file id to <profile>/save-files/deleted, where it is kept for a while; refused (FS_FILE_IN_USE) for the
+// running file, the next start's and the one save-files/current names. FS_FILE_FAILED means the file stays as it was:
+// what a failing Delete of file 1 cannot put back at once, the next start puts back. 0, else FS_FILE_*.
+int fs_save_file_delete(int id);
+const char *fs_save_file_setting(void);                    // NX2NAVI_SAVE_FILE when set (it picks the file at
+                                                           // start), else NULL
+// The file this start made from an import, when this start also mounts it (save_file may pick another); 0 otherwise.
+int fs_save_file_import(void);

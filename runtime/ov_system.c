@@ -505,10 +505,11 @@ static void make_dirs(const char *dir) {
     if (!plat_dir_exists(dir)) rt_fatal("account: cannot create %s", dir);
 }
 
-// Holding account_lock. 1 when <profile>/save holds exactly one folder named as fs_host.c names an account's
-// (<uid hi><uid lo>, 32 hex digits); local is then that account.
+// Holding account_lock. 1 when the account folders of the save files (fs_host.c section "save files":
+// <profile>/save and <profile>/save-files/<n>/save hold one each, named <uid hi><uid lo> in 32 hex digits) all carry
+// one name; local is then that account.
 static int local_adopted;
-typedef struct { int n; uint64_t hi, lo; } AdoptScan;
+typedef struct { int n, mixed; uint64_t hi, lo; } AdoptScan;
 static int adopt_cb(const char *name, int kind, uint64_t size, void *ctx) {
     (void)size;
     AdoptScan *a = ctx;
@@ -516,17 +517,31 @@ static int adopt_cb(const char *name, int kind, uint64_t size, void *ctx) {
     if (strlen(name) != 32 || strspn(name, "0123456789abcdefABCDEF") != 32) return 1;
     char half[17];
     memcpy(half, name, 16), half[16] = 0;
-    a->hi = strtoull(half, NULL, 16);
-    a->lo = strtoull(name + 16, NULL, 16);
+    uint64_t hi = strtoull(half, NULL, 16), lo = strtoull(name + 16, NULL, 16);
+    if (a->n && (hi != a->hi || lo != a->lo)) a->mixed = 1;
+    a->hi = hi, a->lo = lo;
     a->n++;
+    return 1;
+}
+typedef struct { const char *root; AdoptScan *a; } FilesScan;
+static int adopt_files_cb(const char *name, int kind, uint64_t size, void *ctx) {
+    (void)size;
+    FilesScan *f = ctx;
+    char save[1200];
+    if (kind == PLAT_FS_DIR && name[0] >= '1' && name[0] <= '9' && strspn(name, "0123456789") == strlen(name) &&
+        snprintf(save, sizeof save, "%s/%s/save", f->root, name) < (int)sizeof save)
+        plat_fs_list(save, adopt_cb, f->a);
     return 1;
 }
 static int adopt_save_uid(const char *profile) {
     char save[1100];
     AdoptScan a = {0};
-    if (snprintf(save, sizeof save, "%s/save", profile) >= (int)sizeof save || !plat_dir_exists(save)) return 0;
-    plat_fs_list(save, adopt_cb, &a);
-    if (a.n != 1 || (!a.hi && !a.lo)) return 0;
+    if (snprintf(save, sizeof save, "%s/save", profile) < (int)sizeof save) plat_fs_list(save, adopt_cb, &a);
+    if (snprintf(save, sizeof save, "%s/save-files", profile) < (int)sizeof save) {
+        FilesScan f = {save, &a};
+        plat_fs_list(save, adopt_files_cb, &f);
+    }
+    if (!a.n || a.mixed || (!a.hi && !a.lo)) return 0;
     local.lo = a.lo;
     local.hi = a.hi;
     local_adopted = 1;
@@ -544,8 +559,8 @@ static void load_uid(void) {
     // a file that is there but cannot be asked for its size is no reason for a new account: its saves would vanish
     if (size < 0 && plat_fs_kind(path) != PLAT_FS_MISSING) rt_fatal("account: cannot read %s", path);
     if (size <= 0) {
-        // account.uid lost (a profile copied without it, or the save folder alone put in place): the one account
-        // folder in save/ is the player's, and taking its name keeps that save; otherwise a new account
+        // account.uid lost (a profile copied without it, or the save folder alone put in place): the account folders
+        // of the save files are the player's, and taking their name keeps those saves; otherwise a new account
         if (!adopt_save_uid(dir)) {
             do need(plat_random(&local, sizeof local), "account: random uid");
             while (!local.lo && !local.hi);
