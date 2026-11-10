@@ -18,8 +18,8 @@
 //
 // Every join is a new session: a random number the CONNECT tells the relay, which lists it in the roster. A player's
 // messages carry its session and a counter from 1 in the sealed envelope; the others take a message only of the session
-// the roster names for its sender and only once (a window of 64 counters), so a message recorded before a rejoin, or
-// sent twice, is refused.
+// the roster names for its sender and once within a window of 64 counters, so a message recorded before a rejoin, or
+// sent again within the window, is refused (an older one only after four in a row: window_below).
 //
 // One thread owns the socket, the DNS lookup and the state. Other threads reach it through a mailbox (commands, settings), an
 // outbox (messages to send) and a copy of the state they may read; all three sit behind one lock that the thread holds only
