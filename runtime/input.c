@@ -280,11 +280,13 @@ static float mouse_sens_get(void) {
 // ---- walk key: the keyboard's stick samples scaled down while a key is held (NX2NAVI_WALK_KEY, NX2NAVI_WALK_SCALE)
 // A keyboard key is all or nothing, so every keyboard-driven stick sample is +/-32767 and the game only ever sees a
 // full tilt. Holding this key scales those two samples, which gives the half tilt a gamepad gets from its analog range,
-// so the keyboard can walk as well as run.
+// so the keyboard can walk as well as run. NX2NAVI_WALK_MODE = toggle makes a press switch walking on or off instead.
 // Only the keyboard is scaled: the gamepad's axes and the mouse camera sample their own values.
 static int walk_key = KEY_NONE;        // NX2NAVI_WALK_KEY as a KEY_*, KEY_NONE = off; live (cfg_version)
+static int walk_toggle;                // NX2NAVI_WALK_MODE is toggle (else hold); live (cfg_version)
 static float walk_scale = 0.51f;       // NX2NAVI_WALK_SCALE, 0.2 to 0.9; live (cfg_version)
 static unsigned walk_seen = ~0u;
+static int walk_on, walk_was = -1;     // toggle: walking now; the key at the last poll the game read, -1 none (lock)
 
 // The ini takes the key names the Controls tab writes; a hand-written line may spell them in any case.
 static int name_matches(const char *name, const char *key) {
@@ -315,12 +317,34 @@ static void walk_get(void) {
     char *end;
     double d = strtod(sv, &end);
     double s = end == sv || *end || !(d >= 0.2 && d <= 0.9) ? strtod(cfg_meta("NX2NAVI_WALK_SCALE")->def, NULL) : d;
-    if (key != walk_key || (float)s != walk_scale) {
+    const char *mode = cfg_value("NX2NAVI_WALK_MODE");   // hold (the default) or toggle
+    int toggle = name_matches(mode, "toggle");
+    if (!toggle && !name_matches(mode, "hold")) rt_log("input: walk_mode: unknown mode '%s', the walk key holds", mode);
+    if (key != walk_key || toggle != walk_toggle || (float)s != walk_scale) {
+        if (key != walk_key || toggle != walk_toggle) walk_on = 0, walk_was = -1;   // a new key or mode: not walking
         walk_key = key;
+        walk_toggle = toggle;
         walk_scale = (float)s;
-        rt_log("input: walk key %s, keyboard sticks at %.0f%% of their tilt (mouse and gamepad unchanged)",
-               key != KEY_NONE ? input_key_name(key) : "off", s * 100);
+        rt_log("input: walk key %s (%s), keyboard sticks at %.0f%% of their tilt (mouse and gamepad unchanged)",
+               key != KEY_NONE ? input_key_name(key) : "off", toggle ? "toggle" : "hold", s * 100);
     }
+}
+
+// Whether the keyboard's sticks walk at this poll, from the walk key's state (down). Hold: while it is down. Toggle: a
+// press switches walking on or off, and only a press the game reads: none while the menu or a text entry is open or
+// waits for its release, none while the window is not in front (poll_merged sets walk_was to -1 then). A key already
+// down when the game reads again (the press that closed the menu, a key held while the window came back) switches
+// nothing until it is released and pressed again. Walking stays on through the menu, a text entry, a change of window
+// and the gamepad's use; it is not saved, so the game starts running, and a new walk_key or walk_mode switches it off.
+static int walk_held(int down) {
+    if (!walk_toggle) return down;
+    int reading = !g_block && !g_menu;
+    if (reading && walk_was == 0 && down) {
+        walk_on = !walk_on;
+        rt_log("input: walking %s (walk_mode = toggle)", walk_on ? "on" : "off");
+    }
+    walk_was = reading ? down : -1;
+    return walk_on;
 }
 
 static int mouse_selector;
@@ -917,7 +941,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             b |= input_map_buttons(down);
             int32_t k[2];
             walk_get();
-            int walk = walk_key != KEY_NONE && down[walk_key];
+            int walk = walk_held(walk_key != KEY_NONE && down[walk_key]);
             input_map_stick(down, 0, k);
             if (walk) k[0] = (int32_t)(k[0] * walk_scale), k[1] = (int32_t)(k[1] * walk_scale);
             pick(&sl[0], &sl[1], k[0], k[1]);
@@ -934,6 +958,8 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             uint32_t travel = ikb_mouse_travel();
             if (travel - travel_seen >= MOUSE_USED) kbm_used = 1;
             travel_seen = travel;
+        } else {
+            walk_was = -1;   // the window is not in front: a toggle's key state is unknown until it is again
         }
         // A press or a full-way stick on the pad wins over keys held in the same poll: the player picked it up
         if (pad_used) __atomic_store_n(&g_kbm_last, 0, __ATOMIC_RELAXED);

@@ -297,11 +297,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MOUSE_SENS] = "Mouse camera sensitivity",
     [UI_MENU_MOUSE_SENS_DESC] = "How fast the mouse turns the camera.",
     [UI_MENU_WALK_KEY] = "Walk key",
-    [UI_MENU_WALK_KEY_DESC] = "Hold to walk on the keyboard.",
+    [UI_MENU_WALK_KEY_DESC] = "Walk on the keyboard: hold the key, or press it once (Walk key mode).",
     [UI_MENU_WALK_KEY_TAKEN] = "also %s",
+    [UI_MENU_WALK_MODE] = "Walk key mode",
+    [UI_MENU_WALK_MODE_DESC] = "Hold: walk while the key is held. Toggle: one press walks, the next runs again.",
+    [UI_MENU_WALK_MODE_HOLD] = "Hold",
+    [UI_MENU_WALK_MODE_TOGGLE] = "Toggle",
     [UI_MENU_WALK_SCALE] = "Walk scale",
-    [UI_MENU_WALK_SCALE_DESC] = "The tilt the keyboard's sticks get while the walk key is held. Half is a walk, the "
-                                "full tilt a run.",
+    [UI_MENU_WALK_SCALE_DESC] = "The tilt the keyboard's sticks get while walking. Half is a walk, the full tilt a "
+                                "run.",
     [UI_MENU_STICK_SENS] = "Stick camera speed",
     [UI_MENU_STICK_SENS_DESC] = "Right stick camera speed.",
 
@@ -857,11 +861,16 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MOUSE_SENS] = "Чувствительность мыши",
     [UI_MENU_MOUSE_SENS_DESC] = "Как быстро мышь поворачивает камеру.",
     [UI_MENU_WALK_KEY] = "Клавиша шага",
-    [UI_MENU_WALK_KEY_DESC] = "Удерживайте, чтобы идти шагом на клавиатуре.",
+    [UI_MENU_WALK_KEY_DESC] = "Шаг на клавиатуре: удерживайте клавишу или нажмите её один раз (режим клавиши шага).",
     [UI_MENU_WALK_KEY_TAKEN] = "также %s",
+    [UI_MENU_WALK_MODE] = "Режим клавиши шага",
+    [UI_MENU_WALK_MODE_DESC] = "Удержание: шаг, пока клавиша нажата. Переключение: одно нажатие — шаг, следующее — "
+                               "снова бег.",
+    [UI_MENU_WALK_MODE_HOLD] = "Удержание",
+    [UI_MENU_WALK_MODE_TOGGLE] = "Переключение",
     [UI_MENU_WALK_SCALE] = "Сила шага",
-    [UI_MENU_WALK_SCALE_DESC] = "Отклонение стиков клавиатуры при удержании клавиши шага. Половина — шаг, полное "
-                                "отклонение — бег.",
+    [UI_MENU_WALK_SCALE_DESC] = "Отклонение стиков клавиатуры при ходьбе шагом. Половина — шаг, полное отклонение — "
+                                "бег.",
     [UI_MENU_STICK_SENS] = "Скорость камеры (стик)",
     [UI_MENU_STICK_SENS_DESC] = "Скорость камеры на правом стике.",
 
@@ -1534,11 +1543,16 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_SENS] = "Velocidade da câmera (analógico)",
     [UI_MENU_STICK_SENS_DESC] = "Velocidade da câmera no analógico direito.",
     [UI_MENU_WALK_KEY] = "Tecla de andar",
-    [UI_MENU_WALK_KEY_DESC] = "Segure para andar no teclado.",
+    [UI_MENU_WALK_KEY_DESC] = "Andar no teclado: segure a tecla ou aperte uma vez (modo da tecla de andar).",
     [UI_MENU_WALK_KEY_TAKEN] = "também %s",
+    [UI_MENU_WALK_MODE] = "Modo da tecla de andar",
+    [UI_MENU_WALK_MODE_DESC] = "Segurar: anda enquanto a tecla está segura. Alternar: um toque anda, o seguinte volta "
+                               "a correr.",
+    [UI_MENU_WALK_MODE_HOLD] = "Segurar",
+    [UI_MENU_WALK_MODE_TOGGLE] = "Alternar",
     [UI_MENU_WALK_SCALE] = "Intensidade do andar",
-    [UI_MENU_WALK_SCALE_DESC] = "A inclinação dos analógicos do teclado enquanto a tecla de andar está segura. Metade "
-                                "é andar, a inclinação total é correr.",
+    [UI_MENU_WALK_SCALE_DESC] = "A inclinação dos analógicos do teclado ao andar. Metade é andar, a inclinação total é "
+                                "correr.",
     [UI_MENU_OV_SCALE_DOWN] = "bilinear (nitidez FSR 0)",
     [UI_MENU_HDR_HUE] = "Correção de matiz",
     [UI_MENU_HDR_HUE_DESC] = "Quanto as cores brilhantes mantêm o matiz que tinham antes da curva de tons; 0 deixa que "
@@ -2193,10 +2207,14 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_SENS] = "摇杆镜头速度",
     [UI_MENU_STICK_SENS_DESC] = "右摇杆的镜头速度。",
     [UI_MENU_WALK_KEY] = "步行键",
-    [UI_MENU_WALK_KEY_DESC] = "按住可用键盘步行。",
+    [UI_MENU_WALK_KEY_DESC] = "用键盘步行：按住该键，或按一下（见步行键模式）。",
     [UI_MENU_WALK_KEY_TAKEN] = "同时为 %s",
+    [UI_MENU_WALK_MODE] = "步行键模式",
+    [UI_MENU_WALK_MODE_DESC] = "按住：按住键时步行。切换：按一下开始步行，再按一下恢复奔跑。",
+    [UI_MENU_WALK_MODE_HOLD] = "按住",
+    [UI_MENU_WALK_MODE_TOGGLE] = "切换",
     [UI_MENU_WALK_SCALE] = "步行幅度",
-    [UI_MENU_WALK_SCALE_DESC] = "按住步行键时键盘摇杆的推动幅度。一半为走路，推满为奔跑。",
+    [UI_MENU_WALK_SCALE_DESC] = "步行时键盘摇杆的推动幅度。一半为走路，推满为奔跑。",
     [UI_MENU_OV_SCALE_DOWN] = "双线性（FSR 锐度 0）",
     [UI_MENU_HDR_HUE] = "色调校正",
     [UI_MENU_HDR_HUE_DESC] = "明亮色彩保留色调映射前色调的程度；0 让它们随曲线偏移。",
