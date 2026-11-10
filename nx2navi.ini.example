@@ -145,6 +145,13 @@
 # threads mostly wait on the graphics driver's lock: 16 on NVIDIA spent about 8 cores spinning in the driver.
 # lib_prebuild = 1
 # lib_prebuild_threads = 2
+# How many stage libraries (vertex and fragment shaders) the start builds and keeps: those of the shaders whose
+# libraries the game asked for most recently (library-used.bin beside pipeline-keys.bin). A draw that meets a new
+# pipeline then links it at once from kept libraries instead of waiting for them or being left out of the frame, which
+# is where an area starts stutters and flashes black when the driver takes 10 to 14 ms per library (NVIDIA). Each kept
+# library holds 140 to 460 KB of memory, so 2,000 cost about 0.3 to 0.9 GB: on a PC with 16 GB of RAM raise it with
+# care. 0 keeps none.
+# lib_prebuild_keep = 0
 # How many compute pipelines the start builds and keeps: those of the compute shaders the game used most recently.
 # Every other known one is built into the pipeline cache and released again, and made from the cache when the game
 # first uses it (well under a millisecond). Very large compute shaders the game has never used are not built at all.

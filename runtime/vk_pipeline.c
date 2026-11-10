@@ -882,6 +882,7 @@ static void nan_preserve_init(VkCtx *c) {
 
 static void keys_open(void);
 static void cu_open(void);
+static void lu_note(const GfxShader *vs, const GfxShader *fs);
 static void prebuild_start(void);
 
 static int ensure_init(void) {
@@ -3339,6 +3340,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
     FsKey fk;
     FoKey ok;
     lib_keys(s, k, &vk_, &pk, &fk, &ok);
+    lu_note(pk.vs, fk.fs);
     int miss = 0;
     VkPipeline lib[4];
     lib[1] = lib_get(LIB_PR, s, k, l, &pk, sizeof pk, build, &miss);   // shader libraries first: no work when absent
@@ -4205,6 +4207,7 @@ static int lib_queue(const VkPipeState *s, const GKey *k, Layout *l, Lib *b[2]) 
     FsKey fk;
     FoKey ok;
     lib_keys(s, k, &vk_, &pk, &fk, &ok);
+    lu_note(pk.vs, fk.fs);
     U.waits++;
     const void *key[2] = {&pk, &fk};
     uint32_t size[2] = {sizeof pk, sizeof fk};
@@ -4885,10 +4888,14 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 //   compute pipeline's compile below normal priority, lb_compute):
 //   compute pipelines of every recorded and prepared compute shader (vk_pipeline_compute builds compute
 //   synchronously on the replay thread; 163 prepared): those of the shaders dispatched most recently stay, the others
-//   are built into the pipeline cache and destroyed (comment at compute-used.bin). Then the libraries of the first
-//   NX2NAVI_LIB_PREBUILD_KEEP variants play recorded (priority 0), kept in libs[] with their shaders. KEEP defaults to
-//   0: a kept library costs 140-460 KB of process memory (10,000 kept took 9 GB in run 1) to save a rebuild the driver
-//   cache makes 0.1 ms.
+//   are built into the pipeline cache and destroyed (comment at compute-used.bin). Then the libraries of the
+//   NX2NAVI_LIB_PREBUILD_KEEP vertex and fragment shaders whose libraries draws' links asked for most recently
+//   (library-used.bin, kept like compute-used.bin; the first KEEP variants play recorded while there is no such record
+//   yet), kept in libs[] with their shaders. KEEP defaults to 0: a kept library costs 140-460 KB of process memory
+//   (10,000 kept took 9 GB in run 1) to save a rebuild the driver cache makes 0.1 ms on AMD. On NVIDIA the cache is
+//   slower: with it warm a 0.7.1 run built 735 pre-rasterization libraries (avg 9.8 ms) and 1,024 fragment-shader
+//   libraries (avg 13.5 ms) in play, 6.9 s in all, mostly where an area starts, and 3,313 draw lookups found a library
+//   missing (RTX 5060 Ti, 621.14, 2026-11-10). A KEEP of about 2,000 covers what such a session asks for.
 // Library state: the vertex output union known now (vs_union_peek; the prewarm fills it from pipeline-keys.bin, the
 // preparation has none), the clamp, polygon mode and depth mode most recorded pipelines use (defaults without a key
 // file: clamp 0, fill, -w..w), single-sampled, no dual source; the state dynamic on this GPU is 0 in every key.
@@ -5134,23 +5141,29 @@ static int cs_flight_remove(const GfxShader *cs) {   // 1 when a dispatch waited
 // its place. Without a record (the first run that has one) nothing is kept and the run pays the first dispatches once.
 // NX2NAVI_COMPUTE_KEEP=all builds and keeps every compute shader of the warm list, the large ones too, as before; 0
 // keeps none.
+// The same record, in library-used.bin, of the vertex and fragment shaders whose pre-rasterization or fragment-shader
+// library a draw's link asked for (gpl_link, lib_queue): NX2NAVI_LIB_PREBUILD_KEEP keeps the libraries of the ones
+// asked for most recently (lb_start). A UseLog holds either record.
 #define CU_VERSION 1
 typedef struct { char magic[8]; uint32_t version, rec_size, run, pad; } CuHeader;
 typedef struct { uint8_t iid[32]; uint32_t run, pad; } CuRec;
-static struct {
-    PlatMutex lock;
+typedef struct {
+    PlatMutex lock, io;                // io: one writer at a time (cu_write)
+    const char *file, *magic;          // the file's name beside pipeline-keys.bin, its 8-byte magic
     int opened, dirty;
     char path[PLAT_PATH_MAX * 2 + 32];
     CuRec *rec;
-    uint8_t *keep;                     // per record read at boot: among the keep_n dispatched most recently
+    uint8_t *keep;                     // per record read at boot: among the keep_n used most recently
     uint32_t n, cap, n_file;           // n_file: the records read at boot (keep has one byte for each)
     uint32_t *slot;                    // open addressing by the id's first bytes: record index + 1, 0 empty
     uint32_t slot_cap;
     uint32_t run;                      // this run's number
-    int quiet;                         // --probe-prewarm: its dispatches are not the game's, the file stays as it is
-    int32_t keep_n;                    // NX2NAVI_COMPUTE_KEEP; -1: all
+    int quiet;                         // --probe-prewarm: its dispatches are not the game's, the files stay as they are
+    int32_t keep_n;                    // CU: NX2NAVI_COMPUTE_KEEP, -1 all; LU: NX2NAVI_LIB_PREBUILD_KEEP
     uint32_t kept;                     // records flagged in keep
-} CU = {.lock = PLAT_MUTEX_INIT};
+} UseLog;
+static UseLog CU = {.lock = PLAT_MUTEX_INIT, .io = PLAT_MUTEX_INIT, .file = "compute-used.bin", .magic = "NX2NCUSE"};
+static UseLog LU = {.lock = PLAT_MUTEX_INIT, .io = PLAT_MUTEX_INIT, .file = "library-used.bin", .magic = "NX2NLUSE"};
 
 // What the first dispatches of compute shaders cost this run (under P.lock): each creates its pipeline on the replay
 // thread. burst: the creations that fell into one window of CF_WINDOW_MS, the worst such window kept, which is what a
@@ -5163,27 +5176,28 @@ static struct {
     uint32_t win_n, worst_n;
 } CF;
 
-static uint32_t *cu_slot(const uint8_t iid[32]) {   // the id's slot, or the empty one it would take. Caller holds CU.lock.
+// The id's slot, or the empty one it would take. Caller holds u->lock.
+static uint32_t *cu_slot(UseLog *u, const uint8_t iid[32]) {
     uint64_t h;
     memcpy(&h, iid, 8);
-    for (uint32_t j = (uint32_t)(h * 0x9e3779b97f4a7c15ull >> 32) & (CU.slot_cap - 1);; j = (j + 1) & (CU.slot_cap - 1))
-        if (!CU.slot[j] || !memcmp(CU.rec[CU.slot[j] - 1].iid, iid, 32)) return &CU.slot[j];
+    for (uint32_t j = (uint32_t)(h * 0x9e3779b97f4a7c15ull >> 32) & (u->slot_cap - 1);; j = (j + 1) & (u->slot_cap - 1))
+        if (!u->slot[j] || !memcmp(u->rec[u->slot[j] - 1].iid, iid, 32)) return &u->slot[j];
 }
 
-// Room for one more record and a table at most half full. 0 when out of memory. Caller holds CU.lock.
-static int cu_room(void) {
-    if (CU.n == CU.cap) {
-        uint32_t cap = CU.cap ? CU.cap * 2 : 1024;
-        CuRec *t = realloc(CU.rec, cap * sizeof *t);
+// Room for one more record and a table at most half full. 0 when out of memory. Caller holds u->lock.
+static int cu_room(UseLog *u) {
+    if (u->n == u->cap) {
+        uint32_t cap = u->cap ? u->cap * 2 : 1024;
+        CuRec *t = realloc(u->rec, cap * sizeof *t);
         if (!t) return 0;
-        CU.rec = t, CU.cap = cap;
+        u->rec = t, u->cap = cap;
     }
-    if ((CU.n + 1) * 2 > CU.slot_cap) {
-        uint32_t cap = CU.slot_cap ? CU.slot_cap * 2 : 4096;
-        uint32_t *t = calloc(cap, sizeof *t), *old = CU.slot;
+    if ((u->n + 1) * 2 > u->slot_cap) {
+        uint32_t cap = u->slot_cap ? u->slot_cap * 2 : 4096;
+        uint32_t *t = calloc(cap, sizeof *t), *old = u->slot;
         if (!t) return 0;
-        CU.slot = t, CU.slot_cap = cap;
-        for (uint32_t i = 0; i < CU.n; i++) *cu_slot(CU.rec[i].iid) = i + 1;
+        u->slot = t, u->slot_cap = cap;
+        for (uint32_t i = 0; i < u->n; i++) *cu_slot(u, u->rec[i].iid) = i + 1;
         free(old);
     }
     return 1;
@@ -5194,125 +5208,154 @@ static int cu_run_cmp(const void *a, const void *b) {   // {run, index} pairs, t
     return x[0] != y[0] ? (x[0] < y[0] ? 1 : -1) : (x[1] > y[1]) - (x[1] < y[1]);
 }
 
-// The number of records in a compute-used.bin image (f, size) with its header in *h, or -1 when it is not one.
-static long cu_parse(const uint8_t *f, uint64_t size, CuHeader *h) {
+// The number of records in an image (f, size) of u's file with its header in *h, or -1 when it is not one.
+static long cu_parse(const UseLog *u, const uint8_t *f, uint64_t size, CuHeader *h) {
     if (!f || size < sizeof *h) return -1;
     memcpy(h, f, sizeof *h);
-    if (memcmp(h->magic, "NX2NCUSE", 8) || h->version != CU_VERSION || h->rec_size != sizeof(CuRec)) return -1;
+    if (memcmp(h->magic, u->magic, 8) || h->version != CU_VERSION || h->rec_size != sizeof(CuRec)) return -1;
     return (long)((size - sizeof *h) / sizeof(CuRec));
 }
 
-// Reads the record and marks what the boot keeps. Caller holds P.lock (ensure_init), after keys_open.
+// Reads u's file beside pipeline-keys.bin and marks the keep_n records used most recently. Caller holds u->lock.
+static void ul_load(UseLog *u) {
+    snprintf(u->path, sizeof u->path, "%s", K.path);
+    char *cut = plat_last_sep(u->path);
+    snprintf(cut ? cut + 1 : u->path, sizeof u->path - (size_t)(cut ? cut + 1 - u->path : 0), "%s", u->file);
+    uint64_t size = 0;
+    uint8_t *f = plat_file_read(u->path, &size);
+    CuHeader h;
+    long n = cu_parse(u, f, size, &h);
+    if (n >= 0) {
+        for (long i = 0; i < n && cu_room(u); i++) {
+            CuRec r;
+            memcpy(&r, f + sizeof h + (size_t)i * sizeof r, sizeof r);
+            uint32_t *s = cu_slot(u, r.iid);
+            if (*s) continue;          // an id twice: the first entry stands
+            u->rec[u->n] = r, *s = ++u->n;
+        }
+        u->run = h.run;
+    } else if (f) {
+        rt_log("vk_pipeline: %s has another format or version; it is rewritten", u->path);
+    }
+    free(f);
+    u->n_file = u->n, u->run++;
+    uint32_t (*order)[2] = u->n ? malloc(u->n * sizeof *order) : NULL;
+    u->keep = u->n ? calloc(u->n, 1) : NULL;
+    if (order && u->keep) {
+        for (uint32_t i = 0; i < u->n; i++) order[i][0] = u->rec[i].run, order[i][1] = i;
+        qsort(order, u->n, sizeof *order, cu_run_cmp);
+        for (uint32_t i = 0; i < u->n && (u->keep_n < 0 || i < (uint32_t)u->keep_n); i++) u->keep[order[i][1]] = 1, u->kept++;
+    }
+    free(order);
+    u->opened = 1;
+}
+
+// Reads the records and marks what the boot keeps. Caller holds P.lock (ensure_init), after keys_open.
 static void cu_open(void) {
     if (!A.on || !K.path[0]) return;
     const char *e = cfg_value("NX2NAVI_COMPUTE_KEEP");
     plat_mutex_lock(&CU.lock);
     int count = cfg_int("NX2NAVI_COMPUTE_KEEP");   // a value that is neither "all" nor a number reads as the default
     CU.keep_n = !strcmp(e, "all") ? -1 : count < 0 ? 0 : count;
-    snprintf(CU.path, sizeof CU.path, "%s", K.path);
-    char *cut = plat_last_sep(CU.path);
-    snprintf(cut ? cut + 1 : CU.path, sizeof CU.path - (size_t)(cut ? cut + 1 - CU.path : 0), "compute-used.bin");
-    uint64_t size = 0;
-    uint8_t *f = plat_file_read(CU.path, &size);
-    CuHeader h;
-    long n = cu_parse(f, size, &h);
-    if (n >= 0) {
-        for (long i = 0; i < n && cu_room(); i++) {
-            CuRec r;
-            memcpy(&r, f + sizeof h + (size_t)i * sizeof r, sizeof r);
-            uint32_t *s = cu_slot(r.iid);
-            if (*s) continue;          // an id twice: the first entry stands
-            CU.rec[CU.n] = r, *s = ++CU.n;
-        }
-        CU.run = h.run;
-    } else if (f) {
-        rt_log("vk_pipeline: %s has another format or version; it is rewritten", CU.path);
-    }
-    free(f);
-    CU.n_file = CU.n, CU.run++;
-    uint32_t (*order)[2] = CU.n ? malloc(CU.n * sizeof *order) : NULL;
-    CU.keep = CU.n ? calloc(CU.n, 1) : NULL;
-    if (order && CU.keep) {
-        for (uint32_t i = 0; i < CU.n; i++) order[i][0] = CU.rec[i].run, order[i][1] = i;
-        qsort(order, CU.n, sizeof *order, cu_run_cmp);
-        for (uint32_t i = 0; i < CU.n && (CU.keep_n < 0 || i < (uint32_t)CU.keep_n); i++) CU.keep[order[i][1]] = 1, CU.kept++;
-    }
-    free(order);
-    CU.opened = 1;
+    ul_load(&CU);
     rt_log("vk_pipeline: %s: %u compute shaders dispatched in earlier runs; the boot keeps the pipelines of %s%u "
            "dispatched most recently (NX2NAVI_COMPUTE_KEEP %s)", CU.path, CU.n,
            CU.keep_n < 0 ? "every recorded compute shader, among them the " : "the ", CU.kept, e);
     plat_mutex_unlock(&CU.lock);
+    const char *ke = cfg_get("NX2NAVI_LIB_PREBUILD_KEEP");
+    plat_mutex_lock(&LU.lock);
+    LU.keep_n = ke && *ke && atoi(ke) > 0 ? atoi(ke) : 0;
+    ul_load(&LU);
+    if (LU.keep_n)
+        rt_log("vk_pipeline: %s: %u vertex and fragment shaders whose libraries draws asked for in earlier runs; the boot "
+               "keeps the libraries of the %u asked for most recently (NX2NAVI_LIB_PREBUILD_KEEP %d)", LU.path, LU.n,
+               LU.kept, LU.keep_n);
+    plat_mutex_unlock(&LU.lock);
 }
 
-// 1 when the boot keeps the pipeline of the compute shader with this input id.
-static int cu_keep(const uint8_t iid[32]) {
-    plat_mutex_lock(&CU.lock);
-    int keep = CU.keep_n < 0 || !CU.opened;   // without the record (no cache folder): as before, every one
-    if (!keep && CU.slot_cap) {
-        uint32_t s = *cu_slot(iid);
-        keep = s && s <= CU.n_file && CU.keep && CU.keep[s - 1];
+// 1 when the boot keeps u's entry for this input id; none: the answer when u has no record (no cache folder).
+static int ul_keep(UseLog *u, const uint8_t iid[32], int none) {
+    plat_mutex_lock(&u->lock);
+    int keep = none;
+    if (u->opened) {
+        uint32_t s = u->slot_cap ? *cu_slot(u, iid) : 0;
+        keep = s && s <= u->n_file && u->keep && u->keep[s - 1];
     }
-    plat_mutex_unlock(&CU.lock);
+    plat_mutex_unlock(&u->lock);
     return keep;
 }
 
-// The first dispatch of cs in this run: its entry takes this run's number. The runtime's own shaders (no input id)
-// are built at their first use every run and are not recorded.
-static void cu_note(const GfxShader *cs) {
+// 1 when the boot keeps the pipeline of the compute shader with this input id. Without the record (no cache folder):
+// as before, every one.
+static int cu_keep(const uint8_t iid[32]) { return CU.keep_n < 0 || ul_keep(&CU, iid, 1); }
+
+// The first use of the shader with this input id in this run: its entry takes this run's number. The runtime's own
+// shaders (no input id) are built at their first use every run and are not recorded.
+static void ul_note(UseLog *u, const uint8_t *iid) {
     static const uint8_t none[32];
-    const uint8_t *iid = gfx_shader_input_id(cs);
-    if (!CU.opened || !memcmp(iid, none, 32)) return;
-    plat_mutex_lock(&CU.lock);
-    if (cu_room()) {
-        uint32_t *s = cu_slot(iid);
+    if (!u->opened || !iid || !memcmp(iid, none, 32)) return;
+    plat_mutex_lock(&u->lock);
+    if (cu_room(u)) {
+        uint32_t *s = cu_slot(u, iid);
         if (!*s) {
-            memset(&CU.rec[CU.n], 0, sizeof *CU.rec);
-            memcpy(CU.rec[CU.n].iid, iid, 32);
-            *s = ++CU.n;
+            memset(&u->rec[u->n], 0, sizeof *u->rec);
+            memcpy(u->rec[u->n].iid, iid, 32);
+            *s = ++u->n;
         }
-        if (CU.rec[*s - 1].run != CU.run) CU.rec[*s - 1].run = CU.run, CU.dirty = 1;
+        if (u->rec[*s - 1].run != u->run) u->rec[*s - 1].run = u->run, u->dirty = 1;
     }
-    plat_mutex_unlock(&CU.lock);
+    plat_mutex_unlock(&u->lock);
 }
 
-// Writes the record to path. 1 when written.
+static void cu_note(const GfxShader *cs) { ul_note(&CU, gfx_shader_input_id(cs)); }
+
+// A draw's link asked for the libraries of vs and fs (either may be NULL): the boot of the next runs may keep them.
+static void lu_note(const GfxShader *vs, const GfxShader *fs) {
+    if (!LU.opened) return;
+    if (vs) ul_note(&LU, gfx_shader_input_id(vs));
+    if (fs) ul_note(&LU, gfx_shader_input_id(fs));
+}
+
+// Writes u's record to path. 1 when written.
 // One writer at a time, from the copy of the record to the end of the file write: the autosave thread and a save at
 // exit can both be here, and the older copy must not land on the newer file.
-static PlatMutex cu_io = PLAT_MUTEX_INIT;
-
-static int cu_write(const char *path) {
-    plat_mutex_lock(&cu_io);
-    plat_mutex_lock(&CU.lock);
-    uint32_t n = CU.n;
-    plat_mutex_unlock(&CU.lock);
-    // allocated outside CU.lock, which a dispatch takes (cu_note); room for the entries that come meanwhile
+static int cu_write(UseLog *u, const char *path) {
+    plat_mutex_lock(&u->io);
+    plat_mutex_lock(&u->lock);
+    uint32_t n = u->n;
+    plat_mutex_unlock(&u->lock);
+    // allocated outside u->lock, which a dispatch or a link takes (ul_note); room for the entries that come meanwhile
     size_t cap = sizeof(CuHeader) + ((size_t)n + 256) * sizeof(CuRec), size = 0;
     uint8_t *out = malloc(cap);
-    plat_mutex_lock(&CU.lock);
-    CuHeader h = {{'N', 'X', '2', 'N', 'C', 'U', 'S', 'E'}, CU_VERSION, sizeof(CuRec), CU.run, 0};
-    if (out && sizeof h + CU.n * sizeof(CuRec) <= cap) {
-        size = sizeof h + CU.n * sizeof(CuRec);
+    plat_mutex_lock(&u->lock);
+    CuHeader h = {{0}, CU_VERSION, sizeof(CuRec), u->run, 0};
+    memcpy(h.magic, u->magic, 8);
+    if (out && sizeof h + u->n * sizeof(CuRec) <= cap) {
+        size = sizeof h + u->n * sizeof(CuRec);
         memcpy(out, &h, sizeof h);
-        if (CU.n) memcpy(out + sizeof h, CU.rec, CU.n * sizeof(CuRec));
-        CU.dirty = 0;
+        if (u->n) memcpy(out + sizeof h, u->rec, u->n * sizeof(CuRec));
+        u->dirty = 0;
     }
-    plat_mutex_unlock(&CU.lock);
+    plat_mutex_unlock(&u->lock);
     int ok = size && plat_file_write_atomic(path, out, size);
     if (!ok) {   // still to be written: the next flush tries again
-        plat_mutex_lock(&CU.lock);
-        CU.dirty = 1;
-        plat_mutex_unlock(&CU.lock);
+        plat_mutex_lock(&u->lock);
+        u->dirty = 1;
+        plat_mutex_unlock(&u->lock);
     }
     free(out);
-    plat_mutex_unlock(&cu_io);
+    plat_mutex_unlock(&u->io);
     return ok;
 }
 
-// Writes the record when a dispatch changed it (the autosave thread and the save at exit).
+// Writes the records a dispatch or a link changed (the autosave thread and the save at exit).
 static void cu_flush(void) {
-    if (!CU.opened || CU.quiet || !*(volatile int *)&CU.dirty) return;
-    if (!cu_write(CU.path)) LOG_ONCE("vk_pipeline: cannot write %s; the next saves try again", CU.path);
+    UseLog *all[2] = {&CU, &LU};
+    for (int i = 0; i < 2; i++) {
+        UseLog *u = all[i];
+        if (!u->opened || CU.quiet || !*(volatile int *)&u->dirty) continue;
+        if (!cu_write(u, u->path)) LOG_ONCE("vk_pipeline: cannot write %s; the next saves try again", u->path);
+    }
 }
 
 // A compute pipeline created at a dispatch took ms. Caller holds P.lock.
@@ -6134,8 +6177,11 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         if (all[i].stage == GFX_STAGE_CS && !(kf && kf[i])) LB.e[n++] = all[i];
     free(kf);
     n_cs = n;
+    // The libraries of the shaders whose libraries links asked for most recently (library-used.bin); without that
+    // record yet, those of the first KEEP variants play recorded.
+    int by_use = LU.opened && LU.kept;
     for (size_t i = 0; LB.e && i < total && (int32_t)(n - n_cs) < LB.keep_n; i++)
-        if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
+        if (all[i].stage != GFX_STAGE_CS && (by_use ? ul_keep(&LU, all[i].iid, 0) : all[i].prio == 0)) LB.e[n++] = all[i];
     free(all);
     if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
     if (LB.n_keep > n) LB.n_keep = n;
@@ -6167,9 +6213,11 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
                   P.cache_control ? "only from the pipeline caches" : "left to their first dispatch");
     rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines, of which %zu stay (the shaders dispatched most "
            "recently, NX2NAVI_COMPUTE_KEEP) and the others are built into the pipeline cache and destroyed, to be created "
-           "at their first dispatch; %zu recorded variants' libraries (NX2NAVI_LIB_PREBUILD_KEEP %d); on %d idle-priority "
+           "at their first dispatch; %zu recorded variants' libraries (NX2NAVI_LIB_PREBUILD_KEEP %d%s); on %d idle-priority "
            "threads; library state clamp %u, polygon mode %u, depth -w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)",
-           n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly, LB.minus_w,
+           n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n,
+           !LB.keep_n ? "" : by_use ? ", those links asked for most recently" : ", the first play recorded", started, LB.clamp,
+           LB.poly, LB.minus_w,
            LB.samples, big);
 }
 
@@ -6561,9 +6609,9 @@ int vk_pipeline_probe_prewarm(void) {
         uint64_t rsize = 0;
         CuHeader rh = {0};
         uint32_t mine = 0;
-        int wrote = cu_write(rp);
+        int wrote = cu_write(&CU, rp);
         uint8_t *rf = wrote ? plat_file_read(rp, &rsize) : NULL;
-        long rn = cu_parse(rf, rsize, &rh);
+        long rn = cu_parse(&CU, rf, rsize, &rh);
         for (long i = 0; i < rn; i++) {
             CuRec r;
             memcpy(&r, rf + sizeof rh + (size_t)i * sizeof r, sizeof r);
