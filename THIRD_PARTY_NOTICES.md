@@ -109,16 +109,28 @@ folder's `licenses/` and in each component's own folder.
 
 ## Distributed in the Linux build kit AppImage
 
-`tools/make_appimage.py` puts the toolchain that `tools/linux_toolchain.py` assembles into the AppImage's
-`usr/kit/llvm/` (not with `--no-toolchain`). Versions and sha256 of every download are pinned in those two scripts and
-in `tools/make_release_linux.py`; licence texts are in `usr/kit/llvm/licenses/`. meson 1.12.1, nasm 3.02 and CMake 4.4.5
-build dav1d and SDL there and are not distributed. The game built with the toolchain links SDL3, Opus, libvpx, dav1d,
-zstd, libstdc++ and libatomic statically; it is built on the player's PC and never distributed.
+`tools/make_appimage.py --toolchain` puts the toolchain that `tools/linux_toolchain.py` assembles into the AppImage's
+`usr/kit/llvm/`; without that switch the AppImage carries none of this section. Versions and sha256 of every download
+are pinned in those two scripts and in `tools/make_release_linux.py`. The licence texts, with the full LGPL-2.1, GPL-2,
+GPL-3 and Apache-2.0 texts the Debian `copyright` files refer to, are in `usr/kit/llvm/licenses/`, and
+`licenses/SOURCES.txt` says where the corresponding source of the LGPL and GPL object code is. meson 1.12.1, nasm 3.02
+and CMake 4.4.5 build dav1d and SDL there and are not distributed. The game built with the toolchain links SDL3, Opus,
+libvpx, dav1d, zstd, libstdc++ and libatomic statically; it is built on the player's PC and never distributed.
+
+The SDK parts below come from the Steam Runtime 3 "sniper" SDK sysroot 3.0.20261021.266025 (Debian 11 based,
+https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/), whose `sources/` folder holds the
+source package of each. Its headers are taken by the file lists of `libc6-dev`, `linux-libc-dev`, `libstdc++-10-dev`,
+`libopus-dev` and `libvpx-dev` only.
 
 | Component | Source | License | Where in the AppImage |
 |---|---|---|---|
 | LLVM 23.1.4 official Linux X64 release: `clang`, `lld` and the clang resource headers; `llvm-LICENSE.txt` from the `llvmorg-23.1.4` source tag | https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.4 | Apache-2.0 with LLVM exception | `usr/kit/llvm/bin/`, `usr/kit/llvm/lib/clang/` |
-| Steam Runtime 3 "sniper" SDK sysroot 3.0.20261021.266025 (Debian 11 based), only the C, C++ and kernel headers and the libraries a game build reads: glibc 2.31 (headers, `crt*.o`, `libc_nonshared.a`, link libraries), GCC 10 `libstdc++.a`, `libsupc++.a`, `libgcc` and `libatomic.a`, libopus 1.3.1 and libvpx 1.9.0 (static, with their headers), the Vulkan loader's link library; their Debian `copyright` files go into `licenses/`. The corresponding source is the snapshot's `sources/` folder | https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/ | glibc LGPL-2.1+; libstdc++, libgcc and libatomic GPL-3.0 with the GCC Runtime Library Exception; libopus BSD-3-Clause; libvpx BSD-3-Clause with the WebM patent grant (`libvpx-PATENTS.txt` from the v1.17.0 source tag); Vulkan loader Apache-2.0 | `usr/kit/llvm/sysroot/` |
+| glibc 2.31-13+deb11u14 (SDK packages `libc6`, `libc6-dev`): headers, shared objects, `libc_nonshared.a` and the other link libraries, `crt*.o`; `glibc-copyright.txt` | source package `glibc_2.31-13+deb11u14.dsc` in the snapshot's `sources/` folder | LGPL-2.1-or-later (some parts under other free licences, as the copyright file lists) | `usr/kit/llvm/sysroot/` |
+| GCC 10 runtime 10.3.0-3+steamrt3.1 (SDK packages `libstdc++-10-dev`, `libgcc-10-dev`, `libgcc-s1`, `libatomic1`): the C++ headers, `libstdc++.a`, `libsupc++.a`, `libgcc.a`, `libgcc_eh.a`, `libgcc_s.so.1`, `libatomic.a`, `crtbegin*.o`, `crtend*.o`; `libstdc++-libgcc-libatomic-copyright.txt` | source package `gcc-10_10.3.0-3+steamrt3.1.dsc` in the snapshot's `sources/` folder | GPL-3.0-or-later with the GCC Runtime Library Exception 3.1 | `usr/kit/llvm/sysroot/` |
+| Linux 5.10 userspace headers (SDK package `linux-libc-dev` 5.10.262-1); `linux-kernel-headers-copyright.txt` | source package `linux_5.10.262-1.dsc` in the snapshot's `sources/` folder (the headers are source themselves) | GPL-2.0 WITH Linux-syscall-note | `usr/kit/llvm/sysroot/usr/include/` |
+| libopus 1.3.1 (`libopus-dev`): `libopus.a` and its headers; `opus-copyright.txt` | source package `opus_1.3.1-0.1.dsc` in the snapshot's `sources/` folder | BSD-3-Clause | `usr/kit/llvm/sysroot/` |
+| libvpx 1.9.0 (`libvpx-dev`): `libvpx.a` and its headers; `libvpx-copyright.txt`, and `libvpx-PATENTS.txt` from the v1.17.0 source tag (Debian's copyright file carries no patent grant) | source package `libvpx_1.9.0-1+deb11u5.dsc` in the snapshot's `sources/` folder | BSD-3-Clause with the WebM patent grant | `usr/kit/llvm/sysroot/` |
+| Vulkan loader 1.4.309 (`libvulkan1`): `libvulkan.so.1.4.309` and its links, which the link reads (the game loads the driver's loader); `vulkan-loader-copyright.txt` | source package `vulkan-loader_1.4.309.0-1~steamrt3.1.dsc` in the snapshot's `sources/` folder | Apache-2.0 | `usr/kit/llvm/sysroot/usr/lib/x86_64-linux-gnu/` |
 | Vulkan-Headers 1.4.363 (source tag), the C headers | https://github.com/KhronosGroup/Vulkan-Headers/tree/v1.4.363 | Apache-2.0 OR MIT | `usr/kit/llvm/sysroot/usr/local/include/` |
 | Zstandard 1.5.7, built from the release tarball into a static `libzstd.a` | https://github.com/facebook/zstd/releases/tag/v1.5.7 | BSD-3-Clause | `usr/kit/llvm/sysroot/usr/local/` |
 | dav1d 1.5.4, built from the release tarball into a static `libdav1d.a` with its assembly | https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/ | BSD-2-Clause | `usr/kit/llvm/sysroot/usr/local/` |

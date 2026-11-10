@@ -84,12 +84,14 @@ mr.PINS.update(PINS)   # one cache (toolchain/release-dl) and one fetch for both
 # What clang, lld and the runtime build need from the LLVM release (the rest of its 8 GB stays packed).
 LLVM_MEMBERS = [f'bin/clang-{LLVM_MAJOR}', 'bin/clang', 'bin/clang++', 'bin/lld', 'bin/ld.lld', 'bin/llvm-ar',
                 'bin/llvm-ranlib', 'bin/llvm-objcopy', 'bin/llvm-strip', f'lib/clang/{LLVM_MAJOR}/include']
-# The parts of the sniper SDK a C/C++ compile and link for x86_64 can read.
+# The parts of the sniper SDK a C/C++ compile and link for x86_64 can read, the copyright files and full licence texts
+# of what goes into a release, and the package file lists tools/linux_toolchain.py picks the headers by.
 SNIPER_MEMBERS = ['usr/include', 'usr/share/pkgconfig', 'usr/lib/x86_64-linux-gnu', 'usr/lib/gcc/x86_64-linux-gnu',
                   'lib/x86_64-linux-gnu', 'lib64', 'usr/share/doc/libsdl3-0', 'usr/share/doc/libopus0',
                   'usr/share/doc/libvpx6', 'usr/share/doc/libc6', 'usr/share/doc/gcc-10-base',
-                  'usr/share/doc/libvulkan1',
-                  'usr/share/doc/libxft2', 'usr/share/doc/libxrender1']
+                  'usr/share/doc/libvulkan1', 'usr/share/doc/linux-libc-dev',
+                  'usr/share/doc/libxft2', 'usr/share/doc/libxrender1', 'usr/share/common-licenses',
+                  'var/lib/dpkg/info/*.list', 'var/lib/dpkg/status']
 # glibc's link libraries and their scripts (lib<name>.so, .a, _nonshared.a), and the GCC runtime pieces clang links.
 GLIBC_LIBS = ['c', 'm', 'mvec', 'dl', 'pthread', 'rt', 'util']
 GCC_LIBS = {'libgcc.a', 'libgcc_eh.a', 'libgcc_s.so', 'libstdc++.a', 'libsupc++.a'}
@@ -143,10 +145,13 @@ def full_sysroot():
     """The sniper SDK's x86_64 compile and link files in toolchain/release-work/sniper, absolute symlinks made relative
     (the SDK points some at /lib and /usr/lib, which outside its container are the host's)."""
     root = WORK / 'sniper'
-    if (root / '.relinked').is_file() and (root / 'usr/share/doc/libxft2/copyright').is_file():
+    newest = ('usr/share/doc/libxft2/copyright', 'usr/share/common-licenses/GPL-3', 'var/lib/dpkg/status',
+              'var/lib/dpkg/info/libc6-dev:amd64.list', 'usr/share/doc/linux-libc-dev/copyright')
+    if (root / '.relinked').is_file() and all((root / p).is_file() for p in newest):
         return root
     # Older cached SDK extractions omitted the font libraries' architecture-independent pkg-config files and the
-    # libXft and libXrender copyright files.
+    # libXft and libXrender copyright files, and then the full licence texts, the package lists and the kernel
+    # headers' copyright file.
     (root / '.unpacked').unlink(missing_ok=True)
     tar_extract('sniper-sdk', root, SNIPER_MEMBERS)
     for p in root.rglob('*'):

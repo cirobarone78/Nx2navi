@@ -1,8 +1,9 @@
 """Assemble the compiler, the linker and the headers and libraries a Linux game build reads into one folder, so the
-AppImage of tools/make_appimage.py builds the game on a PC without a compiler or development packages (a Steam Deck,
-any system whose base is read-only).
+AppImage of tools/make_appimage.py --toolchain builds the game on a PC without a compiler or development packages
+(SteamOS, any system whose base is read-only).
 
-    python3 tools/linux_toolchain.py --out <folder>     # alone; tools/make_appimage.py puts it in the kit's llvm/
+    python3 tools/linux_toolchain.py --out <folder>     # alone; make_appimage.py --toolchain puts it in the kit's llvm/
+    python3 tools/linux_toolchain.py --check <folder>   # only the end check, on a folder made before
 
 The folder:
 
@@ -13,22 +14,24 @@ The folder:
     sysroot/   the files of the Steam Runtime 3 "sniper" SDK (glibc 2.31) a game build reads, and in usr/local/ what the
                SDK lacks or carries unsuited, built here against it: Vulkan-Headers 1.4.363, zstd 1.5.7, dav1d 1.5.4
                and SDL 3.4.18 (with the client headers of wayland 1.24)
-    licenses/  the licence texts of all of it
+    licenses/  the licence texts of all of it, and SOURCES.txt, which says where the source of its LGPL and GPL parts is
 
 SDL3, Opus, libvpx, dav1d, zstd, libatomic and libstdc++ are there as static archives only, so the game links them in
 and needs nothing on the player's PC but glibc 2.31 or newer and the graphics driver's Vulkan loader. The toolchain
-itself needs glibc 2.34 (the official LLVM binaries are built against it): SteamOS 3, Ubuntu 22.04, Debian 12.
+itself needs what the official LLVM binaries are built against: glibc 2.34, the libstdc++ of GCC 12 or newer
+(GLIBCXX_3.4.30) and zlib (libz.so.1).
 
 The LLVM release, the SDK, the Vulkan headers and zstd are the pins of tools/make_release_linux.py and share its
 download cache (toolchain/release-dl) and its unpacked SDK. dav1d is built with meson and nasm from their pinned
 sources, SDL with CMake's pinned release; none of the three is shipped. Building the folder needs network access the
-first time, make, tar, pkg-config and wayland-scanner.
+first time and HOST_TOOLS; its end check (check) also runs a program, which needs the Vulkan loader (libvulkan.so.1).
 """
 import argparse
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,11 +58,37 @@ mr.PINS.update(PINS)
 
 # What tools/make_game.py runs; the release's archiver and objcopy build the libraries here and stay out (60 MB).
 LLVM_KEEP = {f'clang-{mrl.LLVM_MAJOR}', 'clang', 'clang++', 'lld', 'ld.lld'}
-# The C library's and the kernel's header folders beside usr/include/*.h and the multiarch folder, the C++ library's,
-# and those of the SDK libraries the runtime includes.
-HEADER_DIRS = ['x86_64-linux-gnu', 'arpa', 'net', 'netash', 'netatalk', 'netax25', 'neteconet', 'netinet', 'netipx',
-               'netiucv', 'netpacket', 'netrom', 'netrose', 'nfs', 'protocols', 'rpc', 'scsi', 'linux', 'asm-generic',
-               'misc', 'mtd', 'rdma', 'sound', 'video', 'xen', 'c++', 'opus', 'vpx']
+# What building the folder runs from the system. SDL leaves out a back-end whose tool is missing without an error
+# (Wayland without wayland-scanner), so they are looked for before anything is downloaded.
+HOST_TOOLS = ('make', 'tar', 'xz', 'pkg-config', 'wayland-scanner', 'readelf')
+# The SDK packages whose headers a game build reads: the C library's, the kernel's, the C++ library's, and those of
+# the SDK libraries the runtime includes. Taken by the SDK's own file lists, so no header of another package (and of
+# another licence) comes along.
+HEADER_PACKAGES = ['libc6-dev', 'linux-libc-dev', 'libstdc++-10-dev', 'libopus-dev', 'libvpx-dev']
+# The back-ends SDL must have compiled in, as SDL_build_config.h names them. SDL's options (CMakeCache.txt) stay ON
+# when a dependency is missing, so they cannot tell.
+SDL_BACKENDS = ('SDL_VIDEO_DRIVER_X11', 'SDL_VIDEO_DRIVER_WAYLAND', 'SDL_AUDIO_DRIVER_PIPEWIRE',
+                'SDL_AUDIO_DRIVER_PULSEAUDIO', 'SDL_AUDIO_DRIVER_ALSA', 'SDL_UDEV_DYNAMIC', 'HAVE_DBUS_DBUS_H')
+# The source packages of the object code under the LGPL and the GPL that sysroot/ carries (glibc's shared objects,
+# static parts and start files; GCC's C++ and runtime libraries), by an SDK package built from each. The SDK snapshot
+# publishes them in its sources/ folder; licenses/SOURCES.txt names them, and a new SDK pin with other versions stops
+# the build until they are named here.
+SOURCE_PACKAGES = {'libc6': ('glibc', '2.31-13+deb11u14'), 'libstdc++-10-dev': ('gcc-10', '10.3.0-3+steamrt3.1')}
+SOURCES = '''Where the source of the LGPL and GPL parts of this folder is
+
+sysroot/ holds object code of glibc (LGPL-2.1-or-later: its shared objects, libc_nonshared.a and the crt*.o start
+files) and of GCC's runtime (GPL-3.0-or-later with the GCC Runtime Library Exception: libstdc++.a, libsupc++.a,
+libgcc.a, libgcc_eh.a, libgcc_s.so.1, libatomic.a and crtbegin*.o and crtend*.o), as the Steam Runtime 3 "sniper"
+SDK {sniper} carries them. Their complete corresponding source is published with that SDK:
+
+{packages}
+
+in {url}/{sniper}/sources/
+Each .dsc file names the other files of its source package, which are in the same folder. The licence texts are
+LGPL-2.1.txt and GPL-3.txt here, the exception and the copyright notices are in glibc-copyright.txt and
+libstdc++-libgcc-libatomic-copyright.txt. The kernel's headers (linux-kernel-headers-copyright.txt, GPL-2.0 with the
+Linux syscall note) are themselves source.
+'''
 # The SDK libraries the game links as archives. Without a .so of the same name beside them lld takes the archive, so
 # make_game.py's -lopus -lvpx -latomic need no change, and the game does not depend on the player's versions (the
 # SDK's libvpx.so.6 is on no current distribution).
@@ -74,11 +103,15 @@ CONFIG = '''# clang reads this file from beside itself (and clang++ its copy, cl
 
 
 def sysroot_files(sdk):
-    """The SDK files a compile and link of the game read: headers by folder, the C runtime and the libraries."""
-    inc = sdk / 'usr' / 'include'
-    files = set(inc.glob('*.h'))
-    for d in HEADER_DIRS:   # links into the SDK's /etc/alternatives lead nowhere outside its container
-        files.update(p for p in (inc / d).rglob('*') if p.exists() and not p.is_dir())
+    """The SDK files a compile and link of the game read: the headers of HEADER_PACKAGES, the C runtime and the
+    libraries."""
+    files = set()
+    for pkg in HEADER_PACKAGES:
+        listing = (sdk / 'var' / 'lib' / 'dpkg' / 'info' / f'{pkg}:amd64.list').read_text(encoding='utf-8')
+        for line in listing.splitlines():
+            p = sdk / line.lstrip('/')   # links into the SDK's /etc/alternatives lead nowhere outside its container
+            if line.startswith('/usr/include/') and p.exists() and not p.is_dir():
+                files.add(p)
     lib, root_lib = sdk / 'usr' / 'lib' / 'x86_64-linux-gnu', sdk / 'lib' / 'x86_64-linux-gnu'
     for name in mrl.GLIBC_LIBS:   # the link scripts, their archives and the shared objects they name
         files.update(p for p in lib.glob(f'lib{name}[._]*') if p.suffix in ('.so', '.a') or '.so' in p.name)
@@ -90,7 +123,7 @@ def sysroot_files(sdk):
     gcc = sdk / 'usr' / 'lib' / 'gcc' / 'x86_64-linux-gnu' / '10'
     files.update(p for p in gcc.iterdir() if p.name.startswith('crt') or p.name in mrl.GCC_LIBS)
     files.update(sdk / p for p in STATIC)
-    files.update(lib.glob('libvulkan.so*'))   # the loader is the driver's: linked by name, never copied
+    files.update(lib.glob('libvulkan.so*'))   # what lld links against; the game loads the driver's loader
     return files
 
 
@@ -169,12 +202,28 @@ def build_sdl3(dest, local, sdk):
     for d in ('cmake', 'pkgconfig'):
         shutil.rmtree(local / 'lib' / d, ignore_errors=True)
     shutil.rmtree(local / 'share', ignore_errors=True)
-    summary = (build / 'CMakeCache.txt').read_text(encoding='utf-8')
-    missing = [k for k in ('SDL_X11:BOOL=ON', 'SDL_WAYLAND:BOOL=ON', 'SDL_PIPEWIRE:BOOL=ON', 'SDL_PULSEAUDIO:BOOL=ON',
-                           'SDL_ALSA:BOOL=ON', 'SDL_LIBUDEV:BOOL=ON', 'SDL_DBUS:BOOL=ON') if k not in summary]
+    config = (build / 'include-config-release' / 'build_config' / 'SDL_build_config.h').read_text(encoding='utf-8')
+    # the space after the name keeps the *_DYNAMIC lines (the library a back-end loads) from counting as the back-end
+    missing = [k for k in SDL_BACKENDS if f'#define {k} ' not in config]
     if missing:
-        sys.exit(f'SDL3 was configured without {", ".join(missing)}')
+        sys.exit(f'SDL3 was built without {", ".join(missing)} (its configure output in {build} says why)')
     return src / 'LICENSE.txt', wayland_license
+
+
+def sources_text(sdk):
+    """SOURCES for this SDK; stops when an SDK package of SOURCE_PACKAGES was built from another source version."""
+    versions = {}
+    for para in (sdk / 'var' / 'lib' / 'dpkg' / 'status').read_text(encoding='utf-8').split('\n\n'):
+        f = dict(l.split(': ', 1) for l in para.splitlines() if ': ' in l and not l.startswith(' '))
+        if f.get('Architecture') == 'amd64':
+            versions[f.get('Package')] = f.get('Version', '')
+    lines = []
+    for pkg, (source, version) in SOURCE_PACKAGES.items():
+        if not versions.get(pkg, '').startswith(version):
+            sys.exit(f"the SDK's {pkg} is {versions.get(pkg)}, not built from {source} {version}: "
+                     'name its source in SOURCE_PACKAGES')
+        lines.append(f'  {source} {version}: {source}_{version}.dsc')
+    return SOURCES.format(sniper=mrl.SNIPER, url=mrl.SNIPER_URL, packages='\n'.join(lines))
 
 
 def collect_licenses(dest, sdk, zstd_license, dav1d_license, sdl_licenses):
@@ -185,6 +234,7 @@ def collect_licenses(dest, sdk, zstd_license, dav1d_license, sdl_licenses):
         (mr.fetch('llvm-license'), 'llvm-LICENSE.txt'),
         (doc / 'libc6' / 'copyright', 'glibc-copyright.txt'),
         (doc / 'gcc-10-base' / 'copyright', 'libstdc++-libgcc-libatomic-copyright.txt'),
+        (doc / 'linux-libc-dev' / 'copyright', 'linux-kernel-headers-copyright.txt'),
         (sdl_licenses[0], 'SDL3-LICENSE.txt'),
         (sdl_licenses[1], 'wayland-COPYING.txt'),   # SDL's Wayland code is compiled with its client headers
         (doc / 'libopus0' / 'copyright', 'opus-copyright.txt'),
@@ -193,15 +243,22 @@ def collect_licenses(dest, sdk, zstd_license, dav1d_license, sdl_licenses):
         (mrl.WORK / 'vulkan-headers' / 'LICENSE.md', 'vulkan-headers-LICENSE.txt'),
         (zstd_license, 'zstd-LICENSE.txt'),
         (dav1d_license, 'dav1d-COPYING.txt'),
+    ] + [   # the Debian copyright files above point at these full texts, which a player's system need not have
+        (sdk / 'usr' / 'share' / 'common-licenses' / n, f'{n}.txt') for n in ('LGPL-2.1', 'GPL-2', 'GPL-3', 'Apache-2.0')
     ]:
         shutil.copy2(src, lic / name)
     import tarfile   # Debian's libvpx copyright carries no patent grant: the WebM PATENTS text from the pinned source tag
     with tarfile.open(mr.fetch('libvpx-src')) as t:
         (lic / 'libvpx-PATENTS.txt').write_bytes(t.extractfile('libvpx-1.17.0/PATENTS').read())
+    (lic / 'SOURCES.txt').write_text(sources_text(sdk), encoding='utf-8')
 
 
 def assemble(dest):
     """Write the folder of the module docstring to dest (replaced)."""
+    missing = [t for t in HOST_TOOLS if not shutil.which(t)]
+    if missing:
+        sys.exit(f'missing: {" ".join(missing)} (Debian and Ubuntu: apt install make tar xz-utils pkg-config '
+                 'libwayland-bin binutils)')
     dest = Path(dest).resolve()
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -222,10 +279,10 @@ def assemble(dest):
     dav1d_license = build_dav1d(dest, local)
     sdl_licenses = build_sdl3(dest, local, sdk)
     collect_licenses(dest, sdk, zstd_license, dav1d_license, sdl_licenses)
+    check(dest)
     for p in (dest / 'bin').iterdir():   # the archiver and objcopy built the libraries above; a game build needs neither
         if p.name not in LLVM_KEEP and p.suffix != '.cfg':
             p.unlink()
-    check(dest)
     print(f'toolchain: {dest}, {mr.mib(size(dest))} (sysroot {mr.mib(size(dest / "sysroot"))})')
     return dest
 
@@ -236,39 +293,60 @@ def size(folder):
 
 
 def check(dest):
-    """The folder's clang compiles and links a C++ program against SDL3, Vulkan, Opus, libvpx, dav1d and zstd with no
-    flag of its own, as make_game.py calls it, and the program needs no library of the SDK at run time."""
-    work = mrl.WORK / 'toolchain-check'
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    src = work / 'check.cpp'
-    src.write_text('#include <SDL3/SDL.h>\n#include <vulkan/vulkan.h>\n#include <opus/opus.h>\n'
-                   '#include <vpx/vpx_decoder.h>\n#include <vpx/vp8dx.h>\n#include <dav1d/dav1d.h>\n#include <zstd.h>\n'
-                   '#include <atomic>\n#include <string>\n#include <cstdio>\n'
-                   'int main() { std::atomic<long long> a{1}; std::string s = dav1d_version();\n'
-                   '  std::printf("SDL %d, dav1d %s, opus %s, vpx %s, zstd %u, Vulkan headers %d, %lld\\n",\n'
-                   '              SDL_GetVersion(), s.c_str(), opus_get_version_string(), vpx_codec_version_str(),\n'
-                   '              ZSTD_versionNumber(), VK_HEADER_VERSION, a.fetch_add(1));\n'
-                   '  PFN_vkGetInstanceProcAddr volatile loader = vkGetInstanceProcAddr; return loader ? 0 : 1; }\n', encoding='utf-8')
-    exe = work / 'check'
-    mr.run([dest / 'bin' / 'clang++', '-std=gnu++17', '-O1', '-no-pie', src, '-o', exe, *[
-        '-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-l:libstdc++.a', '-latomic', '-lm', '-lpthread',
-        '-ldl']], env=dict(os.environ, PATH='/usr/bin:/bin'))
-    needed = subprocess.run(['readelf', '-d', str(exe)], capture_output=True, text=True, check=True).stdout
-    libs = sorted(set(l.split('[')[1].rstrip(']') for l in needed.splitlines() if '(NEEDED)' in l))
-    allowed = {'libvulkan.so.1', 'libm.so.6', 'libpthread.so.0', 'libdl.so.2', 'libc.so.6', 'librt.so.1',
-               'libgcc_s.so.1', 'ld-linux-x86-64.so.2'}
-    if set(libs) - allowed:
-        sys.exit(f'toolchain check: the program needs {", ".join(sorted(set(libs) - allowed))} at run time')
-    print(f'toolchain check: linked; needs {", ".join(libs)}')
-    r = subprocess.run([str(exe)], capture_output=True, text=True)
-    print(f'toolchain check: {r.stdout.strip() or r.stderr.strip()}')
+    """What a player's build reads, tried with the folder's tools alone (PATH holds only its bin/): make_game.py
+    compiles every runtime file that does not depend on the game (--make-runtime-lib), so a header or library the
+    runtime gains and the folder lacks fails here, not on a player's PC after the RomFS and the lift; then a C++ program
+    that uses SDL3, Vulkan, Opus, libvpx, dav1d and zstd links with make_game.LINK_LIBS, must need no library of the SDK
+    at run time, and must run. The archiver is the folder's while assemble has it, else NX2NAVI_AR's."""
+    import build_shaders
+    import make_game
+    build_shaders.build(mr.ROOT / 'runtime')   # the runtime includes its shaders compiled; nothing when they are current
+    env = dict(os.environ, PATH=str(dest / 'bin'), VMA_INCLUDE=str(mr.ROOT / 'toolchain' / 'vma'))
+    if (dest / 'bin' / 'llvm-ar').is_file():
+        env['NX2NAVI_AR'] = str(dest / 'bin' / 'llvm-ar')
+    with tempfile.TemporaryDirectory(prefix='toolchain-check-') as tmp:
+        work = Path(tmp)
+        if subprocess.run([sys.executable, mr.ROOT / 'tools' / 'make_game.py', '--make-runtime-lib', work / 'rt'],
+                          env=env).returncode:
+            sys.exit('toolchain check: the runtime does not compile with the folder alone')
+        src = work / 'check.cpp'
+        src.write_text('#include <SDL3/SDL.h>\n#include <vulkan/vulkan.h>\n#include <opus/opus.h>\n'
+                       '#include <vpx/vpx_decoder.h>\n#include <vpx/vp8dx.h>\n#include <dav1d/dav1d.h>\n#include <zstd.h>\n'
+                       '#include <atomic>\n#include <string>\n#include <cstdio>\n'
+                       'int main() { std::atomic<long long> a{1}; std::string s = dav1d_version();\n'
+                       '  std::printf("SDL %d, dav1d %s, opus %s, vpx %s, zstd %u, Vulkan headers %d, %lld\\n",\n'
+                       '              SDL_GetVersion(), s.c_str(), opus_get_version_string(), vpx_codec_version_str(),\n'
+                       '              ZSTD_versionNumber(), VK_HEADER_VERSION, a.fetch_add(1));\n'
+                       '  PFN_vkGetInstanceProcAddr volatile loader = vkGetInstanceProcAddr; return loader ? 0 : 1; }\n',
+                       encoding='utf-8')
+        exe = work / 'check'
+        mr.run([dest / 'bin' / 'clang++', '-std=gnu++17', '-O1', '-no-pie', src, '-o', exe, *make_game.LINK_LIBS],
+               env=env)
+        needed = subprocess.run(['readelf', '-d', str(exe)], capture_output=True, text=True, check=True).stdout
+        libs = sorted(set(l.split('[')[1].rstrip(']') for l in needed.splitlines() if '(NEEDED)' in l))
+        allowed = {'libvulkan.so.1', 'libm.so.6', 'libpthread.so.0', 'libdl.so.2', 'libc.so.6', 'librt.so.1',
+                   'libgcc_s.so.1', 'ld-linux-x86-64.so.2'}
+        if set(libs) - allowed:
+            sys.exit(f'toolchain check: the program needs {", ".join(sorted(set(libs) - allowed))} at run time')
+        print(f'toolchain check: linked; needs {", ".join(libs)}')
+        r = subprocess.run([str(exe)], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f'toolchain check: the program ended with {r.returncode}: {r.stderr.strip()}')
+        print(f'toolchain check: {r.stdout.strip()}')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--out', type=Path, required=True, help='the toolchain folder (replaced)')
-    assemble(ap.parse_args().out)
+    what = ap.add_mutually_exclusive_group(required=True)
+    what.add_argument('--out', type=Path, help='the toolchain folder (replaced)')
+    what.add_argument('--check', type=Path, metavar='FOLDER',
+                      help="only the end check, on a folder made before: it has no archiver then, so NX2NAVI_AR names "
+                           "one (the LLVM release's llvm-ar)")
+    a = ap.parse_args()
+    if a.check:
+        check(a.check.resolve())
+    else:
+        assemble(a.out)
 
 
 if __name__ == '__main__':
