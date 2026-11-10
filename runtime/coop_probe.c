@@ -1021,6 +1021,29 @@ static int in_room(Player *p, int members) {
     return v.state == COOP_JOINED && v.n == members;
 }
 
+// p's roster names q's present session, both in the room: p takes q's messages. With q = p: the last roster p took
+// lists its own session, so no rejoin of p waits for its turn (roster_rejoin in coop.c).
+static int names_session(Player *p, Player *q) {
+    CoopView vp = view_of(p), vq = view_of(q);
+    if (vp.state != COOP_JOINED || vq.state != COOP_JOINED) return 0;
+    for (int i = 0; i < vp.n; i++)
+        if (vp.member[i].id == vq.self) return vp.member[i].session == vq.session;
+    return 0;
+}
+
+// The mock relay lists each player's present session, and both rosters name both: no roster still to come lists
+// another session for either (one sent before has a lower number and is refused), so neither throws the other's
+// messages away or joins again until the relay is made to lie again.
+static int settled(MockRelay *mock, Player *a, Player *b) {
+    Player *both[2] = {a, b};
+    for (int i = 0; i < 2; i++) {
+        CoopView v = view_of(both[i]);
+        MockRoom *room = v.state == COOP_JOINED ? mock_room_of(mock, v.self) : NULL;
+        if (!room || room->m[v.self].session != v.session) return 0;
+    }
+    return names_session(a, a) && names_session(a, b) && names_session(b, a) && names_session(b, b);
+}
+
 // A stop is signalled only once the view that says the session is off is published, so that whoever waited for it
 // (coop_shutdown's caller, a page that switched co-op off) cannot read the view of the step before. One session stepped
 // on this thread, no relay: a view hook that sees "off" notes whether the stop was signalled already.
@@ -1250,9 +1273,13 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
           view_of(bob).made);
     mock->mark = bob_id;
     CHECK(WAIT_FOR(view_of(bob).maker != bob_id, ROSTER_WAIT_MS), "and the mark is gone again");
-    // someone on the path rejoined Alice with a session of its own: the relay lists that one; Alice notices and rejoins
+    // someone on the path rejoined Alice with a session of its own: the relay lists that one; Alice notices and rejoins,
+    // and Bob takes her messages again once a roster with her new session reaches him. Each of those datagrams can be
+    // lost: the wait holds as many rosters as ROSTER_WAIT_MS does.
+    recon = alice->saw_reconnect;
     mock->spoof = view_of(alice).self;
-    plat_sleep_ms(2500);
+    CHECK(WAIT_FOR(alice->saw_reconnect > recon && settled(mock, alice, bob), ROSTER_WAIT_MS),
+          "F9: Alice joined again, and the relay and both rosters list her new session");
     exchange(alice, bob, drop, "F9: after a spoofed rejoin of Alice", first);
 
     // an outsider's datagrams to Alice's port are not the relay's: thrown away
@@ -1280,8 +1307,8 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     }
     unsigned rejoins = alice->saw_reconnect - recon2;
     CHECK(rejoins <= 1, "H4 F4: three rosters that list another session for Alice make her join again once (%u times)", rejoins);
-    CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2), ROSTER_WAIT_MS), "and both are in the room after it");
-    plat_sleep_ms(1500);
+    CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2) && settled(mock, alice, bob), ROSTER_WAIT_MS),
+          "and both are in the room after it, the relay and both rosters listing each one's present session");
     exchange(alice, bob, drop, "H4 F4: after the rosters listing another session for Alice", first);
     // someone on the path sends Alice a roster far ahead of the relay's counter that lists another session for Bob: it
     // is not taken, and Bob's messages keep reaching her
@@ -1290,11 +1317,18 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     plat_sleep_ms(300);
     exchange(alice, bob, drop, "H4 F4: after a forged roster 2^30 ahead", first);
     // one a little ahead is taken (the relay's counter could be there), and the relay's are taken again once none was
-    // for the silence time and 4 s
+    // for the silence time and 4 s (1.5 s and 4 s here): the next of the relay's that arrives then. The mock sends one
+    // a second, so the wait holds at least ten of them after the 5.5 s; all lost at 30 % loss is one run in 170000.
     mock->forge_roster = 1000;
     CHECK(WAIT_FOR(!mock->forge_roster, 2000), "a roster 1000 ahead was sent");
-    plat_sleep_ms(7000);
-    exchange(alice, bob, drop, "H4 F4: 7 s after a forged roster 1000 ahead", first);
+    uint64_t forged_at = plat_now_ms();
+    int forged_taken = WAIT_FOR(!names_session(alice, bob), 1000);   // its three copies can all be lost at 30 % loss
+    CHECK(drop || forged_taken, "H4 F4: a roster 1000 ahead is taken");
+    CHECK(WAIT_FOR(names_session(alice, bob), 1500 + 4000 + 11000), "H4 F4: the relay's rosters are taken again after a forged one 1000 ahead");
+    char what[96];
+    snprintf(what, sizeof what, "H4 F4: %.1f s after a forged roster 1000 ahead%s", (double)(plat_now_ms() - forged_at) / 1000,
+             forged_taken ? "" : ", all of whose copies were lost");
+    exchange(alice, bob, drop, what, first);
     // the sixth review's finding 1: one message in Bob's name and session, sealed with the room's key (which everyone
     // who knows the secret has), its counter 2^31 - 1 ahead of Bob's. Bob's own messages reach Alice again after a few
     mock->forge_ahead = 1;
