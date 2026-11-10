@@ -53,6 +53,16 @@ static void init(void *param) {
     qsort(list, (size_t)nlist, sizeof *list, by_key);
     for (int i = 1; i < nlist; i++)   // one setting each
         if (!strcmp(list[i]->key, list[i - 1]->key)) rt_fatal("restore: two restorations have the key %s", list[i]->key);
+    // A copy's Hash names its object in the whole area (both placement files): no two copies may take the same one.
+    for (int i = 0; i < nlist; i++)
+        for (int a = 0; a < list[i]->nedits; a++)
+            for (int j = i; j < nlist; j++)
+                for (int b = j == i ? a + 1 : 0; b < list[j]->nedits; b++) {
+                    const RestoreEdit *x = &list[i]->edits[a], *y = &list[j]->edits[b];
+                    if (x->kind == RESTORE_KIND_ADD && y->kind == RESTORE_KIND_ADD && x->new_hash == y->new_hash)
+                        rt_fatal("restore: %s and %s both add a copy as the Hash %llu", list[i]->key, list[j]->key,
+                                 (unsigned long long)x->new_hash);
+                }
 }
 
 static void ensure(void) {
@@ -137,6 +147,18 @@ static void *dictionaries(void *(*read)(const char *rel, size_t *n), size_t *n) 
     return d;
 }
 
+// The pack members the last run added or rewrote (restore_member): the member's path, its size before (0: added) and
+// after, its bytes declared (else the game's, copied or edited).
+typedef struct { const char *path; size_t was, now; int declared; } Member;
+static Member *members;
+static int nmembers;
+
+int restore_member(int i, const char **path, size_t *was, size_t *now, int *declared) {
+    if (i < 0 || i >= nmembers) return 0;
+    *path = members[i].path, *was = members[i].was, *now = members[i].now, *declared = members[i].declared;
+    return 1;
+}
+
 // The edits of the switched-on restorations (all: of every declared one); serve NULL applies them without serving.
 // Returns the number of edits skipped.
 static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(const char *rel, void *out, size_t n)) {
@@ -144,6 +166,8 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
     // the counts are of this run alone: the game runs once, the tests and a probe after them run again
     memset(started_applied, 0, sizeof *started_applied * (size_t)(nlist ? nlist : 1));
     memset(started_skipped, 0, sizeof *started_skipped * (size_t)(nlist ? nlist : 1));
+    free(members);
+    members = NULL, nmembers = 0;
     int total = 0, on = 0, np = 0, skipped = 0;
     for (int i = 0; i < nlist; i++) total += list[i]->nedits;
     if (!total) return 0;
@@ -160,7 +184,9 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
     }
     const RestoreEdit **edits = malloc(sizeof *edits * (size_t)np);
     int *ok = malloc(sizeof *ok * (size_t)np);
-    if (!edits || !ok) rt_fatal("restore: out of memory");
+    RestoreMemberSize *sizes = malloc(sizeof *sizes * (size_t)np);
+    members = malloc(sizeof *members * (size_t)np);
+    if (!edits || !ok || !sizes || !members) rt_fatal("restore: out of memory");
     qsort(picks, (size_t)np, sizeof *picks, by_file);
     double t0 = (double)plat_now_ns() / 1e9;
     size_t dn = 0;
@@ -181,7 +207,7 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
                 note(&g, k, "skipped: the file is missing");
             }
         } else {
-            out = restore_file(edits, b - a, in, n, dic, dn, ok, note, &g, &out_n);
+            out = restore_file(edits, b - a, in, n, dic, dn, read, romfs_with, ok, sizes, note, &g, &out_n);
             free(in);
         }
         if (out && serve && !serve(file, out, out_n)) {
@@ -196,6 +222,8 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
             int r = picks[a + k].r;
             if (ok[k]) started_applied[r]++;
             else started_skipped[r]++, skipped++;
+            if (ok[k] && sizes[k].now)
+                members[nmembers++] = (Member){edits[k]->member, sizes[k].was, sizes[k].now, edits[k]->bytes != NULL};
         }
     }
     plat_xchg32(&started_ready, 1);   // a full barrier: the counts above are written before the flag
@@ -206,6 +234,7 @@ static int run(int all, void *(*read)(const char *rel, size_t *n), int (*serve)(
            serve ? "served" : "edited (not served: --probe-restore)", ((double)plat_now_ns() / 1e9 - t0) * 1000);
     free(dic);
     free(ok);
+    free(sizes);
     free(edits);
     free(picks);
     return skipped;

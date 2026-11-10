@@ -84,7 +84,7 @@ static int container(Reader *r, BymlNode *out, uint8_t type, uint32_t off, int d
     if (n > MAX_NODES - r->nodes) return fail(r, "too many nodes");
     r->nodes += n;
     out->type = type;
-    out->n = n;
+    out->n = out->cap = n;
     out->items = n ? calloc(n, sizeof *out->items) : NULL;
     if (type == BYML_DICT && n) out->keys = calloc(n, sizeof *out->keys);
     if (type == BYML_HASH32 && n) out->hashes = calloc(n, sizeof *out->hashes);
@@ -159,8 +159,8 @@ static int value(Reader *r, BymlNode *out, uint8_t type, uint32_t v, int depth) 
     }
 }
 
-static void node_free(BymlNode *node) {
-    for (uint32_t i = 0; i < node->n; i++) node_free(&node->items[i]);
+void byml_node_free(BymlNode *node) {
+    for (uint32_t i = 0; i < node->n; i++) byml_node_free(&node->items[i]);
     free(node->items);
     free(node->keys);
     free(node->hashes);
@@ -208,7 +208,7 @@ done:
     return ok;
 }
 
-void byml_free(Byml *b) { node_free(&b->root); }
+void byml_free(Byml *b) { byml_node_free(&b->root); }
 
 // ---- queries and edits
 
@@ -236,6 +236,83 @@ BymlNode *byml_path(BymlNode *node, const char *path) {
         }
     }
     return node;
+}
+
+int byml_copy(BymlNode *dst, const BymlNode *src) {
+    *dst = *src;
+    dst->items = NULL, dst->keys = NULL, dst->hashes = NULL;
+    dst->n = dst->cap = 0;
+    if (!src->n) return 1;
+    dst->items = calloc(src->n, sizeof *dst->items);
+    if (src->keys) dst->keys = malloc(sizeof *dst->keys * src->n);
+    if (src->hashes) dst->hashes = malloc(sizeof *dst->hashes * src->n);
+    if (!dst->items || (src->keys && !dst->keys) || (src->hashes && !dst->hashes)) {
+        byml_node_free(dst);
+        return 0;
+    }
+    dst->cap = src->n;
+    if (src->keys) memcpy(dst->keys, src->keys, sizeof *dst->keys * src->n);
+    if (src->hashes) memcpy(dst->hashes, src->hashes, sizeof *dst->hashes * src->n);
+    for (uint32_t i = 0; i < src->n; i++) {
+        dst->n = i + 1;
+        if (!byml_copy(&dst->items[i], &src->items[i])) {
+            byml_node_free(dst);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void byml_remove(BymlNode *node, uint32_t i) {
+    if (i >= node->n) return;
+    byml_node_free(&node->items[i]);
+    uint32_t tail = node->n - i - 1;
+    memmove(&node->items[i], &node->items[i + 1], sizeof *node->items * tail);
+    if (node->keys) memmove(&node->keys[i], &node->keys[i + 1], sizeof *node->keys * tail);
+    if (node->hashes) memmove(&node->hashes[i], &node->hashes[i + 1], sizeof *node->hashes * tail);
+    node->n--;
+}
+
+int byml_append(BymlNode *node, const char *key, BymlNode item) {
+    // a hash dict's items need a hash each (byml_write reads one per item), a dict's a key
+    if (node->type != BYML_ARRAY && (node->type != BYML_DICT || !key)) return 0;
+    uint32_t at = node->n;
+    if (node->type == BYML_DICT) {
+        // A dict keeps its keys in increasing order, as the parser reads them: byml_equal compares dicts item by item.
+        uint32_t lo = 0, hi = node->n;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (strcmp(node->keys[mid], key) < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < node->n && !strcmp(node->keys[lo], key)) {
+            byml_node_free(&node->items[lo]);
+            node->items[lo] = item;
+            return 1;
+        }
+        at = lo;
+    }
+    if (node->n == node->cap) {
+        uint32_t cap = node->cap ? node->cap * 2 : 4;
+        if (cap <= node->cap) return 0;
+        BymlNode *items = realloc(node->items, sizeof *items * cap);
+        if (!items) return 0;
+        node->items = items;
+        if (node->type == BYML_DICT) {
+            const char **keys = realloc(node->keys, sizeof *keys * cap);
+            if (!keys) return 0;
+            node->keys = keys;
+        }
+        node->cap = cap;
+    }
+    memmove(&node->items[at + 1], &node->items[at], sizeof *node->items * (node->n - at));
+    if (node->type == BYML_DICT) {
+        memmove(&node->keys[at + 1], &node->keys[at], sizeof *node->keys * (node->n - at));
+        node->keys[at] = key;
+    }
+    node->items[at] = item;
+    node->n++;
+    return 1;
 }
 
 double byml_number(const BymlNode *node) {

@@ -1,11 +1,13 @@
 // BYML documents (byml.c): the parameter and placement files of the game (.byml, .bgyml, .bcett.byml), versions 2 to 7,
-// little-endian ("YB", as this release's files are), read into a tree whose numbers can be set and written back.
-// restore.c edits the player's own files with it.
+// little-endian ("YB", as this release's files are), read into a tree that can be edited and written back. restore.c
+// edits the player's own files with it.
 //
-// Strings of a parsed tree point into the bytes it was read from, so those bytes must outlive the tree. The parser
-// refuses a dict whose keys are not in strictly increasing order and a hash dict whose hashes are not (the game looks
-// them up sorted). byml_write lays the tree out the way the game's files are: sorted key and string tables, containers
-// 4-aligned, 64-bit values 8-aligned, equal containers and values written once.
+// Strings of a parsed tree point into the bytes it was read from, so those bytes must outlive the tree; strings an edit
+// adds must live as long (the engine uses literals, or the bytes of the files it copies from, kept until it ends).
+// The parser refuses a dict whose keys are not in strictly increasing order and a hash dict whose hashes are not (the
+// game looks them up sorted), and byml_append keeps a dict's keys in that order. byml_write lays the tree out the way
+// the game's files are: sorted key and string tables, containers 4-aligned, 64-bit values 8-aligned, equal containers
+// and values written once.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -22,7 +24,7 @@ struct BymlNode {
     uint64_t bits;                // scalars: the value's bits (32-bit types in the low half)
     const char *str;              // BYML_STRING: the text; BYML_BINARY: the bytes
     uint32_t len;                 // BYML_BINARY: the byte count
-    uint32_t n;                   // containers: the item count
+    uint32_t n, cap;              // containers: the item count and the room for items
     BymlNode *items;              // containers: the items (dict values)
     const char **keys;            // BYML_DICT: the key of each item, in increasing order
     uint32_t *hashes;             // BYML_HASH32: the hash of each item, in increasing order
@@ -45,6 +47,15 @@ int byml_equal(const BymlNode *a, const BymlNode *b);
 BymlNode *byml_get(const BymlNode *node, const char *key);
 // The node below node at path: keys and array indices separated by '/' ("Translate/2"); NULL when one is missing.
 BymlNode *byml_path(BymlNode *node, const char *path);
+// A deep copy of src into dst (strings shared); 0 when out of memory.
+int byml_copy(BymlNode *dst, const BymlNode *src);
+void byml_node_free(BymlNode *node);
+// Container edits: remove item i (freeing it); append a node, taking it over: to an array at its end, to a dict under
+// key at the place its order puts it (replacing an item of that key). 0 when out of memory, or when node is not an
+// array or a dict, or a dict and key is NULL (a hash dict takes no new items: each needs a hash); the caller still owns
+// item then.
+void byml_remove(BymlNode *node, uint32_t i);
+int byml_append(BymlNode *node, const char *key, BymlNode item);
 // Scalars: the value as a double (NAN for a node that is not a number or bool), and set from a double in the node's
 // own type (integers rounded); 0 when the node is not a number or bool or the value does not fit.
 double byml_number(const BymlNode *node);

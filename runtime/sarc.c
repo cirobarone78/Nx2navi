@@ -97,33 +97,34 @@ int sarc_at(const uint8_t *p, size_t n, unsigned i, const char **name, size_t *a
     return 1;
 }
 
+// Every node of the archive (malloc'd), for the calls that move members: each inside the data, and each name ending
+// before the data (before the names' last NUL); NULL with why.
+static Node *every_node(const uint8_t *p, size_t n, const Head *h, const char **why) {
+    size_t names_end = h->data;
+    while (names_end > h->names && p[names_end - 1]) names_end--;
+    Node *nodes = malloc(sizeof *nodes * (h->count ? h->count : 1));
+    if (!nodes) return *why = "out of memory", NULL;
+    for (unsigned j = 0; j < h->count; j++) {
+        nodes[j] = node(p, h, j);
+        size_t s = name_at(&nodes[j], h);
+        if (!inside(&nodes[j], h, n)) *why = "a SARC member that runs past the end";
+        else if (s && s >= names_end) *why = "a SARC member name that runs past the names";
+        else continue;
+        free(nodes);
+        return NULL;
+    }
+    return nodes;
+}
+
 uint8_t *sarc_replace(const uint8_t *p, size_t n, const char *name, const uint8_t *data, size_t size, size_t *out_n,
                       const char **why) {
     Head h;
     if (!head(p, n, &h, why)) return NULL;
     int i = find(p, &h, name);
     if (i < 0) return *why = "the pack has no such member", NULL;
-    // Every node, as this moves them: inside the data, and a name that ends before it (before the names' last NUL).
-    size_t names_end = h.data;
-    while (names_end > h.names && p[names_end - 1]) names_end--;
-    Node *nodes = malloc(sizeof *nodes * (h.count ? h.count : 1));
+    Node *nodes = every_node(p, n, &h, why);
     uint8_t *out = NULL;
-    if (!nodes) {
-        *why = "out of memory";
-        goto done;
-    }
-    for (unsigned j = 0; j < h.count; j++) {
-        nodes[j] = node(p, &h, j);
-        size_t s = name_at(&nodes[j], &h);
-        if (!inside(&nodes[j], &h, n)) {
-            *why = "a SARC member that runs past the end";
-            goto done;
-        }
-        if (s && s >= names_end) {
-            *why = "a SARC member name that runs past the names";
-            goto done;
-        }
-    }
+    if (!nodes) return NULL;
     // The members after it (starting at or past its end) and the room up to the first of them.
     size_t begin = nodes[i].begin, slot = n - h.data, align = 4;
     for (unsigned j = 0; j < h.count; j++) {
@@ -157,6 +158,80 @@ uint8_t *sarc_replace(const uint8_t *p, size_t n, const char *name, const uint8_
             wr32(out + h.sfat + 12 + (size_t)j * 16 + 8, nodes[j].begin + (uint32_t)shift);
             wr32(out + h.sfat + 12 + (size_t)j * 16 + 12, nodes[j].end + (uint32_t)shift);
         }
+done:
+    free(nodes);
+    return out;
+}
+
+static size_t low_bit(size_t off) { return off ? (off & (~off + 1)) > 0x2000 ? 0x2000 : off & (~off + 1) : 0x2000; }
+
+size_t sarc_alignment(const uint8_t *p, size_t n, const char *name) {
+    size_t at, size;
+    return sarc_find(p, n, name, &at, &size, NULL) ? low_bit(at) : 0;
+}
+
+uint8_t *sarc_add(const uint8_t *p, size_t n, const char *name, const uint8_t *data, size_t size, size_t align,
+                  size_t *out_n, const char **why) {
+    Head h;
+    if (!head(p, n, &h, why)) return NULL;
+    Node *nodes = every_node(p, n, &h, why);
+    if (!nodes) return NULL;
+    uint8_t *out = NULL;
+    uint32_t mult = rd32(p, h.sfat + 8), hash = 0;
+    for (const char *c = name; *c; c++) hash = hash * mult + (uint32_t)(int32_t)(signed char)*c;
+    // The new node's index (after every node of a smaller hash), where the names' padding ends, and the largest
+    // alignment a member's offset has: the data moves by a multiple of it, so each member keeps its own.
+    unsigned at = 0;
+    size_t end = h.names, step = 4;
+    for (unsigned i = 0; i < h.count; i++) {
+        uint32_t nh = rd32(p, h.sfat + 12 + (size_t)i * 16);
+        size_t s = name_at(&nodes[i], &h);
+        if (s && !strcmp((const char *)p + s, name)) {
+            *why = "the pack has that member already";
+            goto done;
+        }
+        if (nh == hash) {
+            *why = "another member of the pack has the name's hash";
+            goto done;
+        }
+        if (nh < hash) at = i + 1;
+        if (s) {
+            size_t e = h.names + (s - h.names + strlen((const char *)p + s) + 4) / 4 * 4;
+            if (e > end) end = e;
+        }
+        size_t a = low_bit((size_t)h.data + nodes[i].begin);
+        if (a > step) step = a;
+    }
+    if (end > h.data) {
+        *why = "a SARC name table that runs into the data";
+        goto done;
+    }
+    size_t len = strlen(name), room = (len + 4) / 4 * 4, need = end + 16 + room;
+    size_t shift = need > h.data ? (need - h.data + step - 1) / step * step : 0;
+    size_t data_n = n - h.data, base = h.data + shift;
+    size_t new_at = ((base + data_n + align - 1) & ~(align - 1)) - base;   // aligned in the file
+    if ((end - h.names + room) / 4 > 0xffffff || h.count + 1 > 0xffff || new_at + size > UINT32_MAX - base) {
+        *why = "the pack would be too large";
+        goto done;
+    }
+    *out_n = base + new_at + size;
+    if (!(out = calloc(1, *out_n))) {
+        *why = "out of memory";
+        goto done;
+    }
+    size_t node_at = h.sfat + 12 + (size_t)at * 16;
+    memcpy(out, p, node_at);                                    // the header and the nodes before the new one
+    wr32(out + node_at, hash);
+    wr32(out + node_at + 4, 0x01000000u | (uint32_t)((end - h.names) / 4));
+    wr32(out + node_at + 8, (uint32_t)new_at);
+    wr32(out + node_at + 12, (uint32_t)(new_at + size));
+    memcpy(out + node_at + 16, p + node_at, end - node_at);    // the nodes after it, SFNT and the names
+    memcpy(out + end + 16, name, len);                          // its name, NUL-padded by calloc
+    memcpy(out + base, p + h.data, data_n);                     // the data, moved by shift
+    memcpy(out + base + new_at, data, size);
+    out[h.sfat + 6] = (uint8_t)(h.count + 1), out[h.sfat + 7] = (uint8_t)((h.count + 1) >> 8);
+    wr32(out + 8, (uint32_t)*out_n);
+    wr32(out + 12, (uint32_t)base);
 done:
     free(nodes);
     return out;

@@ -5,12 +5,14 @@ Windows: python tests/restore_check.py --toolchain C:/msys64/ucrt64
 
 Writes fixtures with an encoder of its own (BYML laid out parents first and nothing shared, unlike the engine's
 writer): a placement file packed with a zstd dictionary (Pack/ZsDic.pack.zs's role is played by a SARC of two
-trained dictionaries), a pack (SARC) of BYML members and raw bytes, and files that are not what they claim.
-tests/restore_check.c runs the engine's edits on them, prints each note and checks which applied, feeds the parser,
-the engine and the SARC reader and writer every cut length of them and damaged copies, checks that dicts out of order
-are refused, and runs restore.c's switches, a start and the probe with the settings, the log and the RomFS stubbed
-(every switch off: nothing read, served or logged); this script then decodes what it wrote with its own decoder and
-compares the trees with the edits it expects, and checks the pack's other members kept their bytes and alignment.
+trained dictionaries), a pack (SARC) of BYML members and raw bytes, the files edits copy from (another placement,
+another pack) or check against (an area's other placement file, its static compound), and files that are not what
+they claim. tests/restore_check.c runs the engine's edits of every kind on them, prints each note and checks which
+applied, feeds the parser, the engine and the SARC reader and writer every cut length of them and damaged copies,
+checks that dicts out of order are refused, and runs restore.c's switches, a start and the probe with the settings,
+the log and the RomFS stubbed (every switch off: nothing read, served or logged); this script then decodes what it
+wrote with its own decoder and compares the trees with the edits it expects, and checks the packs' members: their
+hashes, order, bytes and alignment.
 """
 import argparse
 import os
@@ -275,16 +277,24 @@ def sarc_encode(members, aligns):
 
 
 def sarc_decode(d):
+    """{name: (absolute offset, bytes)}; checks the size field and that the nodes are sorted by their names' hashes."""
     assert d[:4] == b'SARC'
     head, bom, size, data_at = struct.unpack_from('<HHII', d, 4)
     assert size == len(d), 'SARC size field'
-    count = struct.unpack_from('<H', d, head + 6)[0]
+    count, mult = struct.unpack_from('<HI', d, head + 6)
     names = head + 12 + 16 * count + 8
-    res = {}
+    res, last = {}, -1
     for i in range(count):
-        _, attr, lo, hi = struct.unpack_from('<IIII', d, head + 12 + 16 * i)
+        h, attr, lo, hi = struct.unpack_from('<IIII', d, head + 12 + 16 * i)
         o = names + (attr & 0xffffff) * 4
-        res[d[o:d.index(b'\0', o)].decode()] = (data_at + lo, d[data_at + lo:data_at + hi])
+        name = d[o:d.index(b'\0', o)].decode()
+        x = 0
+        for c in name.encode(): x = (x * mult + (c if c < 0x80 else c - 0x100)) & 0xffffffff
+        assert h == x, 'SARC node hash of %s' % name
+        assert h > last, 'SARC nodes not sorted by hash'
+        last = h
+        assert o < data_at, 'SARC name past the data offset'
+        res[name] = (data_at + lo, d[data_at + lo:data_at + hi])
     return res
 
 
@@ -320,6 +330,37 @@ def placement_expected():
     a[2]['Scale'][1] = F32(5.0)
     a[2]['Dynamic']['Count'] = 9
     t['Misc']['Double'] = F64(2.5)
+    return t
+
+
+def source():
+    """Another area's placement: the object RESTORE_ADD_FROM copies."""
+    return {'Actors': [
+        {'Gyaml': 'Obj_S', 'Hash': U64(5001), 'Translate': [F32(1.0), F32(1.0), F32(1.0)], 'Dynamic': {'Room': 24},
+         'Phive': {'Placement': {'ID': U64(5001)}}, 'SRTHash': U32(9),
+         'Links': [{'Dst': U64(5002), 'Gyaml': 'Reference', 'Name': 'Reference', 'Src': U64(5001)}]},
+        {'Gyaml': 'Obj_T', 'Hash': U64(5002), 'Translate': [F32(0.0), F32(0.0), F32(0.0)]},
+    ], 'FilePath': 'Work/Banc/Scene/Other.bcett.json'}
+
+
+def placement_kinds_expected():
+    t = placement()
+    a = t['Actors']
+    copy = {k: v for k, v in a[1].items() if k not in ('Links', 'SRTHash')}
+    copy['Hash'] = U64(2002)
+    copy['Phive'] = {'Placement': {'ID': U64(2002)}}
+    copy['Translate'] = [F32(10.0), F32(20.0), F32(30.0)]
+    copy['Rotate'] = [F32(0.0), F32(3.0), F32(0.0)]
+    a[2]['Name'] = 'Added'
+    a[2]['Dynamic']['Extra'] = F32(2.5)
+    t['FilePath'] = 'Work/Other.json'
+    t['Misc']['Flag'] = True
+    t['Misc']['Aaa'] = 3
+    del a[0]                                 # Obj_A 1001 removed
+    a.append(copy)
+    a.append({'Gyaml': 'Obj_S', 'Hash': U64(6001), 'Translate': [F32(9.0), F32(9.0), F32(9.0)],
+              'Rotate': [F32(0.0), F32(0.5), F32(0.0)], 'Dynamic': {'Room': 17},
+              'Phive': {'Placement': {'ID': U64(6001)}}})
     return t
 
 
@@ -378,6 +419,12 @@ def main():
     (OUT / 'pack.zs').write_bytes(compress(pack))
     (OUT / 'junk.bin').write_bytes(b'YB\x07\x00' + b'\xff' * 60)
     (OUT / 'otherdic.zs').write_bytes(compress(place, train(samples[:100], 2048)[0]))
+    (OUT / 'src.byml').write_bytes(byml_encode(source()))
+    (OUT / 'area_Dynamic.bcett.byml.zs').write_bytes(compress(byml_encode(
+        {'Actors': [{'Gyaml': 'Obj_D', 'Hash': U64(7001), 'Translate': [F32(0.0), F32(0.0), F32(0.0)]}]})))
+    (OUT / 'compound.bphsc').write_bytes(b'static compound ' + struct.pack('<Q', 1003) + b' rest')
+    x_member = byml_encode({'Liftable': True, 'Pos': [F32(0.0), F32(0.5), F32(0.0)]})
+    (OUT / 'pack2.zs').write_bytes(compress(sarc_encode([('X/x.bgyml', x_member)], {'X/x.bgyml': 0x40})))
 
     r = subprocess.run([str(exe), str(OUT)], env=env, capture_output=True, text=True, timeout=120)
     print(r.stdout, end='')
@@ -408,6 +455,36 @@ def main():
     for n in ('B/two.bin', 'C/three.bgyml'):
         check(g[n][1] == dict(members)[n], 'grown pack: %s lost its bytes' % n)
         check(g[n][0] % aligns[n] == 0, 'grown pack: %s at %#x lost its alignment %#x' % (n, g[n][0], aligns[n]))
+
+    # the kinds that remove, copy, set text and add keys
+    check(same(byml_decode(decompress((OUT / 'place2.out.zs').read_bytes(), dics)), placement_kinds_expected()),
+          'placement, other kinds: the edited tree is not the expected one')
+    m2 = sarc_decode(decompress((OUT / 'pack2.out.zs').read_bytes(), {}))
+    old = dict(members)
+    check(set(m2) == set(old) | {'D/new.bin', 'E/copy.bgyml', 'F/other.bgyml'}, 'pack, members added: the member set')
+    for n in ('A/one.bgyml', 'B/two.bin'):
+        check(m2[n][1] == old[n], 'pack, members added: %s lost its bytes' % n)
+    for n in old:
+        check(m2[n][0] % aligns[n] == 0, 'pack, members added: %s lost its alignment' % n)
+    check(m2['D/new.bin'][1] == b'new\0\x01\x02\x03', 'pack, members added: the declared bytes')
+    check(same(byml_decode(m2['E/copy.bgyml'][1]), {'Params': {'Speed': F32(1.5), 'Count': 8, 'Flag': True}}),
+          'pack, members added: the copy from the same pack, then set')
+    check(m2['F/other.bgyml'][1] == x_member, 'pack, members added: the copy from another pack')
+    check(same(byml_decode(m2['C/three.bgyml'][1]),
+               {'Params': {'Speed': F32(1.5), 'Count': 4, 'Flag': True, 'Name': 'liftable'}}), 'pack, members added: C')
+    check(all(m2[n][0] % 8 == 0 for n in ('D/new.bin', 'E/copy.bgyml', 'F/other.bgyml')),
+          'pack, members added: a new member not 8-aligned')
+    check(m2['F/other.bgyml'][0] % 0x40 == 0, 'pack, members added: the copy lost its source alignment')
+    g2 = sarc_decode((OUT / 'grown2.sarc').read_bytes())
+    check(struct.unpack_from('<I', (OUT / 'grown2.sarc').read_bytes(), 12)[0] > struct.unpack_from('<I', pack, 12)[0],
+          'long names: the data did not move (the test does not reach that path)')
+    for n in old:
+        check(g2[n][1] == old[n] and g2[n][0] % aligns[n] == 0, 'long names: %s lost its bytes or alignment' % n)
+    longs = [n for n in g2 if n.startswith('Long/')]
+    check(len(longs) == 6, 'long names: %d of 6 added' % len(longs))
+    for n in longs:
+        i = int(n.split('/')[1])
+        check(g2[n][1] == b'new\0\x01\x02\x03' and g2[n][0] % (0x100 if i % 2 else 8) == 0, 'long names: ' + n)
 
     fails = [f for f in fails if f]
     for f in fails:

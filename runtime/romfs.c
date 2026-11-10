@@ -718,6 +718,28 @@ static void restbl_overlay(void) {
         }
         raised += want && restbl_raise(out, key, want);
     }
+    // A pack member a restoration added or rewrote (restore.c): its own entry, which the game sizes the member's buffer
+    // from (a member that outgrows it fails to load: an allocation comes back empty and the game writes through it).
+    // A copy of one of the game's members keeps that path's entry; a new path, or declared bytes, gets an estimate; a
+    // member the edits made larger gets its entry raised as a file that grew does.
+    const char *mpath;
+    size_t mwas, mnow;
+    int declared;
+    for (int m = 0; restore_member(m, &mpath, &mwas, &mnow, &declared); m++) {
+        char key[4200];
+        uint32_t have = 0, want;
+        restbl_key(mpath, key, sizeof key);
+        int known = restbl_get(base, key, &have);
+        if (!mwas) {   // added
+            if (known && !declared) continue;
+            want = restbl_estimate(key, mnow);
+        } else {
+            if (mnow <= mwas) continue;
+            want = known ? restbl_grow(key, have, mwas, mnow, 0) : restbl_estimate(key, mnow);
+        }
+        int up = want && restbl_raise(out, key, want);
+        raised += up, estimated += up && (!mwas || !known);
+    }
     restbl_free(base);
     if (!merged && !raised && !served) {
         restbl_free(out);
@@ -786,11 +808,20 @@ static void camera_overlay(void) {
 
 // The restorations switched on (restore.c): each file their edits name, as the game would read it (base: a mod's
 // version, else the original), edited and written to <profile>/restore/<its folder>/, served in the base's place and
-// marked for restbl_overlay. restore_apply reads a file and serves it before it reads the next one.
-static Overlay *restore_base;
+// marked for restbl_overlay. restore_apply also reads the files edits copy from or check against between reading a
+// file and serving it, so restore_serve finds the file's base itself.
 static const char restore_keeps[] = "the restorations that edit it skip it";
 
-static void *restore_read(const char *rel, size_t *n) { return read_served(rel, &restore_base, n, restore_keeps); }
+void *romfs_read_served(const char *rel, size_t *n) {
+    Overlay *base;
+    return read_served(rel, &base, n, restore_keeps);
+}
+
+const char *romfs_with(const char *prefix, int i) {
+    uint64_t at = lower(prefix) + (uint64_t)i;   // the index is sorted by path
+    const char *p = i >= 0 && at < file_count ? entry_name(entry(at)) : NULL;
+    return p && !strncmp(p, prefix, strlen(prefix)) ? p : NULL;
+}
 
 static int restore_serve(const char *rel, void *out, size_t n) {
     char sub[512];
@@ -800,19 +831,17 @@ static int restore_serve(const char *rel, void *out, size_t n) {
         free(out);
         return 0;
     }
-    if (!serve_generated(rel, restore_base, out, n, sub, "restorations", restore_keeps)) return 0;
     uint64_t i = lower(rel);
+    Overlay *base = NULL;   // as read_served chose it
+    for (size_t k = 0; k < noverlay; k++)
+        if (overlays[k].index == i) base = &overlays[k];
+    if (!serve_generated(rel, base, out, n, sub, "restorations", restore_keeps)) return 0;
     for (size_t k = 0; k < noverlay; k++)
         if (overlays[k].index == i) overlays[k].restored = 1;
     return 1;
 }
 
-static void restore_overlay(void) { restore_apply(restore_read, restore_serve); }
-
-void *romfs_read_served(const char *rel, size_t *n) {
-    Overlay *base;
-    return read_served(rel, &base, n, restore_keeps);
-}
+static void restore_overlay(void) { restore_apply(romfs_read_served, restore_serve); }
 
 // The button prompts' folders (input_prompts_folder) and whether each had a manifest next to romfs-index.bin at start;
 // the one the settings asked for at start, the one overlay_init loaded (NULL: the game's own prompts) and why the first

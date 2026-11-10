@@ -15,3 +15,13 @@ int sarc_at(const uint8_t *p, size_t n, unsigned i, const char **name, size_t *a
 // the ones after it by a step that keeps the alignment of each of their offsets (up to 0x2000).
 uint8_t *sarc_replace(const uint8_t *p, size_t n, const char *name, const uint8_t *data, size_t size, size_t *out_n,
                       const char **why);
+// The archive with a new member `name` holding data[0..size) (malloc'd); NULL with why: the name is taken, its hash
+// is another member's, or any member or name runs past the end. Its node goes where the name hash sorts it (the game
+// looks members up by binary search on the hash), its name after the others' and its bytes at the end, at an offset
+// aligned to align (a power of two). When the names outgrow the room before the data, all the data moves by a step
+// that keeps each member's alignment.
+uint8_t *sarc_add(const uint8_t *p, size_t n, const char *name, const uint8_t *data, size_t size, size_t align,
+                  size_t *out_n, const char **why);
+// The alignment of member name's offset in the archive (the largest power of two dividing it, at most 0x2000); 0 when
+// the archive lacks it.
+size_t sarc_alignment(const uint8_t *p, size_t n, const char *name);
