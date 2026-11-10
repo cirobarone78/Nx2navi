@@ -30,6 +30,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "action_prompt.h"
 #include "cfg.h"
 #include "fs.h"
 #include "host.h"
@@ -782,6 +783,32 @@ static void camera_overlay(void) {
     if (ok && serve_generated(CAMPACK, base, out, out_n, "camera", "camera speed", keeps)) cam_pack_served();
 }
 
+// The action prompt's diamond of face buttons for the pad layout at start (action_prompt.c). By position (the
+// Switch's places) the game's own layout is right; by label the Common layout archive the game would read (a mod's, else
+// the RomFS's) is served with the diamond laid out again, written to <profile>/action-prompt/. A pad is not open yet
+// this early, so auto counts as by label, as for the prompts' folders (input_map.c input_prompts_folder).
+static int action_prompt_for = -1;   // romfs_action_prompt
+static void action_prompt_overlay(void) {
+    int layout = input_pad_layout_pick(cfg_value("NX2NAVI_PAD_LAYOUT"), 0);
+    if (layout == PAD_LAYOUT_NINTENDO) {
+        action_prompt_for = layout;
+        return;
+    }
+    static const char keeps[] = "the action prompt keeps the Switch places";
+    Overlay *base, *dic_base;
+    size_t n, dn, out_n = 0;
+    void *in = read_served(ACTION_PROMPT_ARCHIVE, &base, &n, keeps), *out = NULL;
+    void *dic = in ? read_served("Pack/ZsDic.pack.zs", &dic_base, &dn, keeps) : NULL;
+    int made = in && dic ? action_prompt_build(in, n, dic, dn, 1, &out, &out_n) : -1;
+    free(in);
+    free(dic);
+    if (made == 0 || (made > 0 && serve_generated(ACTION_PROMPT_ARCHIVE, base, out, out_n, "action-prompt",
+                                                   "face buttons by label", keeps)))
+        action_prompt_for = layout;
+}
+
+int romfs_action_prompt(void) { return action_prompt_for; }
+
 // The button prompts' folders (input_prompts_folder) and whether each had a manifest next to romfs-index.bin at start;
 // the one the settings asked for at start, the one overlay_init loaded (NULL: the game's own prompts) and why the first
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
@@ -938,6 +965,7 @@ static void overlay_init(void) {
     restbl_overlay();
     heapdef_overlay();
     camera_overlay();
+    action_prompt_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)   // overlay_contest left one per file; the generated ones replace in place

@@ -21,6 +21,22 @@ The log names the layout in effect (`input: gamepad layout ...`) and each gamepa
 (`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
 letters unless *Button prompts* says otherwise (below).
 
+The action prompt (top right) shows the four face buttons as a diamond. The game draws it in the Switch places (A right,
+B bottom, X top, Y left), which `nintendo` keeps. Under `xbox`, `playstation` and `auto` the diamond follows such a
+pad instead (A bottom, B right, X left, Y top), whatever *Button prompts* is.
+
+The game reads the diamond once at start, before a gamepad is open:
+
+- `auto` gets the Xbox diamond, so a Switch Pro Controller under `auto` sees A at the bottom although its A is on the
+  right. Pick `nintendo` for that pad.
+- A change of layout shows after a restart; until then *Button prompts* says *prompts change after restart*.
+- A RomFS mod that changes the action prompt keeps its own diamond. A mod that replaces the same archive for other
+  reasons gets the diamond moved on top of its changes.
+
+The log says what happened in a line that starts with `action prompt:`. How the layout is changed:
+`runtime/action_prompt.c` (`DoCommand_00` in `UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs`, served
+from `<profile>/action-prompt/`).
+
 ## Button prompts
 
 `NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation`, `steamdeck` or `pc` (*Keyboard and mouse*). It changes three things the game draws:

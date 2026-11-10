@@ -51,6 +51,9 @@ enum { ROMFS_PROMPTS_OK, ROMFS_PROMPTS_MISSING, ROMFS_PROMPTS_FAILED, ROMFS_PROM
 const char *romfs_prompts(void);
 int romfs_prompts_ready(const char *folder);
 int romfs_prompts_off(const char *folder);
+// The pad layout (PAD_LAYOUT_*, input_map.h) the action prompt's diamond of face buttons has from start
+// (action_prompt.c); -1 when the layout by label was asked for but the layout file could not be changed.
+int romfs_action_prompt(void);
 const char *romfs_overlay(size_t k, const char **file, uint64_t *size, int *is_added);   // RomFS path of overlay k
 void fs_trace(const char *what, const char *path);         // NX2NAVI_TRACE=fs: one line per open
 

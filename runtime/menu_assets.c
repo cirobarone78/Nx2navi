@@ -19,6 +19,7 @@
 #include "fs.h"
 #include "host.h"
 #include "menu_assets.h"
+#include "sarc.h"
 #include "tex.h"
 
 #define MAX_RAW (512u << 20)
@@ -27,26 +28,6 @@ static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint64_t le64(const uint8_t *p) { return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-
-// SARC member `name`: start and size inside p[0..n); 0 when absent or out of range.
-static int sarc_member(const uint8_t *p, size_t n, const char *name, size_t *at, size_t *size) {
-    if (n < 0x14 || memcmp(p, "SARC", 4)) return 0;
-    size_t hl = le16(p + 4), data = le32(p + 0xc);
-    if (hl + 0xc > n || memcmp(p + hl, "SFAT", 4)) return 0;
-    size_t count = le16(p + hl + 6), ents = hl + 0xc, names = ents + 16 * count + 8;
-    if (names > n || memcmp(p + ents + 16 * count, "SFNT", 4)) return 0;
-    for (size_t i = 0; i < count; i++) {
-        const uint8_t *e = p + ents + 16 * i;
-        size_t no = names + (size_t)(le32(e + 4) & 0xffff) * 4, s = le32(e + 8), end = le32(e + 12);
-        if (no >= n || data + end > n || s > end) continue;
-        size_t len = strnlen((const char *)p + no, n - no);
-        if (len == strlen(name) && !memcmp(p + no, name, len)) {
-            *at = data + s, *size = end - s;
-            return 1;
-        }
-    }
-    return 0;
-}
 
 static ZSTD_DDict *dicts[8];
 static unsigned dict_ids[8];
@@ -59,13 +40,11 @@ static void dicts_load(void) {
     uint8_t *z = romfs_load("Pack/ZsDic.pack.zs", &zn64);
     zn = (size_t)zn64;
     if (!z) return;
-    unsigned long long rn = ZSTD_getFrameContentSize(z, zn);
-    uint8_t *raw = rn && rn <= MAX_RAW ? malloc((size_t)rn) : NULL;
-    if (raw && ZSTD_decompress(raw, (size_t)rn, z, zn) == rn) {
-        static const char *const names[] = {"zs.zsdic", "pack.zsdic", "bcett.byml.zsdic", "bkprb.zsdic"};
-        for (int i = 0; i < 4 && ndicts < 8; i++) {
-            size_t at, size;
-            if (!sarc_member(raw, (size_t)rn, names[i], &at, &size)) continue;
+    size_t rn = 0, at, size;
+    unsigned next = 0;
+    uint8_t *raw = zsdic_unpack(z, zn, MAX_RAW, &rn);
+    if (raw) {
+        while (ndicts < 8 && sarc_next(raw, rn, NULL, &next, &at, &size) == 1) {
             ZSTD_DDict *d = ZSTD_createDDict(raw + at, size);
             if (!d) continue;
             dict_ids[ndicts] = ZSTD_getDictID_fromDDict(d);

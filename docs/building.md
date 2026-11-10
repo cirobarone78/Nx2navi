@@ -318,6 +318,21 @@ A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`.
 
+A change to the action prompt's diamond of face buttons (`runtime/action_prompt.c`) or to the SARC and zstd dictionary
+helpers (`runtime/sarc.c`) passes `python tests\action_prompt_check.py`. It builds them alone, with the
+undefined-behaviour sanitizer, on a layout file, archives and dictionaries it makes from the format `action_prompt.c`'s
+header comment describes, and checks that:
+
+- by label every place, cross, flip and bubble moves and no other byte, in every copy of the layout in the archive;
+- a second run changes nothing, and by label then by position gives the game's file back;
+- a file that is not the expected one is refused and left as it was: one value off, half laid out, one copy of four,
+  damaged offsets, a pane record laid over the records that lead to another field, more than 16 copies, copies that
+  share some of their bytes;
+- the packed file names the dictionary the original named, found by its id in the pack of dictionaries.
+
+No game files. `--romfs <folder with romfs.bin and index.json>` also runs it on the game's own archive: four copies laid
+out, 208 fields, the same dictionary and unpacked size, and no byte changed outside the layout's copies.
+
 A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
 `runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
 the added text by GPU vendor and by why the cache was cold. No game files.

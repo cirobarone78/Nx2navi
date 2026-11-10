@@ -23,6 +23,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "sarc.h"
 
 #define MEMBER "Component/PlayerCameraParam/PlayerCamera.game__component__PlayerCameraParam.bgyml"
 #define MAX_RAW (64u << 20)
@@ -43,32 +44,6 @@ static int u32_at(const uint8_t *p, size_t n, size_t off, uint32_t *v) {
     if (off > n || n - off < 4) return 0;
     memcpy(v, p + off, 4);
     return 1;
-}
-
-// SARC member `name` of the archive p[0..n): its start and size; 0 when it is not there.
-static int sarc_member(const uint8_t *p, size_t n, const char *name, size_t *at, size_t *size) {
-    uint32_t data;
-    uint16_t head, count, bom;
-    if (n < 0x14 || memcmp(p, "SARC", 4)) return 0;
-    memcpy(&head, p + 4, 2);
-    memcpy(&bom, p + 6, 2);
-    if (bom != 0xfeff || !u32_at(p, n, 12, &data) || head + 12u > n || memcmp(p + head, "SFAT", 4)) return 0;
-    memcpy(&count, p + head + 6, 2);
-    size_t names = head + 12 + (size_t)count * 16;
-    if (names + 8 > n || memcmp(p + names, "SFNT", 4)) return 0;
-    names += 8;
-    for (unsigned i = 0; i < count; i++) {
-        uint32_t attr, lo, hi;
-        size_t e = head + 12 + (size_t)i * 16;
-        if (!u32_at(p, n, e + 4, &attr) || !u32_at(p, n, e + 8, &lo) || !u32_at(p, n, e + 12, &hi)) return 0;
-        size_t s = names + (size_t)(attr & 0xffffff) * 4, len = strlen(name);
-        if (!(attr >> 24) || s + len + 1 > n || memcmp(p + s, name, len + 1)) continue;
-        if (lo > hi || data + (size_t)hi > n) return 0;
-        *at = data + lo;
-        *size = hi - lo;
-        return 1;
-    }
-    return 0;
 }
 
 // The StickSensitivity floats of the BYML p[0..n), multiplied by k; their count, 0 when the file has no such array.
@@ -116,21 +91,19 @@ int cam_pack_build(const void *in, size_t n, const void *zsdic, size_t zsdic_n, 
     ZSTD_DDict *dd = NULL;
     ZSTD_CDict *cd = NULL;
     void *z = NULL;
-    // The dictionaries: Pack/ZsDic.pack.zs is a SARC compressed without one.
-    unsigned long long dn = ZSTD_getFrameContentSize(zsdic, zsdic_n);
-    size_t dic_at, dic_n;
-    if (dn == ZSTD_CONTENTSIZE_UNKNOWN || dn == ZSTD_CONTENTSIZE_ERROR || dn > MAX_RAW || !(dics = malloc((size_t)dn)) ||
-        ZSTD_decompress(dics, (size_t)dn, zsdic, zsdic_n) != dn ||
-        !sarc_member(dics, (size_t)dn, "pack.zsdic", &dic_at, &dic_n)) {
-        rt_log("camera speed: no pack.zsdic in Pack/ZsDic.pack.zs; the camera keeps its own speed");
+    // The frame names its dictionary (pack.zsdic) by id; Pack/ZsDic.pack.zs holds them.
+    unsigned id = ZSTD_getDictID_fromFrame(in, n);
+    size_t dn, dic_at, dic_n;
+    if (!id || !(dics = zsdic_unpack(zsdic, zsdic_n, MAX_RAW, &dn)) || !zsdic_find(dics, dn, id, &dic_at, &dic_n)) {
+        rt_log("camera speed: Pack/ZsDic.pack.zs has no dictionary %u for Pack/Actor/PlayerCamera.pack.zs; the camera "
+               "keeps its own speed", id);
         goto done;
     }
     unsigned long long rn = ZSTD_getFrameContentSize(in, n);
-    unsigned id = ZSTD_getDictID_fromFrame(in, n);
     dd = ZSTD_createDDict(dics + dic_at, dic_n);
-    if (!dd || id != ZSTD_getDictID_fromDDict(dd) || rn == ZSTD_CONTENTSIZE_UNKNOWN ||
-        rn == ZSTD_CONTENTSIZE_ERROR || rn > MAX_RAW || !(raw = malloc((size_t)rn))) {
-        rt_log("camera speed: Pack/Actor/PlayerCamera.pack.zs is not a pack.zsdic frame with a size; the camera keeps its "
+    if (!dd || rn == ZSTD_CONTENTSIZE_UNKNOWN || rn == ZSTD_CONTENTSIZE_ERROR || rn > MAX_RAW ||
+        !(raw = malloc((size_t)rn))) {
+        rt_log("camera speed: Pack/Actor/PlayerCamera.pack.zs is not a zstd frame with a size; the camera keeps its "
                "own speed");
         goto done;
     }
