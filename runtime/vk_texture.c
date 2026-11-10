@@ -1221,6 +1221,11 @@ static int idle(const Tex *e, uint64_t now);
 // figure decides there, as before. On Linux the process's figure is its resident anonymous memory, which cannot pass
 // the installed memory, so only a bound set below that holds there; a cgroup's limit and the machine's RAM act through
 // the system's figure.
+// Where a discrete GPU's memory counts against the commit (plat_commit_counts_vram: Windows), the bound compares the
+// commit less the device-local memory the driver reports in use (vk_mem_vram): that memory is on the card, not in RAM
+// or the page file, and the VRAM pressure and tex_disuse already bound it. Counted in, it held the bound all through
+// Hyrule Field on a 16 GB PC with a 16 GB card (RTX 5060 Ti): the process at 28.9 to 30.7 GB, 9 to 10 GB of it video
+// memory, while the system had 8 to 10 GB of its 49 GB limit free, and the ground flickered white as textures gave way.
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
@@ -1275,12 +1280,21 @@ static int commit_is_low(void) {
         double want = commit_free_mb > 0 ? (double)commit_free_mb : limit / 10 > 4096 ? limit / 10 : 4096;
         low = limit - used < want;
     }
-    int high = proc_commit_mb && proc > (double)(proc_high ? proc_commit_mb - proc_commit_mb / 32 : proc_commit_mb);
+    double dev = 0;   // device-local memory in use, MB: in the commit (plat_commit_counts_vram), not in RAM (see above)
+    VkCtx *c = vk_ctx();
+    uint64_t dev_used, dev_budget;
+    int exact;
+    if (proc_commit_mb && plat_commit_counts_vram() && c &&
+        c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && vk_mem_vram(&dev_used, &dev_budget, &exact))
+        dev = dev_used / 1048576.0 < proc ? dev_used / 1048576.0 : proc;
+    int high = proc_commit_mb &&
+               proc - dev > (double)(proc_high ? proc_commit_mb - proc_commit_mb / 32 : proc_commit_mb);
     if (high != proc_high && commit_logs < 40) {
         commit_logs++;
-        rt_log("vk: this process's commit %s: %.0f MB, the bound is %lld MB (system: %.0f of %.0f MB in use); released "
-               "textures kept %d, %.0f MiB of own memory%s", high ? "high" : "no longer high", proc, proc_commit_mb,
-               used, limit, nreleased, rel_bytes / 1048576.0, high ? ": dropping the stale ones" : "");
+        rt_log("vk: this process's commit %s: %.0f MB less %.0f MB of video memory, the bound is %lld MB (system: %.0f "
+               "of %.0f MB in use); released textures kept %d, %.0f MiB of own memory%s", high ? "high" : "no longer high",
+               proc, dev, proc_commit_mb, used, limit, nreleased, rel_bytes / 1048576.0,
+               high ? ": dropping the stale ones" : "");
     }
     proc_high = high;
     if (low != sys_low && commit_logs < 40) {   // a few lines, however often it flips

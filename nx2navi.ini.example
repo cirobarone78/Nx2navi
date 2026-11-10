@@ -215,9 +215,10 @@
 # which game memory gets no copy in video memory (memory = mirror), which costs far more frame time than a texture
 # uploaded again. 0: textures never give way for video memory.
 # tex_vram_pressure = 80
-# Megabytes this process may commit before textures give way as they do while the system's commit runs low (Windows
-# counts video memory against the commit). Default: the installed memory, at least 24576, so that it does not depend
-# on the size of the page file. 0: no bound of its own; only the system's commit counts. On Linux it counts the
+# Megabytes this process may commit before textures give way as they do while the system's commit runs low. Windows
+# counts video memory against the commit; with a discrete GPU the video memory in use is left out of the comparison,
+# since it is not in RAM. Default: the installed memory, at least 24576, so that it does not depend on the size of the
+# page file. 0: no bound of its own; only the system's commit counts. On Linux it counts the
 # process's resident anonymous memory, which stays under the installed memory, so there only a smaller value holds.
 # tex_proc_commit_mb = 32768
 # 1: a texture the game releases or takes back, with nothing else changed at its address, puts the texture table's
