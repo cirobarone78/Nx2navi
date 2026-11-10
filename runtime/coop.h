@@ -36,6 +36,7 @@ typedef struct {
     unsigned version;           // changes with the state, the room, the roster and the status text
     char code[COOP_CODE_LEN + 2];   // "XXX-XXX" in a room, or while joining one; else ""
     int self;                   // this player's member id; 0 outside a room
+    int made;                   // this player made the room (its settings are the room's rules, coop_state.h)
     int n;                      // members of the room, this player included, by id
     CoopPeer member[COOP_MAX_MEMBERS];
     uint32_t ping_ms;           // round trip to the relay; 0 until measured
@@ -55,6 +56,8 @@ void coop_shutdown(void);
 // co-op is off. The outcome shows in coop_view_get.
 int coop_command(CoopCmd cmd, const char *code);
 void coop_view_get(CoopView *out);
+// This player's id on the wire (8 bytes of SHA-256 over the account and the profile folder); reads the account once.
+uint64_t coop_client_id(void);
 
 // Peer messages. kind is COOP_K_*; bytes follow it in the datagram. coop_send goes to every other member, coop_send_to to
 // one (a member id). 1 when queued, 0 when not in a room, the message is too long (COOP_MAX_PAYLOAD - 1 bytes) or the
@@ -69,6 +72,10 @@ int coop_on_message(uint8_t kind, CoopMsgFn fn, void *user);
 // every new member listens here.
 typedef void (*CoopViewFn)(const CoopView *view, void *user);
 int coop_on_view(CoopViewFn fn, void *user);
+// fn(now in ms, user) at every step of the coop thread (every 8 ms or less in a room, 250 ms idle); up to 4 hooks. A layer
+// with timers of its own (digests, repeated sends) runs them here.
+typedef void (*CoopTickFn)(uint64_t now_ms, void *user);
+int coop_on_tick(CoopTickFn fn, void *user);
 
 // "host", "host:port", "[v6]:port" or a bare IPv6 address into host (cap bytes) and port (default 24680). 0 when text is
 // empty or does not fit.
@@ -97,6 +104,7 @@ int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *code);   // as coop_
 int coop_sess_send(CoopSess *s, int member, uint8_t kind, const void *bytes, size_t n);   // member 0 or COOP_DST_ALL: all
 int coop_sess_on_message(CoopSess *s, uint8_t kind, CoopMsgFn fn, void *user);
 int coop_sess_on_view(CoopSess *s, CoopViewFn fn, void *user);
+int coop_sess_on_tick(CoopSess *s, CoopTickFn fn, void *user);
 void coop_sess_view(CoopSess *s, CoopView *out);
 // Replaces the settings the session reads with those of p (the timings stay as they were made); the stepping thread
 // applies them, on or off included. A new server ends the room; a new name, once the room is joined, joins it again under the new name a

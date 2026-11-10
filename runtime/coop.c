@@ -35,11 +35,13 @@ enum {
     OUT_SLOTS = 64,                  // messages waiting to be sent
     DEFAULT_PORT = 24680,
     VIEW_HOOKS = 8,
+    TICK_HOOKS = 4,
 };
 
 typedef struct { uint8_t dst; uint16_t len; uint8_t data[COOP_MAX_PAYLOAD]; } OutMsg;
 typedef struct { CoopMsgFn fn; void *user; } MsgHandler;
 typedef struct { CoopViewFn fn; void *user; } ViewHook;
+typedef struct { CoopTickFn fn; void *user; } TickHook;
 
 // A cause that logs at most once per LOG_EVERY_MS.
 enum { L_MALFORMED, L_SENDER, L_TAG, L_OUTBOX, L_NO_SERVER, L_RESOLVE, L_SOCKET, L_CAUSES };
@@ -73,6 +75,8 @@ struct CoopSess {
     MsgHandler msg[256];
     ViewHook hooks[VIEW_HOOKS];
     int n_hooks;
+    TickHook ticks[TICK_HOOKS];
+    int n_ticks;
     int pub_state;                              // state, readable without the lock
     int pub_joined;
 
@@ -808,6 +812,7 @@ static void view_rebuild(CoopSess *s) {
     else if (s->state == COOP_CONNECTING) format_code(s->want, v->code);
     else v->code[0] = 0;
     v->self = in_room ? s->self : 0;
+    v->made = in_room && s->made_room;
     v->n = in_room ? s->roster.n : 0;
     for (int i = 0; i < v->n; i++) {
         v->member[i].id = s->roster.m[i].id;
@@ -865,6 +870,12 @@ void coop_sess_step(CoopSess *s) {
     }
     timers(s, plat_now_ms());
     publish(s);
+    TickHook ticks[TICK_HOOKS];
+    plat_mutex_lock(&s->lock);
+    int nt = s->n_ticks;
+    memcpy(ticks, s->ticks, sizeof ticks);
+    plat_mutex_unlock(&s->lock);
+    for (int i = 0; i < nt; i++) ticks[i].fn(plat_now_ms(), ticks[i].user);
 }
 
 // ---- the session's interface
@@ -954,6 +965,14 @@ int coop_sess_on_view(CoopSess *s, CoopViewFn fn, void *user) {
     return ok;
 }
 
+int coop_sess_on_tick(CoopSess *s, CoopTickFn fn, void *user) {
+    plat_mutex_lock(&s->lock);
+    int ok = s->n_ticks < TICK_HOOKS;
+    if (ok) s->ticks[s->n_ticks++] = (TickHook){fn, user};
+    plat_mutex_unlock(&s->lock);
+    return ok;
+}
+
 void coop_sess_view(CoopSess *s, CoopView *out) {
     uint64_t now = plat_now_ms();
     plat_mutex_lock(&s->lock);
@@ -989,7 +1008,10 @@ static CoopSess *process_session(void) {
 // The player's identity on the wire: 8 bytes of SHA-256 over the local account and the profile folder. The account alone
 // would make two copies of one profile the same player; with the folder they differ, and a game that stays in its folder
 // keeps its id.
-static uint64_t make_client_id(void) {
+static uint64_t g_client_id;
+static PlatOnce g_client_once = PLAT_ONCE_INIT;
+static void make_client_id(void *arg) {
+    (void)arg;
     uint64_t uid[2];
     account_uid(uid);
     Sha256 h;
@@ -1002,7 +1024,12 @@ static uint64_t make_client_id(void) {
     sha256_final(&h, digest);
     uint64_t id;
     memcpy(&id, digest, sizeof id);
-    return id ? id : 1;
+    g_client_id = id ? id : 1;
+}
+
+uint64_t coop_client_id(void) {
+    plat_once(&g_client_once, make_client_id, NULL);
+    return g_client_id;
 }
 
 static void coop_main(void *arg) {
@@ -1020,7 +1047,7 @@ static void coop_main(void *arg) {
             const char *auto_mode = cfg_get("NX2NAVI_COOP_AUTO"), *drop = cfg_get("NX2NAVI_COOP_DROP");
             int automatic = auto_mode && (!strcmp(auto_mode, "create") || !strcmp(auto_mode, "join"));
             if (want) {
-                if (!client_id) client_id = make_client_id();   // the account is read once the player turns co-op on
+                if (!client_id) client_id = coop_client_id();   // the account is read once the player turns co-op on
                 const char *n = cfg_value("NX2NAVI_COOP_NAME");
                 coop_name_clean(name, sizeof name, (const uint8_t *)n, strlen(n));
                 if (!name[0]) snprintf(name, sizeof name, "Player-%04x", (unsigned)(client_id & 0xFFFF));
@@ -1092,4 +1119,9 @@ int coop_on_message(uint8_t kind, CoopMsgFn fn, void *user) {
 int coop_on_view(CoopViewFn fn, void *user) {
     CoopSess *s = process_session();
     return s && coop_sess_on_view(s, fn, user);
+}
+
+int coop_on_tick(CoopTickFn fn, void *user) {
+    CoopSess *s = process_session();
+    return s && coop_sess_on_tick(s, fn, user);
 }
