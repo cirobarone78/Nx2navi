@@ -31,10 +31,18 @@ void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
 // Restricts t (NULL: the calling thread) to the logical processors in mask (bit n = processor n of the first group).
 // Returns the previous mask, 0 on failure.
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
-// The calling thread gets a core to itself: the process's other threads are kept off it and the caller on it (Windows:
-// CPU sets, a performance core; Linux: the last processor of the affinity mask). Returns the logical processors
-// reserved, 0 when it could not.
-int plat_cpu_reserve(void);
+// The calling thread gets a fast core to itself: the process's other threads are kept off it and the caller on it, with
+// both logical processors of the core when it has two; threads the caller starts later run with the others. Windows
+// takes the highest-numbered core of the fastest efficiency class (CPU sets). Linux takes the core of a hybrid CPU's
+// performance cores that clocks highest, else of the highest capacity or clock, and none when fewer than four cores
+// are that fast. Returns the logical processors reserved, 0 when it could not; *which (when not NULL, size bytes)
+// receives them as text, such as "10,11" (Linux adds what makes the core fast: "10,11 of a performance core").
+int plat_cpu_reserve(char *which, size_t size);
+// Keeps the reserved core reserved: on Linux a thread the holder starts through a library inherits its mask, the core
+// alone, and gets the others' processors here; once the holder has ended, the core goes back to every thread. Returns
+// the threads moved, -1 when the core went back. Windows needs none of it (threads without CPU sets of their own run
+// on the process's default sets, which leave the core out) and returns 0.
+int plat_cpu_reserve_sweep(void);
 uint32_t plat_cpu_count(void);            // logical processors of the machine (system info)
 uint32_t plat_cpu_usable(void);           // the ones this process may run on (its affinity mask): size thread pools by it
 uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id tid (plat_thread_id) so far; 0 unknown
@@ -45,7 +53,9 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first);
 // are not all the same size: the die with AMD's 3D V-Cache on a two-die X3D processor. 0 when they are (one die, or
 // equal dies) or the topology is unknown. *l3_kb: that cache's size.
 uint64_t plat_cpu_cache_die(uint32_t *l3_kb);
-int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
+// Every thread of the process to the processors in mask; 1 on success. On Linux the core plat_cpu_reserve took stays
+// out of the mask for every thread but its holder, which keeps the processors it has.
+int plat_process_affinity(uint64_t mask);
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it
 // wherever it runs, reads where it is, may send it elsewhere, and lets it go on. While it is stopped the caller must not
@@ -244,6 +254,10 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+// Before the host itself writes [addr, addr+n) of a watched reservation: clears the write watch's protection of those
+// pages in one call, where the watch works by protecting pages (Linux), so the stores do not fault page by page. The
+// pages count as written. Returns 0 when there is nothing to clear or it cannot be done; the write is valid either way.
+int plat_mem_prepare_write(uint64_t addr, uint64_t n);
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
@@ -289,6 +303,7 @@ void plat_aligned_free(void *p);
 
 // ---- process
 _Noreturn void plat_exit(int code);       // ends the process at once: other threads stop, no atexit handlers run
+extern void (*plat_exit_hook)(void);      // called first by plat_exit when set (main.c: the queued log lines)
 int plat_setenv(const char *name, const char *value);    // value NULL removes it; 1 on success
 uint32_t plat_process_id(void);
 // CPU time of the process since it started (user and kernel), and wall time since it started, in ns; 0 when unknown.
@@ -457,9 +472,20 @@ void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb);
 void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 // Commit charge in MB: this process's private bytes, the system's commit in use and its limit (RAM plus page files).
 // An allocation fails when the system's reaches the limit, however much physical memory is free. -1 when unknown.
+// Linux overcommits and ends the process instead (the OOM killer), so there the limit is the one with the least
+// headroom of the cgroup v2 limits (memory.max, memory.high) the process lives under and the machine's RAM
+// (MemAvailable against MemTotal), with vm.overcommit_memory = 2 also CommitLimit.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);
-// Whether an allocation fails at that limit: always on Windows; on Linux only with vm.overcommit_memory = 2.
+// Whether the limit is one to stay below: always on Windows (an allocation fails at it); on Linux whenever the kernel
+// reports a memory limit. 0 when none is known.
 int plat_commit_enforced(void);
+// The limits the first plat_commit_info call found, for the log, as text into out ("memory limits: cgroup ... memory.max
+// 12288 MB (...); RAM ...; the one with the least headroom counts (now: ...)"); 0 when there is nothing to add to the
+// numbers (Windows, whose one limit is the system's commit).
+int plat_commit_note(char *out, size_t cap);
+// Whether a discrete GPU's own memory counts against that limit: on Windows the driver charges device memory to the
+// system's commit; Linux's limits count system memory only.
+int plat_commit_counts_vram(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);

@@ -86,8 +86,8 @@ typedef struct PoolRec {
     // csb a power of two, page 0 an empty slot
     struct SBase { uint64_t page; uint8_t *base; } *sb;
     uint32_t nsb, csb;
-    // shadow_lock: the pages shaders wrote through the device address table (vk_gpa.c "Written pages"), each with a base
-    // copy; written back at the fence of every part that runs a shader writing through the table (gw_part)
+    // shadow_lock: pages shaders wrote through the device address table (vk_gpa.c "Written pages"), with base copies;
+    // copied back at the fence of every part that runs a shader writing through the table (gw_part)
     uint64_t *gw;
     int ngw, cgw;
     // NX2NAVI_TRACE=perf per-pool mirror traffic since the last mirror_pool_log, replay thread (the log reads and clears
@@ -326,8 +326,8 @@ int vk_pool_init(pool_t *p) {
         phys_list[nphys++] = r;
     }
     plat_mutex_unlock(&pool_lock);
-    // Both direct imports and VMA-backed shadows expose buf; only direct imports own r->mem.
-    // Register either backing so shaders can follow pointers through the device address table.
+    // The pool's pages go into the device address table: shaders that read a pointer from memory reach them there. An
+    // import and a shadow copy both have buf; only the import owns mem.
     if (r->kind == POOL_IMPORT && r->buf && r->import_hi > r->import_lo)
         r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
     return 1;
@@ -476,9 +476,8 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
 
 // touch: the GPU may read the pool's buffer in the submission being recorded, so its shadow goes on the touched list
 // (shadow storage). A lookup (vk_mem_lookup) leaves it off: the caller reads guest memory itself or only asks what
-// backs the address. A pool in the device address table needs no touch for the shaders that reach it through pointers:
-// when a recorded shader uses the table, the submission prologue copies the CPU's writes into every mapped pool
-// (vk_mem_gpa_sync). Since shadows are mapped too, touching them here would put every pool a lookup sees back on the list.
+// backs the address. Shaders that reach a pool through the device address table resolve nothing: the part they run in
+// brings every pool of the table up to date (vk_mem_gpa_sync).
 static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
@@ -984,12 +983,13 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // Where importing guest memory costs too much (Linux: re-protecting pages that amdgpu imported as a userptr
 // invalidates the buffer, about 1.3 ms per 16 MiB at the next submit, and the import's write pinning clears the
 // write watch), a CPU-visible pool gets a host-visible buffer of its own instead, at the offsets the import would have:
-// - CPU -> shadow: right before each submit, vk_mem_shadow_sync queries explicitly resolved pools; vk_mem_gpa_sync also
-//   covers mapped copied pools when a recorded shader uses the table. Only pages newer than a pool's sgen are copied.
+// - CPU -> shadow: right before each submit (vk_mem_shadow_sync), the pools the replay resolved since the last one are
+//   queried for written pages; pages stamped after a pool's sgen are copied in by the CPU. A part whose shaders read
+//   through the device address table gets every pool the table names brought up to date the same way (vk_mem_gpa_sync).
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
 //   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory. Writes through the
-//   device address table have no address at record time: the shaders mark their pages, and those go back at the fences
-//   of the parts that write through the table (gw_part).
+//   device address table have no address at record time: shaders mark their pages, and those go back at the fences of
+//   parts that write through the table (gw_part).
 // - Pages both write: a GPU write is noted with the whole range its binding names, and the CPU writes other fields of the
 //   same records meanwhile. Each page such a range covers keeps a base copy from its first note on, the bytes guest
 //   memory and the shadow last agreed on. A copy-in takes only the bytes where guest memory differs from the base (the
@@ -1291,10 +1291,24 @@ static int wb_no_reup(void) {
     return wb_reup_off;
 }
 
+// NX2NAVI_SHADOW_BULK_WRITE=1 (default 0): before a write-back stores into guest memory, the write watch's protection
+// of the whole range is cleared in one call (plat_mem_prepare_write). Where the watch protects pages (Linux), the
+// first store into each page otherwise takes a fault of its own; the pages count as written either way.
+static int shadow_bulk_write(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_SHADOW_BULK_WRITE");
+        if (on) rt_log("mem: shadow write-backs clear the write watch's protection of their range in one call "
+                       "(NX2NAVI_SHADOW_BULK_WRITE)");
+    }
+    return on;
+}
+
 // Completion thread: the GPU's bytes of [addr, addr+size) from the shadow into guest memory (merge_page against the
 // base copies; a page without one whole). Returns the bytes moved.
 static uint64_t shadow_write_back(uint64_t addr, uint64_t size) {
     uint64_t moved = 0;
+    int bulk = shadow_bulk_write();   // before the locks: its first call logs
     plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, addr, size);
     PoolRec *r = e ? e->buf : NULL;
@@ -1302,6 +1316,7 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size) {
     if (r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi) {
         uint64_t t0 = qpc();
         mem_thaw(addr, size);
+        if (bulk) plat_mem_prepare_write(addr, size);
         for (uint64_t a = addr, end = addr + size; a < end;) {
             uint64_t pg = a & ~(SB_PAGE - 1), pe = pg + SB_PAGE < end ? pg + SB_PAGE : end;
             uint8_t *base = sbase_find(r, pg), *s = r->smap + (a - r->import_lo);
@@ -1330,11 +1345,20 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
 }
 
 void vk_gpu_written(uint64_t addr, uint64_t size) { gpu_written(addr, size, 0); }
+static int wb_lazy(void);
+static int lazy_clean(uint64_t lo, uint64_t hi, void *ctx);
+
 void vk_gpu_written_back(uint64_t addr, uint64_t size) {
     gpu_written(addr, size, 1);
     // NX2NAVI_WB_PROBE: the bytes are in guest memory now; note who reads them next. With shadow storage they get there
     // later, in the submission's shadow_wb_cb, whose thaw would end the probe at once: that job arms it instead.
     if (!shadow_on) mem_probe(addr, size);
+    VkMemSpan sp;
+    if (size && wb_lazy() && vk_mem_lookup(addr, size, &sp) && sp.pool) {   // or newer ones stay in the mirror from here on
+        PoolRec *r = sp.pool;
+        if (r->mstate == MS_ON && r->mbuf && r->buf && addr >= r->import_lo && addr + size <= r->import_hi)
+            mem_lazy_arm(addr, size, (uint64_t)(uintptr_t)r->mbuf, (uint64_t)(uintptr_t)r->buf, addr - r->import_lo, r);
+    }
 }
 
 int vk_mem_mirrored(uint64_t addr, uint64_t size) {
@@ -1701,9 +1725,11 @@ static void refuse(PoolRec *r, int why, const char *what) {
 // mirrored again, from a whole copy, on its next buffer use. Its freed bytes count as room at once (evict_room), until
 // the GPU is past the submission and the destroy shows in VMA's figures.
 #define MIRROR_IDLE 120
+#define MIRROR_SHARE 2   // the mirrors' share of the budget that the budget check never refuses: one in this many
 #define RETRY_SOON 16
 static int mirror_evict_on = -1;
 static int64_t m_evicted_n, m_evicted_bytes, m_retries;
+static volatile int64_t m_over_n, m_over_bytes;   // mirrors made although the budget check failed (mirror_create)
 static uint64_t room_bytes, room_fence;   // replay: bytes evicted that the budget may still count, until room_fence
 
 static int evict_enabled(void) {
@@ -1752,6 +1778,7 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
     for (; n < nv && freed < need; n++) {
         PoolRec *r = v[n];
         idle_for[n] = msub - r->acc_sub;
+        mem_lazy_release(r->import_lo, r->import_hi - r->import_lo);   // what only the mirror holds comes down first
         mirror_forget(r);   // off the list, mirror_gen bumped: no buffer use gets the mirror from here on
         r->mstate = MS_NONE, r->acc_sub = 0, r->retry_sub = 0;
         dead[n] = r->mbuf, dead_a[n] = r->malloc_;
@@ -1832,17 +1859,36 @@ static void mirror_create(PoolRec *r) {
             uint64_t f = mirror_evict(used + n + budget / 8 - budget, MIRROR_IDLE, why);
             used = used > f ? used - f : 0;
         }
+        // Over the budget still. The mirrors keep their place up to MIRROR_SHARE of the budget whatever else fills the
+        // VRAM: on a 6 GiB card a loaded area's textures alone pass the budget before the game's buffers are first
+        // used, every pool was refused, and the GPU read vertices, indices and storage over PCIe at each draw: 70 to
+        // 250 ms of GPU time a frame, 5 to 13 fps, in two reports from RTX 3060 Laptop cards. A mirror the driver cannot
+        // keep in VRAM is paged to system memory, where the imported pool already is, so a mirror never reads slower
+        // than its pool, and what is drawn from every frame is not what the system pages out first. The textures are
+        // still asked for the room. Past that share a pool is refused as before.
         if (used + n + budget / 8 > budget) {
-            char why[128];
-            snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
-                     n / 1048576.0, used / 1048576.0, budget / 1048576.0);
-            refuse(r, MR_BUDGET, why);
-            if (evict && !r->asked_room) {   // idle textures make the rest; asked again once they had the time
-                vk_texture_want_room(used + n + budget / 8 - budget);
-                r->retry_sub = msub + RETRY_SOON ? msub + RETRY_SOON : 1;
-                r->asked_room = 1;   // later refusals wait RETRY_SUBS: the textures had nothing to give
+            uint64_t over = used + n + budget / 8 - budget;
+            if (evict && (uint64_t)m_live_bytes + n <= budget / MIRROR_SHARE) {
+                vk_texture_want_room(over);
+                plat_inc64(&m_over_n);
+                plat_add64(&m_over_bytes, (int64_t)n);
+                if (m_over_n <= 4 || !(m_over_n & 255))
+                    rt_log("mem: mirror of %.1f MiB made over the VRAM budget (%.0f of %.0f MiB in use, mirrors %.0f MiB): "
+                           "%lld such so far, %.0f MiB; idle textures are asked for the room",
+                           n / 1048576.0, used / 1048576.0, budget / 1048576.0, m_live_bytes / 1048576.0,
+                           (long long)m_over_n, m_over_bytes / 1048576.0);
+            } else {
+                char why[128];
+                snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
+                         n / 1048576.0, used / 1048576.0, budget / 1048576.0);
+                refuse(r, MR_BUDGET, why);
+                if (evict && !r->asked_room) {   // idle textures make the rest; asked again once they had the time
+                    vk_texture_want_room(over);
+                    r->retry_sub = msub + RETRY_SOON ? msub + RETRY_SOON : 1;
+                    r->asked_room = 1;   // later refusals wait RETRY_SUBS: the textures had nothing to give
+                }
+                return;
             }
-            return;
         }
     }
     plat_mutex_lock(&gen_lock);
@@ -1985,20 +2031,28 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
-// Replay / submit lock: mark actual shader use, not descriptor construction (which may be memoized). 1: a shader reads
-// guest memory through the table; 2 as well: one writes through it (res.json's written flag on the table).
-static int gpa_part_used;
-static uint32_t gpa_epoch;   // the guest submission vk_mem_gpa_sync last copied in for: its snapshots are per submission
+// ---- shadow storage: the device address table's readers and writers
+// A shader that follows a pointer through the table (vk_gpa.c) can reach any pool the table names, and the replay
+// never resolves that pool, so nothing put it on the touched list and its shadow kept the bytes of its last use as a
+// buffer. vk_exec_draw.c marks a part whose pipelines declare the table (vk_mem_gpa_use: at the draw or dispatch, not
+// where descriptors are written, which are reused), and the part's prologue (vk_sync.c) calls vk_mem_gpa_sync: the
+// shadows of every pool in the table get the pages the CPU wrote, and those of them that have a VRAM mirror, which
+// the table then names, queue the same pages for upload unless this submission synced the mirror already. No mirror
+// is made for a reader of the table. Without shadow storage nothing is done: an imported pool is guest memory, and
+// mirrors stay unsynced for the table's readers (vk_exec_draw.c ssbo_info).
+static int gpa_part_used;   // replay thread: 1 reads the table, 2 as well writes through it (the table's written flag)
+static uint32_t gpa_epoch;   // guest submission whose write-watch snapshots vk_mem_gpa_sync last copied in
 void vk_mem_gpa_use(int how) { gpa_part_used |= how; }
+int vk_mem_shadow_storage(void) { return shadow_on; }
 
-static int gpa_copied_pool(const PoolRec *r) {
-    return r->kind == POOL_IMPORT && r->gpa_rec && (r->smap || r->mstate == MS_ON);
-}
+static int gpa_shadow_pool(const PoolRec *r) { return r->kind == POOL_IMPORT && r->gpa_rec && r->smap; }
 
-// gen_lock held: r's shadow lacks a page the tables stamped after its generation, or a region of it is not watched.
-static int shadow_stale(const PoolRec *r, int cpu) {
+// gen_lock held: the shadow lacks a page stamped after its generation, or a region is not watched.
+static int shadow_stale(const PoolRec *r, int cpu, uint32_t epoch) {
+    uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
+    if (!epoch || r1 >= SNAP_REGIONS) return 1;   // shadow_sync_pool's direct-query fallback
     const uint32_t *rmax = cpu ? creg_max : reg_max;
-    for (uint64_t k = r->import_lo >> SNAP_SHIFT; k <= (r->import_hi - 1) >> SNAP_SHIFT; k++)
+    for (uint64_t k = r0; k <= r1; k++)
         if (snap_untracked[k] || rmax[k] > r->sgen) return 1;
     return 0;
 }
@@ -2012,13 +2066,11 @@ static void gw_cb(void *arg) {   // completion thread
     free(j);
 }
 
-// Shadow storage, a part that ran a shader writing through the table ("Written pages" in vk_gpa.c): the pages shaders
-// wrote through it before stay in the shadow alone. Each newly reported one gets a base copy, taken from guest memory,
-// the bytes both sides last agreed on as far as the CPU knows: the GPU's writes are only in the shadow. From then on a
-// copy-in moves only the CPU's bytes into it (merge_page), and the fence of this part and of every later one that runs
-// such a shader copies the GPU's bytes back into guest memory, as for a noted write (swb_run). A byte the CPU wrote
-// into such a page between its last copy-in and the report goes back to the shadow's older value once.
-// pool_lock (shared) and shadow_lock held.
+// A part that runs a shader writing through the table (vk_gpa.c "Written pages"). Each newly reported shadow page
+// gets a base copy from guest memory: the GPU's bytes are only in the shadow, which no longer holds the last agreed
+// bytes. Copy-ins then move only the CPU's bytes (merge_page), and this part's fence and every later one that runs such
+// a shader copy the GPU's bytes back (swb_run), as for a noted write. A byte the CPU wrote between its last copy-in and
+// the report goes back to the shadow's older value once. pool_lock (shared) and shadow_lock held.
 static void gw_part(uint64_t fence, const uint64_t *pg, int npg) {
     for (int i = 0; i < npg; i++) {
         const pidx_ent *e = pidx_find(&pool_index, pg[i], SB_PAGE);
@@ -2048,30 +2100,28 @@ static void gw_part(uint64_t fence, const uint64_t *pg, int npg) {
     vk_completion_add(fence, gw_cb, j);
 }
 
-// The table's pointers can reach any mapped pool, without vk_mem_resolve ever seeing that pool: the submission's
-// prologue copies the CPU's writes into all of them. Their write-watch snapshots are queried once per region and guest
-// submission, and only pools with pages stamped after their copy's generation are synced: walking every mapped pool
-// in each submission was about 24,000 pool syncs a frame in Kokiri Forest. Never allocates a mirror for a GPA reader.
 void vk_mem_gpa_sync(uint64_t fence) {
     int used = gpa_part_used;
     gpa_part_used = 0;
-    if (!used || (!shadow_on && !vk_mirror_on)) return;
+    if (!used || !shadow_on) return;
     uint32_t epoch = vk_texture_epoch();
     const uint64_t *pg = NULL;
-    int npg = shadow_on && (used & 2) ? vk_gpa_written_pages(&pg) : 0;   // outside the memory locks
-    if (epoch == gpa_epoch && !(shadow_on && (used & 2))) return;
+    int npg = used & 2 ? vk_gpa_written_pages(&pg) : 0;   // outside the memory locks
+    if (epoch && epoch == gpa_epoch && !(used & 2)) return;
     uint64_t t0 = qpc(), run0 = 0, run1 = 0;
-    int have = 0, cpu = vk_mirror_on && wb_no_reup();   // as vk_mem_shadow_sync
+    int cpu = vk_mirror_on && wb_no_reup(), have = 0;   // before the locks: its first call logs
     plat_mutex_lock_shared(&pool_lock);
     plat_mutex_lock(&shadow_lock);
-    if (shadow_on && (used & 2)) gw_part(fence, pg, npg);   // the base copies before the copy-in below reaches them
-    if (epoch != gpa_epoch) {
+    if (used & 2) gw_part(fence, pg, npg);   // base copies before any copy-in reaches the newly reported pages
+    if (!epoch || epoch != gpa_epoch) {
         gpa_epoch = epoch;
         plat_mutex_lock(&gen_lock);
-        for (int i = 0; i < pool_index.n; i++) {
+        // One query per run of regions the pools cover; shadow_sync_pool finds the submission's snapshots ready.
+        for (int i = 0; epoch && i < pool_index.n; i++) {
             const PoolRec *r = pool_index.e[i].buf;
-            if (!gpa_copied_pool(r)) continue;
+            if (!gpa_shadow_pool(r)) continue;
             uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
+            if (b >= SNAP_REGIONS) continue;
             if (have && a <= run1 + 1) {
                 if (b > run1) run1 = b;
             } else {
@@ -2082,14 +2132,13 @@ void vk_mem_gpa_sync(uint64_t fence) {
         if (have) s_queries += snap_regions(run0, run1, epoch);
         for (int i = 0; i < pool_index.n; i++) {
             PoolRec *r = pool_index.e[i].buf;
-            if (gpa_copied_pool(r) && r->smap && shadow_stale(r, cpu)) shadow_sync_pool(r, epoch, cpu), s_syncs++;
+            if (gpa_shadow_pool(r) && shadow_stale(r, cpu, epoch)) shadow_sync_pool(r, epoch, cpu), s_syncs++;
         }
         plat_mutex_unlock(&gen_lock);
-        // A mirror's sync reads the shadow (or the imported buffer) just brought up to date, after the GPU's earlier
-        // write-backs into it (the prologue orders them).
+        // Uploads read the shadows just brought up to date, after earlier submissions' write-backs in the prologue.
         for (int i = 0; i < pool_index.n; i++) {
             PoolRec *r = pool_index.e[i].buf;
-            if (gpa_copied_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+            if (gpa_shadow_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
         }
     }
     s_ticks += qpc() - t0;
@@ -2519,7 +2568,157 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
     free(f);
 }
 
+// ---- lazy write-back (NX2NAVI_WB_LAZY, default 1 on Windows; memory.c "Lazy write-back")
+// A range a shader wrote goes back to guest memory once and is then armed (vk_gpu_written_back, mem_lazy_arm). While it
+// stays armed, gpu_wrote leaves the later writes of its pages in the mirror: no snapshot, no merge, no copy. When the
+// CPU touches a page, memory.c calls lazy_fetch with the mirror and the imported buffer of the range: a copy of its
+// own, sent after every part handed over so far (the held ones first), and waited for. The part that is still being
+// recorded when that happens has already left its writes out: at its end (lazy_part_check, from vk_mem_mirror_end or
+// from the prologue of a part split off earlier) it writes back, as ever, what it skipped and finds no longer armed;
+// the snapshot for that merge is taken in the part's own prologue, before its GPU work. From that check to the part's
+// hand-over (vk_mem_lazy_handed) memory.c's window keeps a fault from releasing a range unseen.
+static VkCommandPool lz_pool;
+static VkCommandBuffer lz_cb;
+static VkFence lz_fence;
+static volatile int32_t lz_state;   // 0 not asked, 1 on, 2 off
+static PlatMutex lz_init_lock = PLAT_MUTEX_INIT;
+typedef struct { VkMemSpan sp; uint64_t size; int shader; } LzSkip;
+static LzSkip *lz_skip;             // replay: what the part being recorded left in the mirror
+static int lz_nskip, lz_cskip;
+static int lz_win;                  // replay: the part's window is open (lazy_part_check)
+static uint64_t lz_skipped;         // replay: bytes left in the mirror since the last log line
+
+static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds,
+                     VkAccessFlags2 da);
+
+// memory.c's fetch (frz_lock held there, so one at a time): [off, off + size) of the mirror h0 into the imported
+// buffer h1, after all the GPU work handed over so far.
+static void lazy_fetch(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size) {
+    VkCtx *c = vk_ctx();
+    VkBufferCopy reg = {off, off, size};
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkResetCommandPool(c->device, lz_pool, 0);
+    vkBeginCommandBuffer(lz_cb, &bi);
+    mbarrier(lz_cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+             VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBuffer(lz_cb, (VkBuffer)(uintptr_t)h0, (VkBuffer)(uintptr_t)h1, 1, &reg);
+    mbarrier(lz_cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+             VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+             VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    vkEndCommandBuffer(lz_cb);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &lz_cb};
+    vk_queue_lock();
+    vk_sync_flush_held();   // the held submissions wrote first
+    VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, lz_fence);
+    vk_queue_unlock();
+    if (r == VK_SUCCESS) r = vkWaitForFences(c->device, 1, &lz_fence, VK_TRUE, 10000000000ull);
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: bringing %llu bytes the GPU wrote down to guest memory failed (%d)", (unsigned long long)size, (int)r);
+    }
+    vkResetFences(c->device, 1, &lz_fence);
+}
+
+// memory.c's test before it arms [lo, hi) of the pool ctx (frz_lock held there, the pages already inaccessible): the
+// mirror holds every CPU write to them. A fetch copies the mirror over the whole range, not the merge of the bytes the
+// GPU changed that a write-back does, so a CPU write that came after the range's write-back reached guest memory and
+// before this arm, and that no sync of the mirror has carried up yet, would be overwritten by the mirror's older bytes:
+// a page stamped after the mirror's last sync (the CPU-write table, mgen), or a write-watch bit nobody has read yet.
+// No lock: the pages are inaccessible, so nothing stamps them meanwhile; the mirror's mgen only grows.
+static int lazy_clean(uint64_t lo, uint64_t hi, void *ctx) {
+    const PoolRec *r = ctx;
+    uint32_t mgen = __atomic_load_n(&r->mgen, __ATOMIC_ACQUIRE);
+    for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) {
+        const uint32_t *ch = __atomic_load_n(&cgen_chunk[a >> GEN_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
+        if (ch && __atomic_load_n(&ch[(a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)], __ATOMIC_RELAXED) > mgen) return 0;
+    }
+    uint64_t p[1];
+    return mem_written_peek(lo, hi - lo, p, 1) == 0;   // UINT64_MAX (not watched) counts as written
+}
+
+static int wb_lazy(void) {
+    int s = __atomic_load_n(&lz_state, __ATOMIC_ACQUIRE);
+    if (s) return s == 1;
+    plat_mutex_lock(&lz_init_lock);
+    if (!lz_state) {
+        VkCtx *c = vk_ctx();
+        // Not with shadow storage: a fetch copies the mirror into the pool's buffer, which is guest memory only when
+        // the pool is imported; a shadow's bytes reach guest memory in the submission's shadow_wb_cb.
+        int on = vk_mirror_on && !shadow_on && c && cfg_bool("NX2NAVI_WB_LAZY");
+        if (on) {
+            VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                          .queueFamilyIndex = c->gfx_family};
+            VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            on = vkCreateCommandPool(c->device, &pi, NULL, &lz_pool) == VK_SUCCESS;
+            VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = lz_pool,
+                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+            on = on && vkAllocateCommandBuffers(c->device, &ai, &lz_cb) == VK_SUCCESS &&
+                 vkCreateFence(c->device, &fi, NULL, &lz_fence) == VK_SUCCESS;
+            on = on && mem_lazy_enable(lazy_fetch, lazy_clean);
+        }
+        rt_log("mem: what shaders write into mirrored pools %s (NX2NAVI_WB_LAZY%s)",
+               on ? "goes back to guest memory once and then only when the CPU touches it"
+                  : "goes back to guest memory at the end of every submission",
+               shadow_on ? "; shadow storage keeps it off" : "");
+        __atomic_store_n(&lz_state, on ? 1 : 2, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&lz_init_lock);
+    return lz_state == 1;
+}
+
+static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader);
+
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
+    PoolRec *r = sp->pool;
+    if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size || !wb_lazy()) {
+        gpu_wrote_range(sp, size, shader);
+        return;
+    }
+    uint64_t g0 = r->import_lo + sp->offset, g1 = g0 + size, run = g0, out[16][2];
+    int k = mem_lazy_skip(g0, size, out, 16);
+    for (int i = 0; i <= k; i++) {
+        uint64_t lo = i < k ? out[i][0] : g1, hi = i < k ? out[i][1] : g1;
+        if (lo > run) {   // not armed: written back as ever
+            VkMemSpan part = *sp;
+            part.offset = sp->offset + (run - g0);
+            gpu_wrote_range(&part, lo - run, shader);
+        }
+        if (i < k) {
+            if (lz_nskip == lz_cskip) grow((void **)&lz_skip, &lz_cskip, sizeof *lz_skip);
+            LzSkip k = {*sp, hi - lo, shader};
+            k.sp.offset = sp->offset + (lo - g0);
+            lz_skip[lz_nskip++] = k;
+            lz_skipped += hi - lo;
+        }
+        run = hi;
+    }
+}
+
+// The end of the part being recorded: what it left in the mirror for a range that is no longer armed (the CPU touched
+// it meanwhile) is written back after all. Opens memory.c's window, which vk_mem_lazy_handed closes.
+static void lazy_part_check(void) {
+    if (lz_win || !lz_nskip) return;
+    mem_lazy_window(1);
+    lz_win = 1;
+    for (int i = 0; i < lz_nskip; i++) {
+        const PoolRec *r = lz_skip[i].sp.pool;
+        if (!mem_lazy_armed(r->import_lo + lz_skip[i].sp.offset, lz_skip[i].size))
+            gpu_wrote_range(&lz_skip[i].sp, lz_skip[i].size, lz_skip[i].shader);
+    }
+}
+
+// vk_sync.c, before a part's prologue is recorded: the check for a part that was split off (the last part's ran in
+// vk_mem_mirror_end already).
+void vk_mem_lazy_part_end(void) { lazy_part_check(); }
+
+// vk_sync.c, once the part is held or handed to the queue: a fetch from here on has its writes.
+void vk_mem_lazy_handed(void) {
+    lz_nskip = 0;
+    if (lz_win) mem_lazy_window(0), lz_win = 0;
+}
+
+static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
     r->vd_wrote_sub = msub, r->vd_wrote_n++;
@@ -2788,6 +2987,7 @@ int vk_mem_mirror_wb_pending(void) { return vk_mirror_on && (nsnl || nwbl); }
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    lazy_part_check();   // before the merges are recorded: what the last part skipped and has to write back after all
     if (nsnl) {
         // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -2885,6 +3085,20 @@ static void mirror_log(uint64_t frame) {
     uint64_t fz, ff, ft, fo;
     mem_freeze_stats(&fz, &ff, &ft, &fo);
     mem_probe_report(frame);
+    mem_lazy_report(frame, lz_skipped);
+    lz_skipped = 0;
+    // NX2NAVI_WB_LAZY_TOUCH=<n> (test, 0 off): at each of these lines this thread reads a byte of n armed ranges, as
+    // the game's CPU might, so the fault, the fetch and the hold run without waiting for the game to do it.
+    static int touch = -1;
+    if (touch < 0) touch = cfg_int("NX2NAVI_WB_LAZY_TOUCH");
+    if (touch > 0) {
+        uint64_t at[16];
+        int k = mem_lazy_pick(at, touch > 16 ? 16 : touch);
+        for (int i = 0; i < k; i++) {
+            volatile uint8_t v = *(volatile const uint8_t *)(uintptr_t)at[i];
+            (void)v;
+        }
+    }
     if (rt_trace & RT_TRACE_PERF)
         rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
                "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
@@ -3117,9 +3331,9 @@ float vk_mem_device_used_mb(void) {
 // One line per boot stage (vk_pipeline.c calls it after the pipeline cache load, the shader prewarm, the recorded
 // pipelines and the compute pipeline prebuild): the device-local memory in use, the part of it VMA did not allocate
 // (outside_watch's "outside VMA": pipelines and the driver's own, before the swapchain and the upscaler exist), and the
-// process's commit and working set. Subtracting two lines gives what a stage left behind: on an installed copy with
-// its prepared shader list the boot's compute pipelines alone held 2.3 GiB of device memory on an RTX 5090 (4,066
-// pipelines kept, 95 of them dispatched before the first village), which is what this line was added to place.
+// process's commit and working set. Subtracting two lines gives what a stage left behind: on an installed copy the
+// compute pipeline prebuild alone left 2.1 GiB of device memory on an RTX 5090, held by twenty very large compute
+// shaders no run dispatches (vk_pipeline.c, "compute pipelines the boot keeps"), which this line was added to place.
 void vk_mem_stage_log(const char *stage) {
     VkCtx *c = vk_ctx();
     double proc, used, limit;

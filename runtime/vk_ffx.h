@@ -10,6 +10,12 @@ typedef struct {
 } VkFfxImage;
 
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
+// Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
+// whether the library file is there, asked once without loading it. 0 where the build has no FSR 3.1 to load.
+int vk_ffx_available(void);
+// The same for frame generation (vk_fg.cpp), which runs through the library's own API calls (vk_ffx_create and the
+// rest below), not only an upscaler.
+int vk_ffx_framegen_available(void);
 // Records FSR 3.1 into cb: color (the scene light, render size), depth (D32F), mv (R16G16F, render pixels, current to
 // previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took, render pixels. fov_y in
 // radians (0: unknown). 0 on failure (the caller falls back as it does when DLSS fails).

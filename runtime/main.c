@@ -42,6 +42,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "logq.h"
 #include "prof.h"
 #include "platform/platform.h"
 #include "sha256.h"
@@ -66,21 +67,29 @@ static char g_log_early[32768];
 static size_t g_log_early_n;
 static uint64_t g_log_bytes;
 
-void rt_log_raw(const char *p, size_t n) {
+// The log's destinations. logq.c calls it: from the log thread in a game run, else from the thread that logs.
+static void log_sink(const char *p, size_t n) {
     fwrite(p, 1, n, stderr);
-    int state = __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE);
-    if (state == LOG_EARLY) {
+    if (__atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE) != LOG_FILE) return;
+    uint64_t at = __atomic_fetch_add(&g_log_bytes, n, __ATOMIC_RELAXED);
+    if (at + n <= LOG_CAP) {
+        plat_append_write(g_log_file, p, n);
+    } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
+        static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
+        plat_append_write(g_log_file, cut, sizeof cut - 1);
+    }
+}
+
+void rt_log_sync(void) { logq_sync(); }
+
+void rt_log_raw(const char *p, size_t n) {
+    if (__atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE) == LOG_EARLY) {
+        fwrite(p, 1, n, stderr);
         size_t at = __atomic_fetch_add(&g_log_early_n, n, __ATOMIC_RELAXED);
         if (at + n <= sizeof g_log_early) memcpy(g_log_early + at, p, n);
-    } else if (state == LOG_FILE) {
-        uint64_t at = __atomic_fetch_add(&g_log_bytes, n, __ATOMIC_RELAXED);
-        if (at + n <= LOG_CAP) {
-            plat_append_write(g_log_file, p, n);
-        } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
-            static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
-            plat_append_write(g_log_file, cut, sizeof cut - 1);
-        }
+        return;
     }
+    logq_write(p, n);
 }
 
 void rt_vlogf(const char *fmt, va_list ap) {
@@ -115,6 +124,7 @@ const char *rt_log_path(void) {
 // Opens the log file for a game run (game = 1) and writes the buffered lines to it; anything else drops them. Runs on
 // the main thread before the boot starts other threads.
 static void log_open(int game) {
+    logq_init(log_sink);
     char dir[PLAT_PATH_MAX * 3], from[PLAT_PATH_MAX * 3 + 16], to[PLAT_PATH_MAX * 3 + 16];
     char *cut = NULL;
     if (game && !plat_stderr_path(dir, sizeof dir) && plat_exe_path(dir, sizeof dir)) {
@@ -136,14 +146,20 @@ static void log_open(int game) {
     }
     if (!g_log_file) {
         __atomic_store_n(&g_log_state, LOG_OFF, __ATOMIC_RELEASE);
-        return;
+    } else {
+        size_t n = __atomic_load_n(&g_log_early_n, __ATOMIC_RELAXED);
+        if (n > sizeof g_log_early) n = sizeof g_log_early;
+        plat_append_write(g_log_file, g_log_early, n);
+        g_log_bytes = n;
+        __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
+        rt_log("log: %s", g_log_path);
     }
-    size_t n = __atomic_load_n(&g_log_early_n, __ATOMIC_RELAXED);
-    if (n > sizeof g_log_early) n = sizeof g_log_early;
-    plat_append_write(g_log_file, g_log_early, n);
-    g_log_bytes = n;
-    __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
-    rt_log("log: %s", g_log_path);
+    // A game run writes its log from the log thread (logq.c), whether the lines go to a log file or to stderr alone.
+    const char *e = cfg_get("NX2NAVI_LOG_ASYNC");
+    if (!game || (e && !strcmp(e, "0"))) return;
+    plat_exit_hook = rt_log_sync;
+    if (logq_async()) rt_log("log: lines are written by a thread of their own (NX2NAVI_LOG_ASYNC)");
+    else rt_log("log: no log thread; every line is written by the thread that logs it");
 }
 
 static void parse_trace(void) {
@@ -243,6 +259,7 @@ static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
 static void crash_handler(const PlatCrash *x) {
     static volatile int32_t busy;
     if (plat_xchg32(&busy, 1)) plat_exit(71);
+    rt_log_sync();   // the lines before the crash, then the report, each written as it is made
     char d[160];
     uintptr_t rip = x->rip;
     rt_logf("FATAL: %s (%#x) at host %p (", x->what, x->code, (void *)rip);
@@ -580,17 +597,18 @@ int main(int argc, char **argv) {
             if (++i == argc) return usage(argv[0]);
             *path = argv[i];
         } else if (!strcmp(argv[i], "--audio-device")) {
-            // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get), and
-            // nothing has read it yet because the audio renderer opens in rt_boot. An empty value would remove the variable
-            // (plat_setenv) and hand the choice back to nx2navi.ini, so "default" is the spelling for the system default.
+            // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get).
+            // cfg_init has read the settings by now, so the variable goes in through cfg_setenv, which makes the lookups
+            // read again. An empty value would remove the variable (plat_setenv) and hand the choice back to
+            // nx2navi.ini, so "default" is the spelling for the system default.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
-            plat_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
+            cfg_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
         } else if (!strcmp(argv[i], "--monitor")) {
-            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get), and nothing has read it yet:
-            // the window opens in rt_boot. An empty value would remove the variable (plat_setenv) and hand the choice back
-            // to nx2navi.ini, so "auto" is the spelling for "no monitor choice" on the command line.
+            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get); cfg_setenv as above. An empty
+            // value would remove the variable (plat_setenv) and hand the choice back to nx2navi.ini, so "auto" is the
+            // spelling for "no monitor choice" on the command line.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
-            plat_setenv("NX2NAVI_MONITOR", argv[i]);
+            cfg_setenv("NX2NAVI_MONITOR", argv[i]);
         } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);
@@ -611,6 +629,7 @@ int main(int argc, char **argv) {
     log_open(!mode);
     if (!mode) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
+        vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
         rt_boot();
         return 0;

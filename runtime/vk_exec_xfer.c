@@ -366,11 +366,99 @@ static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
     return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
 }
 
+// ---- events the CPU signals
+// Ocarina gates its main queue on the CPU: each frame the game sets one of two events to 0 (they take turns frame by
+// frame), submits the worker queues' command buffers and the main queue's, whose first command waits for the event
+// to be 1, and signals 1 from the CPU (nvnEventSignal) once it has finished writing what the frame's commands read.
+// The signal comes before the main queue's submit call, after it, or while that call is replaying. On the console
+// the GPU starts the queue at the signal and reads memory from then on.
+// Here a submission's recording begins with the copies of what it reads: the VRAM mirrors' sync and the uniform
+// snapshot (vk_exec_record), and the wait is tested when the walk reaches it, some hundred microseconds later. A
+// signal that came in between passed the wait, and the frame was drawn from copies taken before the game had
+// finished writing: single frames with the scene's shadowing missing or the whole scene black, the interface as it
+// was, most of them when other work keeps the CPU busy, since the game's threads then finish later and the signal
+// falls into the replay more often.
+// So a wait is tested against the value the event had when the submission took its copies: every nvnEventSignal is
+// numbered and keeps the value it replaced (vk_exec_event_cpu, before the write), vk_exec_record notes the number at
+// its start (vk_exec_event_sync), and a signal with a later number does not count for that submission. The wait then
+// stops the submission like any wait reached before its signal, and vk_backend.c submit_sync lets it go on at once
+// in a submission of its own, whose copies are taken after the signal.
+// NX2NAVI_EVENT_AT_SYNC=0: the value in memory when the walk reaches the wait, as before.
+#define CPU_EV 16
+#define CPU_EV_HIST 8
+static struct { const void *val; uint64_t seq[CPU_EV_HIST]; uint32_t before[CPU_EV_HIST]; unsigned n; } cpu_ev[CPU_EV];
+static int cpu_ev_n;                             // cpu_ev_lock
+static uint64_t cpu_ev_seq;                      // cpu_ev_lock: nvnEventSignal calls so far
+static uint64_t ev_sync_seq = UINT64_MAX;        // cpu_ev_lock: cpu_ev_seq at the recording's start; UINT64_MAX outside one
+static PlatMutex cpu_ev_lock = PLAT_MUTEX_INIT;
+static uint64_t ev_after_sync;                   // replay: waits only a signal after the copies would have passed
+
+int vk_exec_event_at_sync(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("EVENT_AT_SYNC", "1");
+    return on;
+}
+
+void vk_exec_event_cpu(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0;
+    cpu_ev_seq++;
+    if (i < cpu_ev_n) {
+        unsigned k = cpu_ev[i].n++ % CPU_EV_HIST;
+        cpu_ev[i].seq[k] = cpu_ev_seq, cpu_ev[i].before[k] = __atomic_load_n((const volatile uint32_t *)event, __ATOMIC_ACQUIRE);
+    }
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+void vk_exec_event_sync(int begin) {
+    plat_mutex_lock(&cpu_ev_lock);
+    ev_sync_seq = begin ? cpu_ev_seq : UINT64_MAX;
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+uint64_t vk_exec_event_late_take(void) {
+    uint64_t n = ev_after_sync;
+    ev_after_sync = 0;
+    return n;
+}
+
+// The event's value in memory, and in *at_sync the value it had when the submission being recorded took its copies
+// (the same outside a recording, and for an event the CPU has not signalled since).
+static uint32_t ev_mem(volatile uint32_t *val, uint32_t *at_sync) {
+    uint32_t mem = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    *at_sync = mem;
+    plat_mutex_lock(&cpu_ev_lock);
+    if (ev_sync_seq != UINT64_MAX)
+        for (int i = 0; i < cpu_ev_n; i++) {
+            if (cpu_ev[i].val != (const void *)val) continue;
+            uint64_t first = UINT64_MAX;
+            unsigned n = cpu_ev[i].n < CPU_EV_HIST ? cpu_ev[i].n : CPU_EV_HIST;
+            for (unsigned k = 0; k < n; k++)   // the earliest signal after the copies replaced the value they saw
+                if (cpu_ev[i].seq[k] > ev_sync_seq && cpu_ev[i].seq[k] < first) first = cpu_ev[i].seq[k], *at_sync = cpu_ev[i].before[k];
+            break;
+        }
+    plat_mutex_unlock(&cpu_ev_lock);
+    return mem;
+}
+
+// Whether the wait holds. *late: it holds only by a CPU signal that came after the submission's copies.
+static int ev_met(const p_wait_event *p, uint32_t *mem, const uint32_t **seen, int *late) {
+    uint32_t at_sync;
+    *mem = ev_mem(p->val, &at_sync);
+    *seen = ev_slot(p->val, 0);
+    int by_seen = *seen && ev_holds(**seen, p->mode, p->value);
+    int now = ev_holds(*mem, p->mode, p->value) || by_seen, then = ev_holds(at_sync, p->mode, p->value) || by_seen;
+    *late = now && !then;
+    return vk_exec_event_at_sync() ? then : now;
+}
+
 int vk_exec_event_met(const void *payload) {
-    const p_wait_event *p = payload;
-    const uint32_t *seen = ev_slot(p->val, 0);
-    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value) ||
-           (seen && ev_holds(*seen, p->mode, p->value));
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    return ev_met(payload, &mem, &seen, &late);
 }
 
 int vk_exec_signalled;
@@ -378,9 +466,15 @@ int vk_exec_signalled;
 int vk_exec_wait_event(const void *payload) {
     const p_wait_event *p = payload;
     ev_waits++;
-    uint32_t mem = __atomic_load_n(p->val, __ATOMIC_ACQUIRE);
-    const uint32_t *seen = ev_slot(p->val, 0);
-    if (ev_holds(mem, p->mode, p->value) || (seen && ev_holds(*seen, p->mode, p->value))) return 1;
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    int met = ev_met(p, &mem, &seen, &late);
+    if (late) {
+        ev_after_sync++;
+        vk_exec_evt('L', (const void *)p->val, 0);
+    }
+    if (met) return 1;
     ev_unmet++;
     if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
     ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
@@ -400,6 +494,7 @@ void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint6
 static void signal_event(VkExec *ex, const p_signal_event *p) {
     uint32_t *seen = ev_slot(p->val, 1);
     *seen = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? *seen + p->value : p->value;
+    vk_exec_evt('s', (const void *)p->val, *seen);
     vk_exec_signalled = 1;
     for (int i = 0; i < ev_open_n;)
         if (ev_open[i].val == p->val && ev_holds(*seen, ev_open[i].mode, ev_open[i].value)) {

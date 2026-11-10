@@ -27,7 +27,7 @@ The release folder (--out) holds:
                                   licences and a notice),
                                   lib/libnx2navirt.a (the runtime, prebuilt with the release's compiler),
                                   prompt-art/ with --prompt-art (the button art make_game.py draws the Xbox,
-                                  PlayStation and keyboard and mouse prompts from, tools/prompt_art.py art_files),
+                                  PlayStation, Steam Deck and keyboard and mouse prompts from, tools/prompt_art.py art_files),
                                   toolchain.lock.json (the MSYS2 packages of today, pinned), feed.json, VERSION, the
                                   licence files
     NX2navi-Setup-<version>.exe   launcher/native/setup.c with the folder above appended as a zip: the one file

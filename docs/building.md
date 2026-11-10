@@ -235,7 +235,10 @@ NVIDIA's Linux driver compiles into a disk cache of its own. A process adds at m
 folder, `~/.cache/nvidia`, is shared with every program. `--prepare-shaders` of game 1.1.1 builds 42,142 variants, about
 1.5 GB: on the default limit about 30,700 of them were stored and the rest compiled again at their first draw in play.
 `runtime/vk_device.c` therefore points `__GL_SHADER_DISK_CACHE_PATH` at `nvidia-cache` beside `ocarina` and the size at
-8 GiB before the first Vulkan call, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV. The
+8 GiB, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV, and only while NVIDIA's kernel
+driver is loaded (`/proc/driver/nvidia/version`). The driver does not make that folder and caches nothing in a folder it
+cannot write, so the game makes it, and when it cannot make or write it sets neither variable. A game run sets them in
+`main` before any of its threads starts, since a thread can load the Vulkan driver before the instance is made. The
 folder can be deleted; `ocarina --warm-shaders` fills it again.
 
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,
@@ -245,47 +248,39 @@ host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wro
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
 reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
-Forest (1.1.1, RTX 4090) that cost about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms) while the pools shaders read
-through the device address table were not kept current and the foliage was missing. With them kept current (below) and
-the table's pools synced in every guest submission it was about 8 ms a frame: copy-in 3.4 ms (13 MiB) on the
-submitting thread, write-back 4.7 ms (7 MiB compared) at the fence, 26 ms frames against 18 ms with
-`NX2NAVI_SHADOW=0`. Syncing only the pools with new CPU writes cut the copy-in from 4.4 to 2.6 ms a frame on an RX 9070
-XT (RADV), at 35.6 fps against 28.3. The copies hold about 5 GB. `NX2NAVI_SHADOW=1` turns it on
-under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as well: the shadow copies are chosen for
-the measured cost above, not for a missing extension.
-Direct-import pinning can conservatively mark pages dirty again without a CPU write. Texture coherence probes compare
-the GPU-visible bytes of every rewritten mip; an exact re-upload count is not a backing-independent contract.
-Both direct imports and shadow buffers register their guest address ranges in the GPU device address table, so shaders
-can follow pointers into either backing. Registration depends on the buffer, not a directly owned `VkDeviceMemory`:
-shadow storage uses a VMA allocation. A later VRAM mirror remaps the record with the original buffer as its write twin;
-finalization unmaps the record first.
+Forest (1.1.1, RTX 4090) that cost about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms) before pools read through the
+device address table were kept current, when the foliage was missing. Keeping them current in every part cost about
+8 ms a frame (copy-in 3.4 ms, write-back 4.7 ms). Syncing only pools with new CPU writes, once per guest submission,
+cut copy-in from 4.4 to 2.6 ms a frame on an RX 9070 XT (RADV), at 35.6 fps against 28.3. The copies hold about 5 GB.
+`NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as well:
+the shadow copies are chosen for the measured cost above, not for a missing extension.
 
-A shader reading through the GPA table need not bind or resolve its pointed-to pool, so the replay marks each part
-whose draws or dispatches use the table, even when their descriptors are reused. Once per guest submission, its
-prologue queries the mapped copied pools' shared write-watch snapshots and copies the pages the CPU wrote into the
-shadows and VRAM mirrors of the pools that have any (`runtime/vk_memory.c` `vk_mem_gpa_sync`).
+The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
+pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
+the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, even with reused
+descriptors. Once per guest submission its prologue queries the mapped pools' shared write-watch snapshots, copies
+only pools with newer CPU writes, and queues the same pages for their VRAM mirrors (`runtime/vk_memory.c`
+`vk_mem_gpa_sync`). Without shadow storage, mirrors remain unsynced for the table's readers.
 
-Shaders also write through the table. For an imported pool with a VRAM mirror the table's twin carries those writes
-into guest memory too; a shadow pool has no twin there, so they stayed in the shadow: the CPU never saw them, and the
-copy-in of a page the CPU wrote put guest memory's stale bytes over them. In Kokiri Forest those were the culling
-passes' instance counts and lists, and foliage and shadows flickered now and then. So a store or atomic through the
-table marks its page (translator patch 0039, `runtime/vk_gpa.c` "Written pages"). The memory code keeps a base copy of
-each marked page of a shadow pool and copies the GPU's bytes back at the fence of every part that runs a shader writing
-through the table, as for a noted write. In Kokiri Forest that is 170 pages, copied back in one part per frame.
-`NX2NAVI_MEMORY=verify` found 4,760 pages in 30 million where guest memory lacked the GPU's bytes before, and 20 in 41
-million after.
+Shaders also write through the table. An imported pool's mirror has a twin in guest memory, but a shadow pool's
+record has no twin there: those writes stayed in the shadow, and a later copy-in could overwrite them with stale
+guest bytes. Kokiri Forest's culling passes kept instance counts and lists that way, and foliage and shadows
+flickered. A store or atomic now marks its page (translator patch `0039`, `runtime/vk_gpa.c` `vk_gpa_written_pages`);
+the first mark appends the page to a ring. The memory code keeps a base copy from guest memory for each reported
+shadow page before copying CPU writes in, and at every part's fence whose shaders write through the table copies
+the GPU's changed bytes back (`runtime/vk_memory.c` `gw_part`, `swb_run`, `merge_page`). Marks stay set until remapping,
+so pages already reported are included at later writing parts too. A byte the CPU changed between the last copy-in
+and the first report can take the shadow's older value once. Earlier Kokiri Forest measurements found 170 pages
+copied back in one part per frame; `NX2NAVI_MEMORY=verify` found 4,760 pages in 30 million missing GPU bytes before,
+and 20 in 41 million after.
 
-`--probe-vkmem` exercises that contract through the real GPA table and submission prologue: a shader must read
-`0x13579BDF`, then `0x2468ACE0` after an ordinary CPU write, without resolving, binding or flushing the source after that
-write. Mirror setup occurs only before the first read. On Linux, run all four backing combinations against the rebuilt
-native executable (Fish):
+`--probe-vkmem` checks the read: a shader follows the table to a word of a pool that is never bound, and must read
+`0x13579BDF` and, after a plain CPU write, `0x2468ACE0`. On Linux, run it for each backing:
 
-```fish
-for shadow in 0 1
-    for memory in import mirror
-        env NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
-    end
-end
+```sh
+for shadow in 0 1; do for memory in import mirror; do
+    NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
+done; done
 ```
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
@@ -320,9 +315,28 @@ A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarin
 display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
 frame, uneven frame times one steady step, and game time follows the clock. No game files.
 
+A change to which waits a signalled event or an ended thread wakes (`runtime/kernel.c` `wake_sync_waiters`, the
+`WaitSynchronization` service) passes `python tests\sync_wake_check.py`, which builds `kernel.c` with the platform
+layer and the rest of the runtime stubbed and runs guest threads whose entries are host functions: a signal wakes the
+waits on its event and leaves the others asleep, a wait on several handles reports the right one, a thread's end ends
+the wait on it, timed waits keep their time, a cancel ends any wait, and 4,000 signals to eight looping waiters are
+each seen. It runs a second time with `NX2NAVI_SYNC_WAKE_ALL=1`. No game files.
+
+A change to the log queue (`runtime/logq.c`) passes `python tests\logq_check.py`, which builds it with the platform
+layer and a destination of its own: 160,000 lines from eight threads arrive whole and in each thread's order, a line
+logged while the queue's lock is taken waits and does not pass the lines queued before it, a destination that takes
+30 ms a write does not hold the threads that log, the line about slow writes comes once in ten seconds, a destination
+that stops while four times the queue's size is logged loses nothing, and `logq_sync` returns with everything written.
+The test passes on a busy machine too: it waits for the queue to empty instead of for a time, and counts slow lines
+instead of timing one. No game files.
+
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`.
+
+A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
+`runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
+the added text by GPU vendor and by why the cache was cold. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
@@ -335,7 +349,7 @@ change passes these, all run with `.venv`:
 | `tests\diff\func.py` | whole functions as the generator emits them, loops, jump tables and calls included (calls go to a stub that checks the registers at the call) | yes |
 | `tests\flags_check.py` | the function-local flag helpers of `runtime\cpu.h` against its packed ones | no |
 | `tests\ds3_check.py` | the DualShock 3 report decoding and output report of `runtime\input_ds3.c` | no |
-| `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, and blocks given back and taken again while pool addresses climb (no GPU; any Python) | no |
+| `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, block reuse, and written-page marks (deduplication, remapping, delayed entries and ring overflow; no GPU; any Python) | no |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 
@@ -349,10 +363,14 @@ Runtime probes, each a mode of `nx2navi.exe` (the list is at the top of `runtime
 part of `--probe-vkexec` translate shaders of the census below: they look for `build/<ver>/shaders/jobs.json` of the
 exe's own version first, then of the other one.
 `--probe-vkmem` also checks CPU-backed texture uploads and rewrites, GPU-written texture aliases, and memory write watches.
+A change to the texture detail (`runtime/vk_texture.c` "texture detail": `detail_skip`, `upload`, `astc_bl_regions`)
+passes it three times, with `NX2NAVI_TEXTURE_DETAIL` set to `full`, `reduced` and `low`: each time ASTC textures are
+uploaded and rewritten, and every level and layer of their images must hold the game's level it stands for.
 `--probe-prewarm` runs the boot's pipeline stages without the game, from the caches next to the exe (it skips when
 there are none): the pipeline cache load, the shader prewarm, the recorded pipelines and the compute pipeline prebuild,
 with a `mem: boot stage` log line after each that gives the device memory and the process commit so far. It then asks
-for compute pipelines the boot did not keep, as their first dispatch would, and prints what one costs. A change to what
+for compute pipelines the boot did not keep, as their first dispatch would, and prints what one costs. The device
+memory after the compute stage should be what it was before the stage, apart from the kept pipelines. A change to what
 the boot builds or keeps (`runtime/vk_pipeline.c`: `prewarm_run`, `lb_compute`, the `compute-used.bin` record) passes it.
 
 Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader

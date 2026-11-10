@@ -47,7 +47,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - In-game settings menu (F1, or Minus and Plus together on a gamepad) and performance overlay (F10)
 - Keyboard, mouse and gamepads with remapping, Nintendo, Xbox or PlayStation button layout, rumble and gyro; the game
   follows whichever connected gamepad you press, and DualShock 3 controllers are read directly when enabled
-- Xbox, PlayStation and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is
+- Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is
   built; the keyboard prompts follow your key bindings
 - Stereo or 5.1 surround sound output, on the output device of your choice; the default microphone for the game's
   microphone input

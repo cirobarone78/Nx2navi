@@ -499,8 +499,9 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
 // part was recorded, sub_lock held; may move slots[].
 // First brings the shadow storage up to date with the CPU's writes, which needs no command buffer.
 static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
-    vk_mem_gpa_sync(fence);   // GPA-only readers never resolved their source pools; first: base copies of written pages
+    vk_mem_gpa_sync(fence);   // first: base copies of pages written through the table, before any copy-in reaches them
     vk_mem_shadow_sync();     // shadow storage: the CPU's writes go in before the part is submitted
+    vk_mem_lazy_part_end();   // what the part left in the mirror and has to write back after all joins the snapshots
     if (!vk_mem_mirror_pending()) return VK_NULL_HANDLE;
     int i = claim_slot(c, fence);   // before reading slots: the claim may move it
     VkCommandBuffer cb = slots[i].cb;
@@ -537,6 +538,7 @@ static VkCommandBuffer split_part(int exec) {
         si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &esig, exec_sig = cur_fence;
     ts_submitted();
     queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
+    vk_mem_lazy_handed();
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -610,6 +612,7 @@ static uint64_t submit(const uint64_t *handles, int n, void (*probe_record)(VkCo
                         .pSignalSemaphoreInfos = sig};
     ts_submitted();
     queue_submit(c, &si, fence);   // held or handed to the queue (submit batching)
+    vk_mem_lazy_handed();
     s->fence = recorded ? fence : 0;
     vk_mem_note_submit(fence);
     plat_mutex_lock(&st_lock);

@@ -540,6 +540,21 @@ static void crash_filter_guard(uint64_t frame) {
     }
 }
 
+// A thread the recording thread starts through a library inherits its reserved core, and the core would stay reserved
+// after the recording thread ended (plat_cpu_reserve_sweep): every RESERVE_SWEEP presents both are put right.
+#define RESERVE_SWEEP 300
+static void reserve_sweep(uint64_t frame) {
+    static int logged;
+    if (frame % RESERVE_SWEEP) return;
+    int n = plat_cpu_reserve_sweep();
+    if (!n || logged >= 8) return;
+    logged++;
+    if (n < 0) rt_log("cpu: frame %llu: the recording thread has ended; its core is open to every thread again",
+                      (unsigned long long)frame);
+    else rt_log("cpu: frame %llu: %d thread%s started from the recording thread had its core alone; now on the other "
+                "processors", (unsigned long long)frame, n, n > 1 ? "s" : "");
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     crash_filter_guard(frame);
@@ -551,6 +566,7 @@ void perf_present(uint64_t frame) {
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     ab_b += rt_ab();
     cpu_placement();
+    reserve_sweep(frame);
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);

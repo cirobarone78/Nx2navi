@@ -976,6 +976,82 @@ int vk_exec_held(void) { return evo_pending; }
 
 static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth);
 
+// ---- event order trace (NX2NAVI_EVO_TRACE=1, diagnostics)
+// The order in which a frame's submissions, waits, signals and held parts were replayed, as a string of tokens:
+// |<queue>.<n> a submission of n command buffers on that queue; p it lines up behind held work of its queue; m<e> a
+// wait on event e that holds; u<e> one that does not; h the submission stops there; s<e>=<v> a replayed signal; r<queue>
+// held work of that queue goes on; w it stops at a wait again; d it is through; F it went on without its signal;
+// c<e>=<v> the CPU signals an event (nvnEventSignal, on whatever thread, where the call came between the others); L<e>
+// a wait that holds only by a CPU signal that came after the submission took its copies (vk_exec_xfer.c "events the
+// CPU signals"). Events and queues are numbered in the order they first appear; a value of 16 or more is written n,
+// as a counter would make every frame's string its own. Every distinct string is logged once with its number, and the
+// numbers of the frames are logged sixty to a line, so the frames that were replayed in another order than usual can
+// be set against the pictures of the flight recorder.
+#define EVT_KINDS 512
+static struct {
+    int on;
+    PlatMutex lock;
+    char buf[2048];
+    int n, over;
+    const void *ev[64];
+    int nev;
+    char *kind[EVT_KINDS];
+    int nkind;
+    uint64_t line_first;
+    int line_n;
+    char line[512];
+    int line_len;
+} ET = {.on = -1, .lock = PLAT_MUTEX_INIT};
+
+static int evt_on(void) {
+    if (ET.on < 0) ET.on = rt_knob("EVO_TRACE", "0");
+    return ET.on;
+}
+
+void vk_exec_evt(char what, const void *event, uint32_t value) {
+    if (!evt_on()) return;
+    char t[40];
+    int e = -1;
+    plat_mutex_lock(&ET.lock);
+    if (event) {
+        for (e = 0; e < ET.nev && ET.ev[e] != event; e++) {}
+        if (e == ET.nev && ET.nev < 64) ET.ev[ET.nev++] = event;
+    }
+    if (what == 's' || what == 'c') snprintf(t, sizeof t, value < 16 ? "%c%d=%u " : "%c%d=n ", what, e, value);
+    else if (what == '|') snprintf(t, sizeof t, "|%d.%u ", e, value);
+    else if (event) snprintf(t, sizeof t, "%c%d ", what, e);
+    else snprintf(t, sizeof t, "%c ", what);
+    for (const char *s = t; *s; s++) {
+        if (ET.n >= (int)sizeof ET.buf - 1) { ET.over = 1; break; }
+        ET.buf[ET.n++] = *s;
+    }
+    plat_mutex_unlock(&ET.lock);
+}
+
+void vk_exec_evt_frame(uint64_t frame) {
+    if (!evt_on()) return;
+    plat_mutex_lock(&ET.lock);
+    ET.buf[ET.n] = 0;
+    int k = 0;
+    while (k < ET.nkind && strcmp(ET.kind[k], ET.buf)) k++;
+    if (k == ET.nkind && ET.nkind < EVT_KINDS) {
+        size_t len = strlen(ET.buf) + 1;
+        if ((ET.kind[k] = malloc(len))) {
+            memcpy(ET.kind[k], ET.buf, len);
+            ET.nkind++;
+            rt_log("evo: order %d first at frame %llu%s: %s", k, (unsigned long long)frame, ET.over ? " (cut)" : "", ET.buf);
+        }
+    }
+    if (!ET.line_n) ET.line_first = frame, ET.line_len = 0;
+    ET.line_len += snprintf(ET.line + ET.line_len, sizeof ET.line - (size_t)ET.line_len, " %d", k);
+    if (++ET.line_n == 60 || ET.line_len > (int)sizeof ET.line - 16) {
+        rt_log("evo: frames %llu-%llu:%s", (unsigned long long)ET.line_first, (unsigned long long)frame, ET.line);
+        ET.line_n = 0;
+    }
+    ET.n = 0, ET.over = 0;
+    plat_mutex_unlock(&ET.lock);
+}
+
 static int evo_enabled(void) {
     if (evo_on < 0) {
         const char *e = cfg_get("NX2NAVI_EVENT_ORDER");
@@ -1069,6 +1145,7 @@ static int held_sync(void) {
 static int cont_walk(VkExec *ex, Cont *c) {
     if (c->at && !vk_exec_event_met(nvn_op_payload(c->at))) {
         evo_forced++;
+        vk_exec_evt('F', NULL, 0);
         static int logged;
         if (logged++ < 8)
             rt_log("vk: event order: a held submission goes on after %llu submissions without its signal",
@@ -1108,7 +1185,9 @@ static void evo_resume(VkExec *ex) {
             evo_in = 1, evo_queue = evq[s].q;
             for (;;) {
                 evo_resumed++;
+                vk_exec_evt('r', (const void *)evq[s].q, 0);
                 if (cont_walk(ex, c)) {   // waits again: the queue's state stays with it
+                    vk_exec_evt('w', NULL, 0);
                     vk_exec_pass_end(ex);
                     if (!c->st && !(c->st = malloc(ST_HI - ST_LO))) rt_fatal("vk: out of memory (queue state)");
                     memcpy(c->st, (uint8_t *)ex + ST_LO, ST_HI - ST_LO);
@@ -1118,6 +1197,7 @@ static void evo_resume(VkExec *ex) {
                 evq[s].head = c->next;   // done: the queue's next submission starts with the state this one left
                 if (!evq[s].head) evq[s].tail = NULL;
                 evo_pending--;
+                vk_exec_evt('d', NULL, 0);
                 cont_free(c);
                 c = evq[s].head;
                 if (!c) break;
@@ -1136,11 +1216,125 @@ static void evo_resume(VkExec *ex) {
     }
 }
 
+// ---- looking ahead for pipelines (NX2NAVI_PIPE_AHEAD, default 1; 0 off)
+// A draw whose pipeline is not there yet waits for its fast link or is skipped until a worker has built it, and the
+// next draw with a new pipeline is only found when the replay reaches it: an area's first frame, or a turn that brings
+// a dozen new materials into view, paid for them one after another (each wait a few milliseconds with the stage
+// libraries in the driver's cache, 100 ms and more without), or showed frames with those draws missing while the
+// workers that could have built them all at once sat idle.
+// The submission is recorded before it is replayed, so what comes after the draw is known. The first draw of a
+// submission that finds a shader or pipeline missing has the rest read here (vk_exec_ahead), from the op after it to
+// the end of the submission's last command buffer: the scan applies the binds that decide a draw's shaders and its
+// shader libraries (program, state objects, vertex attributes, textures and images, render targets, depth clamp) to a
+// copy of the replay state and, at each draw, looks its shaders up as the draw will and names the state to
+// vk_pipeline_hint, which queues the libraries not built yet. Nothing is recorded and no Vulkan object is touched;
+// a shader not in memory is queued for its disk read or translation by the lookup itself. The draws then find their
+// libraries built, or building on several workers at once.
+// What the scan does not follow: the op stream past a wait for another queue's signal (what follows may be held), a
+// change of the texture pool, mesh draws (their pipelines have no libraries), and whatever would take it past
+// AHEAD_NS. Render targets are read from their descriptors (format, view format, sample count), which is what the
+// replay resolves them to unless a target is left out; a guess that misses costs two libraries at most.
+#define AHEAD_NS 3000000ull
+#define AHEAD_OPS 400000u
+static struct {
+    int on, live;                      // on: -1 until read; live: vk_exec_record walks handles[i] now
+    const uint64_t *handles;
+    int n, i;
+    const op_hdr *at[CALL_DEPTH + 1];  // the op being replayed at each call depth
+    int depth;
+    uint64_t seq;                      // the submission scanned last
+    uint64_t scans, ops, cut, ns, max_ns, logged_scans;
+} AH = {.on = -1};
+
+static void ahead_set_rt(VkExec *sx, const p_set_rt *r) {
+    sx->rt = *r;
+    int n = r->n < 0 ? 0 : r->n > 8 ? 8 : r->n, samples = 0;
+    for (int i = 0; i < 8; i++) {
+        const tex_t *t = i < n ? r->color[i] : NULL;
+        sx->pipe.color_fmt[i] = !t ? 0 : r->has_cview[i] && r->cview[i].set_format ? (int32_t)r->cview[i].format : t->d.format;
+        if (t && !samples) samples = t->d.samples > 1 ? t->d.samples : 1;
+    }
+    sx->pipe.depth_fmt = r->depth ? r->depth->d.format : 0;
+    if (r->depth && !samples) samples = r->depth->d.samples > 1 ? r->depth->d.samples : 1;
+    sx->pipe.samples = (uint8_t)(samples ? samples : 1);
+}
+
+void vk_exec_ahead(VkExec *ex) {
+    if (AH.on < 0) {
+        AH.on = cfg_bool("NX2NAVI_PIPE_AHEAD");
+        rt_log("vk: a draw that finds its pipeline missing has the rest of its submission read ahead for the stage "
+               "libraries the later draws need: %s (NX2NAVI_PIPE_AHEAD)", AH.on ? "on" : "off");
+    }
+    if (!AH.on || !AH.live || evo_in || AH.seq == vk_exec_submit_seq) return;
+    AH.seq = vk_exec_submit_seq;
+    uint64_t t0 = kern_now_ns();
+    uint32_t ops = 0;
+    static VkExec sx;   // a copy of the replay state: too large for the stack
+    sx = *ex;
+    vk_exec_ahead_begin();
+    const op_hdr *ret[CALL_DEPTH + 1];
+    int depth = AH.depth, i = AH.i;
+    for (int d = 0; d < depth; d++) ret[d] = AH.at[d];
+    const op_hdr *h = nvn_op_next(AH.at[depth]);
+    for (;;) {
+        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) break;   // the replay reports it when it gets there
+        if (++ops >= AHEAD_OPS || (!(ops & 63) && kern_now_ns() - t0 > AHEAD_NS)) {
+            AH.cut++;
+            break;
+        }
+        const void *a = nvn_op_payload(h);
+        int stop = 0;
+        switch (h->op) {
+        case OP_END:
+            if (depth > 0) h = ret[--depth];   // back in the caller: on from the op after its call, below
+            else if (++i < AH.n) {
+                h = nvn_op_first(AH.handles[i]);
+                continue;
+            } else stop = 1;
+            break;
+        case OP_JUMP: h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target; continue;
+        case OP_CALL:
+            if (depth >= CALL_DEPTH) {
+                stop = 1;
+                break;
+            }
+            ret[depth++] = h;
+            h = nvn_op_first(((const p_jump *)a)->target);
+            continue;
+        case OP_WAIT_EVENT: stop = 1; break;
+        case OP_SET_TEX_POOL: stop = ((const p_set_pool *)a)->pool != sx.tex_pool; break;
+        case OP_SET_RT:
+            if (memcmp(&sx.rt, a, sizeof sx.rt)) ahead_set_rt(&sx, a);
+            break;
+        case OP_DEPTH_CLAMP: sx.pipe.depth_clamp = ((const p_flag *)a)->value != 0; break;
+        case OP_RASTER_DISCARD: sx.pipe.raster_discard = ((const p_flag *)a)->value != 0; break;
+        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_TEX: case OP_BIND_IMG:
+        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+            vk_exec_ahead_op(&sx, h->op, a);
+            break;
+        default: break;
+        }
+        if (stop) break;
+        h = nvn_op_next(h);
+    }
+    uint64_t ns = kern_now_ns() - t0;
+    AH.scans++, AH.ops += ops, AH.ns += ns;
+    if (ns > AH.max_ns) AH.max_ns = ns;
+    if ((rt_trace & RT_TRACE_PERF) && AH.scans - AH.logged_scans >= 100) {
+        rt_log("perf: looking ahead: %llu scans so far, %.0f ops and %.2f ms each (longest %.2f ms, %llu ended at their "
+               "limit); %llu draws seen, %llu looked up", (unsigned long long)AH.scans, (double)AH.ops / (double)AH.scans,
+               (double)AH.ns / 1e6 / (double)AH.scans, (double)AH.max_ns / 1e6, (unsigned long long)AH.cut,
+               (unsigned long long)vk_exec_ahead_draws, (unsigned long long)vk_exec_ahead_lookups);
+        AH.logged_scans = AH.scans;
+    }
+}
+
 static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        AH.at[depth] = h, AH.depth = depth;   // where vk_exec_ahead reads on from
         switch (h->op) {
         case OP_END: return NULL;
         case OP_BEGIN: break;
@@ -1213,12 +1407,15 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_CLEAR_BUF:
             vk_exec_op_xfer(ex, h->op, a);
             break;
-        case OP_WAIT_EVENT:
-            if (!vk_exec_wait_event(a) && depth == 0 && evo_queue) {
+        case OP_WAIT_EVENT: {
+            int met = vk_exec_wait_event(a);
+            vk_exec_evt(met ? 'm' : 'u', (const void *)((const p_wait_event *)a)->val, 0);
+            if (!met && depth == 0 && evo_queue) {
                 vk_exec_pass_end(ex);
                 return h;
             }
             break;
+        }
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);
@@ -1227,39 +1424,46 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
     }
 }
 
+// The replay records on the thread the game submitted from, and the kernel schedules that like any other guest
+// thread: a preemption in the middle of a part leaves the submission late for the frame it belongs to (Kokiri
+// Forest: 274 of 2,737 frames had a late submit). The recording thread therefore keeps the highest priority so the
+// scheduler prefers it over the guest's other cores (NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone) and
+// gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's cores, the audio, the
+// shader and pipeline workers, is kept off it, so nothing of this process preempts the recording. That core is then
+// lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only with 12 or more logical processors;
+// 1 always, 0 never. Linux reserves none with fewer than four fast cores.
+// The recording thread is not the first to call vk_exec_record: the game's main thread submits first and goes on
+// submitting a little at a time, while another guest thread does the work (Kokiri Forest: that thread spent 21.9 of
+// the 22.5 s the replay took in a minute and a half, the first one 0.5 s). The first thread to have spent
+// REC_CLAIM_NS in vk_exec_record is the one that keeps both.
+#define REC_CLAIM_NS 500000000ull
+static _Thread_local uint64_t rec_spent_ns;   // time this thread has spent in vk_exec_record
+
+static void rec_claim(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    rt_log("vk: thread %u is the recording thread (the first to spend %.1f s in it)", plat_thread_id(),
+           REC_CLAIM_NS / 1e9);
+    const char *e = cfg_get("NX2NAVI_RECORDER_PRIO");
+    if (!(e && !strcmp(e, "0"))) {
+        plat_thread_priority(PLAT_PRIO_HIGHEST);
+        rt_log("vk: the recording thread keeps the highest scheduling priority (NX2NAVI_RECORDER_PRIO=0 turns it off)");
+    }
+    const char *rc = cfg_value("NX2NAVI_RECORDER_CORE");
+    unsigned ncpu = plat_cpu_usable();
+    if (!strcmp(rc, "1") || (!strcmp(rc, "auto") && ncpu >= 12)) {
+        char which[96];
+        int n = plat_cpu_reserve(which, sizeof which);
+        if (n) rt_log("vk: the recording thread has a core of its own: logical processor%s %s (%d of %u; "
+                      "NX2NAVI_RECORDER_CORE=0 turns it off)", n > 1 ? "s" : "", which, n, ncpu);
+        else rt_log("vk: no core was reserved for the recording thread (too few fast cores, or the system refused it; "
+                    "NX2NAVI_RECORDER_CORE=0 stops the attempt)");
+    }
+}
+
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
-    // The replay records on the thread the game submitted from, and the kernel schedules that like any other guest
-    // thread: a preemption in the middle of a part leaves the submission late for the frame it belongs to (Kokiri
-    // Forest: 274 of 2,737 frames had a late submit). Recording keeps the highest priority so the scheduler prefers it
-    // over the guest's other cores; NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone.
-    static int prio_done;
-    static uint32_t rec_thread;   // the thread that got the priority and the core
-    if (!prio_done) {
-        prio_done = 1;
-        const char *e = cfg_get("NX2NAVI_RECORDER_PRIO");
-        if (!(e && !strcmp(e, "0"))) {
-            plat_thread_priority(PLAT_PRIO_HIGHEST);
-            rt_log("vk: the recording thread keeps the highest scheduling priority (NX2NAVI_RECORDER_PRIO=0 turns it off)");
-        }
-        // The recorder also gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's
-        // cores, the audio, the shader and pipeline workers, is kept off it, so nothing of this process preempts the
-        // recording. That core is then lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only
-        // with 12 or more logical processors; 1 always, 0 never.
-        const char *rc = cfg_value("NX2NAVI_RECORDER_CORE");
-        unsigned ncpu = plat_cpu_usable();
-        if (!strcmp(rc, "1") || (!strcmp(rc, "auto") && ncpu >= 12)) {
-            int n = plat_cpu_reserve();
-            if (n) rt_log("vk: the recording thread has a core of its own (%d logical processor%s of %u; "
-                          "NX2NAVI_RECORDER_CORE=0 turns it off)", n, n > 1 ? "s" : "", ncpu);
-            else rt_log("vk: could not reserve a core for the recording thread (NX2NAVI_RECORDER_CORE)");
-        }
-        rec_thread = plat_thread_id();
-    }
-    if (rec_thread && plat_thread_id() != rec_thread) {   // the priority and the core stay with the first thread
-        static int said;
-        if (!said++) rt_log("vk: a submission is recorded on another thread than the first one; it runs without the "
-                            "recorder's priority and core");
-    }
+    uint64_t in_ns = kern_now_ns();
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME
     if (prof_replay_tid != plat_thread_id()) perf_replay_thread();   // the profiler follows the thread replaying now
     perf_rec_waits = rec_wait_totals;
@@ -1289,6 +1493,8 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     int evo = evo_enabled() && gfx_submit_queue;
     int slot = evo ? evq_slot(gfx_submit_queue) : -1;
     if (evo && slot < 0) evo = 0;
+    vk_exec_evt('|', (const void *)gfx_submit_queue, (uint32_t)n);
+    vk_exec_event_sync(1);   // before the mirror sync and the uniform copy: a CPU signal after this point came after them
     int synced = n || (evo_pending && held_sync() && vk_exec_held_ready());   // held_sync
     if (synced) {
         vk_mem_mirror_begin();
@@ -1310,20 +1516,25 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
     if (evo_pending) evo_resume(ex);   // signals the CPU gave since, and holds past CONT_MAX
     if (evo && evq[slot].head) {   // the queue waits: this submission lines up behind it
-        if (n) cont_push(slot, cont_new(handles, n, 0, NULL)), evo_held++;
+        if (n) cont_push(slot, cont_new(handles, n, 0, NULL)), evo_held++, vk_exec_evt('p', NULL, 0);
     } else {
         evo_queue = evo ? gfx_submit_queue : 0;
+        AH.handles = handles, AH.n = n, AH.live = 1;
         for (int i = 0; i < n; i++) {
+            AH.i = i;
             const op_hdr *stop = walk(ex, nvn_op_first(handles[i]), 0);
             if (!stop) continue;
             cont_push(slot, cont_new(handles, n, i, stop));   // the rest of this submission waits for its signal
             evo_held++;
+            vk_exec_evt('h', NULL, 0);
             break;
         }
+        AH.live = 0;
         evo_queue = 0;
     }
     vk_exec_pass_end(ex);
     x_here = 0;
+    vk_exec_event_sync(0);
     if (ex->recorded) vk_exec_barrier(ex), vk_exec_pool_marks(ex);   // later submissions see this one's writes
     // The write-backs in a part of their own, after one that signals the executed timeline (vk_sync.c exec_tl): the
     // wait after a frame's first submission then ends when the submission's passes are through, not its write-backs.
@@ -1346,11 +1557,15 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f (%.2f first parts sent while the GPU was idle, %.2f "
                "splits inside a pass); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
-               "held now %d", (double)(n_subs + n_parts) / (double)n_subs, (double)n_idle_parts / (double)n_subs,
+               "held now %d; waits a CPU signal met only after the submission's copies were taken: %llu",
+               (double)(n_subs + n_parts) / (double)n_subs, (double)n_idle_parts / (double)n_subs,
                (double)n_pass_splits / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
-               (unsigned long long)evo_forced, (unsigned long long)evo_switches, evo_pending);
+               (unsigned long long)evo_forced, (unsigned long long)evo_switches, evo_pending,
+               (unsigned long long)vk_exec_event_late_take());
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
         n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
     }
+    rec_spent_ns += kern_now_ns() - in_ns;
+    if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();
     return ex->recorded - part_start;   // what the last part holds
 }

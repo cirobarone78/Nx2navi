@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <errno.h>
+#include <unistd.h>
+#endif
 
 #include "cfg.h"
 #include "host.h"
@@ -79,30 +83,56 @@ static void mesa_cache_beside_exe(void) {
 // variants of game 1.1.1 into it in one process: with the default limit it stored about 30,700 of them and the rest
 // were compiled again by the first start after it. So unless the environment sets them, the cache goes to nvidia-cache
 // beside the exe, which nothing else writes, with a limit of NV_CACHE_BYTES. The driver makes GLCache inside that
-// folder but not the folder, so it is made here.
+// folder but not the folder, so it is made here; pointed at a folder that is missing or not writable it caches nothing
+// at all, so when that folder cannot be made or written neither variable is set and the driver keeps its own folder
+// and limit. Without NVIDIA's kernel driver (no /proc/driver/nvidia/version, the test play.sh makes) the variables do
+// nothing and the folder would stay empty, so nothing is done.
 #define NV_CACHE_BYTES "8589934592"   // 8 GiB
 static void nvidia_cache_beside_exe(void) {
+    if (plat_fs_kind("/proc/driver/nvidia/version") != PLAT_FS_FILE) return;
     char dir[PLAT_PATH_MAX * 2], size[32];
-    if (!plat_getenv("__GL_SHADER_DISK_CACHE_PATH", dir, sizeof dir)) {
+    int own_dir = !plat_getenv("__GL_SHADER_DISK_CACHE_PATH", dir, sizeof dir);
+    if (own_dir) {
         int len = plat_exe_path(dir, sizeof dir - 16);
         char *cut = len ? plat_last_sep(dir) : NULL;
-        if (cut) {
-            strcpy(cut + 1, "nvidia-cache");
-            plat_fs_mkdir(dir);   // already there is fine
-            plat_setenv("__GL_SHADER_DISK_CACHE_PATH", dir);
+        if (!cut) return;
+        strcpy(cut + 1, "nvidia-cache");
+        int made = plat_fs_mkdir(dir), there = made == PLAT_FS_OK || made == PLAT_FS_EXISTS;
+        int err = !there ? plat_fs_os_error() : access(dir, W_OK | X_OK) ? errno : 0;
+        if (err) {
+            rt_log("vk: NVIDIA's shader disk cache stays in the driver's own folder with its own limit: %s %s (%s)", dir,
+                   there ? "is not writable" : "cannot be made", strerror(err));
+            return;
         }
+        plat_setenv("__GL_SHADER_DISK_CACHE_PATH", dir);
     }
-    if (!plat_getenv("__GL_SHADER_DISK_CACHE_SIZE", size, sizeof size))
-        plat_setenv("__GL_SHADER_DISK_CACHE_SIZE", NV_CACHE_BYTES);
+    int own_size = !plat_getenv("__GL_SHADER_DISK_CACHE_SIZE", size, sizeof size);
+    if (own_size) plat_setenv("__GL_SHADER_DISK_CACHE_SIZE", NV_CACHE_BYTES);
+    rt_log("vk: NVIDIA's shader disk cache in %s (%s), up to %s bytes (%s)", dir,
+           own_dir ? "beside the exe" : "__GL_SHADER_DISK_CACHE_PATH", own_size ? NV_CACHE_BYTES : size,
+           own_size ? "the game's limit" : "__GL_SHADER_DISK_CACHE_SIZE");
 }
 #endif
 
-static int create_instance(void) {
-    vk_dlssg_early();   // DLSS Frame Generation: Streamline before any Vulkan call of the process (its slInit asks so)
+// A driver may read these variables when it loads, and a thread can load the Vulkan driver before create_instance:
+// widescreen.c's wide_init asks for the monitor's size (fullscreen with a monitor chosen and the picture at the
+// window's size), and SDL's load of the Vulkan library there lists the instance extensions, which loads the drivers,
+// while the prewarm thread may be in create_instance; setenv beside other threads' getenv is not safe either. main
+// therefore calls this for a game run before any thread of the game starts; create_instance calls it for the other
+// modes. Both calls happen before other threads exist or under vk_init's lock, so the flag needs no atomics.
+void vk_driver_cache_env(void) {
+    static int done;
+    if (done) return;
+    done = 1;
     mesa_cache_beside_exe();
 #ifdef __linux__
     nvidia_cache_beside_exe();
 #endif
+}
+
+static int create_instance(void) {
+    vk_driver_cache_env();
+    vk_dlssg_early();   // DLSS Frame Generation: Streamline before any Vulkan call of the process (its slInit asks so)
     const char *ext[12];
     uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};

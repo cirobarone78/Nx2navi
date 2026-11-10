@@ -54,7 +54,9 @@
 # without the interrupt, 0 = off (the old scheduling).
 # async_preempt = 1
 # Replay NVN submissions on their own thread, at most one frame behind the game, 0 or 1. Default: off. Helps where the
-# game waits for the GPU; adds up to a frame of latency.
+# game waits for the GPU and in heavy scenes (15 to 18 percent more frames per second in a village); adds up to a frame
+# of latency, and can show a dark or flickering frame now and then: the other thread reads vertex and buffer memory
+# the game has sometimes rewritten by then.
 # replay_async = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
@@ -62,8 +64,12 @@
 # free_cores = 0
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
-# The thread that records the GPU work keeps the highest scheduling priority (recorder_prio), and a core of its own that
-# the process's other threads stay off (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never).
+# The thread that records the GPU work (the first to spend half a second doing it, not the one that submits first) keeps
+# the highest scheduling priority (recorder_prio), and a core of its own that the process's other threads stay off
+# (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never). That is a fast core, with both of its
+# logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the performance
+# core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when fewer than
+# four cores are that fast. The log names the thread and its logical processors.
 # recorder_prio = 1
 # recorder_core = auto
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).
@@ -90,8 +96,21 @@
 # How many milliseconds the draws of one frame may wait, in all, for a missing pipeline to be linked from the shader
 # libraries in the graphics driver's cache before they are dropped (0 to 100; 0: dropped at once, as before).
 # pipe_link_ms = 6
+# When a draw finds its pipeline missing, the rest of the commands the game submitted with it are read ahead and the
+# shader libraries of every other pipeline they will need are built at once on background threads, so the later draws
+# find theirs ready instead of waiting one after another or being left out of a frame. 0: off, as before.
+# pipe_ahead = 1
+# A pipeline whose fragment shader reads the picture it draws into (soft particles, water, some full-screen passes) is
+# linked from the shader libraries like any other. 0: as before, such a draw waits for the whole compile.
+# gpl_feedback = 1
+# The threads that build shader libraries also link the pipelines of draws that were left out of a frame, several at
+# once, instead of one thread linking them one after another while the others build optimised pipelines. 0: as before.
+# pipe_fast_workers = 1
 # The graphics driver's cache of shader libraries is checked at every start and, when it lost them (a driver update,
 # a cache the driver emptied), filled again in the background while the game runs. 0: no check; force: at every start.
+# After two cold starts in a row warming stops being tried on that driver; once its cache can hold the libraries (on
+# NVIDIA under Windows, Shader Cache Size Unlimited in the NVIDIA app), start once with force, or delete
+# shader-warm.txt, to warm again.
 # lib_warm = 1
 # How long (ms) a draw into a target no recent frame rendered waits for a pipeline built for the first time,
 # then is skipped. The default waits, as such a target (a lookup table, a new area's target) can stay empty if
@@ -106,13 +125,15 @@
 # lib_prebuild_threads = 2
 # How many compute pipelines the start builds and keeps: those of the compute shaders the game used most recently.
 # Every other known one is built into the pipeline cache and released again, and made from the cache when the game
-# first uses it (well under a millisecond). all: the start keeps the pipeline of every known compute shader, as
-# versions up to 0.6.1 did, which held more than 2 GB of video memory. 0: none are kept.
+# first uses it (well under a millisecond). Very large compute shaders the game has never used are not built at all.
+# all: the start builds and keeps the pipeline of every known compute shader, as versions up to 0.6.1 did, which held
+# more than 2 GB of video memory. 0: none are kept.
 # compute_keep = 512
 # 1: very large compute shaders that no cache holds are built on one background thread after the start. 0: each is
 # built when the game first uses it, which can hold that frame for a second or two.
 # lib_prebuild_big_bg = 1
-# The commit headroom in MB those background builds wait for (0: no check).
+# The commit headroom in MB those background builds wait for (0: no check). On Linux the headroom is the smaller of
+# the room left under the cgroup's memory limit (memory.max, memory.high) and the memory available on the machine.
 # big_build_free_mb = 8192
 # How far those background builds may raise the process commit in MB before the rest wait for their first use instead
 # (0: no limit). Each large shader costs the driver 1-4 GB; on a 31 GB machine four of them took the process from 15 to
@@ -189,7 +210,8 @@
 # tex_vram_pressure = 80
 # Megabytes this process may commit before textures give way as they do while the system's commit runs low (Windows
 # counts video memory against the commit). Default: the installed memory, at least 24576, so that it does not depend
-# on the size of the page file. 0: no bound of its own; only the system's commit counts.
+# on the size of the page file. 0: no bound of its own; only the system's commit counts. On Linux it counts the
+# process's resident anonymous memory, which stays under the installed memory, so there only a smaller value holds.
 # tex_proc_commit_mb = 32768
 # 1: a texture the game releases or takes back, with nothing else changed at its address, puts the texture table's
 # slots there back in a state they were in before, and they are not all looked up again (large towns release and take
@@ -257,8 +279,9 @@
 
 [display]
 # Device profile: auto (the Steam Deck when this is one), desktop or deck. On a Steam Deck the keys this file does not
-# set default to fullscreen = 1, window_size = 1280x800, output_res = 1280x800, render_scale = game, vk_present = fifo
-# and fps_limit = 40 (starting points, not measured yet). Read at start.
+# set default to fullscreen = 1, window_size = 1280x800, output_res = 1280x800, render_scale = game, vk_present = fifo,
+# fps_limit = 40, cores = 4 (the game's six cores share the Deck's four), astc_bc = 1 and spin_handoff_us = 30
+# (starting points, not measured yet). Read at start.
 # device_profile = auto
 # Presentation mode: mailbox (default when the driver offers it, vsync otherwise), fifo (vsync) or immediate. The menu's
 # VSync switch sets mailbox when on and immediate when off.
@@ -318,6 +341,14 @@
 # are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes while the game runs take
 # effect at once.
 # aniso = game
+# Texture detail: auto, full, reduced or low. The textures of a loaded area are what fills a card with little video
+# memory, and three quarters of a texture is its largest mip level. reduced makes the large surface textures (256x256 and
+# more, with smaller levels) without that level, low without the two largest when they are 1024x1024 or more. Surfaces
+# seen up close look softer; interface art, small textures, shadow maps and everything the game draws itself keep their
+# size. auto picks by the video memory Windows grants the game: full from 8192 MiB (cards of 10 GB and more), low under
+# 6144 MiB (cards of 6 GB and less), reduced between (8 GB cards). The log says what was picked ("texture detail:").
+# Read at start.
+# texture_detail = auto
 # Sun shadow map size: game (the game's own, which changes with the view and drops to about 400 near the ground, so
 # leaf shadows look blocky and jump) or a fixed 256, 512, 768, 1024, 1536 or 2048. Above 960 the texture heap grows with
 # it. 256 is coarser than the game's own and is for integrated GPUs short of memory bandwidth. Read at start.
@@ -371,14 +402,20 @@
 # The game's own FXAA after the post effects; with DLAA on it is not needed. Changes while the game runs take effect at
 # once.
 # fxaa = 1
-# Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU: one generated frame between every two the game draws, the HUD
-# kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX 40 and 50 GPUs, paced with Reflex; it needs
-# nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable, which the setup puts there). Both need DLSS or
-# FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit counts the frames on screen, generated ones
-# included: the game draws the limit divided by the multiplier (2 for fsr3). With fps_limit unset it is the display's
-# rate.
+# Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU where amd_fidelityfx_vk.dll loads, so not on Linux: one generated
+# frame between every two the game draws, the HUD kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX
+# 40 and 50 GPUs, paced with Reflex; it needs nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable,
+# which the setup puts there). Both need DLSS or FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit
+# counts the frames on screen, generated ones included: the game draws the limit divided by the multiplier (2 for fsr3).
+# With fps_limit unset it is the display's rate.
 # fsr3 takes effect at once, dlss (on or off) at the next start.
 # framegen = off
+# On Linux dlss runs through NVIDIA's NGX itself, without Streamline: it needs dlaa = 1 with DLSS when the game starts
+# and NVIDIA's libnvidia-ngx-dlssg.so.<version> (from NVIDIA's DLSS SDK repository) beside the game, then switches at
+# once, and its multiplier is fg_mult: 2 to 6 (above 2 needs an RTX 50 GPU) or dynamic, which generates only the frames
+# needed to reach the display's refresh rate at the rate the game draws. There fps_limit counts the frames the game
+# draws, and framegen_multiplier is not used.
+# fg_mult = 2
 # DLSS frame generation's multiplier: the frames on screen for each frame the game draws, 2, 3 or 4 (one, two or three
 # generated). 2 needs an RTX 40 GPU or newer, 3 and 4 an RTX 50 and a current driver. A value above what the GPU and
 # driver allow (Streamline reports it) is lowered to that, with a line in the log; the menu offers only what they allow.
@@ -487,9 +524,10 @@
 # pad with Nintendo labels, xbox for the others). The bind_ lines below apply
 # on top. Changes while the game runs take effect at once. 0.1.9's xbox_prompts is read as nintendo with prompts = xbox.
 # pad_layout = nintendo
-# The buttons the game's prompts show: nintendo (the game's own), xbox (LB RB LT RT, Menu, View) or playstation (L1 R1
-# L2 R2, Options, Create), with A B X Y as the button pad_layout presses is labelled: with nintendo, A shows as B or
-# circle and X as Y or triangle. pc: the key each button has (the bind_ lines below when the files are made), WASD
+# The buttons the game's prompts show: nintendo (the game's own), xbox (LB RB LT RT, Menu, View), playstation (L1 R1
+# L2 R2, Options, Create) or steamdeck (the Deck's A B X Y, L1 R1 L2 R2, Menu, View), with A B X Y as the button
+# pad_layout presses is labelled: with nintendo, A shows as B or circle and X as Y or triangle. pc: the key each
+# button has (the bind_ lines below when the files are made), WASD
 # and the mouse. Read at start; their files come from tools/pad_prompts.py (docs/controls.md, "Button prompts").
 # prompts = nintendo
 # Gamepad stick dead zone in percent of full deflection (0 to 50). Raise it for a stick that drifts: inside the circle
@@ -604,6 +642,17 @@
 # Log kernel services that block longer than this many ms, with the service number (0: off). A stalled frame shows up as
 # time in the replay; this says whether the guest was waiting in a service, and which one.
 # svc_slow_ms = 0
+# 1: every signalled event and every thread that ends wakes all the game threads that wait for any event, as before;
+# each takes one of the game's virtual cores to find that its own event is not the one, often from a thread that was
+# working. 0 (default): only the threads that wait for that event or thread are woken. With trace = sched the
+# "sched:" line counts both ("signals woke ..., left ... asleep").
+# sync_wake_all = 0
+# 1 (default): a thread of its own writes the log lines, to the log file and the console, so a write that stalls (a
+# busy disk, a virus scanner, a console that scrolls) no longer holds the thread that logged, which is often the one
+# that draws the frame. A crash, a fatal error and the end of the game write out what is still queued first. 0: each
+# line is written by the thread that logs it, as before. Either way a "log: ... writes of the log took over 2 ms" line
+# counts the slow writes and says whose time they took.
+# log_async = 1
 # 1: the frame-time summary also splits the replay by op kind (draw, bind, transfer), which says where a stalled frame
 # went. The clock reads cost a fraction of a millisecond a frame, so it is off by default.
 # replay_time = 0
@@ -624,6 +673,11 @@
 # keeps its budget): an area load then spreads over several frames with stand-ins instead of holding one frame for
 # 200-400 ms. 0: no limit.
 # pool_create_ms = 6
+# An area load is told from streaming by the number of textures still to make: at this many or more, the two limits
+# above give way (a frame may take pool_load_ms for them) and the picture before the load stays on screen until the
+# area's textures are there, instead of showing the ground and the walls black for the first seconds. 0: never.
+# pool_load_backlog = 512
+# pool_load_ms = 50
 # Written storage-buffer ranges up to this size in MiB (1 to 256) go back to game memory as a merge, in 4 MiB pieces:
 # copied within video memory and only the words that changed written over PCIe. Larger ones are copied back whole at
 # the end of every submission. Raising it from 4 to 16 took a 5.5 MiB range off the plain copies (about 46 MiB a frame
@@ -640,6 +694,14 @@
 # first submission ends when that submission's passes are through, without waiting for the copy back (3 to 4 ms of
 # every frame). 0: the copy back is part of the submission, and the wait covers it.
 # wb_split = 1
+# 1 (the default on Windows): what the game's shaders write into its memory is copied back from the video card once,
+# and after that only when the game's CPU code touches it (most of it never is: 66 MiB a frame in Hyrule Field), for
+# about a third more frames a second in open areas. 0: copied back at the end of every GPU submission, as in 0.7.0.
+# With shadow storage (Linux, Wine) it stays off.
+# wb_lazy = 1
+# Linux, shadow storage: 1 clears the write watch's protection of a range in one call before the GPU's bytes are copied
+# back into the game's memory, instead of taking a fault at the first store into each page.
+# shadow_bulk_write = 0
 # 1: the game's flushes of mirrored memory are copied into the mirrors even where the write watch already sees every
 # page the game wrote; 0 (default) copies only the written pages there, which saved 47-57 MiB of copies a frame in
 # Kokiri Forest.

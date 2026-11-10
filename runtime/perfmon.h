@@ -50,6 +50,8 @@ void perfmon_set_vram_game(float (*used_mb)(void));
 // A game frame was presented (perf_present, the render thread, only while the overlay is on): the time since the last
 // one, the render thread's waits of this frame (PERF_N entries, host.h), its replay time and the running count of
 // texture uploads.
+// A picture went out (the present thread, vk_backend.c): the overlay's frame times are the intervals between these.
+void perfmon_shown(uint64_t now_ns);
 void perfmon_frame(uint64_t now_ns, uint64_t interval_ns, const uint64_t *wait_ns, uint64_t replay_ns,
                    int64_t tex_uploads);
 // The latest numbers (the overlay, present path).

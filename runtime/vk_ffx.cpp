@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <atomic>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -37,6 +38,19 @@ struct Api {
     PfnFfxDispatch dispatch = nullptr;
     int tried = 0, ok = 0;
 } A;
+
+// What the settings menu may ask before anything has used FSR 3.1 (vk_ffx_available), from any thread.
+std::atomic<int> g_loaded{-1};    // what vk_ffx_load found: 1 or 0; -1 while it has not run
+std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
+
+#ifdef _WIN32
+// amd_fidelityfx_vk.dll next to the executable
+void library_path(char *path, size_t size) {
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
+    while (n && path[n - 1] != '\\') n--;
+    snprintf(path + n, size - n, "amd_fidelityfx_vk.dll");
+}
+#endif
 
 void message(uint32_t type, const wchar_t *msg) {
     char s[512];
@@ -134,12 +148,11 @@ extern "C" int vk_ffx_load(void) {
     A.tried = 1;
 #ifdef _WIN32
     char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-    while (n && path[n - 1] != '\\') n--;
-    snprintf(path + n, sizeof path - n, "amd_fidelityfx_vk.dll");
+    library_path(path, sizeof path);
     HMODULE m = LoadLibraryA(path);
     if (!m) {
         rt_log("ffx: %s not found: FSR 3.1 off", path);
+        g_loaded.store(0, std::memory_order_release);
         return 0;
     }
     A.lib = m;
@@ -148,11 +161,35 @@ extern "C" int vk_ffx_load(void) {
     A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
-#endif
     A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
     rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
+#else
+    // Only the Windows build loads AMD's library: there is nothing to load here
+    rt_log("ffx: this build has no FSR 3.1 (it needs amd_fidelityfx_vk.dll, which only the Windows build loads): FSR 3.1 off");
+#endif
+    g_loaded.store(A.ok, std::memory_order_release);
     return A.ok;
 }
+
+extern "C" int vk_ffx_available(void) {
+    int loaded = g_loaded.load(std::memory_order_acquire);
+    if (loaded >= 0) return loaded;
+#ifdef _WIN32
+    int present = g_present.load(std::memory_order_relaxed);
+    if (present < 0) {   // the menu asks every frame: look once, and leave the loading to the first use
+        char path[MAX_PATH];
+        library_path(path, sizeof path);
+        DWORD attr = GetFileAttributesA(path);
+        present = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+        g_present.store(present, std::memory_order_relaxed);
+    }
+    return present;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int vk_ffx_framegen_available(void) { return vk_ffx_available(); }   // the same library, its API calls
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                               const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y) {
