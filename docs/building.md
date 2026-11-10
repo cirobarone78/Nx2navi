@@ -231,7 +231,10 @@ NVIDIA's Linux driver compiles into a disk cache of its own. A process adds at m
 folder, `~/.cache/nvidia`, is shared with every program. `--prepare-shaders` of game 1.1.1 builds 42,142 variants, about
 1.5 GB: on the default limit about 30,700 of them were stored and the rest compiled again at their first draw in play.
 `runtime/vk_device.c` therefore points `__GL_SHADER_DISK_CACHE_PATH` at `nvidia-cache` beside `ocarina` and the size at
-8 GiB before the first Vulkan call, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV. The
+8 GiB, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV, and only while NVIDIA's kernel
+driver is loaded (`/proc/driver/nvidia/version`). The driver does not make that folder and caches nothing in a folder it
+cannot write, so the game makes it, and when it cannot make or write it sets neither variable. A game run sets them in
+`main` before any of its threads starts, since a thread can load the Vulkan driver before the instance is made. The
 folder can be deleted; `ocarina --warm-shaders` fills it again.
 
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,

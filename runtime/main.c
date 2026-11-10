@@ -611,6 +611,7 @@ int main(int argc, char **argv) {
     log_open(!mode);
     if (!mode) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
+        vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
         rt_boot();
         return 0;

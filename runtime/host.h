@@ -379,4 +379,7 @@ int probe_movie(void);                                     // movie_probe.c: hos
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
 int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
+// vk_device.c: the drivers' own shader caches beside the exe (MESA_SHADER_CACHE_DIR, on NVIDIA's Linux driver
+// __GL_SHADER_DISK_CACHE_PATH and _SIZE) in the environment, once; before any thread can load a Vulkan driver
+void vk_driver_cache_env(void);
 int vk_pipeline_spirv_selftest(void);                      // vk_pipeline.c: --selftest, the SPIR-V rewrites without a device
