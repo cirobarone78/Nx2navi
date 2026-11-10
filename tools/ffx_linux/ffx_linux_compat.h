@@ -1,3 +1,4 @@
+// Copyright (c) 2026 JonathanOrr. MIT License: see LICENSE.xplane-fsr3 in this folder. Changed for NX2navi.
 // Force-included (-include) when building FidelityFX SDK v1.1.4 sources on Linux.
 // Supplies the MSVC CRT names the SDK uses without editing AMD's sources.
 #pragma once

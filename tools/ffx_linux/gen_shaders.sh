@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 JonathanOrr. MIT License: see LICENSE.xplane-fsr3 in this folder. Changed for NX2navi.
 # Generates the Vulkan shader permutation headers of the FSR 3.1 upscaler, frame interpolation and optical flow on Linux.
 # Mirrors sdk/include/FidelityFX/gpu/<component>/CMakeCompile*Shaders.txt and sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
 # (FidelityFX SDK v1.1.4) for the GLSL path: four header sets per pass (wave32, wave64, 16-bit, wave64 16-bit).

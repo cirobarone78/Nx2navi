@@ -1,7 +1,7 @@
 # libamd_fidelityfx_vk.so for Linux: AMD FidelityFX SDK v1.1.4's ffx-api library (amd_fidelityfx_vk.dll on Windows) with
 # the FSR 3.1 upscaler, FSR 3.1 frame generation (frame interpolation, optical flow and the frame interpolation swapchain)
-# and their Vulkan backend. AMD ships the library for Windows only. The shader compiler port,
-# gen_shaders.sh, ffx_linux_compat.h and the SDK patches come from github.com/JonathanOrr/xplane-fsr3 (MIT).
+# and their Vulkan backend. AMD ships the library for Windows only. README.md says what
+# each file here does; THIRD_PARTY_NOTICES.md names the code that is not ours.
 cmake_minimum_required(VERSION 3.20)
 project(amd_fidelityfx_vk_linux CXX C)
 set(CMAKE_CXX_STANDARD 17)
