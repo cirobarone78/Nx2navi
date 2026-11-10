@@ -142,6 +142,7 @@ static struct {
     int nflags, npools, cap;
     unsigned count[COOP_CAT_N];
     int bound, gate, slice;
+    int loaded;             // a save was loaded since the start (the title screen's clock runs too)
     uint32_t clock;
     uint64_t clock_at, clock_entry, loading_entry, transition_entry[4];
     uint32_t frames;        // frames played since the save was bound
@@ -517,15 +518,16 @@ static int gate(uint64_t mgr) {
     unsigned moving = 0;
     for (int i = 0; i < 4; i++) moving |= (unsigned)(G.transition_entry[i] && LD8(G.transition_entry[i] + B_CURRENT)) << i;
     if (clock != G.clock) {
-        // the clock counts seconds of play one by one; any other change is a save being loaded (a load, a new game, the
-        // same save again from where it was saved), which also sets the flags: play starts at the next tick
+        // the clock counts seconds one by one, on the title screen too (from 0); any other change is a save being loaded
+        // (a load, a new game, the same save again from where it was saved), which also sets the flags: play starts at
+        // the next tick after one
         int tick = clock > G.clock && clock - G.clock <= 5;
-        if (!tick) unbind("another save was loaded");
+        if (!tick) unbind("another save was loaded"), G.loaded = 1;
         G.clock = clock;
         G.clock_at = tick ? now : 0;
     }
-    if (loading) unbind("a save is loading");
-    int open = !loading && !moving && G.clock_at && now - G.clock_at < CLOCK_MS;
+    if (loading) unbind("a save is loading"), G.loaded = 1;
+    int open = G.loaded && !loading && !moving && G.clock_at && now - G.clock_at < CLOCK_MS;
     if (open != G.gate && TRACE_ON)
         rt_log("coop: sync: game %s (play clock %u, loading %d, scene change %#x)", open ? "running" : "paused", clock, loading, moving);
     G.gate = open;
