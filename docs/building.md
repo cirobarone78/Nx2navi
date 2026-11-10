@@ -245,9 +245,12 @@ host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wro
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
 reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
-Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
-5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
-well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Forest (1.1.1, RTX 4090) that cost about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms) while the pools shaders read
+through the device address table were not kept current and the foliage was missing. With them kept current (below) it
+is about 8 ms a frame: copy-in 3.4 ms (13 MiB) on the submitting thread, write-back 4.7 ms (7 MiB compared) at the
+fence, 26 ms frames against 18 ms with `NX2NAVI_SHADOW=0`. The copies hold about 5 GB. `NX2NAVI_SHADOW=1` turns it on
+under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as well: the shadow copies are chosen for
+the measured cost above, not for a missing extension.
 Direct-import pinning can conservatively mark pages dirty again without a CPU write. Texture coherence probes compare
 the GPU-visible bytes of every rewritten mip; an exact re-upload count is not a backing-independent contract.
 Both direct imports and shadow buffers register their guest address ranges in the GPU device address table, so shaders

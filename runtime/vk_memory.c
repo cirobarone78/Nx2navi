@@ -472,7 +472,9 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
 
 // touch: the GPU may read the pool's buffer in the submission being recorded, so its shadow goes on the touched list
 // (shadow storage). A lookup (vk_mem_lookup) leaves it off: the caller reads guest memory itself or only asks what
-// backs the address. A pool in the device address table is touched either way, as shaders reach it through pointers.
+// backs the address. A pool in the device address table needs no touch for the shaders that reach it through pointers:
+// when a recorded shader uses the table, the submission prologue copies the CPU's writes into every mapped pool
+// (vk_mem_gpa_sync). Since shadows are mapped too, touching them here would put every pool a lookup sees back on the list.
 static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
@@ -485,8 +487,7 @@ static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) 
         out->cls = h->cls;
         out->pool = h->pool;
         if (h->alloc) out->alloc_offset = out->offset;
-        if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched && (touch || ((PoolRec *)h->pool)->gpa_rec))
-            shadow_touch(h->pool);
+        if (shadow_on && touch && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
             if (!resolve_locked(addr, size, &s, touch) || memcmp(&s, out, sizeof s))
@@ -523,7 +524,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
-        if (r->smap && !r->stouched && (touch || r->gpa_rec)) shadow_touch(r);
+        if (r->smap && touch && !r->stouched) shadow_touch(r);
         ok = 1;
     } else if (r && r->kind == POOL_PHYS) {
         out->buffer = r->buf;
