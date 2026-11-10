@@ -79,7 +79,11 @@ Read this before you join a room.
   again with what they held for the players in the room, which recovers a pool that a player who left had emptied,
   also when the maker resets twice before the games joined again. What a game held at the reset is its claim from then
   on, also while that player is at the title screen, so a key another player picks up after the reset comes on top of
-  it. Remove a player who emptied a pool and is still in the room first (both lines in one save of `nx2navi.ini` act
+  it. A player who is not in the room at the reset, or whom the maker has not admitted to the pools yet, is carried
+  for nobody: what it brought and picked up leaves the other games' pools until it plays again in the room, when its
+  game joins them with what it holds. If the maker resets again before such a player's game joined, that game keeps
+  the larger of its two carries, so keys the others used in between can come back (more keys, never fewer). Remove a
+  player who emptied a pool and is still in the room first (both lines in one save of `nx2navi.ini` act
   in that order). The key the maker's game signs the room's rules and
   removals with is kept in the profile folder (`coop-keys/`, readable by your account only: the folder 0700, the file
   0600 on Linux), so a maker whose game restarted is still the room's maker. That file, together with the room's
@@ -93,7 +97,7 @@ Read this before you join a room.
 | Who | Sees | Cannot |
 |---|---|---|
 | The relay's operator, and anyone on the network path | that a room exists (a random id and the locator, a value derived from the secret that does not give the secret back), the players' names, their IP addresses, when and how much they send | read, change or make any message between the players; learn the secret; change anyone's save or the room's rules (moving the relay's maker mark changes nothing for a player who accepted). It can drop, delay and send again what a player sent; a player takes one again only as "Replay" below says |
-| Someone who knows the secret and runs the relay, or sends from its address on your network | all of the above, and every message of the room | make a message in another player's name that a game acts on (each is signed by its sender); change your save other than through a player you accepted. It can also: send one message again within the last 64 of its sender, or four older ones in a row (see "Replay"); seal a message in a member's name with a counter far ahead, after which a player loses that member's next three messages; send rosters, or identities of another key for a member's session, that keep players from being identified or the room from being accepted while it keeps sending and up to 10 s after; send sections and digests in a member's name that use up what a player checks and takes from that member (128 signatures and 48 KB a second), which delays that member's own while it keeps sending; and send digests in a member's name with sums of its choosing (see the sync messages). None of that changes a save, and none of it lasts longer than said once it stops |
+| Someone who knows the secret and runs the relay, or sends from its address on your network | all of the above, and every message of the room | make a section, identity, pool record or set of rules in another player's name that a game acts on (each is signed by its maker); change your save other than through a player you accepted, or the rules of a player who accepted. It can also: send a member's messages again (see "Replay": within the last 64 they are refused, but four older ones in a row let it send the member's whole present session again); seal a message in a member's name with a counter far ahead, which costs a player that member's next three messages, each time it does so (one after every three of the member's keeps them out while it keeps sending); send rosters, or identities of another key for a member's session, that keep players from being identified or the room from being accepted while it keeps sending and up to 10 s after; send sections and digests in a member's name that use up what a player checks and takes from that member (128 signatures and 48 KB a second), which delays that member's own while it keeps sending; send digests in a member's name with sums of its choosing (see the sync messages); and, to a player who has not accepted the room yet, make every member's digest carry rules of a key of its own (a member does not sign its digest, only the rules in it are signed, by whoever made them): with no maker in the room, or one it controls, that player's game shows those rules and their key in the offer, so compare that key with the maker's before you accept (step 3 below). None of that changes a save, and none of it lasts longer than said once it stops |
 | The other players in the room | your name, your progress (what the rules share), your messages, and with `NX2NAVI_COOP_PUPPETS=1` where your Link is (area, position, animation) | your IP address (the relay forwards everything), your account or profile (the id the relay knows you by is random for each start of the game and never shown to them) |
 | Your log and "Copy system info" | the room's first three characters and the offer's number; system info shows that `coop_room`, `coop_server`, `coop_name` and `coop_accept` are set, not their values | the secret, the relay's address (it appears only with `NX2NAVI_TRACE=coop`) |
 
@@ -302,8 +306,12 @@ The rules belong to the room: every game in it merges the same way. They are the
 room, signed with that player's key: a game takes rules only signed by the key its player accepted (pinned at the
 first acceptance in the room). Before that, a game that made the room itself takes its own; otherwise it takes the
 key of the player the relay marks as the maker, but only while no other player carries rules signed by another key
-(the relay's mark cannot outvote the players, and a mark the relay puts on your own name does not make you the
-maker); with no maker in the room it takes the rules every member carries. When the members' rules disagree it takes
+(the relay's mark cannot outvote the rules the players' digests carry, and a mark the relay puts on your own name does
+not make you the maker); with no maker in the room it takes the rules every member's digest carries. A member does
+not sign its digest, so before you accept, someone who knows the secret and runs the relay can make every member's
+digest to you carry rules of a key of its own, which your game then takes (with no maker in the room, or a maker it
+controls): the offer shows the key that signs the rules, and comparing it with the maker's is what tells you (step 3
+of "Before you join a room with strangers"). When the members' rules disagree it takes
 none, applies nothing, and the log and the offer say so: ask the maker which key fingerprint is theirs. No other
 player's settings are used, and a member the relay marks later (after a restart, or a relay that lies) changes
 nothing for a player who accepted; the offer then says that the relay names another maker. The signed rules travel
@@ -387,17 +395,21 @@ and the message delivered. A counter older than the window is refused, unless it
 sender's messages in a row below the window, each later than the one before: then the window starts again from it and
 it is delivered. `K` is the whole room's, so whoever knows the secret can seal one message in a member's name with a
 counter far ahead, which leaves that member's later messages below the window; the member's next four start it again,
-and the first three of them are lost.
+and the first three of them are lost. That is per forged message: one sent again after every three of the member's
+keeps that member's messages from a player for as long as it keeps sending.
 
 **Replay.** A message recorded before a player joined again carries the old session, which the roster no longer
-lists: refused. A message sent again within the last 64 of its sender is refused by the window. An older one is
-refused too, but four or more of them in a row, each later than the one before, are taken again (that is how the
-window starts again after a counter far ahead), and anyone who recorded them can send them so. Someone who knows the
-secret can also seal a recorded message again under a new counter. A sync section carries its sender's own counter
-inside its signature for all of that: a section is taken once, and only within the last 64 of its sender's session;
-a digest taken again repeats what it said. A relay that lists an old session in a forged roster could replay that
-session's messages to a player whose game never saw the session end; they are messages the sender really signed, and
-sync messages only raise values, so this brings nothing new into a save.
+lists: refused. Within a session the window refuses only what it still remembers: a message sent again within the
+last 64 it took is refused, and an older one alone is refused too. But four older ones in a row, each later than the
+one before, start the window again (that is how it recovers from a counter far ahead), and from then on the window
+has forgotten what it took: anyone who recorded a member's messages of its present session (the relay too, without
+the secret) can have every one of them delivered again, in order. Someone who knows the secret can also seal a
+recorded message again under a new counter. So the envelope does not make a message arrive once; a layer for which a
+repeat matters checks a counter of its own. A sync section carries its sender's own counter inside its signature for
+that: a section is taken once, and only within the last 64 of its sender's session; a digest taken again repeats what
+it said (until its sender's next one, 2 s later). A relay that lists an old session in a forged roster could replay
+that session's messages to a player whose game never saw the session end; they are messages the sender really signed,
+and sync messages only raise values, so this brings nothing new into a save.
 
 **The sync messages (version 4).** `runtime/coop_state.c` has the byte layout. Each game makes a signing key for each
 room and start of the game (EdDSA, from a random value of the start and the room's secret, so nothing ties a player
@@ -482,7 +494,7 @@ What nothing can prevent: everyone who knows the secret can join and read the ro
 it (leave messages out, delay them, send one again as "Replay" says, flood within its limits, keep the rules from
 being agreed, change the offer so that nothing is applied until you accept again, keep the room unaccepted by never
 saying who it is, send rosters or identities that keep a player unidentified for as long as it keeps sending, or seal
-a message with a counter far ahead, which costs a player three of a member's messages); and the relay sees who plays
+messages with a counter far ahead, each of which costs a player three of a member's messages); and the relay sees who plays
 with whom and when, with names and addresses. None of that changes a save.
 
 ## Other players in the world (in progress, game 1.1.1)
@@ -529,7 +541,7 @@ frames do no more than check the setting.
 ## The interface for the layers above
 
 `runtime/coop.h`: `coop_send(kind, bytes, n)` and `coop_send_to(member, ...)` send a sealed message to the others (it is
-a datagram: it may be lost or arrive out of order; a replay is refused), `coop_on_message(kind, fn, user)` receives
+a datagram: it may be lost, arrive out of order or, recorded, arrive again: see "Replay"), `coop_on_message(kind, fn, user)` receives
 them on the coop thread, `coop_on_view(fn, user)` reports the state and the roster (with each member's maker mark and
 whether its messages opened), `coop_view_get(&view)` copies them, `coop_command(COOP_CMD_CREATE | COOP_CMD_JOIN |
 COOP_CMD_LEAVE, secret)` drives the room, `coop_remove_member(id)` is the maker's removal (progress sync signs it
@@ -552,7 +564,8 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   and in all, removal by the maker, bad tags, a stolen client id, challenge and room floods, fan-out, garbage from a
   member, the log without secrets, a join attempt asked again without a charge, two players behind one address who
   wait ten minutes for a room, a rejoin during a challenge flood, rooms that send to nobody, a rejoin while the members
-  of four other rooms flood with their tokens) on a fake clock and over
+  of four other rooms flood with their tokens, and a rejoin on a relay with its full 1000 rooms while someone floods
+  with every token of the room and a member of it with its own) on a fake clock and over
   UDP, and the codec against the vectors. With `NX2NAVI_EXE=<game>/ocarina` it also runs the probe against a relay it
   starts (with `--log-joins`, whose log a failure shows), with and without 30 % loss, and restarts that relay in the
   middle.

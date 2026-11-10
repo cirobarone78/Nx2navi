@@ -19,7 +19,8 @@
 // Every join is a new session: a random number the CONNECT tells the relay, which lists it in the roster. A player's
 // messages carry its session and a counter from 1 in the sealed envelope; the others take a message only of the session
 // the roster names for its sender and once within a window of 64 counters, so a message recorded before a rejoin, or
-// sent again within the window, is refused (an older one only after four in a row: window_below).
+// sent again within the window, is refused. Four older ones in a row start the window again (window_below), after which
+// a recorded message of that session can come again: a layer that must take a message once checks a counter of its own.
 //
 // One thread owns the socket, the DNS lookup and the state. Other threads reach it through a mailbox (commands, settings), an
 // outbox (messages to send) and a copy of the state they may read; all three sit behind one lock that the thread holds only
@@ -496,7 +497,9 @@ static void window_commit(Window *w, uint64_t session, uint32_t counter) {
 // that member below the window for the rest of its session. The sender's own next messages then keep arriving below
 // it, each later than the one before: at the WINDOW_AGAIN-th in a row the window starts again from it, which takes this
 // one. One that is not later than the last starts the row again (a copy of one counts once, and one sealed above the
-// sender's own cannot hold the row there). 1 when the window started again.
+// sender's own cannot hold the row there). The window forgets what it took: recorded messages of the session above the
+// new start, and its last 64, can then be taken again (coop.h says what a handler does about it). 1 when the window
+// started again.
 static int window_below(Window *w, uint32_t counter) {
     if (w->low_n && (int32_t)(counter - w->low) <= 0) w->low_n = 0;
     w->low = counter;

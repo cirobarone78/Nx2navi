@@ -848,8 +848,9 @@ static void adopt_charter(CoopSync *s, const Charter *c) {
     // a pool reset: each pool carries what it held for the identities the new charter admits, so the games join the
     // new epoch with that, not with what a drainer who is gone left in their counters. This game's own record counts
     // with the claim its join would have made counting only those identities, so keys it brought while a player who
-    // is not admitted again had gains in the pool are not lost to them. A pool that did not join again since an
-    // earlier reset keeps the larger carry: a second reset finds no records of the first one's epoch yet
+    // is not admitted again had gains in the pool are not lost to them. A game the reset admits signs its carry at once
+    // (below); one it does not admit, or that carries nothing, keeps it unsigned for its first join, and a second reset
+    // before that keeps the larger of the two carries: keys the others used in between may come back, never fewer
     if (had && c->pool_epoch != old_pool_epoch) {
         uint64_t keep[MAX_ADMIT];
         int nk = 0;

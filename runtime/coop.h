@@ -59,6 +59,7 @@ typedef struct {
 void coop_init(void);
 // Leaves the room and says BYE to the others, best effort, for the three ways the process ends (boot.c, svc.c,
 // gfx_present.c, before fs_save_flush): waits at most about 0.4 s for the coop thread, then returns whatever happened.
+// A session still connecting is left running (the process ends next; the relay drops a member it never hears from).
 void coop_shutdown(void);
 // Create, join or leave a room. secret (as typed: any case, '-' and spaces allowed) is required by JOIN; CREATE makes a
 // room of that secret, or of a new random one when it is NULL or empty (the view shows it: the player passes it on to
@@ -82,8 +83,13 @@ uint64_t coop_client_id(void);
 int coop_send(uint8_t kind, const void *bytes, size_t n);
 int coop_send_to(int member, uint8_t kind, const void *bytes, size_t n);
 // fn(from member id, the message bytes after the kind, their count, user) for every message of that kind that opened
-// with the room's key, came from the session the roster names for its sender and is not a replay. One handler per kind;
-// register before the message can arrive (at start-up).
+// with the room's key and came from the session the roster names for its sender. One handler per kind; register before
+// the message can arrive (at start-up). Not once only: the window refuses a repeat within the last 64 it took, but
+// four older messages in a row start it again, after which a recorded message of that session can arrive again (a
+// relay without the secret can do that), and anyone with the secret can seal one again under a new counter. A handler
+// for which a repeat or an old message matters keeps a counter of its own per sender and session inside its messages
+// and takes only one above the last it took (a position message, say, so that an old pose does not move a player
+// back); progress sync signs its counter, which only the sender can then move.
 typedef void (*CoopMsgFn)(int from, const uint8_t *bytes, size_t n, void *user);
 int coop_on_message(uint8_t kind, CoopMsgFn fn, void *user);
 // fn(view, user) after the state, the room, the roster or the status changed; up to 8 hooks. A layer that sends a HELLO to
