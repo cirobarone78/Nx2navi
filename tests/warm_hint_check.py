@@ -20,6 +20,7 @@ def main():
     env = dict(os.environ)
     if os.name == 'nt' and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
+    # both platforms' text is checked through lw_cold_hint's windows argument; LW_ON_WINDOWS on the one built for
     subprocess.check_call([compiler(), '-O1', '-Wall', '-Werror', '-I', str(ROOT / 'runtime'),
                            str(ROOT / 'tests' / 'warm_hint_check.c'), '-o', str(exe)], env=env)
     return subprocess.run([str(exe)], env=env).returncode

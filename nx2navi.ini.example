@@ -93,7 +93,8 @@
 # The graphics driver's cache of shader libraries is checked at every start and, when it lost them (a driver update,
 # a cache the driver emptied), filled again in the background while the game runs. 0: no check; force: at every start.
 # After two cold starts in a row warming stops being tried on that driver; once its cache can hold the libraries (on
-# NVIDIA, Shader Cache Size Unlimited in the NVIDIA app), start once with force, or delete shader-warm.txt, to warm again.
+# NVIDIA under Windows, Shader Cache Size Unlimited in the NVIDIA app), start once with force, or delete
+# shader-warm.txt, to warm again.
 # lib_warm = 1
 # How long (ms) a draw into a target no recent frame rendered waits for a pipeline built for the first time,
 # then is skipped. The default waits, as such a target (a lookup table, a new area's target) can stay empty if

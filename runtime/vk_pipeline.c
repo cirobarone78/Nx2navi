@@ -5157,7 +5157,8 @@ static void lw_main(void *arg) {
     if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
         rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
                "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median, lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP));
+               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
+               lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
         return;
     }
     LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
@@ -5172,8 +5173,10 @@ static void lw_main(void *arg) {
                "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
                "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
                "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
-               lw_cold_hint(LW.vendor, median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
-                                       : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST));
+               lw_cold_hint(LW.vendor,
+                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                            : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
+                            LW_ON_WINDOWS));
     LW.t0 = now_ms();
     LW.running = t;
     int started = 0;
