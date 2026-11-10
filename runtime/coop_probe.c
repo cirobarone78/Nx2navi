@@ -530,6 +530,10 @@ typedef struct {
     uint16_t port;
     volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay, steal;
     volatile int mark, spoof;   // the roster names this member the maker (toggles), or lists another session for it
+    volatile uint32_t forge_roster;      // a roster to member 1 this far ahead of the mock's counter, another session for member 2
+    volatile uint64_t rate_cid;          // CONNECTs of this client are refused for the network's joins
+    volatile uint64_t watch_cid;         // CONNECTs of this client with their proof (a cookie or token) are counted in watch_n
+    volatile unsigned watch_n;
     volatile unsigned forwarded;
     MockRoom rooms[4];
     uint8_t secret[32];
@@ -598,6 +602,8 @@ static void mock_connect(MockRelay *r, const uint8_t *d, size_t n, const CoopHdr
         return;
     }
     if (!coop_dgram_verify(d, n, c.locator)) return;
+    if (r->watch_cid && c.client_id == r->watch_cid) r->watch_n++;
+    if (r->rate_cid && c.client_id == r->rate_cid) return mock_error(r, from, COOP_E_RATE, c.nonce, c.locator);
     if (r->lie) {   // answers this attempt never asked for: another nonce, no tag, another room; then the real one
         r->lie = 0;
         mock_error(r, from, COOP_E_ROOM_FULL, c.nonce ^ 1, c.locator);
@@ -790,6 +796,21 @@ static void mock_main(void *arg) {
             if (room && r->spoof) room->m[r->spoof].session ^= 0x5005;
             if (room) mock_roster_to_all(r, room, 0);
             r->mark = r->spoof = 0;
+        }
+        if (r->forge_roster) {   // someone on the path who saw a CONNECT: a roster with a number of its choosing
+            MockRoom *room = mock_room_of(r, 1);
+            if (room && room->m[2].used) {
+                CoopRoster ro;
+                mock_roster_of(room, &ro);
+                for (int i = 0; i < ro.n; i++)
+                    if (ro.m[i].id == 2) ro.m[i].session ^= 0xBAD;
+                uint8_t payload[300], d[COOP_MAX_DGRAM];
+                size_t pn = coop_roster_pack(payload, sizeof payload, &ro);
+                CoopHdr h = {.ver = COOP_PROTO, .type = COOP_T_ROSTER, .room = room->id, .dst = 1, .seq = r->seq + r->forge_roster};
+                size_t k = coop_dgram_pack(d, sizeof d, &h, payload, pn, room->locator);
+                for (int i = 0; i < 3; i++) plat_udp_send(r->sock, &room->m[1].addr, d, k);   // three copies: the test's loss
+            }
+            r->forge_roster = 0;
         }
         int n = plat_udp_recv(r->sock, buf, sizeof buf, &from, 10);
         if (n > 0) mock_handle(r, buf, (size_t)n, &from);
@@ -1116,6 +1137,58 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     plat_udp_close(evil);
     CHECK(WAIT_FOR(view_of(alice).lost >= lost + 20, 5000), "datagrams from another address are thrown away");
     CHECK(in_room(alice, 2), "and change nothing");
+
+    // the fourth review's finding 4. Three rosters within 300 ms list another session for Alice: she joins again once
+    // in that time, not three times (each join is one of her network's)
+    if (*first < 1000) *first = 1000;   // past the numbers of the messages above
+    unsigned recon2 = alice->saw_reconnect;
+    for (int i = 0; i < 3; i++) {
+        mock->spoof = view_of(alice).self;
+        WAIT_FOR(!mock->spoof, 1000);
+        plat_sleep_ms(100);
+    }
+    unsigned rejoins = alice->saw_reconnect - recon2;
+    CHECK(rejoins <= 1, "H4 F4: three rosters that list another session for Alice make her join again once (%u times)", rejoins);
+    CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2), ROSTER_WAIT_MS), "and both are in the room after it");
+    plat_sleep_ms(1500);
+    exchange(alice, bob, drop, "H4 F4: after the rosters listing another session for Alice", first);
+    // someone on the path sends Alice a roster far ahead of the relay's counter that lists another session for Bob: it
+    // is not taken, and Bob's messages keep reaching her
+    mock->forge_roster = 1u << 30;
+    CHECK(WAIT_FOR(!mock->forge_roster, 2000), "a roster 2^30 ahead was sent");
+    plat_sleep_ms(300);
+    exchange(alice, bob, drop, "H4 F4: after a forged roster 2^30 ahead", first);
+    // one a little ahead is taken (the relay's counter could be there), and the relay's are taken again once none was
+    // for the silence time and 4 s
+    mock->forge_roster = 1000;
+    CHECK(WAIT_FOR(!mock->forge_roster, 2000), "a roster 1000 ahead was sent");
+    plat_sleep_ms(7000);
+    exchange(alice, bob, drop, "H4 F4: 7 s after a forged roster 1000 ahead", first);
+
+    // finding 3: a session that keeps its room waits a minute when the relay refuses it for its network's joins, and
+    // stays; and it asks for a room that is not there at most every 10 s
+    Player erin, fay;
+    mock->watch_cid = 0xE41, mock->watch_n = 0, mock->rate_cid = 0xE41;
+    player_start(&erin, "Erin", 0xE41, srv, drop, 1, 0);
+    coop_sess_command(erin.sess, COOP_CMD_JOIN, ROOM_SECRET);
+    CHECK(WAIT_FOR(strstr(view_of(&erin).status, "minute") != NULL, 5000), "H4 F3: a refusal for the network's joins says when it is tried again: %s (state %d)",
+          view_of(&erin).status, view_of(&erin).state);
+    unsigned asked = mock->watch_n;
+    plat_sleep_ms(3000);
+    CoopView ev = view_of(&erin);
+    CHECK(ev.state == COOP_CONNECTING && mock->watch_n - asked <= 3, "H4 F3: a session that keeps its room stays after it and does not ask again at once "
+          "(state %d, %s; %u more CONNECTs)", ev.state, ev.status, mock->watch_n - asked);
+    player_end(&erin);
+    mock->rate_cid = 0, mock->watch_cid = 0xFA1, mock->watch_n = 0;
+    player_start(&fay, "Fay", 0xFA1, srv, drop, 1, 0);
+    coop_sess_command(fay.sess, COOP_CMD_JOIN, "BCDFGHBCDFGHBCDFGH");
+    CHECK(WAIT_FOR(strstr(view_of(&fay).status, "not found") != NULL, 5000), "H4 F3: a room that is not there is waited for: %s", view_of(&fay).status);
+    asked = mock->watch_n;
+    plat_sleep_ms(4000);
+    CHECK(view_of(&fay).state == COOP_CONNECTING && mock->watch_n - asked <= 3, "H4 F3: a session waiting for a room that is not there asks at most "
+          "every 10 s (%u questions in 4 s)", mock->watch_n - asked);
+    player_end(&fay);
+    mock->watch_cid = 0;
 }
 
 static void probe_sessions(void) {

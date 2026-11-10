@@ -10,9 +10,11 @@
 // CONNECT that carries the cookie is answered by JOINED or an ERROR. Every answer carries the nonce of the attempt and
 // the locator's tag, so a datagram someone else sends from the relay's address does not end or redirect the attempt.
 // A burst of four CONNECTs 250 ms apart carries the exchange over a lossy path; a burst without an answer is followed by
-// a wait of 1, 2, 4, 8, then 15 s. In a room a PING every 2 s keeps the NAT mapping open and measures the round trip,
-// and 8 s without any datagram from the relay is RECONNECTING. JOINED hands out a rejoin token, which a later CONNECT of
-// the same member carries: the relay gives a member's id back only to it.
+// a wait of 1, 2, 4, 8, then 15 s. A session that keeps its room (retry) asks for a room that is not there at most every
+// 10 s, and waits a minute when the relay refuses it for its network's joins, instead of ending. In a room a PING every
+// 2 s keeps the NAT mapping open and measures the round trip, and 8 s without any datagram from the relay is
+// RECONNECTING. JOINED hands out a rejoin token, which a later CONNECT of the same member carries: the relay gives a
+// member's id back only to it.
 //
 // Every join is a new session: a random number the CONNECT tells the relay, which lists it in the roster. A player's
 // messages carry its session and a counter from 1 in the sealed envelope; the others take a message only of the session
@@ -37,6 +39,10 @@
 enum {
     PING_MS = 2000, SILENCE_MS = 8000, BURST_GAP_MS = 250, BACKOFF_FIRST_MS = 1000, BACKOFF_MAX_MS = 15000,
     BURST_TRIES = 4,                 // CONNECTs per burst
+    NO_ROOM_WAIT_MS = 10000,         // a room that is not there is asked for this often at most (each asks the relay for a join)
+    RATE_WAIT_MS = 60000,            // the wait after the relay refused a join for the network's budget
+    ROSTER_AHEAD = 1 << 20,          // a roster's number is taken at most this far ahead of the last one's
+    ROSTER_STALE_MS = 4000,          // after the silence time and this long without a roster taken, any roster is taken
     STATS_MS = 60000,                // the periodic counters line, while in a room
     LOG_EVERY_MS = 30000,            // a repeated cause logs this often
     RENAME_MS = 1000,                // a name change joins the room again after this much quiet
@@ -105,6 +111,8 @@ struct CoopSess {
     int have_cookie, have_token, said_answer, heard_relay;
     uint32_t connect_seq, out_seq, out_counter;
     uint64_t next_tx, last_connect_tx, last_rx, next_ping, next_stats, rename_at;
+    uint64_t roster_at, roster_rejoin_at;       // when a roster was last taken; the last rejoin a roster asked for
+    int own_taken;                              // the roster taken last lists another session for this player
     uint32_t backoff;
     int burst_left;
     uint32_t room;
@@ -416,7 +424,7 @@ static const CoopMemberInfo *member_of(const CoopSess *s, int id) {
 
 // The roster the relay sent replaces ours; the log tells who came, went, changed name or went away. 1 when this
 // player's own line lists another session than its own: someone took its place at the relay (a CONNECT with its
-// token, seen on the way), and the session joins again to take it back.
+// token, seen on the way), and the session joins again to take it back (roster_rejoin).
 static int apply_roster(CoopSess *s, const CoopRoster *r) {
     int taken = 0;
     for (int i = 0; i < r->n; i++) {
@@ -522,6 +530,7 @@ static int on_joined(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, 
     s->room_lost = 0;
     apply_roster(s, &j.roster);   // after a rejoin: against the roster before it, so a member whose session is the same stays as it was
     s->roster_seq = h->seq;
+    s->roster_at = now, s->own_taken = 0;
     s->last_rx = now;
     s->next_ping = now + s->ping_ms;
     s->next_stats = now + STATS_MS;
@@ -557,6 +566,10 @@ static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
             if (s->burst_left || now >= s->next_tx) {   // the first answer of a burst ends it; a CONNECT sent twice is answered twice
                 s->burst_left = 0;
                 schedule_backoff(s, now);
+                // each question asks the relay for one of the network's joins: at most one every NO_ROOM_WAIT_MS, so
+                // that players behind one address who wait for a room leave joins for the others (the same attempt
+                // asked again costs nothing at the relay)
+                if (s->next_tx < now + NO_ROOM_WAIT_MS) s->next_tx = now + NO_ROOM_WAIT_MS;
             }
         } else {
             go_left(s, "no such room", 1);
@@ -564,9 +577,18 @@ static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
         break;
     case COOP_E_ROOM_FULL: go_left(s, "the room is full", 1); break;
     case COOP_E_PROTO: go_left(s, "update required: the relay speaks another protocol version", 1); break;
-    case COOP_E_RATE: go_left(s, "too many joins from this network; try again in a minute", 1); break;
-    case COOP_E_BAD_TAG: go_left(s, "the relay did not accept the room's tag", 1); break;
-    case COOP_E_SERVER_FULL: go_left(s, "the relay is full", 1); break;
+    case COOP_E_RATE:
+        if (s->retry) {   // a session that keeps its room waits until the network's joins are back, and stays
+            if (s->next_tx < now + RATE_WAIT_MS) {
+                say(s, "the relay refused: too many joins from this network; trying again in a minute");
+                s->next_tx = now + RATE_WAIT_MS;
+            }
+            s->heard_relay = 1, s->burst_left = 0;
+            set_status(s, "too many joins from this network; trying again in a minute");
+        } else {
+            go_left(s, "too many joins from this network; try again in a minute", 1);
+        }
+        break;
     case COOP_E_ROOM_EXISTS:
         if (s->retry && s->intent == COOP_INTENT_CREATE) {
             // a session that keeps its room (coop_auto): someone made the room again first after the relay lost it, or
@@ -579,7 +601,15 @@ static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
         }
         break;
     case COOP_E_REMOVED: go_left(s, "the room's maker removed this player", 1); break;
-    case COOP_E_SESSION_USED: go_left(s, "the relay saw this session in the room before (a replay on the way?)", 1); break;
+    case COOP_E_SESSION_USED:
+        if (s->retry) {   // someone sent this attempt's CONNECT first (seen on the way): a new attempt, a new session
+            say(s, "the relay saw this session in the room before (a replay on the way?); trying again with a new one");
+            int rejoin = s->state == COOP_RECONNECTING;
+            if (begin_episode(s, s->intent, s->want, rejoin, now)) s->next_tx = now + NO_ROOM_WAIT_MS;
+        } else {
+            go_left(s, "the relay saw this session in the room before (a replay on the way?)", 1);
+        }
+        break;
     default: go_left(s, "the relay refused", 1); break;
     }
 }
@@ -601,6 +631,15 @@ static int on_error(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, c
     return 1;
 }
 
+// This player's own line lists another session: join again to take the place back, at most once per backoff_max_ms,
+// so that rosters from someone on the path cannot use up the network's joins; a later one waits for its turn (timers).
+static void roster_rejoin(CoopSess *s, uint64_t now) {
+    if (s->roster_rejoin_at && now - s->roster_rejoin_at < s->backoff_max_ms) return;
+    s->roster_rejoin_at = now ? now : 1;
+    say(s, "the relay lists another session for this player; joining the room again");
+    begin_episode(s, COOP_INTENT_JOIN, s->want, 1, now);
+}
+
 static int on_roster(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
     CoopRoster r;
     if (s->state != COOP_JOINED || h->room != s->room) return 0;
@@ -612,12 +651,16 @@ static int on_roster(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, 
         s->n_malformed++, s->n_lost++;
         return 0;
     }
-    if ((int32_t)(h->seq - s->roster_seq) > 0) {   // an older roster arriving late is dropped
-        s->roster_seq = h->seq;
-        if (apply_roster(s, &r)) {
-            say(s, "the relay lists another session for this player; joining the room again");
-            begin_episode(s, COOP_INTENT_JOIN, s->want, 1, now);
-        }
+    // a later roster, up to ROSTER_AHEAD past the last one: anyone who saw a CONNECT can tag one, and a number far
+    // ahead would make every roster of the relay after it look old. An older one arriving late is dropped, unless no
+    // roster was taken for a while (the relay sends one every few seconds): then the last one's number was not the
+    // relay's
+    int32_t ahead = (int32_t)(h->seq - s->roster_seq);
+    int stale = now - s->roster_at >= (uint64_t)s->silence_ms + ROSTER_STALE_MS;
+    if ((ahead > 0 && ahead <= ROSTER_AHEAD) || (stale && ahead)) {
+        s->roster_seq = h->seq, s->roster_at = now;
+        s->own_taken = apply_roster(s, &r);
+        if (s->own_taken) roster_rejoin(s, now);
     }
     return 1;
 }
@@ -874,6 +917,10 @@ static void timers(CoopSess *s, uint64_t now) {
             s->rename_at = 0;
             say(s, "joining the room again as %s", s->name);
             begin_episode(s, COOP_INTENT_JOIN, s->want, 1, now);
+            break;
+        }
+        if (s->own_taken && now - s->roster_rejoin_at >= s->backoff_max_ms) {   // a roster's rejoin that waited for its turn
+            roster_rejoin(s, now);
             break;
         }
         if (now >= s->next_ping) {
@@ -1147,6 +1194,7 @@ static void coop_main(void *arg) {
     int on = 0, said_random = 0;
     uint64_t client_id = 0;
     char name[COOP_NAME_MAX + 1] = "", server[160] = "", removed[24] = "";
+    copy_str(removed, sizeof removed, cfg_get("NX2NAVI_COOP_REMOVE"));   // the value at start is only noted: it acts on nothing
     for (;;) {
         unsigned v = cfg_version();
         if (v != seen && !__atomic_load_n(&g_final, __ATOMIC_ACQUIRE)) {   // the settings changed (the menu writes them)
