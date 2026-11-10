@@ -61,8 +61,10 @@ typedef struct { CoopTickFn fn; void *user; } TickHook;
 enum { L_MALFORMED, L_SENDER, L_TAG, L_REPLAY, L_OUTBOX, L_NO_SERVER, L_RESOLVE, L_SOCKET, L_CAUSES };
 
 // The counters of one sender's session seen last: a counter at most 64 below the highest is taken once, an older one
-// never. A new session (the roster names it) starts a new window.
-typedef struct { uint64_t session; uint32_t high; uint64_t bits; int valid; } Window;
+// is not, unless the sender's own messages keep arriving below the window (window_below). A new session (the roster
+// names it) starts a new window. low and low_n: the last counter that opened below it, and how many did in a row.
+typedef struct { uint64_t session; uint32_t high, low; uint64_t bits; int valid, low_n; } Window;
+enum { WINDOW_AGAIN = 4 };
 
 struct CoopSess {
     // ---- settings, set by coop_sess_new and coop_sess_configure
@@ -464,12 +466,13 @@ static int apply_roster(CoopSess *s, const CoopRoster *r) {
 
 // ---- receiving
 
-// 1 when counter of session is new in the window; nothing changes (commit after the message opened).
+// 1 when counter of session is new in the window, 0 when it was taken before, -1 when it is too old to tell (64 or more
+// below the highest); nothing changes (commit after the message opened).
 static int window_check(const Window *w, uint64_t session, uint32_t counter) {
     if (!w->valid || w->session != session) return 1;
     int32_t d = (int32_t)(counter - w->high);
     if (d > 0) return 1;
-    if (d <= -64) return 0;   // too old to tell: refused, as a replay would be
+    if (d <= -64) return -1;
     return !(w->bits >> (unsigned)-d & 1);
 }
 
@@ -482,9 +485,23 @@ static void window_commit(Window *w, uint64_t session, uint32_t counter) {
     if (d > 0) {
         w->bits = d >= 64 ? 1 : w->bits << d | 1;
         w->high = counter;
+        w->low_n = 0;
     } else {
         w->bits |= 1ull << (unsigned)-d;
     }
+}
+
+// A message that opened with the room's message key but is too old for the window. That key is the whole room's, so
+// whoever holds it can seal one message in a member's name with a counter far ahead and leave every later message of
+// that member below the window for the rest of its session. The sender's own next messages then keep arriving below
+// it, each later than the one before: at the WINDOW_AGAIN-th in a row the window starts again from it, which takes this
+// one. Copies of one old message count once. 1 when the window started again.
+static int window_below(Window *w, uint32_t counter) {
+    if (w->low_n && (int32_t)(counter - w->low) <= 0) return 0;
+    w->low = counter;
+    if (++w->low_n < WINDOW_AGAIN) return 0;
+    *w = (Window){.session = w->session, .high = counter, .bits = 1, .valid = 1};
+    return 1;
 }
 
 // The answers to a CONNECT: the attempt's nonce and the locator's tag.
@@ -697,7 +714,8 @@ static int on_data(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, co
         s->n_malformed++, s->n_lost++;
         return 0;
     }
-    if (session != m->session || !window_check(&s->rw[h->src], session, counter)) {   // an earlier session's, or seen
+    int fresh = session == m->session ? window_check(&s->rw[h->src], session, counter) : 0;
+    if (!fresh) {   // an earlier session's, or seen
         s->n_dup++, s->n_lost++;
         SAY_LIMITED(s, L_REPLAY, now, "a message of member %u that is not of its present session, or seen before, was thrown away", h->src);
         return 0;
@@ -709,7 +727,12 @@ static int on_data(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, co
         SAY_LIMITED(s, L_TAG, now, "a message that does not open with the room's key was thrown away");
         return 0;
     }
-    window_commit(&s->rw[h->src], session, counter);
+    if (fresh < 0 && !window_below(&s->rw[h->src], counter)) {
+        s->n_dup++, s->n_lost++;
+        SAY_LIMITED(s, L_REPLAY, now, "a message of member %u older than its last 64 was thrown away", h->src);
+        return 0;
+    }
+    if (fresh > 0) window_commit(&s->rw[h->src], session, counter);
     plat_mutex_lock(&s->lock);
     s->heard_at[h->src] = now;
     plat_mutex_unlock(&s->lock);

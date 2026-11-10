@@ -560,7 +560,7 @@ typedef struct {
     PlatUdp *sock;
     PlatThread *thread;
     uint16_t port;
-    volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay, steal;
+    volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay, steal, forge_ahead;
     volatile int mark, spoof;   // the roster names this member the maker (toggles), or lists another session for it
     volatile uint32_t forge_roster;      // a roster to member 1 this far ahead of the mock's counter, another session for member 2
     volatile uint64_t rate_cid;          // CONNECTs of this client are refused for the network's joins
@@ -573,6 +573,7 @@ typedef struct {
     uint64_t next_roster;
     uint8_t recorded[COOP_MAX_DGRAM];   // a DATA datagram of member record_from, for a replay later
     size_t recorded_n;
+    uint32_t counter[COOP_MAX_MEMBERS + 1];   // the envelope counter of each member's last DATA forwarded
 } MockRelay;
 
 static void mock_send(MockRelay *r, const PlatAddr *to, uint8_t type, uint32_t room, uint8_t dst, const void *payload, size_t n, const uint8_t *key) {
@@ -732,6 +733,8 @@ static void mock_handle(MockRelay *r, uint8_t *d, size_t n, const PlatAddr *from
         room->m[member].used = 0;
         mock_roster_to_all(r, room, 0);
     } else if (h.type == COOP_T_DATA) {
+        uint32_t c;
+        if (coop_envelope_peek(p, h.len, &session, &c)) r->counter[h.src] = c;
         if (r->record_from == h.src && n <= sizeof r->recorded) {   // kept for a replay after its sender joined again
             memcpy(r->recorded, d, n);
             r->recorded_n = n;
@@ -769,6 +772,20 @@ static void mock_forge(MockRelay *r) {
     CoopHdr h = {.ver = COOP_PROTO, .type = COOP_T_DATA, .room = room->id, .src = 2, .dst = COOP_DST_ALL, .seq = ++r->seq};
     size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, room->locator);
     plat_udp_send(r->sock, &room->m[1].addr, d, k);
+}
+
+// What a relay run by someone who knows the room's secret (or a sender from its address on member 1's network) can do
+// with the message key: one message to member 1 in member 2's name and session, sealed with that key, its counter
+// 2^31 - 1 past member 2's last one, of a kind nobody handles. Three copies: the test's loss.
+static void mock_forge_ahead(MockRelay *r) {
+    MockRoom *room = mock_room_of(r, 1);
+    if (!room || !room->m[2].used) return;
+    uint8_t key[COOP_KEY_LEN], mk[COOP_MSG_KEY_LEN], payload[COOP_MAX_PAYLOAD], d[COOP_MAX_DGRAM];
+    coop_room_keys(ROOM_SECRET, key, mk);
+    size_t n = coop_seal(payload, sizeof payload, mk, 2, COOP_DST_ALL, room->m[2].session, r->counter[2] + 0x7FFFFFFFu, 0xF1, "x", 1);
+    CoopHdr h = {.ver = COOP_PROTO, .type = COOP_T_DATA, .room = room->id, .src = 2, .dst = COOP_DST_ALL, .seq = ++r->seq};
+    size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, room->locator);
+    for (int i = 0; i < 3; i++) plat_udp_send(r->sock, &room->m[1].addr, d, k);
 }
 
 static void mock_replay(MockRelay *r) {
@@ -821,6 +838,7 @@ static void mock_main(void *arg) {
         }
         if (r->fuzz) mock_fuzz(r), r->fuzz = 0;
         if (r->forge) mock_forge(r), r->forge = 0;
+        if (r->forge_ahead) mock_forge_ahead(r), r->forge_ahead = 0;
         for (; r->replay; r->replay--) mock_replay(r);   // several copies: the test's loss may drop some
         if (r->mark || r->spoof) {
             MockRoom *room = mock_room_of(r, r->mark ? r->mark : r->spoof);
@@ -1231,6 +1249,12 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     CHECK(WAIT_FOR(!mock->forge_roster, 2000), "a roster 1000 ahead was sent");
     plat_sleep_ms(7000);
     exchange(alice, bob, drop, "H4 F4: 7 s after a forged roster 1000 ahead", first);
+    // the sixth review's finding 1: one message in Bob's name and session, sealed with the room's key (which everyone
+    // who knows the secret has), its counter 2^31 - 1 ahead of Bob's. Bob's own messages reach Alice again after a few
+    mock->forge_ahead = 1;
+    CHECK(WAIT_FOR(!mock->forge_ahead, 2000), "an envelope 2^31 - 1 ahead was sent");
+    plat_sleep_ms(300);
+    exchange(alice, bob, drop, "H6 F1: after one envelope in Bob's name 2^31 - 1 ahead, sealed with the room's key", first);
 
     // finding 3: a session that keeps its room waits a minute when the relay refuses it for its network's joins, and
     // stays; and it asks for a room that is not there at most every 10 s
