@@ -11,19 +11,26 @@
 // member's key, so every member passes them on and nobody but their owner can change them. The pool's value is the
 // highest base (at least 0) + all gains - all spends, where no contributor's spends count beyond its own gains plus the
 // counter's limit: a contributor can take at most what the pool can hold. Only identities the maker admitted
-// contribute, and a game counts only the records of the keys its own player accepted (and its own).
+// contribute, and a game counts only the records of the keys its own player accepted (and its own). A game remembers
+// what it joined a pool with and the records it saw then, and makes its claim again when the records it counts change
+// (a removal, or its player accepting more keys), so a removed player takes no keys another player brought.
 //
 // Gossip. Registers are split into COOP_SYNC_SECTIONS sections by hash; a DIGEST carries a sum per section (and the
 // room's rules), every 2 s and at once to a member who joins; a section whose sum differs from a peer's is sent to it in
 // SYNC messages, so two players converge within a few digests and a late joiner catches up with everything. A local
 // change goes out at once and again 80 and 250 ms later. Sending is paced (32 KB/s) under the relay's per-member limit.
+// Every SECTION (a push or an answer) carries its sender's signature over the room, its member id and session, a
+// counter and its bytes, checked before anything of it counts: the room's message key, which every holder of the
+// secret has (a relay run by one, a sender on a player's network), makes no values in a member's name.
 //
 // Identities. Each game has a signing key for each room and start of the game (from coop_sync_seed's random value and the
 // room's secret; the room's maker keeps one per room across starts, coop_sync_room_seed), and signs its identity in that
-// room: the key, the name and the session the relay lists for it. A game takes values only from a member whose
-// identity it checked, an identity is bound to one session, and a session of a key that ended is never taken again, so
-// an identity cannot be copied or reused by another member. A signature that fails its check counts against the
-// member that sent it, as a refused value does, and each member gets a bounded number of checks a second.
+// room: the key, the name, the session the relay lists for it and its session in the room before that one. A game takes
+// values only from a member whose identity it checked, an identity is bound to one session, and a session a member's
+// later identity names as the one before is never taken again, so an identity cannot be copied or reused by another
+// member; nothing else (a roster, a lost room) ends a session, since anyone on the path can send those. A signature
+// that fails its check counts against the member that sent it, as a refused value does (a section's against the
+// member's budget of checks only: someone else made it), and each member gets a bounded number of checks a second.
 //
 // Rules belong to the room: every game merges the same way. The maker's game signs a charter: the rules (the maker's
 // settings, coop_sync_settings), the identities admitted to the pools, the identities removed and the pools' epoch,
@@ -44,7 +51,7 @@
 // (and its own), and joins the pools only once the player accepted the room: those are not transitive. Nothing is
 // handed to the game (coop_sync_take) until its player accepted the room as it is now (the identities in it, the
 // rules, the maker's key and the save being played: coop_sync_offer) and a copy of the save was made
-// (coop_sync_copied); a member that is
+// (coop_sync_copied), and another save joins the pools only once it is accepted too; a member that is
 // present and has not identified itself after a few seconds keeps the room unaccepted. The offer's number is keyed
 // with this start's random value, so nobody can compute it in advance; it changes with any of those, and so does the
 // acceptance.
@@ -88,7 +95,7 @@ void coop_rules_text(const CoopRules *r, char *out, size_t cap);
 
 // Register kinds on the wire (2 to 4 were protocol 2's unsigned pool registers).
 enum { COOP_R_FLAG = 1, COOP_R_POOL = 5 };
-enum { COOP_SYNC_SECTIONS = 64, COOP_K_DIGEST_VER = 3 };   // 3: identities, a signed charter, signed pool records
+enum { COOP_SYNC_SECTIONS = 64, COOP_K_DIGEST_VER = 4 };   // 4: signed sections, identities that name the session before
 
 typedef struct CoopSync CoopSync;
 // self_id: random for this start of the game (contributor ids derive from it). schema: games merge only with the same
@@ -117,13 +124,11 @@ unsigned coop_sync_ignored(const CoopSync *s);
 // nothing of one room reaches the next. The acceptance, the pinned maker, the charter, the removals, the sessions that
 // ended and this game's own pool records stay while the code comes back the same (the session reached the room again);
 // another room starts them anew.
-// self: this player's member id; ids and sessions: every member's (self included; sessions NULL: each id's own
-// number); maker: the member the relay names as the room's maker, 0 when none is in the room.
+// self: this player's member id; ids and sessions: every member's (self included: this game's own session, the one it
+// joined with, which its identity and sections are signed for; sessions NULL: each id's own number); maker: the member
+// the relay names as the room's maker, 0 when none is in the room.
 void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, const uint64_t *sessions, int n, int maker,
                     uint64_t now_ms);
-// The relay lost the room (the session is joining it again): every session in it ended, so an identity bound to one of
-// them is never taken again. Call before the room goes to "".
-void coop_sync_room_lost(CoopSync *s);
 // The room's own seed for this player's key in the room of that code (the maker's, kept in its profile so that its key
 // outlives a restart of the game); without it the key comes from coop_sync_seed's value of this start.
 void coop_sync_room_seed(CoopSync *s, const char *code, const uint8_t seed[32]);
@@ -238,6 +243,8 @@ typedef struct {
     unsigned unaccepted;            // flags dropped because their sender's key is not one this player accepted
     unsigned sig_checks;            // signatures checked
     unsigned sig_skipped;           // messages dropped because their sender's budget of checks was spent
+    unsigned forged;                // sections whose sender's signature did not check out (made in its name by someone else)
+    unsigned replayed;              // sections whose counter was taken before (sealed again by someone with the secret)
     unsigned rate_dropped;          // messages over a member's rate
     unsigned probe_max;             // the longest run of index slots an insert walked
     unsigned own_key;               // digests of another member that carried this game's own key (a copy of its key file)
@@ -249,8 +256,14 @@ uint32_t coop_sync_flag(const CoopSync *s, int cat, uint32_t hash);
 int coop_sync_pool(const CoopSync *s, uint32_t hash, int64_t *value);
 // The record this game signed for a pool in the pools' epoch in force (tests): 1 when it has one.
 int coop_sync_own_record(const CoopSync *s, uint32_t hash, int32_t *base, uint32_t *gain, uint32_t *spend);
+// The record of key kid this game holds for a pool in the pools' epoch in force, and that epoch (tests).
+int coop_sync_record(const CoopSync *s, uint32_t hash, uint64_t kid, int32_t *base, uint32_t *gain, uint32_t *spend);
+uint32_t coop_sync_pool_epoch(const CoopSync *s);
 // 1 when this player accepted key kid in the room (its own key counts as accepted).
 int coop_sync_accepted_key(const CoopSync *s, uint64_t kid);
+// A SECTION message of n bytes in msg (cap at most) as this game sends one: its next counter and its signature for its
+// member id and session appended (tests that hand an engine what a member sends). The new length, 0 when it does not fit.
+size_t coop_sync_sign_section(CoopSync *s, uint8_t *msg, size_t n, size_t cap);
 // The digest sums, for tests: two engines with equal sums hold the same synced state.
 void coop_sync_sums(const CoopSync *s, uint32_t out[COOP_SYNC_SECTIONS]);
 

@@ -102,7 +102,7 @@ struct CoopSess {
     int relay_known;
     char relay_text[64];                        // the relay's resolved address, for the trace
     int intent, made_room;                      // CONNECT's intent; this session's own CREATE made the room
-    int room_lost;                              // the relay lost the room this session is joining again
+    uint64_t room_session;                      // the session the room lists for this player since its last JOINED
     char want[COOP_SECRET_LEN + 1];             // the secret of the room being joined or made
     uint8_t locator[COOP_KEY_LEN];              // of want: the relay's name of the room and the tags' key
     uint8_t msg_key[COOP_MSG_KEY_LEN];          // of want: seals the players' messages
@@ -527,7 +527,7 @@ static int on_joined(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, 
     memcpy(s->token, j.token, COOP_COOKIE_LEN);
     s->have_token = 1;
     if (!rejoined) s->made_room = s->intent == COOP_INTENT_CREATE;   // this session's own creation, not the relay's mark
-    s->room_lost = 0;
+    s->room_session = s->session;
     apply_roster(s, &j.roster);   // after a rejoin: against the roster before it, so a member whose session is the same stays as it was
     s->roster_seq = h->seq;
     s->roster_at = now, s->own_taken = 0;
@@ -559,7 +559,6 @@ static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
             } else if (begin_episode(s, COOP_INTENT_JOIN, s->want, 0, now)) {
                 set_status(s, "the room was lost; waiting for it");
             }
-            s->room_lost = 1;   // every session in it ended with it (coop_state.h: coop_sync_room_lost)
         } else if (s->retry) {   // not made yet, perhaps: wait and ask again
             s->heard_relay = 1;
             set_status(s, "room %s not found; waiting for it", label);
@@ -956,7 +955,7 @@ static void view_rebuild(CoopSess *s) {
     label_of(secret, v->label);
     v->self = in_room ? s->self : 0;
     v->made = in_room && s->made_room;
-    v->room_lost = s->room_lost;
+    v->session = in_room ? s->room_session : 0;
     copy_str(v->name, sizeof v->name, s->name);
     v->maker = 0;
     v->n = in_room ? s->roster.n : 0;

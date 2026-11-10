@@ -43,7 +43,8 @@ typedef struct {
     int maker;                  // the member id of the room's maker, 0 when the maker is not in the room
     int made;                   // this player's session made the room (its own CREATE, not the relay's mark: its
                                 // settings are the room's rules, coop_state.h)
-    int room_lost;              // the relay lost the room and the session is joining it again (every session in it ended)
+    uint64_t session;           // this player's session in the room, the one it joined with (0 outside a room); a roster
+                                // may list another for it, which progress sync does not sign for
     char name[COOP_NAME_MAX + 1];   // this player's own name (COOP_NAME, cleaned), whatever the relay's roster says
     int n;                      // members of the room, this player included, by id
     CoopPeer member[COOP_MAX_MEMBERS];

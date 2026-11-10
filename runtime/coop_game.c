@@ -546,7 +546,8 @@ static void on_view(const CoopView *v, void *user) {
     uint64_t sessions[COOP_MAX_MEMBERS];
     int in_room = v->state == COOP_JOINED || v->state == COOP_RECONNECTING;
     for (int i = 0; in_room && i < v->n; i++) {
-        sessions[n] = v->member[i].session;
+        // this player's own session is the one it joined with (the engine signs for it), whatever a roster lists
+        sessions[n] = v->member[i].id == v->self && v->session ? v->session : v->member[i].session;
         ids[n++] = v->member[i].id;
     }
     if (in_room && (strcmp(G.key_code, v->code) || (v->made && !G.has_room_key))) {   // the file once per room, outside the lock
@@ -558,7 +559,6 @@ static void on_view(const CoopView *v, void *user) {
     if (G.eng) {
         coop_sync_name(G.eng, v->name);   // the player's own name, signed: the relay's roster may say another
         if (in_room && G.has_room_key) coop_sync_room_seed(G.eng, v->code, G.room_key);
-        if (!in_room && v->room_lost) coop_sync_room_lost(G.eng);
         coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, sessions, n, in_room ? v->maker : 0, plat_now_ms());
         CoopRules mine;
         read_rules(&mine);
