@@ -44,6 +44,8 @@ static uint64_t reserved;         // asynchronous replay: newest value handed ou
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
+static Pending *fqueue;           // vk_completion_add_first: run before the callbacks of their value (merge lists)
+static int fqhead, fqn, fqcap;
 
 // ---- submit batching
 // Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
@@ -160,6 +162,10 @@ static void hold_release(uint64_t value, int aged, int try_only) {
     vk_sync_flush_held();
     vk_queue_unlock();
 }
+
+// The replay thread is about to wait for what submission `value` leaves (vk_memory.c apply_wait, NX2NAVI_MERGE_CPU): a
+// held submission that signals it goes to the queue now, or the wait would last out the hold.
+void vk_sync_release_held(uint64_t value) { hold_release(value, 0, 0); }
 
 // ---- GPU time (NX2NAVI_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
 // ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
@@ -383,7 +389,7 @@ static void completion_main(void *arg) {
     VkCtx *c = arg;
     plat_mutex_lock(&st_lock);
     for (;;) {
-        while (!stop && done == issued && !(qn && queue[qhead].fence <= done))
+        while (!stop && done == issued && !(qn && queue[qhead].fence <= done) && !(fqn && fqueue[fqhead].fence <= done))
             plat_cond_wait(&cv_work, &st_lock);
         if (stop) break;
         uint64_t reached = done;
@@ -404,6 +410,13 @@ static void completion_main(void *arg) {
             vkGetSemaphoreCounterValue(c->device, c->timeline, &reached);
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
+        }
+        while (fqn && fqueue[fqhead].fence <= reached) {
+            Pending p = fqueue[fqhead++];
+            fqn--;
+            plat_mutex_unlock(&st_lock);
+            p.fn(p.arg);
+            plat_mutex_lock(&st_lock);
         }
         while (qn && queue[qhead].fence <= reached) {
             Pending p = queue[qhead++];
@@ -514,6 +527,8 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     vkEndCommandBuffer(cb);
     return cb;
 }
+
+uint64_t vk_sync_rec_fence(void) { return cur_fence; }
 
 static VkCommandBuffer split_part(int exec);
 VkCommandBuffer vk_sync_split(void) { return split_part(0); }
@@ -637,20 +652,37 @@ uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg
     return submit(NULL, 0, record, arg);
 }
 
-void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
-    plat_mutex_lock(&st_lock);
-    if (qhead + qn == qcap) {
-        if (qhead) {
-            memmove(queue, queue + qhead, sizeof *queue * (size_t)qn);
-            qhead = 0;
+// st_lock held.
+static void cq_push(Pending **q, int *head, int *n, int *room, Pending p) {
+    if (*head + *n == *room) {
+        if (*head) {
+            memmove(*q, *q + *head, sizeof **q * (size_t)*n);
+            *head = 0;
         } else {
-            int cap = qcap ? qcap * 2 : 256;
-            Pending *q = realloc(queue, sizeof *q * (size_t)cap);
-            if (!q) rt_fatal("vk: out of memory (completion queue)");
-            queue = q, qcap = cap;
+            int c = *room ? *room * 2 : 256;
+            Pending *a = realloc(*q, sizeof *a * (size_t)c);
+            if (!a) rt_fatal("vk: out of memory (completion queue)");
+            *q = a, *room = c;
         }
     }
-    queue[qhead + qn++] = (Pending){fence, fn, arg};
+    // in value order (the completion thread runs a queue from its head up to the values reached): callbacks come from
+    // several threads, the replay's and the host submits'; equal values keep their order
+    int i = *head + (*n)++;
+    while (i > *head && (*q)[i - 1].fence > p.fence) (*q)[i] = (*q)[i - 1], i--;
+    (*q)[i] = p;
+}
+
+// As vk_completion_add, in a queue the completion thread runs first.
+void vk_completion_add_first(uint64_t fence, void (*fn)(void *), void *arg) {
+    plat_mutex_lock(&st_lock);
+    cq_push(&fqueue, &fqhead, &fqn, &fqcap, (Pending){fence, fn, arg});
+    if (fence <= done) plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
+}
+
+void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
+    plat_mutex_lock(&st_lock);
+    cq_push(&queue, &qhead, &qn, &qcap, (Pending){fence, fn, arg});
     // The completion thread sleeps only while nothing is issued beyond done: a callback for a later value (the replay's,
     // for the submission it records: counter reports, freed resources) becomes due through the submit, which wakes it.
     if (fence <= done) plat_cond_broadcast(&cv_work);
@@ -733,7 +765,7 @@ void vk_sync_shutdown(void) {
         plat_thread_join(completion_thread);
         completion_thread = NULL;
         plat_mutex_lock(&st_lock);
-        qhead = qn = 0;   // callbacks of values never submitted
+        qhead = qn = fqhead = fqn = 0;   // callbacks of values never submitted
         plat_mutex_unlock(&st_lock);
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
