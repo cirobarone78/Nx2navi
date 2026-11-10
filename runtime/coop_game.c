@@ -174,6 +174,11 @@ static struct {
     // the maker's remedies by setting (coop_remove = a key's fingerprint, coop_reset_pools): the values last acted on
     char remove_seen[32], reset_seen[32];
     uint64_t spent_seen, spent_at;  // the contributors' spends last logged for the maker, and when
+    // nx2navi.ini as it is now (cfg reads it at start only), once a second: coop_accept, and the maker's coop_remove and
+    // coop_reset_pools as last seen there (the first reading is only noted: a value left from before acts on nothing)
+    uint64_t ini_at;
+    int ini_primed;
+    char ini_accept[32], ini_remove[32], ini_reset[32];
 } G;
 
 #define TRACE_ON (rt_trace & RT_TRACE_COOP)
@@ -532,8 +537,9 @@ static void on_view(const CoopView *v, void *user) {
 
 // coop_accept: "always" accepts every offer, but only from the environment, so an nx2navi.ini someone hands a player
 // cannot make their game take a room without asking. A number (hex) accepts that offer from any source: it is keyed
-// with a random value of this start of the game, so no file can hold it in advance. 1 for always, else 0 and the
-// number (0 none) in *number.
+// with a random value of this start of the game, so no file can hold it in advance; nx2navi.ini's line counts as the
+// file is now (poll_ini), so the player puts the number the log shows there while the game runs. 1 for always, else 0
+// and the number (0 none) in *number.
 static int accept_setting(uint32_t *number) {
     const char *v = cfg_value("NX2NAVI_COOP_ACCEPT");
     *number = 0;
@@ -544,6 +550,7 @@ static int accept_setting(uint32_t *number) {
         G.said_always = 1;
         return 0;
     }
+    if (G.ini_accept[0] && !cfg_from_env("NX2NAVI_COOP_ACCEPT")) v = G.ini_accept;
     char *end;
     unsigned long n = strtoul(v, &end, 16);
     if (*v && !*end) *number = (uint32_t)n;
@@ -659,6 +666,26 @@ int coop_game_contributors(CoopContributor *out, int max) {
     return n;
 }
 
+// The maker's coop_remove (a member's id, or a key's fingerprint) and coop_reset_pools, from nx2navi.ini as it is now,
+// once a second (on the coop thread, without G.lock: a removal by id goes through coop_remove_member's hook).
+static void poll_ini(uint64_t now) {
+    if (G.ini_at && now - G.ini_at < 1000) return;
+    G.ini_at = now;
+    char rm[32], rp[32];
+    if (!cfg_ini_now("coop_accept", G.ini_accept, sizeof G.ini_accept)) G.ini_accept[0] = 0;
+    if (!cfg_ini_now("coop_remove", rm, sizeof rm)) rm[0] = 0;
+    if (!cfg_ini_now("coop_reset_pools", rp, sizeof rp)) rp[0] = 0;
+    int primed = G.ini_primed;
+    G.ini_primed = 1;
+    if (primed && strcmp(rm, G.ini_remove) && rm[0]) {
+        if (strspn(rm, "0123456789") == strlen(rm)) coop_remove_member(atoi(rm));
+        else coop_game_remove_key(rm);
+    }
+    if (primed && strcmp(rp, G.ini_reset) && rp[0] && strcmp(rp, "0")) coop_game_reset_pools();
+    snprintf(G.ini_remove, sizeof G.ini_remove, "%s", rm);
+    snprintf(G.ini_reset, sizeof G.ini_reset, "%s", rp);
+}
+
 // coop_remove_member's hook (coop.h): the maker's removal, signed, so that every game drops that identity.
 static int on_remove(int member, void *user) {
     (void)user;
@@ -717,6 +744,7 @@ static void on_tick(uint64_t now, void *user) {
     (void)user;
     unsigned v = cfg_version();
     make_snapshot();
+    poll_ini(now);
     plat_mutex_lock(&G.lock);
     if (!G.eng) {
         plat_mutex_unlock(&G.lock);

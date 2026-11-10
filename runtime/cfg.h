@@ -23,6 +23,10 @@ unsigned cfg_version(void);
 int cfg_setenv(const char *name, const char *value);
 // 1 when the environment sets name: cfg_set cannot change what cfg_get returns (the menu greys the setting out).
 int cfg_from_env(const char *name);
+// The value of key, as nx2navi.ini spells it ("coop_accept"), in nx2navi.ini as the file is now: the file is read again,
+// for the few settings that act while the game runs without the menu (co-op's acceptance and the room maker's
+// remedies; everything else is read at start). 1 and the value in out when the file sets it.
+int cfg_ini_now(const char *key, char *out, size_t cap);
 // 1 when the player set name (the environment or nx2navi.ini), 0 when cfg_get gives a device profile's default or NULL.
 int cfg_is_set(const char *name);
 // The device profile in use, "deck" or "desktop" (NX2NAVI_DEVICE_PROFILE, else what the machine is).

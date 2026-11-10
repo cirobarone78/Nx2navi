@@ -949,6 +949,31 @@ static void load_ini(void) {
     }
 }
 
+int cfg_ini_now(const char *key, char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    if (!find_ini()) return 0;
+    uint64_t size = 0;
+    uint8_t *data = plat_file_read(ini_path, &size);
+    if (!data) return 0;
+    int found = 0;
+    for (char *p = (char *)data; *p && !found;) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = 0;
+        char *s = trim(p), *eq = strchr(s, '=');
+        if (*s && *s != '#' && *s != ';' && *s != '[' && eq) {
+            *eq = 0;
+            const char *k = trim(s);
+            size_t i = 0;
+            while (k[i] && key[i] && tolower((unsigned char)k[i]) == tolower((unsigned char)key[i])) i++;
+            if (!k[i] && !key[i]) found = 1, snprintf(out, cap, "%s", trim(eq + 1));
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    free(data);
+    return found;
+}
+
 void cfg_init(void) {
     load_ini();
     if (profile_of())
