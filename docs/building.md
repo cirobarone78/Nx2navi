@@ -235,16 +235,37 @@ NVIDIA's Linux driver compiles into a disk cache of its own. A process adds at m
 folder, `~/.cache/nvidia`, is shared with every program. `--prepare-shaders` of game 1.1.1 builds 42,142 variants, about
 1.5 GB: on the default limit about 30,700 of them were stored and the rest compiled again at their first draw in play.
 `runtime/vk_device.c` therefore points `__GL_SHADER_DISK_CACHE_PATH` at `nvidia-cache` beside `ocarina` and the size at
-8 GiB before the first Vulkan call, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV. The
+8 GiB, each unless the environment sets it, as it does `MESA_SHADER_CACHE_DIR` for RADV, and only while NVIDIA's kernel
+driver is loaded (`/proc/driver/nvidia/version`). The driver does not make that folder and caches nothing in a folder it
+cannot write, so the game makes it, and when it cannot make or write it sets neither variable. A game run sets them in
+`main` before any of its threads starts, since a thread can load the Vulkan driver before the instance is made. The
 folder can be deleted; `ocarina --warm-shaders` fills it again.
 
 Memory: on Windows the GPU imports guest memory and `GetWriteWatch` tracks the CPU's writes to it. On Linux,
 re-protecting imported memory invalidates the driver's userptr buffer on every submit (about 1.3 ms per 16 MiB on
 amdgpu), and importing pins the pages, which drops their write protection. Each CPU-visible pool therefore gets a
 host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wrote go in before each submit, and the GPU's
-writes come back at its fence. In play that costs about 0.2 ms a frame and doubles the memory of those pools (about
-1.1 GB). `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
+writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
+a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
+reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
+Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
+5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+
+The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
+pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
+the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, and its prologue brings
+the shadow of every pool in the table up to date with the pages the CPU wrote and queues the same pages for those
+pools' VRAM mirrors (`vk_memory.c` `vk_mem_gpa_sync`). That copies the written pages of every CPU-visible pool in
+each such part, which the cost above does not include. What a shader stores through the table into a shadow copy does
+not come back to guest memory. `--probe-vkmem` checks the read: a shader follows the table to a word of a pool that is
+never bound, and must read `0x13579BDF` and, after a plain CPU write, `0x2468ACE0`. On Linux, run it for each backing:
+
+```sh
+for shadow in 0 1; do for memory in import mirror; do
+    NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
+done; done
+```
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.
@@ -278,9 +299,28 @@ A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarin
 display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
 frame, uneven frame times one steady step, and game time follows the clock. No game files.
 
+A change to which waits a signalled event or an ended thread wakes (`runtime/kernel.c` `wake_sync_waiters`, the
+`WaitSynchronization` service) passes `python tests\sync_wake_check.py`, which builds `kernel.c` with the platform
+layer and the rest of the runtime stubbed and runs guest threads whose entries are host functions: a signal wakes the
+waits on its event and leaves the others asleep, a wait on several handles reports the right one, a thread's end ends
+the wait on it, timed waits keep their time, a cancel ends any wait, and 4,000 signals to eight looping waiters are
+each seen. It runs a second time with `NX2NAVI_SYNC_WAKE_ALL=1`. No game files.
+
+A change to the log queue (`runtime/logq.c`) passes `python tests\logq_check.py`, which builds it with the platform
+layer and a destination of its own: 160,000 lines from eight threads arrive whole and in each thread's order, a line
+logged while the queue's lock is taken waits and does not pass the lines queued before it, a destination that takes
+30 ms a write does not hold the threads that log, the line about slow writes comes once in ten seconds, a destination
+that stops while four times the queue's size is logged loses nothing, and `logq_sync` returns with everything written.
+The test passes on a busy machine too: it waits for the queue to empty instead of for a time, and counts slow lines
+instead of timing one. No game files.
+
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`.
+
+A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
+`runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
+the added text by GPU vendor and by why the cache was cold. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
@@ -307,10 +347,14 @@ Runtime probes, each a mode of `nx2navi.exe` (the list is at the top of `runtime
 part of `--probe-vkexec` translate shaders of the census below: they look for `build/<ver>/shaders/jobs.json` of the
 exe's own version first, then of the other one.
 `--probe-vkmem` also checks CPU-backed texture uploads and rewrites, GPU-written texture aliases, and memory write watches.
+A change to the texture detail (`runtime/vk_texture.c` "texture detail": `detail_skip`, `upload`, `astc_bl_regions`)
+passes it three times, with `NX2NAVI_TEXTURE_DETAIL` set to `full`, `reduced` and `low`: each time ASTC textures are
+uploaded and rewritten, and every level and layer of their images must hold the game's level it stands for.
 `--probe-prewarm` runs the boot's pipeline stages without the game, from the caches next to the exe (it skips when
 there are none): the pipeline cache load, the shader prewarm, the recorded pipelines and the compute pipeline prebuild,
 with a `mem: boot stage` log line after each that gives the device memory and the process commit so far. It then asks
-for compute pipelines the boot did not keep, as their first dispatch would, and prints what one costs. A change to what
+for compute pipelines the boot did not keep, as their first dispatch would, and prints what one costs. The device
+memory after the compute stage should be what it was before the stage, apart from the kept pipelines. A change to what
 the boot builds or keeps (`runtime/vk_pipeline.c`: `prewarm_run`, `lb_compute`, the `compute-used.bin` record) passes it.
 
 Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader

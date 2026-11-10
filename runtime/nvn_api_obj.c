@@ -443,6 +443,15 @@ NVN_API(nvnProgramFinalize) {
     prog_release(o);
     o->magic = 0;
 }
+// NX2NAVI_PROG_LEAD=1 (diagnostics): when each program was made, by serial (direct-mapped; a serial that lost its
+// slot reads 0). vk_exec_draw.c prog_lead compares it with the program's first draw.
+#define PROG_MADE_N 16384
+static uint64_t prog_made_serial[PROG_MADE_N], prog_made_at[PROG_MADE_N];
+uint64_t nvn_prog_made_ns(uint64_t serial) {
+    uint32_t i = (uint32_t)serial & (PROG_MADE_N - 1);
+    return __atomic_load_n(&prog_made_serial[i], __ATOMIC_RELAXED) == serial ? __atomic_load_n(&prog_made_at[i], __ATOMIC_RELAXED) : 0;
+}
+
 static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     if (n < 0 || n > 6 || (n && !sd)) {
         rt_log("nvn: ProgramSetShaders with %d stages at %p", n, (const void *)sd);
@@ -452,6 +461,13 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
     o->serial = nvn_new_serial();
+    static int lead = -1;
+    if (lead < 0) lead = cfg_get("NX2NAVI_PROG_LEAD") != NULL && strcmp(cfg_get("NX2NAVI_PROG_LEAD"), "0") != 0;
+    if (lead) {
+        uint32_t i = (uint32_t)o->serial & (PROG_MADE_N - 1);
+        __atomic_store_n(&prog_made_at[i], plat_now_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&prog_made_serial[i], o->serial, __ATOMIC_RELAXED);
+    }
     NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }

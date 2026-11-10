@@ -87,6 +87,8 @@ struct RtThread {
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
+    const uint32_t *whs;       // a WaitSynchronization that blocks: its handles, in the waiter's own memory (holding G)
+    int wn;
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
@@ -153,6 +155,7 @@ typedef struct { int st; uint32_t waker; uint64_t obj, ns; } WaitRec;
 static WaitRec g_rw[RW_N], g_mw[RW_N];                   // the render and main thread's waits by object and waker
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
+static uint64_t g_sync_woken, g_sync_spared;              // such waits a signal woke, and those it left asleep
 
 static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t ns) {
     for (int i = 0; i < RW_N; i++)
@@ -246,10 +249,31 @@ static void wake(RtThread *t, uint32_t res) {
     plat_cond_signal(&t->cv);
 }
 
-static void wake_sync_waiters(void) {
+// 1 when one of the handles w waits on names obj, an event (either a readable handle of it) or a thread.
+static int sync_watches(const RtThread *w, const void *obj) {
+    for (int i = 0; i < w->wn; i++) {
+        unsigned k = w->whs[i] - 0x1000;
+        if (k > 0 && k < MAX_H && g_h[k].obj == obj && (g_h[k].type == O_EVENT_R || g_h[k].type == O_THREAD)) return 1;
+    }
+    return 0;
+}
+
+// obj became signalled: an event (its Event) or a thread that exited. The WaitSynchronization waits that hold a handle
+// of it are woken to look again. Every other such wait stays asleep: woken, it took a virtual core (block: core_take,
+// which asks a running thread of lower priority for its core when every core is held), found nothing signalled and
+// blocked again, and the audio renderer alone signals its event 200 times a second, each time waking every thread
+// that waits for a message, a timer or the end of another thread. NX2NAVI_SYNC_WAKE_ALL=1 wakes them all, as before
+// ("ab": in the B blocks of NX2NAVI_AB); the sched line counts the waits woken and left asleep.
+static void wake_sync_waiters(const void *obj) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("SYNC_WAKE_ALL", "0");
+    int all = RT_KNOB_ON(mode);
     for (RtThread *w = g_wait; w;) {
         RtThread *n = w->next;
-        if (w->wkind == W_SYNC) wake(w, (uint32_t)-1);
+        if (w->wkind == W_SYNC) {
+            if (all || sync_watches(w, obj)) g_sync_woken++, wake(w, (uint32_t)-1);
+            else g_sync_spared++;
+        }
         w = n;
     }
 }
@@ -1184,7 +1208,7 @@ void kern_sched_report(uint64_t frame) {
                 }
     }
     uint64_t pre_stale = g_pre_stale, pre_req = g_pre_req, pre_n = g_pre_n, pre_ns = g_pre_ns, pre_max = g_pre_max;
-    uint64_t sc = g_sync_calls, sb = g_sync_blocks;
+    uint64_t sc = g_sync_calls, sb = g_sync_blocks, sw = g_sync_woken, ss = g_sync_spared;
     for (RtThread *t = g_all; t; t = t->all) {
         memset(t->st_ns, 0, sizeof t->st_ns);
         t->nblk = t->npre = 0;
@@ -1194,14 +1218,16 @@ void kern_sched_report(uint64_t frame) {
     memset(g_rw, 0, sizeof g_rw);
     memset(g_mw, 0, sizeof g_mw);
     g_pre_req = g_pre_n = g_pre_ns = g_pre_max = g_pre_stale = 0;
-    g_sync_calls = g_sync_blocks = 0;
+    g_sync_calls = g_sync_blocks = g_sync_woken = g_sync_spared = 0;
     unlock();
     if (!span) return;
     rt_log("sched: frame %llu: %.2f s, cores busy %.2f of %d, core wait %.2f thread-s, preempt req %llu released %llu "
-           "avg %.2f ms max %.2f ms, WaitSynchronization %llu calls %llu blocks, stale preempt %llu%s",
+           "avg %.2f ms max %.2f ms, WaitSynchronization %llu calls %llu blocks (signals woke %llu, left %llu asleep), "
+           "stale preempt %llu%s",
            (unsigned long long)frame, span / 1e9, (double)all_run / span, NCORE, all_core / 1e9,
            (unsigned long long)pre_req, (unsigned long long)pre_n, pre_n ? pre_ns / 1e6 / pre_n : 0.0, pre_max / 1e6,
-           (unsigned long long)sc, (unsigned long long)sb, (unsigned long long)pre_stale, self ? "" : " (render thread is not a guest thread)");
+           (unsigned long long)sc, (unsigned long long)sb, (unsigned long long)sw, (unsigned long long)ss,
+           (unsigned long long)pre_stale, self ? "" : " (render thread is not a guest thread)");
     for (int i = 0; i < nr; i++) {
         Row *r = &rows[i];
         char d[128], s[256];
@@ -1336,7 +1362,7 @@ static void thread_finish(RtThread *t) {
     if (t->hthr) plat_intr_free(t->hthr);   // no waiter interrupts a thread without a core
     t->hthr = NULL;
     t->exited = 1;
-    wake_sync_waiters();
+    wake_sync_waiters(t);
     if (t->closed) thr_free(t);
     unlock();
 }
@@ -1858,7 +1884,7 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             if (r == R_BAD_HANDLE) rt_log("kernel: event svc %#x: invalid handle %#x", imm, h);
         } else if (imm == 0x11) {
             e->signaled = 1;
-            wake_sync_waiters();
+            wake_sync_waiters(e);
         } else if (imm == 0x17 && !e->signaled) {
             r = R_BAD_STATE;
         } else {
@@ -1939,7 +1965,9 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             }
             t->wobj = n ? hs[0] | (uint64_t)n << 32 : 0;
             g_sync_blocks++;
+            t->whs = hs, t->wn = n;
             woke = block(t, W_SYNC, left);
+            t->whs = NULL, t->wn = 0;
             if (woke == R_TIMEOUT) {
                 r = R_TIMEOUT;
                 break;
@@ -2010,7 +2038,7 @@ void kern_event_signal(uint32_t hw) {
     Event *e = h_peek(hw, O_EVENT_W);
     if (!e) rt_fatal("kern_event_signal: %#x is not a writable event handle", hw);
     e->signaled = 1;
-    wake_sync_waiters();
+    wake_sync_waiters(e);
     unlock();
 }
 

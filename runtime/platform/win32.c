@@ -331,8 +331,9 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
 // core. The core is the highest-numbered one of the fastest efficiency class (a performance core on a hybrid CPU),
 // with both its logical processors when it has two; only processors in group 0 and in the process's affinity mask
 // count. CPU sets are soft: the scheduler may still use the core when nothing else wants it. Returns the logical
-// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify.
-int plat_cpu_reserve(void) {
+// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify; *which
+// (when not NULL, size bytes) receives their numbers, such as "10,11".
+int plat_cpu_reserve(char *which, size_t size) {
     typedef BOOL(WINAPI * GetInfoFn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
     typedef BOOL(WINAPI * SetProcFn)(HANDLE, const ULONG *, ULONG);
     typedef BOOL(WINAPI * SetThreadFn)(HANDLE, const ULONG *, ULONG);
@@ -362,6 +363,7 @@ int plat_cpu_reserve(void) {
         o += s->Size;
     }
     ULONG rest[64], mine[8];
+    unsigned mine_cpu[8];   // the logical processor numbers of mine
     int nrest = 0, nmine = 0;
     for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
         const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
@@ -369,7 +371,7 @@ int plat_cpu_reserve(void) {
         if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
             (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
             if (s->CpuSet.EfficiencyClass == best_class && s->CpuSet.CoreIndex == best_core) {
-                if (nmine < 8) mine[nmine++] = s->CpuSet.Id;
+                if (nmine < 8) mine_cpu[nmine] = s->CpuSet.LogicalProcessorIndex, mine[nmine++] = s->CpuSet.Id;
             } else if (nrest < 64) {
                 rest[nrest++] = s->CpuSet.Id;
             }
@@ -383,8 +385,16 @@ int plat_cpu_reserve(void) {
         set_proc(GetCurrentProcess(), NULL, 0);   // back to every processor
         return 0;
     }
+    if (which && size) {
+        size_t n = 0;
+        which[0] = 0;
+        for (int i = 0; i < nmine && n < size; i++)
+            n += (size_t)snprintf(which + n, size - n, "%s%u", n ? "," : "", mine_cpu[i]);
+    }
     return nmine;
 }
+
+int plat_cpu_reserve_sweep(void) { return 0; }
 
 uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -819,6 +829,11 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
     return 1;
 }
 
+int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
+    (void)addr; (void)n;
+    return 0;
+}
+
 // Contains code Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 // GetWriteWatch with the reset flag.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
@@ -1120,7 +1135,10 @@ __attribute__((constructor)) static void pgo_flush_start(void) {
 }
 #endif
 
+void (*plat_exit_hook)(void);
+
 void plat_exit(int code) {
+    if (plat_exit_hook) plat_exit_hook();
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
 #endif
@@ -1887,6 +1905,15 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 }
 
 int plat_commit_enforced(void) { return 1; }
+
+// The numbers name the one limit there is, the system's commit.
+int plat_commit_note(char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+// The driver charges the device memory it allocates to the system's commit.
+int plat_commit_counts_vram(void) { return 1; }
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};

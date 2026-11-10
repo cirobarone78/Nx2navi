@@ -69,6 +69,7 @@ __attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uin
 }
 __attribute__((weak)) int gfx_replay_async(void) { return 0; }
 __attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
+__attribute__((weak)) void gfx_event_signalling(const void *value, uint32_t to) { (void)value, (void)to; }
 
 // ---------- pools: GPU window (section 3.1) and the address index
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;   // guards gva and index
@@ -540,7 +541,10 @@ NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);
     uint32_t v = (uint32_t)arg_x(c, 2);
-    if ((uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v;
+    int add = (uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD;
+    // before the write: the replay tells a signal that came after a submission's copies from one before them
+    gfx_event_signalling((const void *)e->val, add ? *e->val + v : v);
+    if (add) *e->val += v;
     else *e->val = v;
 }
 
