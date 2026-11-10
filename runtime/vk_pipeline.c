@@ -1581,6 +1581,8 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
     return o;
 }
 
+uint32_t *vk_spirv_optimize(const uint32_t *, uint64_t, uint64_t *);
+
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
@@ -1602,11 +1604,14 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
         free(fixed);
         w = fixed = np, words = np_n;
     }
+    uint64_t opt_words = 0;
+    uint32_t *optimized = vk_spirv_optimize(w, words, &opt_words);
+    if (optimized) w = optimized, words = opt_words;
     if (P.feedback >= 2) mm_hash = fnv(FNV0, w, (size_t)words * 4);
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
-    free(fixed);
+    free(fixed); free(optimized);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
