@@ -914,6 +914,43 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     return untracked ? -1 : changed;
 }
 
+void vk_mem_gen_lock_shared(void) { plat_mutex_lock_shared(&gen_lock); }
+void vk_mem_gen_unlock_shared(void) { plat_mutex_unlock_shared(&gen_lock); }
+
+void vk_mem_gen_lock(void) { plat_mutex_lock(&gen_lock); }
+void vk_mem_gen_unlock(void) { plat_mutex_unlock(&gen_lock); }
+
+int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch) {
+    if (!size || !epoch) return 4;
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
+    if (r1 >= SNAP_REGIONS) return 4;
+    for (uint64_t r = r0; r <= r1; r++) {   // REG_SHIFT is SNAP_SHIFT: reg_max is the newest stamp in the region
+        if (snap_at[r] != epoch) return 1;
+        if (snap_untracked[r]) return 2;
+        if (reg_max[r] > since) return 3;
+    }
+    return 0;
+}
+
+int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch) {
+    return !vk_mem_unchanged_why_locked(addr, size, since, epoch);
+}
+
+uint64_t vk_mem_snap_range_locked(uint64_t addr, uint64_t size, uint32_t epoch) {
+    if (!size || !epoch) return 0;
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
+    if (r1 >= SNAP_REGIONS) return 0;
+    for (uint64_t r = r0; r <= r1; r++)
+        if (snap_at[r] != epoch) {
+            uint64_t q = snap_regions(r0, r1, epoch);
+            n_snap_calls += q;
+            return q;
+        }
+    return 0;
+}
+
 void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked) {
     *checks = __atomic_exchange_n(&n_snap_checks, 0, __ATOMIC_RELAXED);
     *calls = __atomic_exchange_n(&n_snap_calls, 0, __ATOMIC_RELAXED);

@@ -555,8 +555,42 @@ uint32_t vk_texture_entry_gen(void);                 // vk_texture.c: bumped by 
 // Slots whose token may have changed since *pos (0 at first; then the value these calls leave): fn is called for each
 // (some more than once) and *pos advanced. 0 when too many changes came since: the caller looks at every slot. *pos
 // from vk_texture_dirty_pos_locked after such a walk. Texture lock held.
-int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg);
+// gfn, when given, gets each slot group of a bucket in place of fn for its members.
+int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void (*gfn)(int g, void *arg), void *arg);
+// Slot groups (vk_texture.c): the GPU-written slots of one address bucket with one descriptor hash kh, which resolve
+// alike. head the first member, vk_texture_group_next_locked the next (-1: the end), n how many; stamp and fmask the
+// texture pool's (vk_exec_draw.c pool_dirty_group: 1 when every member holds the same views, of the kinds fmask; a slot
+// that joins goes to the tail, refilled on its own), set 0 by vk_texture_groups_unstamp_locked. Texture lock held.
+typedef struct { uint64_t kh; int32_t head, n; uint32_t stamp, fmask; } VkSlotGroup;
+VkSlotGroup *vk_texture_group_locked(int g);
+int vk_texture_group_next_locked(int id);
+void vk_texture_groups_unstamp_locked(void);
 uint64_t vk_texture_dirty_pos_locked(void);
+// The bindless pool's entries (vk_texture.c): after a pool fill of slot id, notes the entry it resolved to (1; 0: none)
+// and gives its number for vk_texture_pool_hold_locked in *ent (0: none); a submission's freshness check of every
+// noted entry (returns how many). Texture lock held.
+int vk_texture_pool_note_locked(int id, uint32_t *ent);
+int vk_texture_pool_fresh_locked(void);
+// A pool slot that held the entry old (0: none) now holds ent: the entries slots hold get the use stamps a lookup
+// leaves (vk_texture.c touch) from the check by list. Texture lock held.
+void vk_texture_pool_hold_locked(uint32_t old, uint32_t ent);
+// A slot whose last lookup found no entry, looked up again: 1 it resolves now; 0 still none, its storage may become
+// readable; -1 none until its token changes (a CPU slot whose texture was released after its registration, no storage).
+int vk_texture_slot_retry_locked(int id);
+// vk_memory.c, for the pool's freshness check: the generation table's lock, shared; with it held, 1 when every 2 MiB
+// region of [addr, addr+size) has this epoch's write-watch snapshot and no page stamped after since (nothing in it can
+// have changed), 0 when a closer look is due (vk_mem_changed_snap).
+void vk_mem_gen_lock_shared(void);
+void vk_mem_gen_unlock_shared(void);
+int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+// The same check's reason when it fails: 1 a region without this epoch's snapshot yet, 2 one untracked, 3 one written
+// since, 4 nothing to check (no size, beyond the regions); 0 unchanged.
+int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+// The lock exclusively, for the snapshot of the regions of [addr, addr+size) that have none in epoch yet (the number of
+// write-watch queries it took).
+void vk_mem_gen_lock(void);
+void vk_mem_gen_unlock(void);
+uint64_t vk_mem_snap_range_locked(uint64_t addr, uint64_t size, uint32_t epoch);
 void vk_sampler_dlss_bias(float bias);           // texture LOD bias added for DLSS upscaling (material samplers)
 void vk_sampler_aniso_live(void);                   // each present: NX2NAVI_ANISO after a settings change (tiled samplers)
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered

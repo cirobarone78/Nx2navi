@@ -161,6 +161,7 @@ uint32_t mem_map(uint64_t dst, uint64_t src, uint64_t n);                       
 uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n);                     // 0x05
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out);                              // 0x06
 int mem_readable(uint64_t a, uint64_t n);                                        // every page readable
+uint32_t mem_map_gen(void);   // changes with everything mem_readable answers from (mapping, heap, permissions)
 int mem_read_hold(uint64_t a, uint64_t n);   // mem_readable that keeps the range mapped until mem_read_release
 void mem_read_release(void);
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C

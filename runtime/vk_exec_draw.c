@@ -1743,6 +1743,9 @@ static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int stor
 // absent from that submit's page tables, a GPU page fault on the 128x128 probe pass of Kokiri Forest's first frame
 // (RADV's radv_wait_for_vm_map_updates hid it, as did NX2NAVI_SPLIT_DRAWS=0).
 volatile uint32_t vk_pool_kinds_used;
+// Per texture slot, what pool_fill keeps between refills: the descriptor hash of the registration it was read under,
+// and the lookup memo stamp its entries were last written from (0: none) with the kinds that write covered.
+typedef struct { uint64_t kh; uint32_t kreg, stamp, fmask; } PoolSlot;
 #define POOL_SETS VK_POOL_SETS
 #define POOL_LOG (1u << 20)   // entries of the change log: binding * VK_POOL_TEX + id, one per write
 static struct {
@@ -1758,7 +1761,24 @@ static struct {
     uint64_t logn;                     // writes so far
     uint64_t *last;                    // per entry: the log position of its newest write (catch-up writes it once, there)
     uint64_t switches, waits, catchup, written, rewrites, catch_ns, sync_ns, n_slots, n_refill, n_fresh;
+    uint64_t n_walk[2], walk_visit[2], walk_refill[2], walk_ns[2];   // dirty walks: at a submission's start, within one
+    uint64_t n_visit;                  // slots the dirty walks looked at
+    uint64_t n_gwalk, n_gskip, n_gskip_slots, n_grep;   // POOL_GROUP: groups walked, left alone and their slots, first
+                                       // members looked up for the memo
+    uint64_t n_gchk_writes, n_gchk_groups;   // POOL_GROUP_CHECK: writes the groups left alone got all the same, and in how many
+    uint64_t n_gchk_pending, n_gchk_bad;     // of members registered since their last fill (not counted above); this group's
+    uint64_t n_gnouni, n_gchanged;     // groups walked member by member: not known to hold one resolution, first member changed
+    int gmode;                         // pool_group() as of the last sync
     uint64_t n_by_reg, n_by_addr;      // refills whose token changed by a registration, by an address generation only
+    uint64_t full_ns, n_full;          // the walks over every slot (a submission's first sync) and their time
+    uint64_t ep_ns, n_ep, n_ep_ent;    // POOL_FAST: a submission's freshness check of the noted entries instead
+    uint64_t unres_ns, n_unres_walks;  // of it: the walks over the slots without an entry
+    uint32_t unres_mg;                 // mem_map_gen of the last such walk
+    int unres_more;                    // it left a lookup for the creation budget: the next submission walks again
+    PoolSlot *ps;                      // [id]
+    uint8_t *unres_on;                 // [id]: its last fill resolved to no entry (POOL_FAST: retried each submission)
+    int *unres, nunres, cunres;        // those slots (some may have left: unres_on clear)
+    uint32_t *ent;                     // [id]: the entry its last fill resolved to, held there (pool_hold); 0: none
     uint64_t dirty_pos;                // vk_texture_dirty_slots_locked position (0: the next sync walks every slot)
     int ready, uab, sealed;            // sealed: a part of the current submission already reads sets[cur]
     uint32_t kinds, gen, epoch, sgen;
@@ -1836,7 +1856,10 @@ static VkDescriptorSetLayout pool_layout_make(void) {
     PL.tok = calloc(VK_POOL_TEX, sizeof *PL.tok);
     PL.view = calloc((size_t)VK_POOL_KINDS * VK_POOL_TEX, sizeof *PL.view);
     PL.samp = calloc(VK_POOL_SAMP, sizeof *PL.samp);
-    if (!PL.tok || !PL.view || !PL.samp) rt_fatal("vk: out of memory");
+    PL.ps = calloc(VK_POOL_TEX, sizeof *PL.ps);
+    PL.unres_on = calloc(VK_POOL_TEX, 1);
+    PL.ent = calloc(VK_POOL_TEX, sizeof *PL.ent);
+    if (!PL.tok || !PL.view || !PL.samp || !PL.ps || !PL.unres_on || !PL.ent) rt_fatal("vk: out of memory");
     rt_log("vk: bindless texture pools: %d kinds x %d textures, %d samplers, %s, %d sets (one per submission in turn)%s",
            VK_POOL_KINDS, VK_POOL_TEX, VK_POOL_SAMP,
            PL.uab ? "update after bind" : "no update-after-bind on this GPU (entries written while bound are undefined)", PL.nsets,
@@ -2071,6 +2094,7 @@ uint64_t vk_pool_takes(void) { return __atomic_load_n(&pool_takes, __ATOMIC_ACQU
 
 // The current set gets the entries written into other sets in [from, to) of the log, as PL.view / PL.samp hold them now.
 static uint64_t pool_memo_hits;   // pool_fill: slots that shared another slot's lookup (defined with pool_memo below)
+static uint64_t pool_memo_same;   // of those, slots whose entries held the shared views already
 
 static void pool_catch_up(uint64_t from, uint64_t to) {
     VkDescriptorSet set = PL.set;
@@ -2089,23 +2113,47 @@ static void pool_catch_up(uint64_t from, uint64_t to) {
     pool_flush();
     PL.switches++;
     if (PL.switches % 3600 == 0) {   // diagnosis: what invalidates the slots (vk_texture.c vk_texture_bucket_stats)
-        char bs[320];
+        char bs[768];
         vk_texture_bucket_stats(bs, sizeof bs);
         rt_log("vk: texture pool buckets over 3600 switches: %s", bs);
     }
     if (PL.switches % 3600 == 0)
         rt_log("vk: texture pool sets: %llu switches, %llu waited for the GPU, %.1f log entries and %.1f writes per "
-               "catch-up, %llu whole rewrites; %.3f ms catch-up and %.3f ms entry refresh per switch (%.0f slots, %.0f "
-               "refilled: %.0f registered, %.0f address changes, %.0f shared a lookup; %.0f checked); %llu identical registrations kept; "
+               "catch-up, %llu whole rewrites; %.3f ms catch-up and %.3f ms entry refresh per switch (%.3f ms of it in "
+               "%.2f walks over every slot, %.3f ms in %.2f checks of %.0f listed entries and %d slots without one "
+               "(%.3f ms in %.2f walks over those); "
+               "%.0f slots, %.0f refilled: %.0f registered, %.0f address changes, %.0f "
+               "shared a lookup, %.0f of them holding its views already; %.0f checked); %llu identical registrations kept; "
                "%llu refreshes created nothing for their frame's time (pool_create_ms), %llu lookups of slots left in the frame skipped",
                (unsigned long long)PL.switches, (unsigned long long)PL.waits, (double)PL.catchup / (double)PL.switches,
                (double)PL.written / (double)PL.switches, (unsigned long long)PL.rewrites,
                PL.catch_ns / 1e6 / (double)PL.switches, PL.sync_ns / 1e6 / (double)PL.switches,
+               PL.full_ns / 1e6 / (double)PL.switches, (double)PL.n_full / (double)PL.switches,
+               PL.ep_ns / 1e6 / (double)PL.switches, (double)PL.n_ep / (double)PL.switches,
+               PL.n_ep ? (double)PL.n_ep_ent / (double)PL.n_ep : 0.0, PL.nunres,
+               PL.unres_ns / 1e6 / (double)PL.switches, (double)PL.n_unres_walks / (double)PL.switches,
                (double)PL.n_slots / (double)PL.switches, (double)PL.n_refill / (double)PL.switches,
                (double)PL.n_by_reg / (double)PL.switches, (double)PL.n_by_addr / (double)PL.switches,
-               (double)pool_memo_hits / (double)PL.switches,
+               (double)pool_memo_hits / (double)PL.switches, (double)pool_memo_same / (double)PL.switches,
                (double)PL.n_fresh / (double)PL.switches, (unsigned long long)vk_texture_same_regs(),
                (unsigned long long)PL.n_frame_stops, (unsigned long long)PL.n_defer_skips);
+    if (PL.switches % 3600 == 0)
+        rt_log("vk: texture pool dirty walks per switch: %.2f at a submission's start (%.0f slots looked at, %.0f "
+               "refilled, %.3f ms), %.2f within one (%.0f looked at, %.0f refilled, %.3f ms)",
+               (double)PL.n_walk[0] / (double)PL.switches, (double)PL.walk_visit[0] / (double)PL.switches,
+               (double)PL.walk_refill[0] / (double)PL.switches, PL.walk_ns[0] / 1e6 / (double)PL.switches,
+               (double)PL.n_walk[1] / (double)PL.switches, (double)PL.walk_visit[1] / (double)PL.switches,
+               (double)PL.walk_refill[1] / (double)PL.switches, PL.walk_ns[1] / 1e6 / (double)PL.switches);
+    if (PL.switches % 3600 == 0)
+        rt_log("vk: texture pool slot groups per switch (NX2NAVI_POOL_GROUP): %.0f walked, %.0f left alone with %.0f "
+               "slots, %.0f first members refilled (%.0f changed), %.0f not known to hold one resolution; check "
+               "(NX2NAVI_POOL_GROUP_CHECK): %llu writes in %llu groups left alone so far, %llu more to members registered "
+               "since their last fill",
+               (double)PL.n_gwalk / (double)PL.switches, (double)PL.n_gskip / (double)PL.switches,
+               (double)PL.n_gskip_slots / (double)PL.switches, (double)PL.n_grep / (double)PL.switches,
+               (double)PL.n_gchanged / (double)PL.switches, (double)PL.n_gnouni / (double)PL.switches,
+               (unsigned long long)PL.n_gchk_writes, (unsigned long long)PL.n_gchk_groups,
+               (unsigned long long)PL.n_gchk_pending);
 }
 
 // Entry id of every kind in mask: the slot's view of that kind or the kind's stand-in. Texture lock held. 0: the
@@ -2151,22 +2199,75 @@ static int pool_on(void) {
 // transient render target registered over its storage, and every finalize and initialize of that target changes their
 // tokens, so a refill looked up the same texture ~400 times, ~15,000 lookups a frame in Kokiri Forest. An entry holds the
 // views one slot got, for the slots with its hash, address generation and entry generation.
+// Its stamp changes only when one of its views does (NX2NAVI_POOL_FAST, default on): a slot whose entries were written
+// from the entry at the stamp it has now (PoolSlot) holds those views already, so a refill that finds the entry so
+// compares and writes nothing. That is most refills: a transient render target released and taken back moves the
+// address generation of its storage, ~1,300 slots in Kokiri Forest, and every slot resolves as before (18,500 of 18,800
+// refills a submission shared a lookup, each comparing up to 16 views a quarter megabyte apart: 1.9 ms).
 #define POOL_MEMO 4096
-static struct { uint64_t kh; uint32_t agen, egen, mask; VkImageView view[VK_POOL_KINDS]; } pool_memo[POOL_MEMO];
-static uint64_t pool_memo_hits;
+static struct { uint64_t kh; uint32_t agen, egen, mask, stamp, got, ent; VkImageView view[VK_POOL_KINDS]; } pool_memo[POOL_MEMO];
+static uint32_t pool_stamp;   // the last stamp given out
+static uint64_t pool_memo_hits, pool_memo_same;
+
+static int pool_fast(void) {   // ab: in the B blocks
+    static int on = -1;
+    if (on < 0) on = rt_knob("POOL_FAST", "1");
+    return RT_KNOB_ON(on);
+}
+
+// Slot id's last fill resolved to the entry ent (vk_texture_pool_note_locked; 0: none). vk_texture.c counts the slots
+// that hold each entry: the entries held are the ones the walk over every slot reached with a lookup in each
+// submission, and the check by list leaves their use stamps from that count (vk_texture_pool_hold_locked).
+static void pool_hold(uint32_t id, uint32_t ent) {
+    if (PL.ent[id] == ent) return;
+    vk_texture_pool_hold_locked(PL.ent[id], ent);
+    PL.ent[id] = ent;
+}
+
+// Slot id's last fill resolved to no entry (got 0) or to one: the slots without one are looked up again each
+// submission (pool_sync_entries), as the walk over every slot did: an entry their storage could not have then may be
+// made now, and its address generation then refills them.
+static void pool_unres(uint32_t id, int got) {
+    if (got || PL.unres_on[id]) {
+        if (got) PL.unres_on[id] = 0;
+        return;
+    }
+    PL.unres_on[id] = 1;
+    if (PL.nunres == PL.cunres) {
+        int n = PL.cunres ? PL.cunres * 2 : 1024;
+        int *p = realloc(PL.unres, sizeof *p * (size_t)n);
+        if (!p) rt_fatal("vk: out of memory");
+        PL.unres = p, PL.cunres = n;
+    }
+    PL.unres[PL.nunres++] = (int)id;
+}
 
 static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
     vk_texture_create_deferred_locked();
-    uint64_t kh = tok ? vk_texture_slot_khash_locked((int)id) : 0;
+    PoolSlot *ps = &PL.ps[id];
+    uint64_t kh = 0;
+    if (tok) {   // the descriptor hash changes only with a registration (the token's upper half)
+        uint32_t reg = (uint32_t)(tok >> 32);
+        if (ps->kreg != reg || !ps->kh) ps->kh = vk_texture_slot_khash_locked((int)id), ps->kreg = reg;
+        kh = ps->kh;
+    }
     uint32_t ag = (uint32_t)tok;
     typeof(pool_memo[0]) *m = kh ? &pool_memo[(kh >> 20) % POOL_MEMO] : NULL;
     if (m && m->kh == kh && m->agen == ag && m->egen == vk_texture_entry_gen() && (m->mask & mask) == mask) {
+        pool_memo_hits++;
+        pool_unres(id, (int)m->got);
+        pool_hold(id, m->ent);
+        if (ps->stamp && ps->stamp == m->stamp && (ps->fmask & mask) == mask && pool_fast()) {
+            pool_memo_same++;
+            return 1;
+        }
         for (int k = 0; k < VK_POOL_KINDS; k++) {
             if (!(mask >> k & 1)) continue;
             VkImageView *e = &PL.view[(size_t)k * VK_POOL_TEX + id];
             if (*e != m->view[k]) *e = m->view[k], pool_write((uint32_t)k, id, m->view[k], VK_NULL_HANDLE);
         }
-        pool_memo_hits++;
+        ps->fmask = ps->stamp == m->stamp ? ps->fmask | mask : mask;
+        ps->stamp = m->stamp;
         return 1;
     }
     for (int k = 0; k < VK_POOL_KINDS; k++) {
@@ -2180,12 +2281,29 @@ static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
         if (*e != ii.imageView) *e = ii.imageView, pool_write((uint32_t)k, id, ii.imageView, VK_NULL_HANDLE);
     }
     int ok = !vk_texture_create_deferred_locked();
+    uint32_t ent = 0;
+    int got = vk_texture_pool_note_locked((int)id, &ent);
+    if (tok) pool_unres(id, got);
+    pool_hold(id, tok ? ent : 0);
+    ps->stamp = 0;   // its entries match no memo entry, unless the one below
     if (m && ok) {   // the generation after the lookups: an entry they created is part of what they resolved
         uint32_t eg = vk_texture_entry_gen();
-        if (m->kh != kh || m->agen != ag || m->egen != eg) m->kh = kh, m->agen = ag, m->egen = eg, m->mask = 0;
+        // a view that changes gives the entry a new stamp; one kept outside the mask keeps its value, so a kind that
+        // comes back with another view is a change too
+        int changed = !m->stamp;
         for (int k = 0; k < VK_POOL_KINDS; k++)
-            if (mask >> k & 1) m->view[k] = PL.view[(size_t)k * VK_POOL_TEX + id];
+            if (mask >> k & 1) {
+                VkImageView v = PL.view[(size_t)k * VK_POOL_TEX + id];
+                if (m->view[k] != v) m->view[k] = v, changed = 1;
+            }
+        if (m->kh != kh || m->agen != ag || m->egen != eg) m->kh = kh, m->agen = ag, m->egen = eg, m->mask = 0;
         m->mask |= mask;
+        m->got = (uint32_t)got, m->ent = ent;
+        if (changed) {
+            if (!++pool_stamp) pool_stamp = 1;
+            m->stamp = pool_stamp;
+        }
+        ps->stamp = m->stamp, ps->fmask = mask;
     }
     return ok;
 }
@@ -2237,6 +2355,7 @@ static int pool_refill(VkExec *ex, uint32_t id, uint32_t used, uint64_t t, int s
 
 static void pool_dirty_slot(int id, void *arg) {   // vk_texture_dirty_slots_locked: a slot whose token may have changed
     PoolDirty *d = arg;
+    PL.n_visit++;
     if (id >= d->n) return;
     uint64_t t = vk_texture_slot_token(id);
     if (t == PL.tok[id]) return;
@@ -2251,6 +2370,76 @@ static void pool_dirty_slot(int id, void *arg) {   // vk_texture_dirty_slots_loc
 static int pool_current(void) {
     return PL.ready && !PL.retry && __atomic_load_n(&vk_pool_kinds_used, __ATOMIC_RELAXED) == PL.kinds &&
            vk_texture_slots_gen() == PL.gen && vk_texture_epoch() == PL.epoch && vk_sampler_gen() == PL.sgen;
+}
+
+// NX2NAVI_POOL_GROUP=1 (default), 0, ab: a dirty bucket's slot groups (vk_texture.c) are walked whole. The members of a
+// group resolve alike, so once a walk of the group brought every member to the current resolution (every fill done, an
+// entry for each) they all hold the same views, and later the group is left alone when its first member still holds the
+// current resolution: its token did not change (its views are what that token resolves to), or its refill wrote nothing.
+// A slot that joined since is at the tail and refilled on its own (its registration's entry on the dirty ring).
+// The members keep their older tokens: their views are what those tokens resolved to, and what the current ones do.
+// (Comparing the memo's stamps instead left half the groups to their members: the memo's entries are shared between
+// hashes, so the same views came back under a new stamp.)
+static int pool_group(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("POOL_GROUP", "1");
+    return RT_KNOB_ON(mode);
+}
+
+// NX2NAVI_POOL_GROUP_CHECK=1: a group left alone is walked member by member all the same, and the writes that walk
+// makes are counted (none when the rule holds; the pool log's slot groups line), but for the members registered since
+// their last fill: their registration's entry on the dirty ring refills them in the same walk (counted apart).
+static int pool_group_check(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("POOL_GROUP_CHECK", "0") == 1;   // a diagnosis: no settings row
+    return on;
+}
+
+static void pool_dirty_group(int g, void *arg) {
+    PoolDirty *d = arg;
+    uint64_t chk = 0;
+    VkSlotGroup *G = vk_texture_group_locked(g);
+    int rep = G->head;
+    PL.n_gwalk++;
+    if (!G->stamp) PL.n_gnouni++;
+    if (G->stamp && (G->fmask & d->used) == d->used && rep >= 0 && rep < d->n && !PL.unres_on[rep]) {
+        uint64_t t = vk_texture_slot_token(rep);
+        int same = t == PL.tok[rep];
+        if (!same) {   // the first member's refill: nothing written, an entry found, its token taken
+            uint64_t l0 = PL.logn;
+            PL.n_grep++;
+            pool_dirty_slot(rep, arg);
+            same = PL.tok[rep] == t && PL.logn == l0 && !PL.unres_on[rep];
+            if (!same) PL.n_gchanged++;
+        }
+        if (same) {
+            PL.n_gskip++, PL.n_gskip_slots += (uint64_t)G->n;
+            if (!pool_group_check()) return;
+            chk = PL.logn + 1;
+        }
+    }
+    int r0 = d->retry, uni = 1;   // member by member: then all hold the current resolution, unless a fill was left
+    d->retry = 0;
+    for (int id = G->head; id >= 0; id = vk_texture_group_next_locked(id)) {
+        if (id >= d->n) continue;   // outside the pool
+        if (chk) {   // the check: a member registered since its last fill is refilled by its own entry anyway
+            uint64_t l0 = PL.logn;
+            int pending = vk_texture_slot_token(id) >> 32 != PL.tok[id] >> 32;
+            pool_dirty_slot(id, arg);
+            if (PL.logn != l0) {
+                if (pending) PL.n_gchk_pending += PL.logn - l0;
+                else PL.n_gchk_writes += PL.logn - l0, PL.n_gchk_bad++;
+            }
+        } else {
+            pool_dirty_slot(id, arg);
+        }
+        if (PL.unres_on[id]) uni = 0;
+    }
+    if (d->retry) uni = 0;
+    d->retry |= r0;
+    G = vk_texture_group_locked(g);
+    G->stamp = (uint32_t)uni, G->fmask = uni ? d->used : 0;
+    if (chk && PL.n_gchk_bad) PL.n_gchk_groups++, PL.n_gchk_bad = 0;
 }
 
 static void pool_sync_entries(VkExec *ex) {
@@ -2277,12 +2466,51 @@ static void pool_sync_entries(VkExec *ex) {
         vk_texture_create_budget_locked(spent ? 0 : pool_create_budget());
         PL.n_frame_stops += (uint64_t)spent;
         // Only a slot change since the last sync (no new kinds, no new submission, nothing left over): the slots that
-        // changed (vk_texture_dirty_slots_locked), not the whole table
+        // changed (vk_texture_dirty_slots_locked), not the whole table. With NX2NAVI_POOL_FAST (default on) a new
+        // submission too: its freshness check goes through the entries the slots resolved to and the slots that
+        // resolved to none (vk_texture_pool_fresh_locked, pool_unres), not every slot.
         PoolDirty pd = {ex, used, n, 0, spent};
-        int walked = !fresh && ep == PL.epoch && !PL.retry && PL.dirty_pos &&
-                     vk_texture_dirty_slots_locked(&PL.dirty_pos, pool_dirty_slot, &pd);
+        int newep = ep != PL.epoch;
+        uint64_t v0 = PL.n_visit, f0 = PL.n_refill, w0 = kern_now_ns();
+        int grp = pool_group();
+        if (grp && !PL.gmode) vk_texture_groups_unstamp_locked();   // members were refilled one by one meanwhile
+        PL.gmode = grp;
+        int walked = !fresh && (!newep || pool_fast()) && !PL.retry && PL.dirty_pos &&
+                     vk_texture_dirty_slots_locked(&PL.dirty_pos, pool_dirty_slot, grp ? pool_dirty_group : NULL, &pd);
+        if (walked) {
+            int at = newep ? 0 : 1;
+            PL.n_walk[at]++, PL.walk_visit[at] += PL.n_visit - v0, PL.walk_refill[at] += PL.n_refill - f0;
+            PL.walk_ns[at] += kern_now_ns() - w0;
+        }
         retry = pd.retry;
+        if (walked && newep) {
+            uint64_t te = kern_now_ns();
+            PL.n_ep_ent += (uint64_t)vk_texture_pool_fresh_locked();
+            // The slots without an entry are over storage the guest has not mapped (stale descriptors, 1,160 in
+            // Kokiri Forest): looked up again when the mapping changed, while a lookup is left for the creation budget,
+            // and every 8th submission for the rest (an entry whose creation failed, an image at their address that
+            // took GPU content since: slot_resolve's alias rule)
+            uint32_t mg = mem_map_gen();
+            uint64_t tu = kern_now_ns();
+            int walk_unres = mg != PL.unres_mg || PL.unres_more || !(PL.n_ep & 7);
+            if (walk_unres) PL.unres_mg = mg, PL.n_unres_walks++, vk_texture_create_deferred_locked();
+            for (int i = 0; walk_unres && i < PL.nunres;) {
+                int id = PL.unres[i];
+                uint64_t t = PL.unres_on[id] ? vk_texture_slot_token(id) : 0;
+                int r = t && t == PL.tok[id] ? vk_texture_slot_retry_locked(id) : -1;
+                if (r) {   // resolves now (an entry it made changes its token: refilled), was refilled since, or
+                    PL.unres_on[id] = 0;   // resolves to none until its token changes (the refill lists it again)
+                    PL.unres[i] = PL.unres[--PL.nunres];
+                    continue;
+                }
+                i++;
+            }
+            if (walk_unres) PL.unres_more = vk_texture_create_deferred_locked();
+            PL.unres_ns += kern_now_ns() - tu;
+            PL.n_ep++, PL.ep_ns += kern_now_ns() - te;
+        }
         if (!walked) PL.dirty_pos = vk_texture_dirty_pos_locked();
+        uint64_t tw = walked ? 0 : kern_now_ns();
         for (int id = 0; id < n && !walked; id++) {   // slots past n were never registered: stand-ins since the first sync
             uint64_t t = vk_texture_slot_token(id);
             if (t != PL.tok[id]) {
@@ -2298,7 +2526,10 @@ static void pool_sync_entries(VkExec *ex) {
                 vk_texture_by_id_locked(id, NULL, NULL);   // the submit's freshness check
             }
         }
-        if (!walked) PL.n_slots += (uint64_t)n;
+        if (!walked) {
+            PL.n_slots += (uint64_t)n, PL.n_full++, PL.full_ns += kern_now_ns() - tw;
+            vk_texture_groups_unstamp_locked();   // the walk over every slot refilled members one by one
+        }
         vk_texture_create_budget_locked(-1);
     }
     PL.retry = retry != 0;
