@@ -9,8 +9,9 @@
 // Spendable counters (rupees, ammunition, small keys) in a shared pool are records, one per contributor (a member's
 // identity) and pool: the base it brought when it joined the pool, and the units it gained and spent, signed with the
 // member's key, so every member passes them on and nobody but their owner can change them. The pool's value is the
-// highest base + all gains - all spends, where no contributor's spends count beyond its own gains plus the counter's
-// limit: a contributor can take at most what the pool can hold. Only identities the maker admitted contribute.
+// highest base (at least 0) + all gains - all spends, where no contributor's spends count beyond its own gains plus the
+// counter's limit: a contributor can take at most what the pool can hold. Only identities the maker admitted
+// contribute, and a game counts only the records of the keys its own player accepted (and its own).
 //
 // Gossip. Registers are split into COOP_SYNC_SECTIONS sections by hash; a DIGEST carries a sum per section (and the
 // room's rules), every 2 s and at once to a member who joins; a section whose sum differs from a peer's is sent to it in
@@ -38,9 +39,12 @@
 //
 // Acceptance. Flags are taken (stored, passed on, applied) only from a member whose key this player accepted in this
 // room: what a member brings that the player did not accept never enters this game's state. Acceptance is transitive:
-// a member the player accepted passes on what it took from members it accepted. Nothing is handed to the game
-// (coop_sync_take) until its player accepted the room as it is now (the identities in it, the rules, the maker's key
-// and the save being played: coop_sync_offer) and a copy of the save was made (coop_sync_copied); a member that is
+// a member the player accepted passes on what it took from members it accepted. Pool records are stored and passed on
+// as the maker admits them, so the games converge, but a pool counts only the records of keys this player accepted
+// (and its own), and joins the pools only once the player accepted the room: those are not transitive. Nothing is
+// handed to the game (coop_sync_take) until its player accepted the room as it is now (the identities in it, the
+// rules, the maker's key and the save being played: coop_sync_offer) and a copy of the save was made
+// (coop_sync_copied); a member that is
 // present and has not identified itself after a few seconds keeps the room unaccepted. The offer's number is keyed
 // with this start's random value, so nobody can compute it in advance; it changes with any of those, and so does the
 // acceptance.
@@ -183,15 +187,16 @@ int coop_sync_reset_pools(CoopSync *s);
 int coop_sync_is_maker(const CoopSync *s);
 // A key's fingerprint as the offer shows it (xxxx-xxxx-xxxx-xxxx, or the 16 hex digits) into its id; 1 when it is one.
 int coop_sync_key_parse(const char *text, uint64_t *kid);
-// The identities the pools admit, with what each spent beyond what it gained (summed over the pools of keys, rupees
-// and ammunition): whom a maker would remove after a drain. Their count (at most max).
+// The identities the pools admit, with what each took beyond what it brought (per pool, what its spends took up to its
+// gains plus the counter's limit and what entered the pool, beyond its gains; summed over the pools of keys, rupees and
+// ammunition): whom a maker would remove after a drain. Their count (at most max).
 typedef struct {
     char key[20];                   // its fingerprint
     int member;                     // its member id in the room, 0 when it is not in it
     int self;                       // this player's
     int removed;                    // the maker removed it
     char name[COOP_NAME_MAX + 1];   // the name its identity signed, while it is in the room
-    int64_t spent[3];               // keys, rupees, ammunition: spends minus gains (negative: it brought more)
+    int64_t spent[3];               // keys, rupees, ammunition taken beyond what it brought, in pools it took from (>= 0)
 } CoopContributor;
 int coop_sync_contributors(const CoopSync *s, CoopContributor *out, int max);
 // 1 once every peer's digest matched this player's after it joined (or it is alone): the room's pools are known.
@@ -204,8 +209,9 @@ int coop_sync_caught_up(const CoopSync *s);
 void coop_sync_rebind(CoopSync *s);
 // A flag's local value: 1 for a flag that differs from its default, a count for an item. Values only grow the merged state.
 void coop_sync_local(CoopSync *s, int cat, uint32_t hash, uint32_t value, uint64_t now_ms);
-// A pool counter's local value and its cap (-1: none). Before the room is known it is only remembered; then it joins the
-// pool (the pool rises to it if lower: nothing is taken away) and each later change counts as a gain or a spend.
+// A pool counter's local value and its cap (-1: none). Before the room is known and accepted it is only remembered;
+// then it joins the pool (the pool rises to it if lower: nothing is taken away) and each later change counts as a gain
+// or a spend.
 void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, int32_t cap, uint64_t now_ms);
 
 typedef struct {
@@ -234,11 +240,17 @@ typedef struct {
     unsigned sig_skipped;           // messages dropped because their sender's budget of checks was spent
     unsigned rate_dropped;          // messages over a member's rate
     unsigned probe_max;             // the longest run of index slots an insert walked
+    unsigned own_key;               // digests of another member that carried this game's own key (a copy of its key file)
+    int own_key_member;             // the member that sent the last of them
 } CoopSyncStats;
 void coop_sync_stats(const CoopSync *s, CoopSyncStats *out);
-// The merged value of a flag (0 when absent), and a pool's value and whether it is bound.
+// The merged value of a flag (0 when absent), and a pool's value (as this game counts it) and whether it is bound.
 uint32_t coop_sync_flag(const CoopSync *s, int cat, uint32_t hash);
 int coop_sync_pool(const CoopSync *s, uint32_t hash, int64_t *value);
+// The record this game signed for a pool in the pools' epoch in force (tests): 1 when it has one.
+int coop_sync_own_record(const CoopSync *s, uint32_t hash, int32_t *base, uint32_t *gain, uint32_t *spend);
+// 1 when this player accepted key kid in the room (its own key counts as accepted).
+int coop_sync_accepted_key(const CoopSync *s, uint64_t kid);
 // The digest sums, for tests: two engines with equal sums hold the same synced state.
 void coop_sync_sums(const CoopSync *s, uint32_t out[COOP_SYNC_SECTIONS]);
 

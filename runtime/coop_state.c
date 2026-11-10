@@ -35,6 +35,7 @@ enum {
     MAX_REMOVED = 16,            // identities a charter carries as removed (each game keeps every removal it saw)
     MAX_ACCEPTED = 64,           // identities this player accepted in the room
     ENDED_MAX = 1 << 16,         // (key, session) pairs that ended in this room: an identity of one is never taken again
+    KEPT_PER_KEY = 1024,         // and the latest pairs of each key this player accepted, which no other key's churn removes
     SIG_RATE = 128,              // signature checks per second on behalf of one peer, and at most SIG_BURST at once
     SIG_BURST = 256,
     POOL_REG_MAX = 1 << 20,      // a record's gains or spends at most, and its base either way
@@ -112,9 +113,12 @@ typedef struct {
     uint64_t bad_sig;               // the last signature that failed its check (a tag of it), not checked again
     unsigned bad;                   // flags it sent that this game refuses, and signatures that failed
     int ignored;                    // past BAD_MAX of them: nothing more is taken from it while it is in the room
+    int pend;                       // the roster listed another session after an identified one: that one (pend_kid,
+    uint64_t pend_kid, pend_session;   // pend_session) ends once the member is heard in the new one, or leaves
 } Peer;
 
 typedef struct { uint64_t kid, session; } Ended;
+typedef struct { uint64_t kid; uint64_t *sess; unsigned n, cap; } Kept;   // a ring of up to KEPT_PER_KEY sessions
 
 // idx >= 0: a flag register; else a record, -1 - (pool * MAX_ADMIT + record)
 typedef struct { int idx; uint8_t round; uint64_t due, first; } Push;
@@ -147,8 +151,10 @@ struct CoopSync {
     int in_room, self, caught_up;
     uint64_t joined_at;
     Peer peer[COOP_MAX_MEMBERS + 1];
-    Ended *ended;                   // kept while the room's code stays (a ring past ENDED_MAX)
+    Ended *ended;                   // kept while the room's code stays (a ring past ENDED_MAX): keys not accepted
     unsigned nended, ended_cap;
+    Kept kept[MAX_ACCEPTED];        // the ended sessions of the keys this player accepted, each key apart
+    int nkept;
 
     // the charter in force (and the rules it makes), kept while the room's code stays
     Charter ch;
@@ -414,34 +420,44 @@ static void queue_apply(CoopSync *s, int code) {
     s->apply[s->apply_tail++ % s->apply_cap] = code;
 }
 
-// The pool's value: the highest base + all gains - all spends. A record's spends count up to its gains plus the
-// counter's limit, and never beyond what entered the pool (the highest base and every gain): no contributor takes more
-// than the pool really held, so a dungeon's pool loses at most its real number of keys however much a record claims.
-static int64_t pool_sum(const Pool *p, const uint64_t *only, int nonly, uint32_t epoch) {
-    int64_t base = INT64_MIN, gains = 0, spends = 0, lim = p->max < POOL_REG_MAX ? p->max : POOL_REG_MAX;
-    int n = 0;
+// The records of a pool that count in this game: its own, and those of the keys its player accepted in the room. A
+// pool follows this player's acceptance, as flags do; the maker's admission decides who may contribute at all.
+static int rec_counts(const CoopSync *s, const Rec *r) { return r->kid == s->kid || in_list(s->acc_kids, s->nacc, r->kid); }
+
+typedef struct { int64_t value, top, in; int n; } PoolSum;   // n: the records counted; top: the highest base; in: what entered
+
+// The pool's value over the records that count here (with only: those of these keys in that epoch): the highest base
+// + all gains - all spends. The highest base counts as at least 0: an honest epoch starts with a claim of at least 0,
+// so a lower base is a record that would only turn what the others bring into a debt, which no removal undoes. A
+// record's spends count up to its gains plus the counter's limit, and never beyond what entered the pool (the highest
+// base and every gain): no contributor takes more than the pool really held, so a dungeon's pool loses at most its real
+// number of keys however much a record claims.
+static PoolSum pool_sum(const CoopSync *s, const Pool *p, const uint64_t *only, int nonly, uint32_t epoch) {
+    PoolSum o = {0, 0, 0, 0};
+    int64_t gains = 0, spends = 0, lim = p->max < POOL_REG_MAX ? p->max : POOL_REG_MAX;
     for (int i = 0; i < p->nrec; i++) {
         const Rec *r = &p->rec[i];
-        if (only && (r->epoch != epoch || !in_list(only, nonly, r->kid))) continue;
-        if (r->base > base) base = r->base;
+        if (!rec_counts(s, r) || (only && (r->epoch != epoch || !in_list(only, nonly, r->kid)))) continue;
+        if (r->base > o.top) o.top = r->base;
         gains += r->gain;
-        n++;
+        o.n++;
     }
-    if (!n) return 0;
-    int64_t in = base + gains > 0 ? base + gains : 0;
+    if (!o.n) return o;
+    o.in = o.top + gains;
     for (int i = 0; i < p->nrec; i++) {
         const Rec *r = &p->rec[i];
-        if (only && (r->epoch != epoch || !in_list(only, nonly, r->kid))) continue;
-        int64_t bound = (int64_t)r->gain + lim < in ? (int64_t)r->gain + lim : in;
+        if (!rec_counts(s, r) || (only && (r->epoch != epoch || !in_list(only, nonly, r->kid)))) continue;
+        int64_t bound = (int64_t)r->gain + lim < o.in ? (int64_t)r->gain + lim : o.in;
         spends += r->spend < bound ? (int64_t)r->spend : bound;
     }
-    return base + gains - spends;
+    o.value = o.top + gains - spends;
+    return o;
 }
 
-static int64_t pool_value(const Pool *p) { return pool_sum(p, NULL, 0, 0); }
+static int64_t pool_value(const CoopSync *s, const Pool *p) { return pool_sum(s, p, NULL, 0, 0).value; }
 
-static int32_t pool_target(const Pool *p) {
-    int64_t v = pool_value(p);
+static int32_t pool_target(const CoopSync *s, const Pool *p) {
+    int64_t v = pool_value(s, p);
     if (v < 0) v = 0;
     if (p->cap >= 0 && v > p->cap) v = p->cap;
     if (v > p->max) v = p->max;
@@ -449,7 +465,7 @@ static int32_t pool_target(const Pool *p) {
 }
 
 static void pool_check(CoopSync *s, Pool *p) {
-    if (!p->bound || p->queued || pool_target(p) == p->expected) return;
+    if (!p->bound || p->queued || pool_target(s, p) == p->expected) return;
     p->queued = 1;
     queue_apply(s, -1 - (int)(p - s->pools));
 }
@@ -638,8 +654,8 @@ void coop_sync_free(CoopSync *s) {
     if (!s) return;
     free(s->regs);
     free(s->index);
-    free(s->apply);
     free(s->ended);
+    for (int i = 0; i < MAX_ACCEPTED; i++) free(s->kept[i].sess);
     free(s->gone);
     free(s);
 }
@@ -746,13 +762,19 @@ static void adopt_charter(CoopSync *s, const Charter *c) {
     s->rules_ver++;
     for (int i = 0; i < c->nremoved; i++) gone_add(s, c->removed[i]);
     // a pool reset: each pool carries what it held for the identities the new charter admits, so the games join the
-    // new epoch with that, not with what a drainer who is gone left in their counters
+    // new epoch with that, not with what a drainer who is gone left in their counters. A pool that did not join again
+    // since an earlier reset keeps the larger carry: a second reset finds no records of the first one's epoch yet
     if (had && c->pool_epoch != old_pool_epoch) {
         uint64_t keep[MAX_ADMIT];
         int nk = 0;
         for (int i = 0; i < c->nadmit; i++)
             if (!removed(s, c->admit[i])) keep[nk++] = c->admit[i];
-        for (int k = 0; k < s->npools; k++) s->pools[k].carry = pool_sum(&s->pools[k], keep, nk, old_pool_epoch), s->pools[k].has_carry = 1;
+        for (int k = 0; k < s->npools; k++) {
+            Pool *p = &s->pools[k];
+            int64_t carry = pool_sum(s, p, keep, nk, old_pool_epoch).value;
+            if (!p->has_carry || carry > p->carry) p->carry = carry;
+            p->has_carry = 1;
+        }
     }
     // records of identities no longer admitted, removed, or of another pools' epoch are dropped; a pool this game no
     // longer contributes to, or of a new epoch, joins again
@@ -989,8 +1011,13 @@ int coop_sync_contributors(const CoopSync *s, CoopContributor *out, int max) {
             for (int j = 0; j < p->nrec; j++)
                 if (p->rec[j].kid == kid) r = &p->rec[j];
             if (!r) continue;
+            // per pool, what its spends took (up to its gains plus the limit and what entered the pool) beyond its own
+            // gains: gains it signs for one pool hide nothing it took from another
             int at = p->cat == COOP_CAT_KEYS ? 0 : p->cat == COOP_CAT_RUPEES ? 1 : 2;
-            c->spent[at] += (int64_t)r->spend - (int64_t)r->gain;
+            int64_t lim = p->max < POOL_REG_MAX ? p->max : POOL_REG_MAX, took = r->spend, in = pool_sum(s, p, NULL, 0, 0).in;
+            if (took > (int64_t)r->gain + lim) took = (int64_t)r->gain + lim;
+            if (took > in) took = in;
+            if (took > (int64_t)r->gain) c->spent[at] += took - (int64_t)r->gain;
         }
     }
     return n;
@@ -1053,6 +1080,8 @@ int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
     return 1;
 }
 
+static void keep_ended_of(CoopSync *s, uint64_t kid);
+
 int coop_sync_accept(CoopSync *s, uint32_t token) {
     CoopOffer o;
     if (!token || !coop_sync_offer(s, &o, s->now) || o.token != token || o.unidentified) return 0;
@@ -1066,12 +1095,14 @@ int coop_sync_accept(CoopSync *s, uint32_t token) {
             continue;
         }
         s->acc_kids[s->nacc++] = p->kid;
+        keep_ended_of(s, p->kid);
     }
     memcpy(s->acc_mode, s->room.mode, COOP_CAT_N);
     s->pin_kid = s->ch.kid, s->have_pin = 1;
     s->acc_save_gen = s->save_gen;
     s->accepted = 1;
     if (s->copy_gen != s->save_gen || s->copy != 1) s->copy = 0, s->copy_wanted = 1;
+    for (int k = 0; k < s->npools; k++) pool_check(s, &s->pools[k]);   // the pools count the keys accepted now
     tracef(s, "the room is accepted; its rules' key is pinned");
     return 1;
 }
@@ -1092,17 +1123,60 @@ int coop_sync_open(CoopSync *s) {
 // ---- the room
 
 // A (key, session) pair whose session ended: an identity of that key signed for that session is never taken again.
-static void end_session(CoopSync *s, const Peer *p) {
-    if (!p->ident) return;   // an identity was never taken in it: there is nothing to take again
+// The latest pairs of each key this player accepted are kept apart, where no other key's churn pushes them out; the
+// other keys share a ring.
+static Kept *kept_of(const CoopSync *s, uint64_t kid) {
+    for (int i = 0; i < s->nkept; i++)
+        if (s->kept[i].kid == kid) return (Kept *)&s->kept[i];
+    return NULL;
+}
+
+static void kept_add(CoopSync *s, uint64_t kid, uint64_t session) {
+    Kept *k = kept_of(s, kid);
+    if (!k) {
+        if (s->nkept == MAX_ACCEPTED) return;
+        k = &s->kept[s->nkept++];   // its ring of an earlier room is reused
+        k->kid = kid, k->n = 0;
+    }
+    if (k->n == k->cap && k->cap < KEPT_PER_KEY) {
+        unsigned nc = k->cap ? k->cap * 2 : 16;
+        uint64_t *ns = realloc(k->sess, nc * sizeof *ns);
+        if (ns) k->sess = ns, k->cap = nc;
+    }
+    if (k->cap) k->sess[k->n++ % k->cap] = session;
+}
+
+static void end_pair(CoopSync *s, uint64_t kid, uint64_t session) {
+    if (in_list(s->acc_kids, s->nacc, kid) && (kept_of(s, kid) || s->nkept < MAX_ACCEPTED)) {
+        kept_add(s, kid, session);
+        return;
+    }
     if (s->nended == s->ended_cap && s->ended_cap < ENDED_MAX) {
         unsigned nc = s->ended_cap ? s->ended_cap * 2 : 64;
         Ended *ne = realloc(s->ended, nc * sizeof *ne);
         if (ne) s->ended = ne, s->ended_cap = nc;
     }
-    if (s->ended_cap) s->ended[s->nended++ % s->ended_cap] = (Ended){p->kid, p->session};
+    if (s->ended_cap) s->ended[s->nended++ % s->ended_cap] = (Ended){kid, session};
+}
+
+// A peer's sessions end: the one waiting to end, and its present one when an identity was taken in it (else there is
+// nothing to take again).
+static void end_session(CoopSync *s, const Peer *p) {
+    if (p->pend) end_pair(s, p->pend_kid, p->pend_session);
+    if (p->ident) end_pair(s, p->kid, p->session);
+}
+
+// The ring's pairs of a key the player accepts now go to its own (it had none: the pairs of an accepted key go there).
+static void keep_ended_of(CoopSync *s, uint64_t kid) {
+    unsigned n = s->nended < s->ended_cap ? s->nended : s->ended_cap;
+    for (unsigned i = 0; i < n; i++)
+        if (s->ended[i].kid == kid) kept_add(s, kid, s->ended[i].session);
 }
 
 static int session_ended(const CoopSync *s, uint64_t kid, uint64_t session) {
+    const Kept *k = kept_of(s, kid);
+    for (unsigned i = 0; k && i < k->n && i < k->cap; i++)
+        if (k->sess[i] == session) return 1;
     unsigned n = s->nended < s->ended_cap ? s->nended : s->ended_cap;
     for (unsigned i = 0; i < n; i++)
         if (s->ended[i].session == session && s->ended[i].kid == kid) return 1;
@@ -1136,7 +1210,7 @@ void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, con
             s->have_room = 0, s->accepted = 0, s->have_pin = 0, s->nacc = 0, s->copy = 0, s->copy_wanted = 0, s->copy_gen = UINT32_MAX;
             memset(&s->ch, 0, sizeof s->ch);
             memset(&s->room, 0, sizeof s->room);
-            s->nended = 0, s->ngone = 0;
+            s->nended = 0, s->nkept = 0, s->ngone = 0;
         }
         if (code[0]) derive(s);
         s->next_digest = now;
@@ -1157,9 +1231,18 @@ void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, con
     for (int id = 1; id <= COOP_MAX_MEMBERS; id++) {
         Peer *p = &s->peer[id];
         if (seen[id] && (!p->present || p->session != sess[id])) {
-            if (p->present) end_session(s, p);
+            // another session listed for a member: the one it was identified in ends once it is heard in the new one,
+            // or leaves, not now: a roster from someone on the path may list a session nobody holds, and the member's
+            // real one comes back with the relay's next roster
+            int pend = p->present && p->pend;
+            uint64_t pk = p->pend_kid, ps = p->pend_session;
+            if (p->present && p->ident) {
+                if (pend) end_pair(s, pk, ps);
+                pend = 1, pk = p->kid, ps = p->session;
+            }
             memset(p, 0, sizeof *p);
             p->present = 1, p->session = sess[id], p->seen_at = now;
+            if (pend && ps != sess[id]) p->pend = 1, p->pend_kid = pk, p->pend_session = ps;
             s->digest_to |= 1ull << id;   // a member who just joined hears this player's state at once
         } else if (!seen[id] && p->present) {
             end_session(s, p);
@@ -1274,6 +1357,7 @@ static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_
         // key another member holds is not taken
         if (p->ident && memcmp(p->pk, pk, COOP_PK_LEN)) return;
         uint64_t kid = kid_of(pk);
+        if (kid == s->kid) s->st.own_key++, s->st.own_key_member = from;   // another game holds this game's key: a copied key file
         if (session_ended(s, kid, p->session) || kid == s->kid || member_of_kid(s, kid)) return;
         char raw[NAME_CAP];
         memcpy(raw, name_raw, nl), raw[nl] = 0;
@@ -1372,8 +1456,8 @@ static void on_section(CoopSync *s, int from, const uint8_t *b, size_t n) {
     if (n < SYNC_HDR || b[0] != COOP_K_DIGEST_VER || get32(b + 1) != s->schema) return;
     size_t count = b[5], at = SYNC_HDR;
     // flags only from a key this player accepted in this room: nothing of a member it did not accept is stored, so
-    // nothing of it is passed on or applied later (when that member leaves or is removed). Pool records are the
-    // maker's admission's (on_record).
+    // nothing of it is passed on or applied later (when that member leaves or is removed). Pool records are stored as
+    // the maker admits them (on_record), and a pool counts those of the keys this player accepted (pool_sum).
     const Peer *p = &s->peer[from];
     int take = s->accepted && in_list(s->acc_kids, s->nacc, p->kid);
     for (size_t i = 0; i < count && !p->ignored; i++) {
@@ -1425,6 +1509,7 @@ void coop_sync_receive(CoopSync *s, int from, uint8_t kind, const uint8_t *bytes
     if (now > s->now) s->now = now;
     Peer *p = &s->peer[from];
     if (!p->present || p->ignored) return;
+    if (p->pend) end_pair(s, p->pend_kid, p->pend_session), p->pend = 0;   // heard in its new session: the last one ended
     if (!p->tok_at) p->tok_at = now, p->tokens = PEER_BURST;   // a member's messages are taken at PEER_RATE
     if (now > p->tok_at) p->tokens += (int64_t)(now - p->tok_at) * PEER_RATE / 1000, p->tok_at = now;
     if (p->tokens > PEER_BURST) p->tokens = PEER_BURST;
@@ -1598,22 +1683,23 @@ void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, in
         return;
     }
     if (!p->bound) {
-        // join the pool once the room's records are known and the maker admitted this identity. With the pool in
-        // credit, this game's base claim makes it hold at least what this player has (after a pool reset, at least what
-        // it held for the players still admitted). In debt (spends beyond what entered it, as a drain leaves it), what a
-        // new contributor has pays the debt like a gain: a claim would cover the debt and outlast the drainer's removal
-        if (!s->caught_up || !admitted(s, s->kid)) return;
-        int64_t pv = pool_value(p), want = value, top = 0;
+        // join the pool once the room's records are known, the maker admitted this identity and the player accepted the
+        // room (the pool counts the keys it accepted). With the pool in credit, this game's base claim makes it hold at
+        // least what this player has (after a pool reset, at least what it held for the players still admitted). In
+        // debt (spends beyond what entered it, as a drain leaves it), what a new contributor has pays the debt like a
+        // gain: a claim would cover the debt and outlast the drainer's removal
+        if (!s->caught_up || !admitted(s, s->kid) || !s->accepted) return;
+        PoolSum ps = pool_sum(s, p, NULL, 0, 0);
+        int64_t pv = ps.value, want = value, top = ps.top;
         if (p->has_carry && p->carry > want) want = p->carry;
         p->has_carry = 0;
-        for (int i = 0; i < p->nrec; i++) top = i && top > p->rec[i].base ? top : p->rec[i].base;
         Rec *mine = rec_of(p, s->kid);
         int fresh = !mine || mine->epoch != s->ch.pool_epoch, changed = fresh;
         Rec r;
         if (fresh) memset(&r, 0, sizeof r), r.base = -POOL_REG_MAX, r.epoch = s->ch.pool_epoch, r.kid = s->kid, memcpy(r.pk, s->pk, COOP_PK_LEN);
         else r = *mine;
-        if (pv >= 0 || !p->nrec) {
-            int32_t claim = (int32_t)clamp_reg(want - (p->nrec ? pv - top : 0));
+        if (pv >= 0 || !ps.n) {
+            int32_t claim = (int32_t)clamp_reg(want - (ps.n ? pv - top : 0));
             if (fresh || claim > r.base) r.base = claim, changed = 1;
         } else if (fresh && want > 0) {
             r.gain = (uint32_t)(want < POOL_REG_MAX ? want : POOL_REG_MAX);
@@ -1624,7 +1710,7 @@ void coop_sync_pool_local(CoopSync *s, int cat, uint32_t hash, int32_t value, in
         }
         p->expected = value, p->bound = 1;
         s->st.pools_bound++;
-        tracef(s, "pool %s %08x joined at %d, the pool holds %lld", cat_names[cat], hash, value, (long long)pool_value(p));
+        tracef(s, "pool %s %08x joined at %d, the pool holds %lld", cat_names[cat], hash, value, (long long)pool_value(s, p));
         pool_check(s, p);
         return;
     }
@@ -1650,7 +1736,7 @@ int coop_sync_take(CoopSync *s, CoopApply *out, int max) {
             Pool *p = &s->pools[-1 - code];
             p->queued = 0;
             if (!p->bound) continue;
-            int32_t t = pool_target(p);
+            int32_t t = pool_target(s, p);
             if (t == p->expected) continue;
             out[n++] = (CoopApply){1, p->cat, p->hash, t};
         }
@@ -1702,11 +1788,24 @@ uint32_t coop_sync_flag(const CoopSync *s, int cat, uint32_t hash) {
 int coop_sync_pool(const CoopSync *s, uint32_t hash, int64_t *value) {
     for (int i = 0; i < s->npools; i++)
         if (s->pools[i].hash == hash) {
-            if (value) *value = pool_value(&s->pools[i]);
+            if (value) *value = pool_value(s, &s->pools[i]);
             return s->pools[i].bound;
         }
     if (value) *value = 0;
     return 0;
 }
+
+int coop_sync_own_record(const CoopSync *s, uint32_t hash, int32_t *base, uint32_t *gain, uint32_t *spend) {
+    for (int i = 0; i < s->npools; i++) {
+        const Pool *p = &s->pools[i];
+        const Rec *r = p->hash == hash ? rec_of((Pool *)p, s->kid) : NULL;
+        if (!r || r->epoch != s->ch.pool_epoch) continue;
+        *base = r->base, *gain = r->gain, *spend = r->spend;
+        return 1;
+    }
+    return 0;
+}
+
+int coop_sync_accepted_key(const CoopSync *s, uint64_t kid) { return kid == s->kid || in_list(s->acc_kids, s->nacc, kid); }
 
 void coop_sync_sums(const CoopSync *s, uint32_t out[COOP_SYNC_SECTIONS]) { memcpy(out, s->sums, sizeof s->sums); }
