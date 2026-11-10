@@ -196,6 +196,30 @@ static void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     rt_fatal("aud:u: command %u is not implemented (1 is GetAudioOutManager: no audout service here)", rq->cmd);
 }
 
+static void csrng_fill(uint64_t addr, uint64_t size) {
+    if (!size) return;
+    if (!plat_random(ipc_guest(addr, size), (size_t)size)) {
+        ipc_backtrace();
+        rt_fatal("csrng: no random bytes from the system");
+    }
+}
+
+// csrng: the SDK's random source, which the game asks for entropy while it boots. GenerateRandomBytes (0) is its one
+// command; the host's generator fills the output buffer. The SDK sends it as a B buffer (seen at boot: one B buffer,
+// no others); a C buffer is filled too, with its reply entry, for a caller that lets the buffer type be chosen.
+static void csrng_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    if (rt_trace & RT_TRACE_IPC)
+        rt_log("csrng: command %u (x%u a%u b%u w%u c%u)", rq->cmd, rq->nx, rq->na, rq->nb, rq->nw, rq->nc);
+    if (rq->cmd != 0) ipc_unimplemented(s, rq);
+    for (unsigned i = 0; i < rq->nb; i++) csrng_fill(rq->b[i].addr, rq->b[i].size);
+    for (unsigned i = 0; i < rq->nc; i++)
+        if (rq->c[i].size && (i >= rq->nb || !rq->b[i].size)) {
+            csrng_fill(rq->c[i].addr, rq->c[i].size);
+            rs->xout[rs->nxout++] = (IpcBuffer){rq->c[i].addr, rq->c[i].size, i};
+        }
+    rs->result = 0;
+}
+
 // Services sm: hands out. Anything else is a named fatal.
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
@@ -204,6 +228,7 @@ static const struct { const char *name; IpcHandler handler; } services[] = {
     {"aud:u", aud_user_handler},
     {"auddmg:u", audio_dmg_handler},
     {"audsmx:u", audio_sysmix_handler},
+    {"csrng", csrng_handler},
 };
 
 static volatile int32_t g_live;
