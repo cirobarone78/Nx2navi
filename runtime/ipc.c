@@ -243,7 +243,7 @@ void ipc_handle_closed(int kind, void *obj) {
 }
 
 // ---- helpers for services
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
+static int readable(uint64_t a, uint64_t n) { return mem_host_readable(a, n); }
 
 void ipc_backtrace(void) {
     const Cpu *c = t_req;

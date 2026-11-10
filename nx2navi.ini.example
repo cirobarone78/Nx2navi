@@ -711,6 +711,11 @@
 # about a third more frames a second in open areas. 0: copied back at the end of every GPU submission, as in 0.7.0.
 # With shadow storage (Linux, Wine) it stays off.
 # wb_lazy = 1
+# Windows, 1 (experimental): the game's heap is committed a 64 KiB run at a time where it is first used, instead of
+# all of it when the game sizes it. Windows counts committed memory against RAM plus the page file whether it is used
+# or not, and in Castle Town after Hyrule Field about 3.4 of the heap's 6.8 GiB had never been used. 0: committed up
+# front. Linux commits pages on first use anyway.
+# heap_lazy = 0
 # Linux, shadow storage: 1 clears the write watch's protection of a range in one call before the GPU's bytes are copied
 # back into the game's memory, instead of taking a fault at the first store into each page.
 # shadow_bulk_write = 0

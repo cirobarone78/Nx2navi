@@ -1152,8 +1152,10 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
-        // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting
+        // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting;
+        // so would a heap page NX2NAVI_HEAP_LAZY has not committed yet
         if (mem_probing()) mem_thaw((uintptr_t)buffer + done, chunk);
+        mem_kernel_access((uintptr_t)buffer + done, chunk);
         int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (put <= 0) rt_fatal("fs: host save write failure");
         done += (uint64_t)put;

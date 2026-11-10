@@ -307,7 +307,12 @@ static int probe = -1;
 static float last_pos[3];
 static uint64_t last_pos_ns;
 
-static int read_guest(uint64_t a, void *out, size_t n) { return a && plat_mem_read(a, out, n); }
+// plat_mem_read copies through the kernel, which fails on a heap page NX2NAVI_HEAP_LAZY has not committed yet
+static int read_guest(uint64_t a, void *out, size_t n) {
+    if (!a) return 0;
+    mem_kernel_access(a, n);
+    return plat_mem_read(a, out, n);
+}
 static uint64_t read_ptr(uint64_t a) {
     uint64_t p = 0;
     return read_guest(a, &p, 8) ? p : 0;
@@ -456,7 +461,7 @@ static void ocarina_step_write(double dt) {
         return;
     }
     uint64_t slot = read_ptr(MOD_MAIN_BASE + 0x4c7e890), mgr = slot ? read_ptr(slot) : 0;
-    if (!mgr || !plat_mem_readable(mgr + 0x1c0, 4)) return;
+    if (!mgr || !mem_host_readable(mgr + 0x1c0, 4)) return;
     _Atomic uint32_t *word = (_Atomic uint32_t *)(uintptr_t)(mgr + 0x1c0);
     uint32_t now_bits = atomic_load_explicit(word, memory_order_relaxed);
     float now_v;

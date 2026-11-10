@@ -24,7 +24,7 @@ RtStats rt_stats(void) {
     return (RtStats){__atomic_load_n(&g_svcs, __ATOMIC_RELAXED), kern_threads_created(), hostfn_calls()};
 }
 
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
+static int readable(uint64_t a, uint64_t n) { return mem_host_readable(a, n); }
 
 void kern_backtrace(const Cpu *c) {
     char d[160];

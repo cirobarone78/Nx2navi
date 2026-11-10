@@ -183,7 +183,12 @@ int mem_freeze(uint64_t a);                                // makes the 2 MiB re
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
-                                                           // before a kernel write (file read) into guest memory
+                                                           // before a kernel write (file read) into guest memory;
+                                                           // also commits pages the lazy heap left reserved
+void mem_kernel_access(uint64_t a, uint64_t n);            // NX2NAVI_HEAP_LAZY: commits the reserved heap pages of
+                                                           // [a, a+n) before the kernel reads them (a file write)
+int mem_host_readable(uint64_t a, uint64_t n);             // plat_mem_readable that first commits the untouched
+                                                           // pages of the lazy heap in [a, a+n), which read zero
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
 // NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
