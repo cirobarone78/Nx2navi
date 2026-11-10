@@ -80,7 +80,8 @@ struct CoopSess {
     PlatEvent off_done;
     int cmd;                                    // a command waiting (COOP_CMD_*), 0 none; a later one replaces it
     char cmd_secret[COOP_SECRET_LEN + 1];
-    int cmd_remove;                             // a member the maker removes, 0 none
+    int cmd_remove;                             // a member the maker removes, 0 none, and its session in the view then
+    uint64_t cmd_remove_session;
     int cfg_pending;                            // pending holds settings the thread has not applied
     struct { char server[160], name[COOP_NAME_MAX + 1]; uint64_t client_id; uint16_t local_port; unsigned drop_pct; int retry, on; } pending;
     OutMsg *out;
@@ -881,15 +882,17 @@ static void do_command(CoopSess *s, int cmd, const char *secret, uint64_t now) {
     }
 }
 
-// The maker's KICK of a member, with the member's session so that a KICK sent again later cannot remove whoever has the id then.
-static void do_remove(CoopSess *s, int member) {
+// The maker's KICK of a member, with the member's session so that a KICK sent again later cannot remove whoever has the
+// id then: the session the published view listed when the maker removed it (progress sync removed that member's key at
+// that moment), so that a member that rejoined since, or another player given the id, is not the one kicked.
+static void do_remove(CoopSess *s, int member, uint64_t session) {
     const CoopMemberInfo *m = member_of(s, member);
     uint8_t payload[16];
     if (s->state != COOP_JOINED || !s->made_room || !m || member == s->self) {
         say(s, "only the room's maker can remove a member, and only one that is in the room");
         return;
     }
-    size_t k = coop_kick_pack(payload, sizeof payload, (uint8_t)member, m->session);
+    size_t k = coop_kick_pack(payload, sizeof payload, (uint8_t)member, session ? session : m->session);
     for (int i = 0; i < 2; i++) send_room(s, COOP_T_KICK, 0, payload, k);
     say(s, "removing %s (member %d) from the room", m->name, member);
 }
@@ -991,13 +994,14 @@ void coop_sess_step(CoopSess *s) {
     uint64_t now = plat_now_ms();
     plat_mutex_lock(&s->lock);
     int cmd = s->cmd, remove = s->cmd_remove;
+    uint64_t remove_session = s->cmd_remove_session;
     char secret[sizeof s->cmd_secret];
     memcpy(secret, s->cmd_secret, sizeof secret);
     s->cmd = 0, s->cmd_remove = 0;
     plat_mutex_unlock(&s->lock);
     apply_settings(s, now);
     if (cmd) do_command(s, cmd, secret, now);
-    if (remove) do_remove(s, remove);
+    if (remove) do_remove(s, remove, remove_session);
     flush_outbox(s);
     publish(s);   // what a command or a setting changed shows before this thread waits for a datagram
     uint32_t wait = s->state == COOP_JOINED ? 8 : s->state == COOP_CONNECTING || s->state == COOP_RECONNECTING ? 50 : 250;
@@ -1106,7 +1110,9 @@ int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *secret) {
 int coop_sess_remove(CoopSess *s, int member) {
     if (member < 1 || member > COOP_MAX_MEMBERS || !__atomic_load_n(&s->pub_joined, __ATOMIC_ACQUIRE)) return 0;
     plat_mutex_lock(&s->lock);
-    s->cmd_remove = member;
+    s->cmd_remove = member, s->cmd_remove_session = 0;
+    for (int i = 0; i < s->view.n; i++)
+        if (s->view.member[i].id == member) s->cmd_remove_session = s->view.member[i].session;
     plat_mutex_unlock(&s->lock);
     return 1;
 }
@@ -1229,7 +1235,7 @@ static void coop_main(void *arg) {
             // the maker removes a member: COOP_REMOVE = its member id (until the menu has a row for it); a key's
             // fingerprint there is progress sync's (coop_game.c), for a member that left
             const char *rm = cfg_get("NX2NAVI_COOP_REMOVE");
-            if (want && rm && *rm && strcmp(rm, removed) && strspn(rm, "0123456789") == strlen(rm)) coop_remove_member(atoi(rm));
+            if (want && rm && *rm && strcmp(rm, removed) && strlen(rm) <= 2 && strspn(rm, "0123456789") == strlen(rm)) coop_remove_member(atoi(rm));
             copy_str(removed, sizeof removed, rm);
             on = want;
         }

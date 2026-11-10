@@ -698,14 +698,23 @@ int coop_game_accept(uint32_t token) {
     return ok || done;
 }
 
-// The maker's pool reset (the coop thread, without G.lock).
+// The maker's pool reset (G.lock held), with the order that gives a drain back: a player still in the room when the
+// pools are reset is admitted to the new ones with what it took already taken, so it is removed first.
 static int reset_pools(void) {
-    plat_mutex_lock(&G.lock);
     int ok = G.eng && coop_sync_reset_pools(G.eng);
     G.pub_contrib_at = 0;
+    if (ok)
+        rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room; a player "
+               "who drained a pool and is still in the room keeps what it took, so remove it first (coop_remove), then reset");
+    else rt_log("coop: sync: coop_reset_pools: only the room's maker resets the pools");
+    return ok;
+}
+
+// The same on the coop thread without G.lock: nx2navi.ini's value, and a reset the menu queued.
+static int lock_and_reset_pools(void) {
+    plat_mutex_lock(&G.lock);
+    int ok = reset_pools();
     plat_mutex_unlock(&G.lock);
-    if (ok) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
-    else rt_log("coop: sync: only the room's maker resets the pools");
     return ok;
 }
 
@@ -714,7 +723,7 @@ int coop_game_reset_pools(void) {
     int maker = G.pub_maker;
     plat_mutex_unlock(&G.pub_lock);
     if (maker) __atomic_store_n(&G.want_reset, plat_now_ms(), __ATOMIC_RELEASE);
-    else rt_log("coop: sync: only the room's maker resets the pools");
+    else rt_log("coop: sync: coop_reset_pools: only the room's maker resets the pools");
     return maker;
 }
 
@@ -792,8 +801,10 @@ static void poll_ini(uint64_t now) {
     G.ini_primed = 1;
     if (rm[0] && strcmp(rm, G.ini_remove)) {
         snprintf(G.ini_remove, sizeof G.ini_remove, "%s", rm);
+        uint64_t kid;
         if (!primed) {
-        } else if (strspn(rm, "0123456789") == strlen(rm)) {
+        } else if (!coop_sync_key_parse(rm, &kid) && strspn(rm, "0123456789") == strlen(rm)) {
+            // a fingerprint is 16 digits (dashes aside), so one that is all decimal digits is still a fingerprint
             rt_log("coop: sync: coop_remove = %s in nx2navi.ini names a member number, which another player may have by now: put the "
                    "member's key fingerprint there (the log shows it beside each member)", rm);
         } else {
@@ -803,7 +814,7 @@ static void poll_ini(uint64_t now) {
     if (!strcmp(rp, "0")) snprintf(G.ini_reset, sizeof G.ini_reset, "0");
     else if (rp[0] && strcmp(rp, G.ini_reset)) {
         snprintf(G.ini_reset, sizeof G.ini_reset, "%s", rp);
-        if (primed) reset_pools();
+        if (primed) lock_and_reset_pools();
     }
 }
 
@@ -836,8 +847,8 @@ static void say_spenders(uint64_t now) {
         if (c[i].member) snprintf(who, sizeof who, "member %d, %s", c[i].member, c[i].name);
         else snprintf(who, sizeof who, "not in the room");
         rt_log("coop: sync: key %s (%s) took %lld keys, %lld rupees and %lld ammunition from the pools beyond what it brought; "
-               "coop_remove = %s removes it and gives back what it took", c[i].key, who, (long long)c[i].spent[0], (long long)c[i].spent[1],
-               (long long)c[i].spent[2], c[i].key);
+               "coop_remove = %s removes it and gives back what it took (remove it before a pool reset: a reset while it is in the "
+               "room keeps what it took)", c[i].key, who, (long long)c[i].spent[0], (long long)c[i].spent[1], (long long)c[i].spent[2], c[i].key);
     }
 }
 
@@ -880,7 +891,7 @@ static void on_tick(uint64_t now, void *user) {
     plat_mutex_unlock(&G.pub_lock);
     if (asked[0]) remove_by_fingerprint(asked);
     uint64_t reset_at = __atomic_exchange_n(&G.want_reset, 0, __ATOMIC_ACQ_REL);
-    if (reset_at && now - reset_at < 2000) reset_pools();
+    if (reset_at && now - reset_at < 2000) lock_and_reset_pools();
     plat_mutex_lock(&G.lock);
     if (!G.eng) {
         plat_mutex_unlock(&G.lock);
@@ -903,10 +914,7 @@ static void on_tick(uint64_t now, void *user) {
         G.cfg_primed = 1;
         if (primed && strcmp(rm, G.remove_seen) && coop_sync_key_parse(rm, &kid)) remove_key(rm);
         snprintf(G.remove_seen, sizeof G.remove_seen, "%s", rm);
-        if (primed && strcmp(rp, G.reset_seen) && *rp && strcmp(rp, "0")) {
-            if (coop_sync_reset_pools(G.eng)) rt_log("coop: sync: the pools are reset: every game joins them again with what they held for the players in the room");
-            else rt_log("coop: sync: coop_reset_pools: only the room's maker resets the pools");
-        }
+        if (primed && strcmp(rp, G.reset_seen) && *rp && strcmp(rp, "0")) reset_pools();
         snprintf(G.reset_seen, sizeof G.reset_seen, "%s", rp);
     }
     coop_sync_tick(G.eng, now, send_fn, NULL);
