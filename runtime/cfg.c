@@ -610,6 +610,42 @@ int cfg_int(const char *name) {
 
 int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
 
+// ---- the restart-only settings' values at start (cfg_init), which the running game keeps using whatever the menu sets
+// later: cfg_pending compares against them, so the menu says "after restart" only while a restart would change
+// something. One per row of metas, NULL for a live one.
+static const char *at_start[sizeof metas / sizeof *metas];
+
+static const char *meta_value(size_t i) {
+    char name[80];
+    snprintf(name, sizeof name, PREFIX "%s", metas[i].key);
+    return cfg_value(name);
+}
+
+static void start_values(void) {
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++)
+        if (!metas[i].live) at_start[i] = strdup(meta_value(i));   // a copy: cfg_load (the probes) frees what it read
+}
+
+// A value the environment sets never waits: the menu cannot change it and a restart keeps the environment. The command
+// line's --monitor and --audio-device arrive that way after the start values are taken (main.c).
+static int pending_at(size_t i) {
+    char name[80];
+    if (!at_start[i]) return 0;
+    snprintf(name, sizeof name, PREFIX "%s", metas[i].key);
+    return !cfg_from_env(name) && strcmp(at_start[i], cfg_value(name)) != 0;
+}
+
+int cfg_pending(const char *key) {
+    const CfgMeta *m = cfg_meta(key);
+    return m ? pending_at((size_t)(m - metas)) : 0;
+}
+
+int cfg_pending_count(void) {
+    int n = 0;
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++) n += pending_at(i);
+    return n;
+}
+
 // ---- cfg_save: the file as lines, each with its line ending
 typedef struct { const char *s; size_t n; } Line;   // n includes the '\n' (and '\r') when present
 
@@ -879,4 +915,5 @@ void cfg_init(void) {
     if (profile_of())
         rt_log("cfg: device profile Steam Deck: defaults for the keys nx2navi.ini does not set (NX2NAVI_DEVICE_PROFILE=desktop "
                "turns it off)");
+    start_values();
 }

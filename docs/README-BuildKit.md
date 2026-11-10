@@ -149,7 +149,8 @@ beside the game.
   a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card where it loads; it needs DLSS or FSR 3.1
   upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the display's refresh
   rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
-  resolution. Those marked "after restart" take effect when the game starts again.
+  resolution. A setting that takes effect only when the game starts again says "after restart" once you change it,
+  until you set it back, and the Restart button at the bottom then counts the settings waiting for it.
 - **Controls** in the menu has Button prompts: the game's own, or Xbox, PlayStation, Steam Deck or keyboard and mouse ones when
   the build drew them (a kit with `prompt-art`). It takes effect after a restart. The keyboard and mouse prompts show
   the keys `nx2navi.ini` binds when the build runs: after rebinding keys, run

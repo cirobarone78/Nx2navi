@@ -1,4 +1,5 @@
-// --probe-cfg: nx2navi.ini parsing, the environment override and a missing file (cfg.c). Needs no game files.
+// --probe-cfg: nx2navi.ini parsing, the environment override, a missing file and the settings waiting for a restart
+// (cfg.c). Needs no game files.
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +18,26 @@ static int fails;
 #define EQ(a, b) ((a) && !strcmp((a), (b)))
 
 int probe_cfg(void) {
+    // cfg_pending, before this probe's files replace the settings cfg_init read: a restart-only setting counts while its
+    // value differs from the one at start, a live one never
+    if (!cfg_from_env("NX2NAVI_MICROPHONE") && !cfg_from_env("NX2NAVI_VOLUME")) {
+        const char *mic = cfg_value("NX2NAVI_MICROPHONE");
+        int base = cfg_pending_count();
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE"), "pending: unchanged since the start");
+        cfg_set("NX2NAVI_MICROPHONE", strcmp(mic, "0") ? "0" : "1");
+        CHECK(cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base + 1, "pending: a restart-only setting changed");
+        cfg_set("NX2NAVI_MICROPHONE", mic);
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base, "pending: set back to its start value");
+        cfg_set("NX2NAVI_VOLUME", "7");
+        CHECK(!cfg_pending("NX2NAVI_VOLUME") && cfg_pending_count() == base, "pending: a live setting never counts");
+        // a value the environment sets after the start (the command line's --monitor arrives that way) never waits:
+        // no row can change it and a restart keeps it
+        if (!cfg_from_env("NX2NAVI_MONITOR")) {
+            cfg_setenv("NX2NAVI_MONITOR", "2");
+            CHECK(!cfg_pending("NX2NAVI_MONITOR") && cfg_pending_count() == base, "pending: set by the environment after the start");
+            cfg_setenv("NX2NAVI_MONITOR", NULL);
+        }
+    }
     char path[1024];
     if (!plat_exe_path(path, sizeof path)) return 1;
     char *cut = plat_last_sep(path);
