@@ -127,7 +127,7 @@ XLATE_NAME = 'nx2navi_xlate.exe' if WIN else 'nx2navi_xlate'
 GENERATED_HEADERS = ('layout.h', 'patches.h', 'romfs_config.h')
 RUNTIME_LIB = 'libnx2navirt.a'
 RUNTIME_PATTERNS = ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp',
-                    'third_party/imgui/backends/*.cpp')
+                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c')
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
 
 # Runs a script the way `python script.py` does, with the script's folder first on sys.path. The launcher's
