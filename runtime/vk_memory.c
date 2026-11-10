@@ -1042,9 +1042,17 @@ static void share_init(VkCtx *c) {
     p_get_fd = (PFN_vkGetMemoryFdKHR)vk_dpa(c->device, "vkGetMemoryFdKHR");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &share_buffer, .size = 0x10000,
                              .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    // Cached: the game reads its pools on the CPU as much as it writes them.
+    // Cached: the game reads its pools on the CPU as much as it writes them. Not from a device-local heap where the
+    // device has host memory beside it (VRAM seen through the PCI BAR): one NVIDIA driver's dma-buf of such memory,
+    // mapped on the CPU, did not show the buffer's bytes past its first 64 KiB. Where every heap is device-local (an
+    // integrated GPU) no type is left out: the mask stays 0, which allows them all.
+    uint32_t host_types = 0;
+    for (uint32_t i = 0; i < c->mem_props.memoryTypeCount; i++)
+        if (!(c->mem_props.memoryHeaps[c->mem_props.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            host_types |= 1u << i;
     VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  .preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT};
+                                  .preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                  .memoryTypeBits = host_types};
     uint32_t type;
     VmaPoolCreateInfo pi = {.minAllocationAlignment = 0x1000, .pMemoryAllocateNext = (void *)&share_export};
     if (!p_get_fd || vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &ai, &type) != VK_SUCCESS ||
@@ -1065,6 +1073,35 @@ static int pool_overlap_locked(uint64_t lo, uint64_t hi, const PoolRec *self) {
     return 0;
 }
 
+// One try at making the pool's pages [import_lo, import_hi) a new allocation's (flags: VMA_ALLOCATION_CREATE_*); 1 when
+// they are, 0 with the pages as they were. *off is the allocation's offset in its VkDeviceMemory.
+static int share_try(VkCtx *c, PoolRec *r, VmaAllocationCreateFlags flags, uint64_t *off) {
+    uint64_t n = r->import_hi - r->import_lo;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &share_buffer, .size = n,
+                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | flags, .pool = share_vma};
+    VmaAllocationInfo info;
+    *off = 0;
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &r->buf, &r->salloc, &info) != VK_SUCCESS) return 0;
+    *off = info.offset;
+    uint8_t *map = info.pMappedData, *guest = (uint8_t *)(uintptr_t)r->import_lo;
+    memcpy(map, guest, n);
+    VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = info.deviceMemory,
+                               .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    int fd = -1, ok = p_get_fd(c->device, &gi, &fd) == VK_SUCCESS;
+    if (ok && !plat_mem_share(r->import_lo, n, fd, info.offset)) {
+        memcpy(guest, map, n);   // the platform gave the range its own memory again
+        ok = 0;
+    }
+    if (!ok) {
+        vmaDestroyBuffer(c->vma, r->buf, r->salloc);
+        r->buf = VK_NULL_HANDLE, r->salloc = NULL;
+        return 0;
+    }
+    r->smap = map;
+    return 1;
+}
+
 // The pool's pages [import_lo, import_hi) become a shared allocation's; 0 leaves them as they were. Not where another
 // pool's pages meet them: the mapping replaces the guest's pages, and a shared pool already there would go on reading
 // its own allocation. The new pool stays a copy; its write-backs reach the guest's pages through their own address,
@@ -1081,31 +1118,24 @@ static int share_pool(VkCtx *c, PoolRec *r) {
     int overlap = pool_overlap_locked(r->import_lo, r->import_hi, r);
     plat_mutex_unlock_shared(&pool_lock);
     if (overlap) return 0;
-    uint64_t n = r->import_hi - r->import_lo;
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &share_buffer, .size = n,
-                             .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT, .pool = share_vma};
-    VmaAllocationInfo info;
-    if (vmaCreateBuffer(c->vma, &bi, &ai, &r->buf, &r->salloc, &info) != VK_SUCCESS) return 0;
-    uint8_t *map = info.pMappedData, *guest = (uint8_t *)(uintptr_t)r->import_lo;
-    memcpy(map, guest, n);
-    VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = info.deviceMemory,
-                               .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-    int fd = -1, ok = p_get_fd(c->device, &gi, &fd) == VK_SUCCESS;
-    if (ok && !plat_mem_share(r->import_lo, n, fd, info.offset)) {
-        memcpy(guest, map, n);   // the platform gave the range its own memory again
-        ok = 0;
+    // Pools share VkDeviceMemory blocks. A driver that maps a dma-buf only from its start (NVIDIA's: EINVAL at any
+    // other offset) refuses every pool past a block's first, so a refused one gets a block of its own, at offset 0.
+    uint64_t n = r->import_hi - r->import_lo, off;
+    int ok = share_try(c, r, 0, &off);
+    if (!ok && off) {
+        ok = share_try(c, r, VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT, &off);
+        static volatile int32_t n_own;
+        if (ok && plat_inc32(&n_own) == 1)
+            rt_log("vk: pool %#llx+%#llx: shared from an allocation of its own (the driver refused it at offset %#llx)",
+                   (unsigned long long)r->import_lo, (unsigned long long)n, (unsigned long long)off);
     }
     if (!ok) {
         static volatile int32_t n_failed;
         if (plat_inc32(&n_failed) <= 4)
-            rt_log("vk: pool %#llx+%#llx: not shared (%s); copied instead", (unsigned long long)r->import_lo,
-                   (unsigned long long)n, fd < 0 ? "no dma-buf" : "mapping failed");
-        vmaDestroyBuffer(c->vma, r->buf, r->salloc);
-        r->buf = VK_NULL_HANDLE, r->salloc = NULL;
+            rt_log("vk: pool %#llx+%#llx: not shared; copied instead", (unsigned long long)r->import_lo,
+                   (unsigned long long)n);
         return 0;
     }
-    r->smap = map;
     r->shared = 1;
     plat_mutex_lock(&shadow_lock);
     s_live_n++, s_live_bytes += (int64_t)n, s_shared_n++, s_shared_bytes += (int64_t)n;

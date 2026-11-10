@@ -252,9 +252,11 @@ Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-ba
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
 Where the device exports dma-bufs (`VK_EXT_external_memory_dma_buf`, RADV), the shadow allocation is the guest memory
-instead of a copy (shared pools, `runtime/vk_memory.c` `share_pool`): it comes from exportable host-cached memory and
-is mapped at the pool's guest address (`runtime/platform/linux.c` `plat_mem_share`), so the CPU and the GPU read and
-write the same bytes, nothing is copied before a submit or after a fence, and the pools' memory is not doubled. The
+instead of a copy (shared pools, `runtime/vk_memory.c` `share_pool`): it comes from exportable host-cached memory, never
+from VRAM behind the PCI BAR (`share_init`), and is mapped at the pool's guest address (`runtime/platform/linux.c`
+`plat_mem_share`), so the CPU and the GPU read and write the same bytes, nothing is copied before a submit or after a
+fence, and the pools' memory is not doubled. Pools share VkDeviceMemory blocks; a driver that maps a dma-buf only from
+its start (NVIDIA's) refuses the others, which then get an allocation of their own (`share_try`). The
 userfaultfd write watch cannot cover such a mapping: writes to it are tracked by page protection, only where a texture
 or a VRAM mirror watches (`plat_mem_watch`), and a pool earns its mirror after a trial in which the CPU wrote at most
 16 of its pages (`mirror_trial`), since every CPU write to a watched page costs a fault. Kokiri Forest on an
