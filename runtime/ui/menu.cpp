@@ -514,8 +514,11 @@ extern "C" void menu_vk_release(void) {
 // optional) at that presented frame; changes live settings with no input, menu open or not. nx2navi.ini is written only by
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
-// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs. SAVE_FILE_OPEN,
-// SAVE_FILE_PAGE and SAVE_FILE_PLAY drive the Saves tab's file window (ui/saves_page.h saves_test_set).
+// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs. KEY=<name> taps a
+// key (up, down, left, right, enter, escape or tab) and TYPE=<text> types text, into the page shown as the window's key
+// and text events go (test_key), also on the hook's own pages, which drop the window's events; so a run fills a text
+// field and confirms it as a keyboard does. SAVE_FILE_OPEN, SAVE_FILE_PAGE and SAVE_FILE_PLAY drive the Saves tab's
+// file window (ui/saves_page.h saves_test_set).
 enum { TAB_SCREEN, TAB_GAME, TAB_SAVES, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };   // Ocarina of Time: the options this port has
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
@@ -564,6 +567,30 @@ static void test_parse(void) {
                (unsigned long long)g_test.at, (unsigned long long)g_test.per_page, g_test.n_sets);
 }
 
+// The test hook's KEY and TYPE: into Dear ImGui as drain_events hands it the window's events. A key goes down and up in
+// the same frame, as a quick tap can arrive; ImGui takes the down this frame and the up the next.
+static void test_key(const char *key, const char *value) {
+    if (!g_ctx_ok) {   // before the menu's first frame there is nothing to take them
+        rt_log("menu: test hook: %s=%s before the menu was made; dropped", key, value);
+        return;
+    }
+    ImGuiIO &io = ImGui::GetIO();
+    if (!strcmp(key, "NX2NAVI_TYPE")) {
+        io.AddInputCharactersUTF8(value);
+        return;
+    }
+    static const struct { const char *name; ImGuiKey key; } keys[] = {
+        {"up", ImGuiKey_UpArrow}, {"down", ImGuiKey_DownArrow}, {"left", ImGuiKey_LeftArrow},
+        {"right", ImGuiKey_RightArrow}, {"enter", ImGuiKey_Enter}, {"escape", ImGuiKey_Escape}, {"tab", ImGuiKey_Tab}};
+    for (const auto &k : keys)
+        if (!strcmp(value, k.name)) {
+            io.AddKeyEvent(k.key, true);
+            io.AddKeyEvent(k.key, false);
+            return;
+        }
+    rt_log("menu: test hook: KEY=%s is no key the hook knows", value);
+}
+
 static void test_apply_sets(uint64_t frame) {
     for (; g_test.next_set < g_test.n_sets && g_test.sets[g_test.next_set].frame <= frame; g_test.next_set++) {
         const TestSet &t = g_test.sets[g_test.next_set];
@@ -574,6 +601,8 @@ static void test_apply_sets(uint64_t frame) {
             char row[80];
             snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
             opt_focus_key(row);
+        } else if (!strcmp(t.key, "NX2NAVI_KEY") || !strcmp(t.key, "NX2NAVI_TYPE")) {
+            test_key(t.key, t.value);
         } else if (!saves_test_set(t.key, t.value)) {
             cfg_set(t.key, t.value);
         }
