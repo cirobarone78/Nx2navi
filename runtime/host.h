@@ -347,6 +347,7 @@ void rtss_limit_restore(void);                            // before the process 
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (NX2NAVI_FPS_LIMIT, live)
 uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)
+int frame_player_pos(float xyz[3]);                        // 1 with the player in the world: its position in metres
 // In-launch A/B measurement: NX2NAVI_AB=<seconds> splits the world clock (frame_step_world_us) into blocks of that much
 // game time in the order A B B A (repeated); rt_ab() is 1 in the B blocks, 0 in A blocks, before the world clock and
 // without NX2NAVI_AB. rt_knob(name, def) reads the switch

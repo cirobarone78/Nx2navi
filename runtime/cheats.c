@@ -28,6 +28,7 @@
 #include "input.h"
 #include "mods.h"
 #include "platform/platform.h"
+#include "resume.h"
 
 #ifdef _WIN32
 #define SEP "\\"
@@ -635,6 +636,7 @@ void cheats_frame(uint64_t frame) {
     uint64_t keys = 0;
     int32_t lx, ly, rx, ry;
     input_poll(&keys, &lx, &ly, &rx, &ry);   // 0 while the menu is open
+    if (resume_booting()) keys = 0;   // resume.c's A presses after Restart are for the title, not for key cheats
     for (int i = 0; i < g_n; i++) {
         Cheat *c = &g_cheats[i];
         switch (c->info.kind) {

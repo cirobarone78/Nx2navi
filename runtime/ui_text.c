@@ -279,6 +279,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_DESC] = "Closes the game and starts it again with the new prompts. Progress since your last save "
                              "is lost.",
     [UI_MENU_RESTART_CONFIRM] = "Restart the game now? Progress since your last save is lost.",
+    [UI_MENU_RESTART_RESUME] = "Restart the game now? It saves first and continues where you stand.",
+    [UI_MENU_RESTART_RESUME_WAIT] = "Restart the game now? It saves first, as soon as the game allows it (in about %d "
+                                    "s), and continues where you stand.",
+    [UI_MENU_RESTART_NOSAVE] = "The game cannot save here. Restart to the title? Progress since your last save is lost.",
+    [UI_MENU_RESTART_PENDING] = "The game is saving; the restart follows.",
+    [UI_MENU_RESTART_PENDING_WAIT] = "Waiting until the game can save (about %d s); the restart follows.",
     [UI_MENU_QUIT_CONFIRM] = "Quit the game? Progress since your last save is lost.",
     [UI_MENU_RESTART_YES] = "Restart",
     [UI_MENU_RESTART_COUNT] = "Restart (%d)",
@@ -547,6 +553,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
+    [UI_BOOT_RESUME_TITLE] = "Restarting", [UI_BOOT_RESUME] = "Back where you were in a moment",
     [UI_MENU_UPSCALING] = "Upscaling",
     [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window.",
     [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window.",
@@ -839,6 +846,13 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_DESC] = "Закрывает игру и запускает её снова с новыми подсказками. Прогресс после последнего "
                              "сохранения будет потерян.",
     [UI_MENU_RESTART_CONFIRM] = "Перезапустить игру сейчас? Прогресс после последнего сохранения будет потерян.",
+    [UI_MENU_RESTART_RESUME] = "Перезапустить игру сейчас? Она сначала сохранится и продолжится там, где вы стоите.",
+    [UI_MENU_RESTART_RESUME_WAIT] = "Перезапустить игру сейчас? Она сохранится, как только игра позволит (примерно через "
+                                    "%d с), и продолжится там, где вы стоите.",
+    [UI_MENU_RESTART_NOSAVE] = "Здесь игра не может сохраниться. Перезапустить с титульного экрана? Прогресс после "
+                               "последнего сохранения будет потерян.",
+    [UI_MENU_RESTART_PENDING] = "Игра сохраняется; затем перезапуск.",
+    [UI_MENU_RESTART_PENDING_WAIT] = "Ждём, пока игра сможет сохраниться (примерно %d с); затем перезапуск.",
     [UI_MENU_QUIT_CONFIRM] = "Выйти из игры? Прогресс после последнего сохранения будет потерян.",
     [UI_MENU_RESTART_YES] = "Перезапустить",
     [UI_MENU_RESTART_COUNT] = "Перезапустить (%d)",
@@ -1112,6 +1126,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
+    [UI_BOOT_RESUME_TITLE] = "Перезапуск", [UI_BOOT_RESUME] = "Через мгновение вы вернётесь туда, где были",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Некоторые читы меняют код игры и ещё не собраны в неё: они новые или изменены, "
                                     "либо прошлая пересборка не удалась или была отменена. Закрывает игру; установщик "
@@ -1526,6 +1541,13 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_DESC] = "Fecha o jogo e o abre de novo com os novos ícones. O progresso desde o último "
                              "salvamento é perdido.",
     [UI_MENU_RESTART_CONFIRM] = "Reiniciar o jogo agora? O progresso desde o último salvamento é perdido.",
+    [UI_MENU_RESTART_RESUME] = "Reiniciar o jogo agora? Ele salva antes e continua onde você está.",
+    [UI_MENU_RESTART_RESUME_WAIT] = "Reiniciar o jogo agora? Ele salva assim que o jogo permitir (em cerca de %d s) e "
+                                    "continua onde você está.",
+    [UI_MENU_RESTART_NOSAVE] = "O jogo não pode salvar aqui. Reiniciar na tela de título? O progresso desde o último "
+                               "salvamento é perdido.",
+    [UI_MENU_RESTART_PENDING] = "O jogo está salvando; depois reinicia.",
+    [UI_MENU_RESTART_PENDING_WAIT] = "Esperando o jogo poder salvar (cerca de %d s); depois reinicia.",
     [UI_MENU_QUIT_CONFIRM] = "Sair do jogo? O progresso desde o último salvamento é perdido.",
     [UI_MENU_RESTART_YES] = "Reiniciar",
     [UI_MENU_RESTART_COUNT] = "Reiniciar (%d)",
@@ -1661,6 +1683,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
+    [UI_BOOT_RESUME_TITLE] = "Reiniciando", [UI_BOOT_RESUME] = "Você volta para onde estava em instantes",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Alguns cheats alteram o código do jogo e ainda não foram compilados nele: são "
                                     "novos ou editados, ou a última recompilação falhou ou foi cancelada. Fecha o "
@@ -2185,6 +2208,11 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART] = "立即重启",
     [UI_MENU_RESTART_DESC] = "关闭游戏并以新的按键提示重新启动。上次存档之后的进度将会丢失。",
     [UI_MENU_RESTART_CONFIRM] = "现在重启游戏？上次存档之后的进度将会丢失。",
+    [UI_MENU_RESTART_RESUME] = "现在重启游戏？游戏会先存档，并在你所在的位置继续。",
+    [UI_MENU_RESTART_RESUME_WAIT] = "现在重启游戏？游戏允许时（约 %d 秒后）会先存档，并在你所在的位置继续。",
+    [UI_MENU_RESTART_NOSAVE] = "此处无法存档。重启并回到标题画面？上次存档之后的进度将会丢失。",
+    [UI_MENU_RESTART_PENDING] = "游戏正在存档，之后重启。",
+    [UI_MENU_RESTART_PENDING_WAIT] = "正在等待游戏可以存档（约 %d 秒），之后重启。",
     [UI_MENU_QUIT_CONFIRM] = "退出游戏？上次存档之后的进度将会丢失。",
     [UI_MENU_RESTART_YES] = "重启",
     [UI_MENU_RESTART_COUNT] = "重启（%d）",
@@ -2301,6 +2329,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
+    [UI_BOOT_RESUME_TITLE] = "正在重启", [UI_BOOT_RESUME] = "马上回到你刚才的位置",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",
     [UI_MENU_CHEATS_REBUILD_DESC] = "有些金手指会修改游戏代码，但尚未构建进游戏：它们是新增或修改的，或上次重新构建失败或被取消。将关闭游戏；安装程序会把它们构建进去（几分钟）并重新启动游戏。上次存档之后的进度会丢失。",
     [UI_MENU_MODS_EXEFS_UNSUPPORTED] = "此模组修改游戏代码（exefs）的方式本移植无法应用，因此整个模组保持关闭。%s",

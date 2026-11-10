@@ -21,6 +21,7 @@
 #include "input_ds3.h"
 #endif
 #include "nvn_api.h"
+#include "resume.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -1006,6 +1007,10 @@ static int blocked(volatile int32_t *flag, volatile uint64_t *closed, const char
 
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
+    // resume.c: after Restart, until the player stands in the world again, the game gets only the presses that take the
+    // title to the save; the player's buttons and sticks could move the title's cursor off Continue. poll_merged has
+    // taken the menu's key combination already, so it still opens the menu.
+    if (resume_booting()) *buttons = resume_buttons(), *lx = *ly = *rx = *ry = 0;
     if (!g_block && !g_menu) menu_cursor_poll(buttons);
     const int32_t axes[4] = {*lx, *ly, *rx, *ry};
     int text = blocked(&g_block, &g_block_closed, "text entry", *buttons, axes),

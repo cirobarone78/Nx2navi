@@ -114,8 +114,13 @@ typedef enum {
     // the notes under the prompts: their files are missing or damaged, they change after restart, or why they are off
     UI_MENU_PROMPTS_MISSING, UI_MENU_PROMPTS_FAILED, UI_MENU_PROMPTS_RESTART, UI_MENU_PROMPTS_OFF_SHAPE,
     UI_MENU_PROMPTS_OFF_MODS, UI_MENU_PROMPTS_OFF_PATCHES,
-    // "Restart now" under the prompts while they change after restart, and its confirmation (Cancel: UI_MENU_RESET_NO)
-    UI_MENU_RESTART, UI_MENU_RESTART_DESC, UI_MENU_RESTART_CONFIRM, UI_MENU_QUIT_CONFIRM, UI_MENU_RESTART_YES, UI_MENU_RESTART_SAVING, UI_MENU_QUIT_SAVING,
+    // "Restart now" under the prompts while they change after restart, and its confirmation (Cancel: UI_MENU_RESET_NO).
+    // In play on 1.1.1 (resume.c resume_answer): RESUME, it saves first and continues there; RESUME_WAIT the same after
+    // the game's cooldown (printf: "%d" seconds); NOSAVE, the game cannot save here; after Restart, PENDING while the
+    // game saves and PENDING_WAIT while its cooldown runs ("%d" seconds)
+    UI_MENU_RESTART, UI_MENU_RESTART_DESC, UI_MENU_RESTART_CONFIRM, UI_MENU_RESTART_RESUME, UI_MENU_RESTART_RESUME_WAIT,
+    UI_MENU_RESTART_NOSAVE, UI_MENU_RESTART_PENDING, UI_MENU_RESTART_PENDING_WAIT, UI_MENU_QUIT_CONFIRM,
+    UI_MENU_RESTART_YES, UI_MENU_RESTART_SAVING, UI_MENU_QUIT_SAVING,
     UI_MENU_RESTART_COUNT,   // the bar's Restart with the count of settings waiting for it (printf: %d)
     UI_MENU_GROUP_STICKS, UI_MENU_LSTICK_DEADZONE, UI_MENU_RSTICK_DEADZONE, UI_MENU_STICK_DEADZONE_DESC,
     UI_MENU_STICK_DEADZONE_NOW, UI_MENU_STICK_SENS, UI_MENU_STICK_SENS_DESC,
@@ -271,6 +276,8 @@ typedef enum {
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total
+    // the box over the game while the boot after Restart takes it back to the save (resume.c, ui/menu.cpp)
+    UI_BOOT_RESUME_TITLE, UI_BOOT_RESUME,
     // the settings menu's Picture rows for this game (ui/menu.cpp tab_screen): one upscaling choice (bilinear, FSR 1
     // or a DLSS mode) and the picture's resolution
     UI_MENU_UPSCALING, UI_MENU_UPSCALING_DESC, UI_MENU_FRAMEGEN, UI_MENU_FRAMEGEN_DESC,

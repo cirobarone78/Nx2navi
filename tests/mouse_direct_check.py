@@ -224,6 +224,8 @@ void menu_toggle(void) { abort(); }
 void menu_perf_cycle(void) { abort(); }
 const char *input_action_name(int action) { (void)action;abort(); }
 void input_map_configure(void) { abort(); }
+int resume_booting(void) { abort(); }
+uint64_t resume_buttons(void) { abort(); }
 int input_direct_mouse_active(void) { return 1; }
 int input_direct_mouse_enabled(void) { return 1; }
 static int row_calls, radial_calls, live_mouse;

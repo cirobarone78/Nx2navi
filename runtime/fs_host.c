@@ -24,6 +24,7 @@
 #include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "resume.h"
 #include "romfs_path.h"
 #include "save_share.h"
 
@@ -93,7 +94,7 @@ static char *join(const char *dir, const char *name) {
 
 // Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet
 // (NX2navi writes a slot's files back to back and then commits; between the files nothing is open for a moment).
-static volatile int32_t save_writers, save_dirty;
+static volatile int32_t save_writers, save_dirty, save_commits;
 static volatile int64_t save_changed_ns;
 static void save_wait_commit(void);
 static void save_touched(void) {
@@ -105,6 +106,10 @@ int fs_save_busy(void) {
     if (plat_cas32(&save_writers, 0, 0) > 0) return 1;
     return plat_cas32(&save_dirty, 0, 0) &&
            plat_now_ns() - (uint64_t)plat_cas64(&save_changed_ns, 0, 0) < 3000000000ull;
+}
+int fs_save_commits(void) { return plat_cas32(&save_commits, 0, 0); }
+int fs_save_path(const char *rel, char *out, size_t cap) {
+    return *save_root && snprintf(out, cap, "%s/%s", save_root, rel) < (int)cap;
 }
 
 // ---- host directories
@@ -555,6 +560,7 @@ static uint32_t save_commit_locked(void) {
     if (tx_dead) return FS_R_INVALID_ARGUMENT;
     rt_log("fs commit save: %d files, %d changed (%.1f MiB written), %d unchanged linked, in %.0f ms%s", nfiles,
            nfiles - linked, bytes / 1048576.0, linked, (plat_now_ns() - t0) / 1e6, waits ? "; waits in save-tx" : "");
+    plat_inc32(&save_commits);   // resume.c waits for the save it asked the game for
     return 0;
 }
 
@@ -1099,6 +1105,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     int err = 0;
     PlatFile *f = plat_fs_open(p, (mode & FS_OPEN_WRITE) != 0, &err);
     if (!f) return fs_result(err);
+    if (kind == M_SAVE) resume_save_file(path, save_writer);   // resume.c: which slot is saved and loaded
     plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {

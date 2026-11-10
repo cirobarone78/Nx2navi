@@ -45,6 +45,17 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
   everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
   (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
+- Restart (the menu's button for settings that apply at start): the process starts again with the same command line
+  and environment (`platform/platform.h plat_restart`, in `linux.c` and `win32.c`). In play on game 1.1.1 the
+  confirmation asks the game's own autosave check, called on a guest thread, whether it would take the autosave
+  request its event scripts make, and adds two conditions of the runtime's own: no event script runs (what the game's
+  save manager waits for before its own deferred autosave) and the player has stood still for a second. When all hold,
+  Restart makes that request, waits for the save's Commit and hands the slot to the new process in the environment
+  variable `NX2NAVI_RESUME`; Cancel, or closing the menu, before that cancels the restart. The new process then ends
+  the title movies at once, presses A until the game opens that save (Continue, the title's first choice when a save
+  exists; the player's own input does not reach the game meanwhile) and shows a "Restarting" box until the player
+  stands in the world again. When the game would not save there, the confirmation says so and Restart goes to the
+  title as before (`runtime/resume.c`).
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores

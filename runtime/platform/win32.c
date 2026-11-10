@@ -745,6 +745,14 @@ int64_t plat_file_size(const char *path) {
     return (int64_t)(((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow);
 }
 
+int64_t plat_file_mtime_ms(const char *path) {
+    wchar_t w[WPATH];
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!widen(path, w, WPATH) || !GetFileAttributesExW(w, GetFileExInfoStandard, &d)) return -1;
+    uint64_t t = ((uint64_t)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+    return (int64_t)((t - 116444736000000000ull) / 10000);   // 100 ns ticks since 1601
+}
+
 int plat_file_set_readonly(const char *path, int on) {
     wchar_t w[WPATH];
     if (!widen(path, w, WPATH)) return 0;

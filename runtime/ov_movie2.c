@@ -38,6 +38,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "resume.h"
 
 #define R_NO_FRAME 0x7bu
 #define R_BUSY 0x7du       // DecodeAsync while the queues are full: the game retries on its input-ready event
@@ -707,13 +708,14 @@ static void ov_decode(Cpu *c) {
         skip_ns = e && *e ? (int64_t)(atof(e) * 1e9) : -1;
         if (skip_ns >= 0) rt_log("movie: movies end after %.1f s (NX2NAVI_MOVIE_SKIP)", skip_ns / 1e9);
     }
+    int64_t skip = resume_booting() ? 0 : skip_ns;   // resume.c: the boot after Restart ends every movie at once
     plat_mutex_lock(&v->lock);
-    if (skip_ns >= 0 && v->eos_queued) {   // after the early end: what the demuxer still sends is dropped
+    if (skip >= 0 && v->eos_queued) {   // after the early end: what the demuxer still sends is dropped
         plat_mutex_unlock(&v->lock);
         ret_x(c, 0);
         return;
     }
-    if (skip_ns >= 0 && !eos && ts >= skip_ns) eos = 1, size = 0;   // the early end
+    if (skip >= 0 && !eos && ts >= skip) eos = 1, size = 0;   // the early end
     if (v->in_n >= INMAX || ((v->qn >= QREADY || v->in_n >= QREADY) && !eos)) {
         update_events(v);
         plat_mutex_unlock(&v->lock);

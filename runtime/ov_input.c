@@ -15,6 +15,7 @@
 #include "input.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "resume.h"
 
 typedef struct { int64_t sampling; uint64_t buttons; int32_t lx, ly, rx, ry; uint32_t attributes, pad; } NpadState;
 typedef struct { int64_t sampling; int32_t x, y, dx, dy, wx, wy; uint32_t buttons, attributes; } MouseState;
@@ -94,6 +95,7 @@ static void npad_states(Cpu *c, uint32_t want) {
         input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
     }
     *out = s;
+    resume_guest(c);   // resume.c: Restart's autosave request needs a guest thread; the game calls this every frame
     ret_x(c, 1);
 }
 static void ov_states_full_key(Cpu *c) { npad_states(c, STYLE_FULL_KEY); }

@@ -345,6 +345,10 @@ static int player_pos(float xyz[3]) {
     return 0;
 }
 
+// The player in the world: found, and away from the origin where the title screen keeps it (the world clock below,
+// resume.c).
+int frame_player_pos(float xyz[3]) { return player_pos(xyz) && fabsf(xyz[0]) + fabsf(xyz[2]) >= 1.0f; }
+
 // Ocarina 1.1.1's time manager, **[main+0x4c7e890]: +0x1c0 the frame's base step in 60 Hz frames, +0x10 the game
 // speed (main+0x2c84c makes each time category's {frames, 1/frames, seconds, 1/seconds} from them and the category's
 // factor). Read by the speed lines of a free-running build: the game seconds a frame stepped, or -1.
@@ -552,7 +556,7 @@ static void world_clock(double dt, double step) {
     int64_t w = atomic_load_explicit(&world_us, memory_order_relaxed);
     if (w < 0) {
         float p[3];
-        if (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f) return;   // a few guest reads, until the load ends
+        if (!frame_player_pos(p)) return;   // a few guest reads, until the load ends
         rt_log("frame step: world clock starts at present %llu, %.2f s after the guest started (the player at %.1f %.1f %.1f)",
                (unsigned long long)presents, rt_guest_start_ns ? (kern_now_ns() - rt_guest_start_ns) / 1e9 : 0.0, p[0],
                p[1], p[2]);

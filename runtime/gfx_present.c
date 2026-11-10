@@ -24,6 +24,7 @@
 #include "nvn_api.h"
 #include "ov.h"
 #include "platform/platform.h"
+#include "resume.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "vk_fg.h"
@@ -1330,6 +1331,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
     flip_locked();
+    // resume.c: Restart waits for the game's save; after it, the return to play. Before the minimised early-out, so its
+    // time limits run while the game plays on behind a minimised window.
+    if (src) resume_present();
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }

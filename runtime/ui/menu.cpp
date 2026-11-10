@@ -50,6 +50,7 @@ extern "C" {
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "resume.h"
 #include "save_share.h"
 #include "sysinfo.h"
 #include "ui/menu.h"
@@ -103,10 +104,16 @@ static PlatMutex ev_lock = PLAT_MUTEX_INIT;   // the event queue below
 static int ev_n;
 
 // want 0 or 1 sets the state; -1 flips it. Returns the new state. The window events queued before the change go with it:
-// keys pressed just before a close would otherwise reach the menu when it next opens.
+// keys pressed just before a close would otherwise reach the menu when it next opens. Closing, by any way, cancels a
+// restart that waits for the game's save (resume.c resume_menu_close), as the player is back in play; a restart
+// already under way keeps the menu open until the window closes.
 static int change_open(int want) {
     plat_mutex_lock(&open_lock);
     int open = want < 0 ? !g_open.load() : want;
+    if (!open && g_open.load() && !resume_menu_close()) {
+        open = 1;
+        rt_log("menu: stays open, the restart is under way");
+    }
     if (g_open.load() != open) {
         g_open.store(open);
         g_reset.store(1);
@@ -511,7 +518,12 @@ extern "C" void menu_vk_release(void) {
 // optional) at that presented frame; changes live settings with no input, menu open or not. nx2navi.ini is written only by
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
-// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
+// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs. The pseudo-key
+// RESTART=1 opens the menu and its Restart confirmation, CONFIRM=1 presses the confirmation's Restart button (only
+// while it can be pressed) and CANCEL=1 its Cancel, so scripted runs see the boxes a player sees; CLOSE=1 closes an
+// open menu through menu_toggle, the call F1 and Minus+Plus make, without a key. RESTART=1 first takes
+// NX2NAVI_MENU_TEST_SET and NX2NAVI_INPUT_SCRIPT out of the environment, so the new process neither repeats the
+// changes and the restart nor replays the script of the first start.
 enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };   // Ocarina of Time: the options this port has
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
@@ -524,6 +536,8 @@ static struct {
     TestSet sets[TEST_SETS];
     int n_sets, next_set; // NX2NAVI_MENU_TEST_SET, in frame order
 } g_test = {0, 0, 0, 0, -1, {}, 0, 0};
+static int g_test_confirm;   // RESTART=1: open the Restart confirmation at the next layout
+static int g_test_press;     // CONFIRM=1: 1, CANCEL=1: 2, until the confirmation takes it
 
 static void test_parse(void) {
     g_test.parsed = 1;
@@ -570,6 +584,15 @@ static void test_apply_sets(uint64_t frame) {
             char row[80];
             snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
             opt_focus_key(row);
+        } else if (!strcmp(t.key, "NX2NAVI_RESTART")) {
+            cfg_setenv("NX2NAVI_MENU_TEST_SET", NULL);
+            cfg_setenv("NX2NAVI_INPUT_SCRIPT", NULL);
+            set_open(1);
+            g_test_confirm = 1;
+        } else if (!strcmp(t.key, "NX2NAVI_CONFIRM") || !strcmp(t.key, "NX2NAVI_CANCEL")) {
+            g_test_press = t.key[8] == 'C' && t.key[9] == 'O' ? 1 : 2;
+        } else if (!strcmp(t.key, "NX2NAVI_CLOSE")) {
+            if (menu_is_open()) menu_toggle();
         } else {
             cfg_set(t.key, t.value);
         }
@@ -1295,12 +1318,17 @@ static int restart_pending(void) {
 }
 
 // The confirmation of the menu's Restart button, over the menu; Cancel has the cursor first. Restart writes nx2navi.ini,
-// then closes the game as Quit does and starts it again (gfx_window_request_restart). It waits while the game writes a
-// save, and the game stays when nx2navi.ini cannot be written, as the changed settings would not come back. From the
-// Cheats tab (restart_rebuild) Restart also lets the next start rebuild for cheats whose last rebuild failed
-// (cheats_rebuild_allow). The Quit button's confirmation is the same box (g_confirm_quit), and it waits too: the game
-// runs on while the menu is open, and closing the window finishes only a Commit that has begun (gfx_window_closed,
-// fs_save_flush), so a save between writing its files and committing them would be dropped.
+// then closes the game as Quit does and starts it again (gfx_window_request_restart). In play on 1.1.1 the text says
+// what resume.c can keep, from the game's own answer (resume_answer): it saves first and continues where the player
+// stands, the same after the game's cooldown, or the game cannot save here and Restart goes to the title. After a
+// Restart that saves, the box stays and says it saves, with Cancel alone (resume_cancel; closing the menu cancels too,
+// change_open); when the game then does not save, it offers the restart to the title; once the restart is under way it
+// says so, with no button, until the window closes. It waits while the game writes a save, and the game stays when
+// nx2navi.ini cannot be written, as the changed settings would not come back. From the Cheats tab (restart_rebuild)
+// Restart also lets the next start rebuild for cheats whose last rebuild failed (cheats_rebuild_allow), and restarts
+// plainly. The Quit button's confirmation is the same box (g_confirm_quit), and it waits too: the game runs on while
+// the menu is open, and closing the window finishes only a Commit that has begun (gfx_window_closed, fs_save_flush), so
+// a save between writing its files and committing them would be dropped.
 static bool restart_rebuild, g_confirm_quit;
 static void restart_confirm(float scale) {
     g_modal = false;
@@ -1313,8 +1341,21 @@ static void restart_confirm(float scale) {
     g_modal = true;
     const ImVec2 box = ImGui::GetWindowPos(), box_size = ImGui::GetWindowSize();
     skin_panel(ImGui::GetWindowDrawList(), box, ImVec2(box.x + box_size.x, box.y + box_size.y), scale);
-    ImGui::TextUnformatted(menu_text(g_confirm_quit ? UI_MENU_QUIT_CONFIRM : UI_MENU_RESTART_CONFIRM));
-    bool saving = fs_save_busy() != 0;
+    int wait_s = 0, answer = g_confirm_quit || restart_rebuild ? RESUME_PLAIN : resume_answer(&wait_s);
+    bool pending = answer == RESUME_PENDING, gone = answer == RESUME_GONE;   // gone: the window closes, no buttons
+    char text[512];
+    if (g_confirm_quit) snprintf(text, sizeof text, "%s", menu_text(UI_MENU_QUIT_CONFIRM));
+    else if (answer == RESUME_CAN) snprintf(text, sizeof text, "%s", menu_text(UI_MENU_RESTART_RESUME));
+    else if (answer == RESUME_WAIT) snprintf(text, sizeof text, menu_text(UI_MENU_RESTART_RESUME_WAIT), wait_s);
+    else if (answer == RESUME_NO) snprintf(text, sizeof text, "%s", menu_text(UI_MENU_RESTART_NOSAVE));
+    else if (pending && wait_s) snprintf(text, sizeof text, menu_text(UI_MENU_RESTART_PENDING_WAIT), wait_s);
+    else if (pending) snprintf(text, sizeof text, "%s", menu_text(UI_MENU_RESTART_PENDING));
+    else if (gone) snprintf(text, sizeof text, "%s", menu_text(UI_BOOT_RESUME_TITLE));
+    else snprintf(text, sizeof text, "%s", menu_text(UI_MENU_RESTART_CONFIRM));
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    bool saving = !pending && !gone && fs_save_busy() != 0;
     if (saving || (!g_confirm_quit && !cfg_last_save_ok()))
         ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "%s",
                            menu_text(!saving ? UI_MENU_SAVE_FAILED : g_confirm_quit ? UI_MENU_QUIT_SAVING
@@ -1323,22 +1364,35 @@ static void restart_confirm(float scale) {
     const char *yes = menu_text(g_confirm_quit ? UI_MENU_QUIT : UI_MENU_RESTART_YES), *no = menu_text(UI_MENU_RESET_NO);
     const ImGuiStyle &st = ImGui::GetStyle();
     float bw = fmaxf(ImGui::CalcTextSize(yes).x, ImGui::CalcTextSize(no).x) + st.FramePadding.x * 4;
-    bool close = skin_widget_button(no, ImVec2(bw, 0), scale);
+    bool close = false;
+    if (!gone) close = skin_widget_button(no, ImVec2(bw, 0), scale) || g_test_press == 2;
     if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();
-    ImGui::SameLine(0, st.ItemSpacing.x + skin_cursor_reach(scale));
-    ImGui::BeginDisabled(saving);
-    if (skin_widget_button(yes, ImVec2(bw, 0), scale)) {
-        if (g_confirm_quit) {
-            gfx_window_request_close();
-        } else if (cfg_save()) {
-            if (restart_rebuild) cheats_rebuild_allow();
-            gfx_window_request_restart();
+    bool can_yes = !pending && !gone && !saving && answer != RESUME_CHECKING;
+    if (!pending && !gone) {   // after a Restart that saves first only Cancel is left
+        ImGui::SameLine(0, st.ItemSpacing.x + skin_cursor_reach(scale));
+        ImGui::BeginDisabled(!can_yes);
+        bool pressed = skin_widget_button(yes, ImVec2(bw, 0), scale) || (g_test_press == 1 && can_yes);
+        ImGui::EndDisabled();
+        if (pressed) {
+            if (g_test_press == 1) rt_log("menu: test hook: the confirmation's Restart button");
+            if (g_confirm_quit) {
+                gfx_window_request_close();
+            } else if (cfg_save()) {
+                if (restart_rebuild) {
+                    cheats_rebuild_allow();
+                    gfx_window_request_restart();
+                } else {
+                    resume_restart();
+                }
+            }
         }
     }
-    ImGui::EndDisabled();
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+    if (g_test_press == 1 && !can_yes) rt_log("menu: test hook: the confirmation's Restart button cannot be pressed now");
+    g_test_press = 0;
+    if (!gone && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
         close = true, menu_sound_play(MENU_SOUND_CANCEL);
     if (close) {
+        if (pending) resume_cancel();
         ImGui::CloseCurrentPopup();
         restart_rebuild = false;
     }
@@ -1529,7 +1583,8 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SetCursorPos(ImVec2(fmaxf(st.WindowPadding.x, ImGui::GetWindowWidth() - st.WindowPadding.x - bw * 3 - gap * 2), y));
     if (skin_widget_button(cont, ImVec2(bw, 0), scale)) set_open(0);
     ImGui::SameLine(0, gap);
-    if (skin_widget_button(restart, ImVec2(bw, 0), scale)) g_confirm_quit = false, ImGui::OpenPopup("##confirm");
+    if (skin_widget_button(restart, ImVec2(bw, 0), scale) || g_test_confirm)
+        g_test_confirm = 0, g_confirm_quit = false, ImGui::OpenPopup("##confirm");
     ImGui::SameLine(0, gap);
     if (skin_widget_button(quit, ImVec2(bw, 0), scale)) g_confirm_quit = true, ImGui::OpenPopup("##confirm");
     restart_confirm(scale);
@@ -1690,6 +1745,20 @@ static void perf_draw(const MenuTarget *t, float scale) {
     dl->AddText(ImVec2(p.x + padx, p.y + pady), SKIN_TEXT, g_perf_text);
 }
 
+// While the boot after Restart takes the game back to the save (resume.c resume_booting): the title and the loading
+// screens behind are dimmed nearly to black, under the boot screen's box with its sweeping segment.
+static void resume_box(const MenuTarget *t, float scale) {
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)t->width, (float)t->height),
+                                                  IM_COL32(0, 0, 0, 235));
+    ImFont *body = ImGui::GetFont();
+    float body_px = ImGui::GetFontSize();
+    ImFont *head = g_title_font ? g_title_font : body;
+    float head_px = g_title_font ? g_title_font->FontSize * ImGui::GetIO().FontGlobalScale : body_px * 1.2f;
+    float s = (float)fmod(plat_now_ns() / 1e9 * 0.8, 2.0);
+    skin_boot_panel(ImGui::GetForegroundDrawList(), head, head_px, body, body_px, ui_text(UI_BOOT_RESUME_TITLE),
+                    ui_text(UI_BOOT_RESUME), -1, s < 1 ? s : 2 - s, (float)t->width, (float)t->height, scale);
+}
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     *shot = NULL;
     if (t->phys && t->phys != g_gpu_vendor_of) {   // the GPU's vendor for the rows that depend on it (dlss_offered)
@@ -1720,7 +1789,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
             g_tab_request = 0;
             set_open(1);
             open = true;
-        } else if (!g_perf_mode) {
+        } else if (!g_perf_mode && !resume_booting()) {
             return 0;
         }
     }
@@ -1749,6 +1818,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     // the overlay alone was drawn), and that frame's reset would be spent on an overlay frame, so the first open frame
     // ran without its focus row and with the opening key still down.
     open = g_open.load(std::memory_order_acquire);
+    if (open) resume_probe_want();   // resume.c: the Restart confirmation shows the game's answer
     if (reset) {
         io.ClearEventsQueue();   // events handed over before the close and not yet taken (ImGui spreads them over frames)
         io.ClearInputKeys();
@@ -1776,6 +1846,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     // no ImGui_ImplVulkan_NewFrame: all it does is upload Dear ImGui's own font atlas when the back end holds none,
     // which it never does here (fonts_up uploads it, ui/menu_art.cpp menu_font_upload)
     ImGui::NewFrame();
+    if (resume_booting()) resume_box(t, scale);
     if (open) layout_menu(t->width, t->height, scale);
     perf_draw(t, scale);
     ImGui::Render();

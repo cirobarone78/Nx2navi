@@ -61,6 +61,9 @@ void fs_host_lock_profile(void);                           // the one-game-per-p
                                                            // holds it (rt_boot, before the prewarm; storage_init)
 int fs_save_busy(void);                                    // a save is being written: a save file open for writing,
                                                            // or save data changed in the last 3 s and not committed
+int fs_save_commits(void);                                 // save Commits with changes this process has finished
+int fs_save_path(const char *rel, char *out, size_t cap);  // the host path of a file of the user's save; 0 before
+                                                           // the game mounted it
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends
 // A shared save (save_share.c). fs_save_export: visit(ctx, path below the save with '/', bytes, size) for every file of
