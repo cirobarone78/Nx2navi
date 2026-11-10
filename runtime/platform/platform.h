@@ -287,8 +287,8 @@ int plat_mem_unshare(uint64_t addr, uint64_t n);
 void plat_mem_watch(uint64_t addr, uint64_t n);
 void plat_mem_unwatch(uint64_t addr, uint64_t n);
 // The watched shared pages of [addr, addr + n) become writable and count as written: before a write that does not
-// fault (the kernel's, a file read into guest memory).
-void plat_mem_shared_write(uint64_t addr, uint64_t n);
+// fault (the kernel's, a file read into guest memory). Returns how many were read-only.
+int plat_mem_shared_write(uint64_t addr, uint64_t n);
 // Shared-page write faults and the pages made read-only again by plat_mem_written since the last call.
 void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed);
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or

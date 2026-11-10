@@ -1507,22 +1507,31 @@ void plat_mem_unwatch(uint64_t addr, uint64_t n) {
     }
 }
 
-void plat_mem_shared_write(uint64_t addr, uint64_t n) {
-    if (!sstate || !n) return;
+// A page whose lock is held is changing protection (a reset or a watch protects it before its bits say so): it is
+// locked here too, which waits for the change, and looked at again.
+static int sh_maybe_readonly(uint64_t page) {
+    uint8_t v = sh_get(page);
+    return (v & SH_LOCK) || (v & (SH_WATCHED | SH_WRITTEN)) == SH_WATCHED;
+}
+
+int plat_mem_shared_write(uint64_t addr, uint64_t n) {
+    if (!sstate || !n) return 0;
+    int made = 0;
     for (uint64_t p = addr & ~(PG - 1), end = addr + n; p < end;) {
-        if ((sh_get(p) & (SH_WATCHED | SH_WRITTEN)) != SH_WATCHED) { p += PG; continue; }
+        if (!sh_maybe_readonly(p)) { p += PG; continue; }
         uint64_t q = p;   // the run of read-only watched pages from p, locked and marked
-        for (; q < end; q += PG) {
-            if ((sh_get(q) & (SH_WATCHED | SH_WRITTEN)) != SH_WATCHED) break;
+        for (; q < end && sh_maybe_readonly(q); q += PG) {
             sh_lock(q);
-            if (sh_get(q) & SH_WRITTEN) { sh_unlock(q); break; }
+            if ((sh_get(q) & (SH_WATCHED | SH_WRITTEN)) != SH_WATCHED) { sh_unlock(q); break; }
             sh_set(q, SH_WRITTEN);
         }
         if (q == p) { p += PG; continue; }
         if (mprotect((void *)(uintptr_t)p, q - p, PROT_READ | PROT_WRITE) && !sh_untrack(p)) sh_fatal("made writable", p, q - p);
         for (uint64_t x = p; x < q; x += PG) sh_unlock(x);
+        made += (int)((q - p) / PG);
         p = q;
     }
+    return made;
 }
 
 void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed) {
@@ -1735,12 +1744,26 @@ void plat_file_close(PlatFile *f) {
     if (f) close(fd_of(f));
 }
 
+// Watched pages shared with the GPU are made writable first: the kernel's write fails on a read-only page instead of
+// faulting. A write-watch query on another thread (plat_mem_written with reset) can protect one again before the kernel
+// writes it, which ends the read early: short, or EFAULT before its first byte. The whole read then goes again, which
+// keeps an unbuffered read's alignment, when such a page was made writable again and, for a short read, the file goes
+// on past it. At most READ_TRIES reads: a query that keeps protecting the pages, or a fault on another page, does not
+// hold the caller for good.
+#define READ_TRIES 8
 int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
-    plat_mem_shared_write((uint64_t)(uintptr_t)buf, n);   // the kernel's write fails on a read-only page, not faults
-    ssize_t k;
-    do k = pread(fd_of(f), buf, n, (off_t)off);
-    while (k < 0 && errno == EINTR);
-    return k >= 0 ? k : errno == EFAULT ? -2 : -1;
+    plat_mem_shared_write((uint64_t)(uintptr_t)buf, n);
+    for (int tries = 1;; tries++) {
+        ssize_t k;
+        do k = pread(fd_of(f), buf, n, (off_t)off);
+        while (k < 0 && errno == EINTR);
+        int err = k < 0 ? errno : 0;
+        struct stat st;
+        int done = k == (ssize_t)n || (k < 0 && err != EFAULT) ||
+                   (k >= 0 && (fstat(fd_of(f), &st) || off + (uint64_t)k >= (uint64_t)st.st_size));   // the end of the file
+        if (done || tries == READ_TRIES || !plat_mem_shared_write((uint64_t)(uintptr_t)buf, n))
+            return k >= 0 ? k : err == EFAULT ? -2 : -1;
+    }
 }
 
 int plat_file_id(PlatFile *f, PlatFileId *out) {

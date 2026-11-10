@@ -887,7 +887,7 @@ void plat_mem_watch(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
 
 void plat_mem_unwatch(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
 
-void plat_mem_shared_write(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+int plat_mem_shared_write(uint64_t addr, uint64_t n) { (void)addr, (void)n; return 0; }
 
 void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed) { *faults = *rearmed = 0; }
 
