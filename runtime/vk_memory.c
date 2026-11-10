@@ -791,8 +791,9 @@ static uint32_t *slot_in(uint32_t **tab, uint64_t page_addr, int create) {
 
 static uint32_t *gen_slot(uint64_t page_addr, int create) { return slot_in(gen_chunk, page_addr, create); }
 
-// gen_lock held exclusively; g is the newest generation handed out. back: a mirror's write-back, which leaves the
-// CPU-side tables alone.
+// gen_lock held exclusively; g is the newest generation handed out. back: a write-back whose bytes the copies the
+// CPU-side tables drive already hold (a mirror's, or one out of an unmirrored shadow: gpu_written), which leaves those
+// tables alone.
 static void stamp_page_as(uint64_t a, uint32_t g, int back) {
     uint32_t *s = gen_slot(a, 1);
     if (!s) return;
@@ -1056,13 +1057,30 @@ static void share_init(VkCtx *c) {
            type);
 }
 
-// The pool's pages [import_lo, import_hi) become a shared allocation's; 0 leaves them as they were.
+// pool_lock held: another pool's pages meet [lo, hi), page-aligned (self, when it is in the index, left out). The
+// index is sorted by start and keeps the largest end so far (maxhi), so the walk stops at the first entry below lo.
+static int pool_overlap_locked(uint64_t lo, uint64_t hi, const PoolRec *self) {
+    for (int i = pidx_upper(&pool_index, (uintptr_t)(hi - 1)) - 1; i >= 0 && pool_index.maxhi[i] > lo; i--)
+        if (pool_index.e[i].buf != self && pool_index.e[i].hi > lo) return 1;
+    return 0;
+}
+
+// The pool's pages [import_lo, import_hi) become a shared allocation's; 0 leaves them as they were. Not where another
+// pool's pages meet them: the mapping replaces the guest's pages, and a shared pool already there would go on reading
+// its own allocation. The new pool stays a copy; its write-backs reach the guest's pages through their own address,
+// since the platform gives no unwatched view over shared pages (linux.c plat_mem_host_view).
+// ponytail: a pool made at the same moment over the same pages is not seen; none overlap in Kokiri Forest
+// ("overlapping 0" in the mirror lines), re-check under the index lock if that changes.
 static int share_pool(VkCtx *c, PoolRec *r) {
     plat_mutex_lock(&shadow_lock);
     if (!share_state) share_init(c);
     int on = share_state > 0;
     plat_mutex_unlock(&shadow_lock);
     if (!on) return 0;
+    plat_mutex_lock_shared(&pool_lock);
+    int overlap = pool_overlap_locked(r->import_lo, r->import_hi, r);
+    plat_mutex_unlock_shared(&pool_lock);
+    if (overlap) return 0;
     uint64_t n = r->import_hi - r->import_lo;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &share_buffer, .size = n,
                              .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1344,9 +1362,10 @@ void vk_mem_shadow_sync(void) {
     if (!shadow_on) return;
     uint64_t t0 = qpc();
     uint32_t epoch = vk_texture_epoch();
-    // The CPU-side tables in every mode: a write-back out of the shadow is stamped as one (gpu_written, in_shadow), and a
-    // mirror's goes through the shadow too, so the shadow already holds every page those tables leave out. With the
-    // texture tables the 65 MiB a frame the compute passes write in Kokiri Forest came straight back in at the next copy-in.
+    // The CPU-side tables in every mode: a write-back is stamped as one only where the shadow it came out of is the only
+    // copy of those pages (gpu_written, shadow_write_back), and a mirror's goes through the shadow too, so the shadows
+    // already hold every page those tables leave out. With the texture tables the 65 MiB a frame the compute passes
+    // write in Kokiri Forest came straight back in at the next copy-in.
     int cpu = 1;
     plat_mutex_lock(&shadow_lock);
     if (nstouch) {
@@ -1410,7 +1429,7 @@ static int shadow_bulk_write(void) {
 // the GPU's write, so the write watch must not report it as the CPU's, and it costs no protection fault per page.
 // Elsewhere the guest pages must be writable for it. A shared pool has nothing to copy: the GPU wrote the guest's
 // pages themselves. Returns the bytes moved; *in_shadow: 1 when the bytes are in guest memory or a shadow that no
-// mirror stands in front of.
+// mirror stands in front of, and no other pool's pages meet the range: another pool's shadow does not hold them.
 static uint64_t shadow_write_back(uint64_t addr, uint64_t size, int *in_shadow) {
     uint64_t moved = 0;
     int bulk = shadow_bulk_write();   // before the locks: its first call logs
@@ -1418,8 +1437,9 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size, int *in_shadow) 
     const pidx_ent *e = pidx_find(&pool_index, addr, size);
     PoolRec *r = e ? e->buf : NULL;
     plat_mutex_lock(&shadow_lock);
+    int alone = r && !pool_overlap_locked(addr & ~0xfffull, (addr + size + 0xfff) & ~0xfffull, r);
     if (r && r->shared) {
-        if (in_shadow) *in_shadow = r->mstate != MS_ON;
+        if (in_shadow) *in_shadow = r->mstate != MS_ON && alone;
     } else if (r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi) {
         uint64_t t0 = qpc();
         uint8_t *dst = plat_mem_host_view(addr, size);
@@ -1435,7 +1455,7 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size, int *in_shadow) 
             else memcpy(g, s, pe - a), moved += pe - a;   // a write never noted as pending
             a = pe;
         }
-        if (in_shadow) *in_shadow = r->mstate != MS_ON;
+        if (in_shadow) *in_shadow = r->mstate != MS_ON && alone;
         s_wb_bytes += moved, s_wb_seen += size, s_wb_ticks += qpc() - t0;
     }
     plat_mutex_unlock(&shadow_lock);
@@ -1446,7 +1466,7 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size, int *in_shadow) 
 static void gpu_written(uint64_t addr, uint64_t size, int back) {
     // back: the bytes are in a VRAM mirror, and its write-back brings them into the shadow; that submission's
     // shadow_wb_cb, after the replay's own callbacks, then copies them into guest memory.
-    int in_shadow = 0;   // the bytes came out of a shadow that no mirror stands in front of
+    int in_shadow = 0;   // the bytes are where the copy-ins would read them anyway (shadow_write_back)
     if (shadow_on && size && !back) shadow_write_back(addr, size, &in_shadow);
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;

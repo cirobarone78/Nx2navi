@@ -1225,11 +1225,6 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
     return 1;
 }
 
-void *plat_mem_host_view(uint64_t addr, uint64_t n) {
-    SharedRegion *s = shared_region(addr);
-    return s && addr + n <= s->hi ? s->view + (addr - s->lo) : NULL;
-}
-
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
     int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
     if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
@@ -1307,6 +1302,16 @@ static int64_t sh_faults, sh_rearmed;
 
 static uint8_t sh_get(uint64_t page) {
     return sstate && page < PS_LIMIT ? __atomic_load_n(&sstate[page / PG], __ATOMIC_ACQUIRE) : 0;
+}
+
+// The reservation's unwatched alias of [addr, addr + n), or NULL. Not over a page a dma-buf maps (plat_mem_share): the
+// alias's bytes there are not the guest's any more (punched out), so a write through it would never be seen.
+void *plat_mem_host_view(uint64_t addr, uint64_t n) {
+    SharedRegion *s = shared_region(addr);
+    if (!s || addr + n > s->hi) return NULL;
+    for (uint64_t p = addr & ~(PG - 1); p < addr + n; p += PG)
+        if (sh_get(p) & SH_ON) return NULL;
+    return s->view + (addr - s->lo);
 }
 
 static void sh_lock(uint64_t page) {

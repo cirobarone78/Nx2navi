@@ -270,8 +270,8 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr));
 // go on. fn sees every access violation of the process and tells its own pages apart. One hook per process.
 void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
 // The pages of a PLAT_HOST_VIEW reservation [addr, addr + n) through a mapping without the write watch, or NULL where
-// there is none (Windows; Linux without shared-memory write protection). A host write there changes the guest's pages
-// and is not reported by plat_mem_written.
+// there is none (Windows; Linux without shared-memory write protection; a range holding shared pages, plat_mem_share).
+// A host write there changes the guest's pages and is not reported by plat_mem_written.
 void *plat_mem_host_view(uint64_t addr, uint64_t n);
 // Shared pages: committed pages [addr, addr + n) of a watched reservation take their bytes from a GPU allocation the
 // driver exported (fd, a dma-buf, which the call closes; off: where the range starts in it), so the CPU and the GPU
