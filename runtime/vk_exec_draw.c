@@ -1701,8 +1701,13 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
 // dialogue frames, a fifth of them; none once each submission waited for its GPU work, NX2NAVI_SUBMIT_FINISH). A
 // submission's first pool_sync takes the next set (pool_take_set), waits for the GPU only if that set's last
 // submission is still running, and brings it up to date from the change log (every entry written since the set was
-// last current; the whole set when the log has wrapped). Writes within a submission go to its own set at once, as
-// before.
+// last current; the whole set when the log has wrapped). Writes within a submission go to its own set at once, until a
+// part of the submission goes to the queue early (vk_exec.c maybe_split): that part may read any entry of the set, so
+// the set is sealed (vk_exec_pool_split) and the next sync takes the following set as if a new submission began.
+// Writing into it instead updated descriptors a pending command buffer reads, which Vulkan does not allow: the part
+// sampled textures registered after it went, and on RADV a texture whose memory was mapped after the part's submit is
+// absent from that submit's page tables, a GPU page fault on the 128x128 probe pass of Kokiri Forest's first frame
+// (RADV's radv_wait_for_vm_map_updates hid it, as did NX2NAVI_SPLIT_DRAWS=0).
 volatile uint32_t vk_pool_kinds_used;
 #define POOL_SETS 4
 #define POOL_LOG (1u << 20)   // entries of the change log: binding * VK_POOL_TEX + id, one per write
@@ -1721,7 +1726,7 @@ static struct {
     uint64_t switches, waits, catchup, written, rewrites, catch_ns, sync_ns, n_slots, n_refill, n_fresh;
     uint64_t n_by_reg, n_by_addr;      // refills whose token changed by a registration, by an address generation only
     uint64_t dirty_pos;                // vk_texture_dirty_slots_locked position (0: the next sync walks every slot)
-    int ready, uab;
+    int ready, uab, sealed;            // sealed: a part of the current submission already reads sets[cur]
     uint32_t kinds, gen, epoch, sgen;
     int retry;                         // the last sync left slots to the creation budget
     uint64_t *tok;                     // per texture slot: vk_texture_slot_token it was filled under (0: stand-ins)
@@ -1870,16 +1875,27 @@ static void pool_entry_to(VkDescriptorSet set, uint32_t e) {
 // A submission's first pool use: the next set of the ring, once the GPU is done with it. 1 when it switched; *from is
 // the log position the set holds writes up to (pool_catch_up brings it level once pool_sync has refreshed the entries:
 // a view written into a set must be alive, and the refresh is what replaces the views of destroyed textures).
+static int pool_current(void);
+
 static int pool_take_set(VkExec *ex, uint64_t *from) {
-    if (PL.cur_fence == ex->fence) return 0;
+    // a sealed set stays bound while it is current: reading it is what the pending part does too
+    if (PL.cur_fence == ex->fence && (!PL.sealed || pool_current())) return 0;
     int i = (PL.cur + 1) % PL.nsets;
     if (PL.nsets > 1) {
         const GfxBackend *b = gfx_backend();
         if (b->fence_done() < PL.set_fence[i]) PL.waits++, b->fence_wait(PL.set_fence[i], UINT64_MAX);
     }
     *from = PL.set_synced[i];
-    PL.cur = i, PL.set = PL.sets[i], PL.cur_fence = ex->fence, PL.set_fence[i] = ex->fence;
+    PL.cur = i, PL.set = PL.sets[i], PL.cur_fence = ex->fence, PL.set_fence[i] = ex->fence, PL.sealed = 0;
     return PL.nsets > 1;
+}
+
+int vk_exec_pool_split(uint64_t fence) {
+    if (PL.cur_fence != fence || PL.sealed) return 1;   // no part of this submission has the current set unsealed
+    // pool_take_set moves to the next set of the ring: it must not be bound by this submission's earlier parts too
+    if (PL.nsets < 2 || PL.set_fence[(PL.cur + 1) % PL.nsets] == fence) return 0;
+    PL.sealed = 1;
+    return 1;
 }
 
 // The current set gets the entries written into other sets in [from, to) of the log, as PL.view / PL.samp hold them now.
@@ -2007,6 +2023,7 @@ static void pool_sync(VkExec *ex) {
     if (!PL.layout) vk_pool_set_layout();
     uint64_t from = 0, pre = PL.logn;
     int switched = pool_take_set(ex, &from);   // every submission its own set, before the shortcut
+    if (PL.sealed) return;   // current when checked: a change since waits for the next sync, which takes a new set
     uint64_t t0 = kern_now_ns();
     pool_sync_entries(ex);
     uint64_t t1 = kern_now_ns();
@@ -2032,6 +2049,12 @@ static void pool_dirty_slot(int id, void *arg) {   // vk_texture_dirty_slots_loc
     else PL.n_by_addr++;
     if (pool_fill(d->ex, (uint32_t)id, d->used, t)) PL.tok[id] = t;
     else d->retry = 1;
+}
+
+// Every entry as the slots, kinds and samplers are now (pool_sync_entries has nothing to write).
+static int pool_current(void) {
+    return PL.ready && !PL.retry && __atomic_load_n(&vk_pool_kinds_used, __ATOMIC_RELAXED) == PL.kinds &&
+           vk_texture_slots_gen() == PL.gen && vk_texture_epoch() == PL.epoch && vk_sampler_gen() == PL.sgen;
 }
 
 static void pool_sync_entries(VkExec *ex) {

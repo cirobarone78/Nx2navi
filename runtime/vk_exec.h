@@ -137,6 +137,10 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+// vk_exec_draw.c, before a part of submission fence goes to the queue (vk_exec.c maybe_split): 1 when it may go. The
+// texture pool set it binds is then sealed and the next draw that needs the pools takes another; 0 when every other set
+// is bound by this submission's earlier parts, and the replay keeps recording into the same part.
+int vk_exec_pool_split(uint64_t fence);
 // vk_exec_draw.c: the vertex and fragment shader of the last draw recorded into this command buffer (NULL: none yet).
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);

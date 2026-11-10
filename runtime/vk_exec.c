@@ -870,7 +870,8 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // command-buffer state is lost there (bindings and dynamic state: vk_exec_draw_new_cb, ex->dirty); barriers, layouts and
 // queries are not: a barrier's first scope is everything earlier in submission order, image layouts belong to the image,
 // and occlusion queries end with their pass. Fences, completion callbacks and reports stay per submission: only the last
-// part signals the value.
+// part signals the value. The texture pool set a part binds is sealed when the part goes (vk_exec_pool_split): later
+// parts write and bind another, and a part is not split off while no other set is free of this submission.
 // A part also spans at least NX2NAVI_SPLIT_US (1000) of replay time: a split costs about 40 us of the render thread
 // (vkQueueSubmit2, a command buffer, the mirror prologue), and a fight frame of 2,000 draws made 15 parts on the 7900X;
 // a millisecond of recording is a fraction of a millisecond of GPU work, so the GPU still starts early.
@@ -922,8 +923,8 @@ static void maybe_split(VkExec *ex) {
     }
     split_draws = 0;
     split_at = split_n;
-    if (idle && ex->recorded != part_start) n_idle_parts++;
-    if (ex->recorded == part_start) return;
+    if (ex->recorded == part_start || !vk_exec_pool_split(ex->fence)) return;
+    if (idle) n_idle_parts++;
     if (ex->in_pass) vk_exec_pass_end(ex), n_pass_splits++;   // the next draw begins the pass again, in the new part
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
