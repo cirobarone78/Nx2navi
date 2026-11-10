@@ -8,16 +8,25 @@ The window is one Tk canvas at 1000 x 640 logical pixels, scaled to the display.
 flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
-    home        Play, Updates, the game folder, Rebuild the Game, Settings
+    home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
+    customize   the colour scheme, the player's own background picture, animations and sounds
+    saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
     settings    the launcher's choices, the folders, the logs and Uninstall
     uninstall   what to remove, then Uninstall or Cancel
 
 Mouse, keyboard (arrows, Enter or Space, Esc, F5) and an XInput gamepad (d-pad or stick, A, B, Y) all move the cursor.
+
+The look is the player's (Customize Launcher): art.set_theme fills the palette every picture is drawn from, a picture
+of the player's own can replace the backdrop (picture.py), and unless Animations is off the cursor glides between
+rows, a new screen slides in, sparks drift over the backdrop and Navi bobs in the title band (animate). sound.py
+plays the game's own decide and cancel sounds, read from the player's game, for a choice and for going back.
 """
 import argparse
+import math
 import os
+import random
 import shutil
 import sys
 import time
@@ -28,7 +37,7 @@ from tkinter import filedialog
 
 from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, versions, winsys
 from ..context import Context
-from . import art
+from . import art, picture, sound
 
 W, H = 1000, 640
 BAND = (0, 1000, 56)            # x0, x1, height: the whole top of the window, which is also its title bar
@@ -38,7 +47,12 @@ ROWS = (140, 552, 96)           # x0, x1, top
 LABEL_W = 222                   # 54 % of the row
 GAP = 12
 DESC = (614, 336)               # x, width
-P = art.PALETTE
+P = art.PALETTE                 # the colour scheme in use: art.set_theme changes it in place
+FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
+SPARKS = 22                     # the dust drifting over the backdrop
+DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2}
+DIMS = (0, 20, 40, 60, 80)      # Background Dimming, in percent
+SOUND_LEVELS = (('off', 'Off'), ('low', 'Low'), ('medium', 'Medium'), ('high', 'High'))
 
 
 class Row:
@@ -153,7 +167,9 @@ class App:
                                         enabled=not self.layout.dev and not args.selftest)
         self.row_gap = GAP
         self.message = ''
-        self.save_message = ''   # the last Import Saves result, shown in its description
+        self.look_message = ''   # why the last background picture was not taken, in Customize Launcher's descriptions
+        self.save_message = ''   # the last import's result, shown in the import rows' descriptions
+        self.export_message = ''   # the last Export Save result, shown in its description
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
@@ -164,6 +180,23 @@ class App:
         self.tb_hover = None
         self.drag = None
         self.ico = None
+        # the look: the colour scheme, the player's background picture at the window's size (None: the scheme's own
+        # backdrop), the sounds (none while the selftest draws the screens)
+        art.set_theme(self.settings.get('theme'))
+        self.bg_store = self.layout.data / 'background.npy'
+        self.picture = None
+        self.sounds = sound.Sounds(self.layout.cache, 'off' if args.selftest else self.settings.get('sounds'), ctx.log)
+        # the animations' state (animate): the clock and the last step's time, the cursor's place on its way to the
+        # focused row, how far the screen still stands from its place after a change, the sparks, Navi and its halo
+        self.anim_t = 0.0
+        self.anim_last = time.perf_counter()
+        self.cur_xy = self.cur_target = None
+        self.cur_screen = None
+        self.slide = 0.0
+        self.slide_applied = 0
+        self.sparks = []
+        self.navi_xy = None
+        self.halo = []
 
         root.title(NAME)
         root.resizable(False, False)
@@ -173,6 +206,7 @@ class App:
         self.canvas.pack()
         self.set_icon()
         self.load_fonts()
+        self.load_picture()
         self.draw_static()
         self.bind_input()
         self.start()
@@ -271,18 +305,29 @@ class App:
         return self.fcache[(family, max(7, int(px * smallest)), weight)]
 
     def fonts_from_game(self, game_dir='', dump=''):
-        """Decode the game's fonts in the background and redraw with them."""
-        if self.game_fonts:
+        """Decode the game's fonts and its interface sounds in the background, redraw with the fonts and take up
+        the sounds."""
+        fonts, sounds = not self.game_fonts, not self.sounds.game
+        if not fonts and not sounds:
             return
 
         def work():
+            got = heard = {}
             try:
-                got = gamefiles.extract_fonts(self.layout, game_dir, dump)
+                if fonts:
+                    got = gamefiles.extract_fonts(self.layout, game_dir, dump)
             except Exception as e:
                 self.ctx.log(f'fonts: {e}')
-                got = {}
+            try:
+                if sounds:
+                    heard = gamefiles.extract_sounds(self.layout, game_dir, dump)
+                    self.ctx.log(f'sounds: {len(heard)} of {len(gamefiles.SOUNDS)} interface sounds from the game')
+            except Exception as e:
+                self.ctx.log(f'sounds: {e}')
             if got:
                 self.root.after(0, self.reload_fonts)
+            if heard:
+                self.root.after(0, self.sounds.load_game)
         import threading
         threading.Thread(target=work, daemon=True).start()
 
@@ -298,15 +343,35 @@ class App:
             self.sprites[key] = art.photo(self.root, make())
         return self.sprites[key]
 
+    def animated(self):
+        """Animations on (Customize Launcher); never while the selftest draws the screens, whose pictures must not
+        depend on the moment they are taken."""
+        return bool(self.settings.get('animations')) and not self.args.selftest
+
+    def load_picture(self):
+        """The player's background at the window's size, when one is set and its kept copy is readable."""
+        self.picture = None
+        if self.settings.get('background'):
+            self.picture = picture.kept(self.bg_store, self.X(W), self.X(H))
+            if self.picture is None:
+                self.ctx.log(f'background: {self.bg_store} is missing or unreadable; the colour scheme\'s backdrop')
+
+    def see_through(self):
+        """How solid the panel and the description box are: a little see-through over the player's own picture."""
+        return 0.8 if self.picture is not None else 1.0
+
     def draw_static(self):
         c, s = self.canvas, self.s
         c.delete('static')
-        c.create_image(0, 0, anchor='nw', image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s)),
-                       tags='static')
+        dim = max(0, min(100, self.settings.get('background_dim', 40))) / 100.0
+        c.create_image(0, 0, anchor='nw', tags='static',
+                       image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s, self.picture, dim)))
+        self.make_sparks()   # over the backdrop, under the panel and the band
         bx0, bx1, bh = BAND
         px0, ptop, px1 = PANEL
         c.create_image(self.X(px0), self.X(ptop), anchor='nw', tags='static',
-                       image=self.sprite('panel', lambda: art.panel(self.X(px1) - self.X(px0), self.X(H - ptop), s)))
+                       image=self.sprite('panel', lambda: art.panel(self.X(px1) - self.X(px0), self.X(H - ptop), s,
+                                                                    self.see_through())))
         c.create_image(self.X(bx0), 0, anchor='nw', tags='static',
                        image=self.sprite('band', lambda: art.band(self.X(bx1) - self.X(bx0), self.X(bh), s)))
         k = max(1, int(round(2 * s)))   # Navi in whole pixels: two screen pixels per artwork pixel at 100 %
@@ -315,15 +380,49 @@ class App:
         title_w = self.f['band'].measure(NAME)
         gap = self.X(12)
         x = self.X(W / 2) - (ew + gap + title_w) // 2
-        c.create_image(x, self.X(bh / 2), anchor='w', image=emblem, tags='static')
+        # Navi's halo, behind her: a soft light that pulses while the animations run
+        size = self.X(bh) - 2
+        if ('halo', size) not in self.sprites:
+            self.sprites[('halo', size)] = [art.photo(self.root, f) for f in art.halo_frames(size)]
+        self.halo = self.sprites[('halo', size)]
+        c.create_image(x + ew // 2, self.X(bh / 2), image=self.halo[0], tags=('static', 'halo'))
+        self.navi_xy = (x, self.X(bh / 2))
+        c.create_image(x, self.X(bh / 2), anchor='w', image=emblem, tags=('static', 'navi'))
         tx = x + ew + gap
-        c.create_text(tx + 1, self.X(bh / 2) + self.X(2), text=NAME, anchor='w', font=self.f['band'], fill='#1a120a',
-                      tags='static')
+        c.create_text(tx + 1, self.X(bh / 2) + self.X(2), text=NAME, anchor='w', font=self.f['band'],
+                      fill=P['band_shadow'], tags='static')
         c.create_text(tx, self.X(bh / 2), text=NAME, anchor='w', font=self.f['band'], fill=P['band_text'],
                       tags='static')
-        c.create_rectangle(0, 0, self.X(W) - 1, self.X(H) - 1, outline='#140e09', tags='static')
+        c.create_rectangle(0, 0, self.X(W) - 1, self.X(H) - 1, outline=P['frame'], tags='static')
         c.tag_lower('static')
         self.draw_title_buttons()
+
+    def make_sparks(self):
+        """The dust over the backdrop: SPARKS soft dots of three sizes, each with its own speed, sway and twinkle, at
+        places of their own from the first frame on. None while Animations is off."""
+        self.sparks = []
+        if not self.animated():
+            return
+        rnd = random.Random(7)
+        for i in range(SPARKS):
+            size = self.X((5, 8, 12)[i % 3])
+            pics = [self.sprite(('spark', size, a), lambda sz=size, al=a: art.spark(sz, al)) for a in (0.9, 0.55, 0.25)]
+            # logical pixels: its speed upwards a second, how far it sways to each side and how fast
+            sp = {'x': rnd.uniform(0, W), 'y': rnd.uniform(BAND[2], H), 'vy': rnd.uniform(4, 14),
+                  'sway': rnd.uniform(4, 16), 'rate': rnd.uniform(0.4, 1.1), 'phase': rnd.uniform(0, 6.28),
+                  'pics': pics, 'shown': 0}
+            sp['id'] = self.canvas.create_image(self.X(sp['x']), self.X(sp['y']), image=pics[0], tags=('static', 'spark'))
+            self.sparks.append(sp)
+
+    def apply_look(self):
+        """Draw everything again after the colour scheme, the background or Animations changed."""
+        art.set_theme(self.settings.get('theme'))
+        self.sprites.clear()
+        self.root.configure(background=P['window'])
+        self.canvas.configure(background=P['window'])
+        self.load_picture()
+        self.draw_static()
+        self.render()
 
     def draw_title_buttons(self):
         """Minimise and close at the band's right end, lit when the mouse is over them."""
@@ -401,6 +500,8 @@ class App:
             r.pick = max(0, min(len(r.actions) - 1, getattr(r, 'pick', 0) + d))
         else:
             return
+        if r.kind != 'pair':   # a switch or a choice changed
+            self.sounds.play('select')
         self.render()
 
     def activate(self):
@@ -408,22 +509,36 @@ class App:
         if not r or not r.enabled:
             return
         if r.kind == 'toggle':
+            self.sounds.play('select')
             r.on(not r.get())
         elif r.kind == 'enum':
+            self.sounds.play('select')
             r.right()
         elif r.kind == 'pair':
+            self.sounds.play('select')
             r.actions[getattr(r, 'pick', 0)][1]()
             return
         elif r.on:
+            self.sounds.play('back' if r.kind == 'action' and r.label == 'Back' else 'select')
             r.on()
             return
         self.render()
 
+    def home_row(self, label):
+        """The index of the home screen's row with this label, for coming back to it."""
+        return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
+
     def back(self):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job'):
+            self.sounds.play('back')
         if self.screen == 'settings':
-            self.show('home')
+            self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
             self.show('settings')
+        elif self.screen == 'saves':
+            self.show('home', self.home_row('Saves'))
+        elif self.screen == 'customize':
+            self.show('home', self.home_row('Customize Launcher'))
         elif self.screen == 'job' and self.job and self.job.result is None:
             self.cancel_job()
         elif self.screen == 'job':
@@ -490,14 +605,17 @@ class App:
             return
         if r.kind == 'toggle' and r.value_rect:
             x0, _, x1, _ = r.value_rect
+            self.sounds.play('select')
             r.on(e.x < (x0 + x1) / 2)
             self.render()
         elif r.kind == 'enum' and r.value_rect:
             x0, _, x1, _ = r.value_rect
+            self.sounds.play('select')
             (r.left if e.x < x0 + (x1 - x0) / 3 else r.right)()
             self.render()
         elif r.kind == 'pair':
             r.pick = 0 if e.x < (r.rect[0] + r.rect[2]) / 2 else 1
+            self.sounds.play('select')
             r.actions[r.pick][1]()
         else:
             self.activate()
@@ -507,6 +625,7 @@ class App:
             self.job.cancel()
         if self.bg.staging():   # what it downloaded is resumed, and its unfinished folder replaced, next time
             self.bg.job.cancel()
+        self.sounds.stop()
         self.root.destroy()
 
     # ---------------------------------------------------------------- screens
@@ -546,6 +665,10 @@ class App:
                             f'{versions.display(self.layout.version)}.')
 
     def show(self, screen, focus=None):
+        if screen != self.screen and self.screen is not None and self.animated():
+            # another screen slides into place: from the right when it lies deeper, from the left on the way back
+            deeper = DEPTH.get(screen, 1) >= DEPTH.get(self.screen, 0)
+            self.slide = float(self.X(44) if deeper else -self.X(44))
         self.screen = screen
         self.rows = getattr(self, 'rows_' + screen)()
         idx = self.focusables()
@@ -755,33 +878,220 @@ class App:
             Row('divider'),
             Row('value', 'Game Folder', gd, on=lambda: self.open(gd),
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
-                      'nx2navi.ini and its logs in logs. Its saves folder is for saves to import.',)),
+                      'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
             self.saves_row(gd),
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
                       'after changing build tools, or if the game stopped starting.',)),
+            Row('value', 'Customize Launcher', art.THEMES[art.theme]['label'], 'arrow',
+                on=lambda: self.show('customize'),
+                desc=('Colour scheme, background picture, animations and sounds.',)),
             Row('value', 'Settings', '', 'arrow', on=lambda: self.show('settings'),
                 desc=('Updates, the game folder, the logs and uninstalling.',)),
         ]
 
-    def saves_row(self, gd):
-        """Import Saves: a save put into the game folder's saves folder, else a folder the player picks."""
-        ready = False
+    # ---- customize
+
+    def rows_customize(self):
+        names = list(art.THEMES)
+        custom = bool(self.settings.get('background'))
+
+        def scheme(d):
+            self.settings['theme'] = names[(names.index(art.theme) + d) % len(names)]
+            self.settings.save()
+            self.apply_look()
+
+        def dim(d):
+            now = self.settings.get('background_dim', 40)
+            at = min(range(len(DIMS)), key=lambda i: abs(DIMS[i] - now))
+            self.settings['background_dim'] = DIMS[max(0, min(len(DIMS) - 1, at + d))]
+            self.settings.save()
+            self.apply_look()
+
+        def animations(v):
+            self.settings['animations'] = bool(v)
+            self.settings.save()
+            self.cur_xy = None
+            self.slide = 0.0
+            self.apply_look()
+
+        def sounds(d):
+            keys = [k for k, _ in SOUND_LEVELS]
+            now = self.settings.get('sounds')
+            at = keys.index(now if now in keys else sound.DEFAULT_LEVEL)
+            self.settings['sounds'] = keys[max(0, min(len(keys) - 1, at + d))]
+            self.settings.save()
+            self.sounds.set_level(self.settings['sounds'])
+            self.sounds.play('select')   # the new loudness, heard at once
+
+        bg_desc = ('Use a picture of your own as the background.',)
+        if self.look_message:
+            bg_desc = (self.look_message,) + bg_desc
+        rows = [
+            Row('enum', 'Color Scheme', get=lambda: art.THEMES[art.theme]['label'],
+                left=lambda: scheme(-1), right=lambda: scheme(1),
+                desc=('The launcher\'s colours.',)),
+            Row('value', 'Background', Path(self.settings['background']).name if custom else 'Choose a Picture',
+                'arrow', on=self.choose_background, desc=bg_desc),
+        ]
+        if custom:
+            rows += [
+                Row('enum', 'Background Dimming', get=lambda: f'{self.settings.get("background_dim", 40)} %',
+                    left=lambda: dim(-1), right=lambda: dim(1),
+                    desc=('Darkens your picture so the text stays easy to read.',)),
+                Row('value', 'Remove Background', '', 'arrow', on=self.clear_background,
+                    desc=('Go back to the colour scheme\'s own background.',)),
+            ]
+        rows += [
+            Row('divider'),
+            Row('toggle', 'Animations', on=animations, get=lambda: bool(self.settings.get('animations')),
+                desc=('A gliding cursor, sliding screens and drifting sparks.',)),
+            Row('enum', 'Sounds', get=lambda: dict(SOUND_LEVELS).get(self.settings.get('sounds'),
+                                                                     dict(SOUND_LEVELS)[sound.DEFAULT_LEVEL]),
+                left=lambda: sounds(-1), right=lambda: sounds(1),
+                desc=('The game\'s select and back sounds. Low by default.',)),
+            Row('divider'),
+            Row('action', 'Back', on=lambda: self.show('home', self.home_row('Customize Launcher')), height=40,
+                desc=('Back to the main menu.',)),
+        ]
+        return rows
+
+    def choose_background(self):
+        start = self.settings.get('background')
+        start = str(Path(start).parent) if start and Path(start).parent.is_dir() else \
+            str(winsys.known_folder('pictures') or Path.home())
+        pattern = ' '.join('*' + t for t in picture.TYPES)
+        path = filedialog.askopenfilename(parent=self.root, title='Choose a background picture', initialdir=start,
+                                          filetypes=[('Pictures', pattern), ('All files', '*.*')])
+        if not path:
+            return
+        try:
+            picture.keep(path, self.bg_store, self.root)
+        except (picture.PictureError, OSError, MemoryError, ValueError) as e:
+            self.ctx.log(f'background: {path}: {e!r}')
+            self.look_message = str(e) if isinstance(e, picture.PictureError) else \
+                f'{Path(path).name} could not be used as the background: {e}'
+            self.sounds.play('back')
+            self.show('customize', self.focus)
+            return
+        self.look_message = ''
+        self.settings['background'] = str(Path(path))
+        self.settings.save()
+        self.apply_look()
+        self.show('customize', self.focus)
+
+    def clear_background(self):
+        self.settings['background'] = ''
+        self.settings.save()
+        try:
+            self.bg_store.unlink(missing_ok=True)
+        except OSError as e:
+            self.ctx.log(f'background: {e}')
+        self.look_message = ''
+        self.apply_look()
+        self.show('customize', 1)
+
+    def save_waiting(self, gd):
+        """A save put into the game folder's saves folder (a shared zip, a save folder), waiting to be imported."""
         if gd and Path(gd).is_dir():
             try:
                 saves.ensure_saves_dir(gd)
-                ready = saves.waiting(gd)[0] is not None
+                return saves.waiting(gd)[0] is not None
             except OSError:
                 pass
-        desc = ('Bring in a save from a Switch save backup, an emulator or another NX2navi install. Put it into the '
-                'saves folder of the game folder and select this row, or select this row and choose its folder.',
-                'Your current save is copied to the saves folder first.')
-        if self.save_message:
-            desc = (self.save_message,) + desc
-        return Row('value', 'Import Saves', 'From the Saves Folder' if ready else 'Choose a Folder',
-                   'orange_arrow' if ready else 'arrow', on=self.import_saves, desc=desc)
+        return False
 
-    def import_saves(self):
+    def saves_row(self, gd):
+        """Saves: the screen that exports and imports saves; orange while a save waits in the saves folder."""
+        ready = self.save_waiting(gd)
+        desc = ('Export your save into one zip, to attach to a bug report or give to another player, or import a '
+                'save someone shared, a Switch save backup or an emulator\'s save.',)
+        if ready:
+            desc += ('A save waits in the saves folder of the game folder: select this row, then Import a Save.',)
+        return Row('value', 'Saves', 'Import Waiting' if ready else '', 'orange_arrow' if ready else 'arrow',
+                   on=lambda: self.show('saves'), desc=desc)
+
+    # ---- saves
+
+    def export_dir(self):
+        d = self.settings.get('save_export_dir')
+        return Path(d) if d and Path(d).is_dir() else saves.default_export_dir()
+
+    def rows_saves(self):
+        gd = self.settings.get('game_dir')
+        ready = self.save_waiting(gd)
+        out = self.export_dir()
+        export_desc = ('Write your save into one zip file, to attach to a bug report or give to another player: every '
+                       'save slot and a note of the NX2navi and game versions, never your keys or game files. The '
+                       'folder opens with the zip selected.',)
+        if self.export_message:
+            export_desc = (self.export_message,) + export_desc
+        import_desc = ('Make a save someone shared (an NX2navi-save zip) your save: every slot is replaced. Put the zip '
+                       'into the saves folder of the game folder and select this row, or select this row and choose '
+                       'the zip.', 'Your current save is copied to the saves folder first.')
+        if gd and saves.pending_import(gd):
+            import_desc += ('A save imported in the game\'s menu waits for the game\'s next start; an import here '
+                            'replaces it.',)
+        folder_desc = ('Bring in a save folder: a Switch save backup, an emulator\'s save, another NX2navi install, or '
+                       'one save slot (a folder named slot_00 to slot_05: only that slot is replaced).',
+                       'Your current save is copied to the saves folder first.')
+        if self.save_message:
+            import_desc, folder_desc = (self.save_message,) + import_desc, (self.save_message,) + folder_desc
+
+        def report(v):
+            self.settings['export_with_log'] = bool(v)
+            self.settings.save()
+        return [
+            Row('value', 'Export Save', out.name or str(out), on=self.export_save, desc=export_desc),
+            Row('toggle', 'Add Log and Settings', on=report, get=lambda: bool(self.settings.get('export_with_log')),
+                desc=('On: the zip also holds the game\'s latest log (logs\\nx2navi.log) and its settings '
+                      '(nx2navi.ini), which show what happened and with which settings. Keep it on for a bug report.',
+                      'Off: the save alone, to give to another player.')),
+            Row('value', 'Export To', str(out), on=self.choose_export_dir,
+                desc=(f'Export Save writes into {out}.', 'Select this row to choose another folder.')),
+            Row('divider'),
+            Row('value', 'Import a Save', 'From the Saves Folder' if ready else 'Choose a Zip',
+                'orange_arrow' if ready else 'arrow', on=lambda: self.import_saves(folder=False), desc=import_desc),
+            Row('value', 'Import a Save Folder', 'Choose a Folder', 'arrow',
+                on=lambda: self.import_saves(folder=True), desc=folder_desc),
+            Row('value', 'Open Saves Folder', '', 'arrow',
+                on=lambda: gd and Path(gd).is_dir() and self.open(saves.ensure_saves_dir(gd)),
+                desc=('The saves folder of the game folder: saves to import, and a backup of each save an import '
+                      'replaced.',)),
+            Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
+        ]
+
+    def choose_export_dir(self):
+        d = filedialog.askdirectory(parent=self.root, title='Choose where Export Save writes its zip',
+                                    initialdir=str(self.export_dir()), mustexist=True)
+        if d:
+            self.settings['save_export_dir'] = str(Path(d))
+            self.settings.save()
+        self.show('saves', self.focus)
+
+    def export_save(self):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.export_message = 'Install the game first.'
+        else:
+            try:
+                r = saves.export_save(gd, self.export_dir(), bug_report=bool(self.settings.get('export_with_log')),
+                                      version=versions.display(build.built_version(gd) or self.layout.version),
+                                      log=self.ctx.log)
+            except (saves.SaveError, OSError) as e:
+                self.export_message = f'The save was not exported: {e}'
+            else:
+                extra = ' with the game\'s log and settings' if r['extras'] else ''
+                self.export_message = f'Exported {r["files"]} files{extra} to {r["path"]}.'
+                try:
+                    winsys.reveal(r['path'])
+                except OSError:
+                    pass
+        self.show('saves', self.focus)
+
+    def import_saves(self, folder):
+        """Import a Save (folder False): what waits in the saves folder, else a zip the player picks. Import a Save
+        Folder (folder True): a folder the player picks; the saves folder itself takes what waits there."""
         gd = self.settings.get('game_dir')
         if not gd or not Path(gd).is_dir():
             self.save_message = 'Install the game first.'
@@ -789,20 +1099,37 @@ class App:
             self.save_message = 'Quit the game first: it keeps its save open while it runs.'
         else:
             try:
-                folder = None
-                if saves.waiting(gd)[0] is None:
-                    folder = filedialog.askdirectory(parent=self.root, title='Choose the folder with the save',
-                                                     initialdir=str(saves.ensure_saves_dir(gd)), mustexist=True)
-                    if not folder:
+                src = None
+                if folder:
+                    src = filedialog.askdirectory(parent=self.root, title='Choose the folder with the save',
+                                                  initialdir=str(saves.ensure_saves_dir(gd)), mustexist=True)
+                    if not src:
                         return
-                r = saves.import_save(gd, folder, log=self.ctx.log)
+                elif saves.waiting(gd)[0] is None:
+                    src = filedialog.askopenfilename(parent=self.root, title='Choose the save to import',
+                                                     initialdir=str(self.export_dir()),
+                                                     filetypes=[('NX2navi save', '*.zip'), ('All files', '*.*')])
+                    if not src:
+                        return
+                r = saves.import_save(gd, src, log=self.ctx.log)
             except (saves.SaveError, OSError) as e:
                 self.save_message = f'The save was not imported: {e}'
             else:
-                self.save_message = ((f'Save imported into {r["slot"]}.' if r['slot'] else
-                                      f'Save imported: {r["files"]} files from {r["source"].name}.')
-                                     + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else ''))
-        self.show('home', self.focus)
+                self.save_message = self.imported_text(r)
+        self.show('saves', self.focus)
+
+    @staticmethod
+    def imported_text(r):
+        """What an import did, for the import rows' descriptions."""
+        m = r.get('manifest')
+        if m:
+            text = (f'Save imported from {r["source"].name} (exported {str(m.get("exported", ""))[:10]} with NX2navi '
+                    f'{m.get("nx2navi") or "?"}).')
+        elif r['slot']:
+            text = f'Save imported into {r["slot"]}.'
+        else:
+            text = f'Save imported: {r["files"]} files from {r["source"].name}.'
+        return text + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else '')
 
     def update_desc(self):
         r = self.release
@@ -895,6 +1222,7 @@ class App:
             self.render()
             return
         self.ctx.log(f'play: {exe}')
+        self.sounds.play('select')
         if self.settings.get('hide_while_playing'):
             self.root.withdraw()
         self.root.after(1000, self.watch_game)
@@ -1171,6 +1499,8 @@ class App:
         j = self.job
         winsys.keep_awake(False)
         self.ctx.log(f'job {j.kind}: {j.result} {j.error}')
+        if j.result in ('ok', 'failed'):
+            self.sounds.play('select' if j.result == 'ok' else 'back')
         if j.result == 'ok':
             if j.after == 'restart':
                 if winsys.restart(self.layout, ['--continue-update', versions.display(self.layout.version)]):
@@ -1254,10 +1584,66 @@ class App:
         self.root.after(60000, self.minute)
 
     def animate(self):
-        if self.cursor_frames:
-            self.cursor_k = (self.cursor_k + 1) % len(self.cursor_frames)
-            self.canvas.itemconfigure('cursor', image=self.cursor_frames[self.cursor_k])
-        self.root.after(250, self.animate)
+        """One step of everything that moves: the cursor on its way to the focused row and its breath, the screen
+        sliding into place, the sparks and Navi. Each moves by the time since the last step (the timer comes when
+        Tk gets to it, 16 to 50 ms apart), at most a tenth of a second's worth. With Animations off, and while the
+        window is hidden or minimised (the game is running), nothing moves and the timer runs slowly."""
+        moving = False
+        try:
+            now = time.perf_counter()
+            dt = min(0.1, max(0.0, now - self.anim_last))
+            self.anim_last = now
+            moving = self.animated() and self.root.state() == 'normal'
+            if moving:
+                self.anim_t += dt
+                self.step_slide(dt)
+                self.step_cursor(dt)
+                self.step_backdrop(dt)
+        except Exception as e:   # a drawing error must not stop the timer
+            self.ctx.log(f'animate: {e!r}')
+        self.root.after(FRAME_MS if moving else 300, self.animate)
+
+    def step_slide(self, dt):
+        if not self.slide:
+            return
+        left = self.slide * math.exp(-dt * 16)   # most of the way in a fifth of a second
+        if abs(left) < 1:
+            left = 0.0
+        self.canvas.move('dyn', int(left) - self.slide_applied, 0)
+        self.slide, self.slide_applied = left, int(left)
+
+    def step_cursor(self, dt):
+        c = self.canvas
+        if self.cursor_frames:   # one breath in 1.6 s
+            k = int(self.anim_t / 1.6 * len(self.cursor_frames)) % len(self.cursor_frames)
+            if k != self.cursor_k:
+                self.cursor_k = k
+                c.itemconfigure('cursor', image=self.cursor_frames[k])
+        if self.cur_xy and self.cur_target and self.cur_xy != self.cur_target:
+            (x, y), (tx, ty) = self.cur_xy, self.cur_target
+            f = 1 - math.exp(-dt * 22)   # there in about a tenth of a second
+            x, y = x + (tx - x) * f, y + (ty - y) * f
+            if abs(tx - x) < 0.6 and abs(ty - y) < 0.6:
+                x, y = tx, ty
+            self.cur_xy = (x, y)
+            c.coords('cursor', round(x) + self.slide_applied, round(y))
+
+    def step_backdrop(self, dt):
+        c, t = self.canvas, self.anim_t
+        for sp in self.sparks:   # up, swaying, and back in at the bottom once under the title band
+            sp['y'] -= sp['vy'] * dt
+            if sp['y'] < BAND[2] - 8:
+                sp['y'] = H + 8
+            c.coords(sp['id'], self.X(sp['x'] + math.sin(t * sp['rate'] + sp['phase']) * sp['sway']), self.X(sp['y']))
+            k = int((math.sin(t * sp['rate'] * 2.3 + sp['phase'] * 3) + 1) * 1.49)   # 0, 1 or 2: its twinkle
+            if k != sp['shown']:
+                sp['shown'] = k
+                c.itemconfigure(sp['id'], image=sp['pics'][k])
+        if self.navi_xy:   # Navi rises and sinks two pixels every 2.4 s, her halo pulses with her
+            x, y = self.navi_xy
+            c.coords('navi', x, y + round(math.sin(t * 2.6) * self.X(2)))
+            if self.halo:
+                c.itemconfigure('halo', image=self.halo[int(t / 2.4 * len(self.halo)) % len(self.halo)])
 
     # ---------------------------------------------------------------- drawing
 
@@ -1277,6 +1663,9 @@ class App:
         self.draw_status()
         self.draw_cursor()
         self.draw_desc()
+        self.slide_applied = int(self.slide)
+        if self.slide_applied:   # drawn in place, then put where the slide has got to (step_slide)
+            c.move('dyn', self.slide_applied, 0)
 
     def fit_rows(self, top, bottom):
         """The height of each row and the gap between rows (logical pixels) that end the rows above bottom. A screen
@@ -1317,7 +1706,7 @@ class App:
     def text(self, x, y, text, font, fill, anchor='w', shadow=True, width=0):
         c = self.canvas
         if shadow:
-            c.create_text(x + 1, y + 1, text=text, font=font, fill='#2a1e10', anchor=anchor, tags='dyn',
+            c.create_text(x + 1, y + 1, text=text, font=font, fill=P['text_shadow'], anchor=anchor, tags='dyn',
                           width=width)
         return c.create_text(x, y, text=text, font=font, fill=fill, anchor=anchor, tags='dyn', width=width)
 
@@ -1336,7 +1725,9 @@ class App:
             for k, (label, cb) in enumerate(parts):
                 px0 = x0 + k * (w + gap)
                 px1 = px0 + w if k < len(parts) - 1 else x1
-                img = self.sprite(('label', px1 - px0, y1 - y0), lambda a=px1 - px0, b=y1 - y0: art.label_cell(a, b, s))
+                lit = r is self.focused() and (r.kind == 'action' or getattr(r, 'pick', 0) == k)
+                img = self.sprite(('label', px1 - px0, y1 - y0, lit),
+                                  lambda a=px1 - px0, b=y1 - y0: art.label_cell(a, b, s, lit))
                 ring = max(1, int(round(s)))
                 c.create_image(px0 - ring, y0 - ring, anchor='nw', image=img, tags='dyn')
                 font = self.fit_font(self.f['action_big'] if r.h >= 50 else self.f['action'], label,
@@ -1347,7 +1738,8 @@ class App:
             return
         lw = X(LABEL_W)
         lx1 = x0 + lw
-        img = self.sprite(('label', lw, y1 - y0), lambda: art.label_cell(lw, y1 - y0, s))
+        lit = r is self.focused()
+        img = self.sprite(('label', lw, y1 - y0, lit), lambda: art.label_cell(lw, y1 - y0, s, lit))
         ring = max(1, int(round(s)))
         c.create_image(x0 - ring, y0 - ring, anchor='nw', image=img, tags='dyn')
         tx = x0 + X(16)
@@ -1364,8 +1756,8 @@ class App:
             size = X(22)
             b = self.sprite(('badge', size), lambda: art.badge(size, s))
             c.create_image(bx, (y0 + y1) // 2, anchor='w', image=b, tags='dyn')
-            c.create_text(bx + (size + 4) // 2, (y0 + y1) // 2, text='!', font=self.f['badge'], fill='#3a2208',
-                          tags='dyn')
+            c.create_text(bx + (size + 4) // 2, (y0 + y1) // 2, text='!', font=self.f['badge'],
+                          fill=P['badge_text'], tags='dyn')
         vx0 = lx1
         r.value_rect = (vx0, y0, x1, y1)
         c.create_rectangle(vx0, y0, x1 - 1, y1 - 1, fill=P['value'], outline=P['value_border'], width=1, tags='dyn')
@@ -1396,7 +1788,7 @@ class App:
             fw = int((ix1 - ix0) * max(0.0, min(1.0, r.fraction)))
             if fw > 2:
                 self.orange(ix0, iy0, ix0 + fw, iy1)
-            self.canvas.create_text(cx + 1, cy + 1, text=r.value, font=vfont, fill='#1a120a', tags='dyn')
+            self.canvas.create_text(cx + 1, cy + 1, text=r.value, font=vfont, fill=P['band_shadow'], tags='dyn')
             self.canvas.create_text(cx, cy, text=r.value, font=vfont, fill=P['on_text'], tags='dyn')
         elif r.style == 'orange_arrow':
             self.orange(ix0, iy0, ix1, iy1)
@@ -1410,7 +1802,7 @@ class App:
             c.create_image(sx + label_w + X(10), cy, anchor='w', image=img, tags='dyn')
         elif r.style == 'arrow':
             cw, ch = X(9), X(12)
-            img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, '#d9ccae'))
+            img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, P['chevron_dim']))
             c.create_image(x1 - X(16), cy, anchor='e', image=img, tags='dyn')
             if r.value:   # a value, centred in the cell's room left of the arrow
                 right = x1 - X(16) - cw - X(10)
@@ -1442,6 +1834,7 @@ class App:
         r = self.focused()
         self.cursor_frames = []
         if not r or not r.rect:
+            self.cur_xy = self.cur_target = None
             return
         if r.kind == 'pair' and r.parts:
             box = r.parts[getattr(r, 'pick', 0)][0]
@@ -1453,7 +1846,14 @@ class App:
         frames, mg = self.glow(x1 - x0, y1 - y0)
         self.cursor_frames = frames
         self.cursor_k %= len(frames)
-        self.canvas.create_image(x0 - mg, y0 - mg, anchor='nw', image=frames[self.cursor_k], tags=('dyn', 'cursor'))
+        # The cursor is drawn where it has got to and animate takes it on to the row (step_cursor); on a new screen,
+        # while one slides in and with Animations off it stands on the row at once.
+        target = (float(x0 - mg), float(y0 - mg))
+        glide = self.animated() and self.cur_xy and self.cur_screen == self.screen and not self.slide
+        self.cur_xy = self.cur_xy if glide else target
+        self.cur_target, self.cur_screen = target, self.screen
+        self.canvas.create_image(round(self.cur_xy[0]), round(self.cur_xy[1]), anchor='nw',
+                                 image=frames[self.cursor_k], tags=('dyn', 'cursor'))
 
     def glow(self, w, h):
         key = ('glow', w, h)
@@ -1538,7 +1938,7 @@ class App:
                 y += X(22)
             elif kind == 'bullet':
                 (text,) = args
-                c.create_rectangle(x0 + padx + X(1), y + X(8), x0 + padx + X(6), y + X(13), fill='#c99a45',
+                c.create_rectangle(x0 + padx + X(1), y + X(8), x0 + padx + X(6), y + X(13), fill=P['bullet'],
                                    outline='', tags=('dyn', 'desc'))
                 tid = c.create_text(x0 + padx + X(16), y, text=text, font=self.f['value'], fill=P['desc_text'],
                                     anchor='nw', width=inner - X(16), tags=('dyn', 'desc'))
@@ -1566,7 +1966,7 @@ class App:
         hb = max(X(60), height)
         key = ('desc', w, hb // 4)
         if key not in self.sprites:
-            img, pad = art.desc_box(w, hb, self.s)
+            img, pad = art.desc_box(w, hb, self.s, self.see_through())
             self.sprites[key] = (art.photo(self.root, img), pad)
         pic, pad = self.sprites[key]
         bid = c.create_image(x0 - pad, top - pad, anchor='nw', image=pic, tags='dyn')

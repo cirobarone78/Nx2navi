@@ -44,6 +44,7 @@ void vk_caps_driver(VkPhysicalDevice p) {
     // AMD split RDNA 1 and 2 off into a driver branch of their own; its driverInfo reads
     // "26.10.1 (AMD proprietary shader compiler)" where the RDNA 3 and 4 driver names LLPC.
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
+    vk_caps.amd_llpc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !vk_caps.amd_sc;
     vk_caps.mesa = drv.driverID == VK_DRIVER_ID_MESA_RADV || drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
                    drv.driverID == VK_DRIVER_ID_MESA_NVK;
 }

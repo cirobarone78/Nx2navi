@@ -769,7 +769,7 @@ static void heapdef_overlay(void) {
 // overlay that replaces the pack (a mod's camera stays), else the RomFS original; the dictionary is the RomFS's own.
 #define CAMPACK "Pack/Actor/PlayerCamera.pack.zs"
 static void camera_overlay(void) {
-    if (cam_speed_wanted() == 1.0f) return;
+    // also at factor 1: cam_pack_build reads the game's own values, which a change during the run needs
     static const char keeps[] = "the camera keeps its own speed";
     Overlay *base, *dic_base;
     size_t n, dn;
@@ -787,7 +787,17 @@ static void camera_overlay(void) {
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
 // romfs-patches-pc keeps that name, but at a game resolution of another shape than 16:9 its files come from pc_dir,
 // romfs-patches-pc-<w>x<h> (overlay_init).
-#define PROMPTS_FOLDERS 5   // Xbox and PlayStation by position and by label, then PC
+#define PROMPTS_PADS 3      // the pad styles: Xbox, PlayStation, Steam Deck
+#define PROMPTS_FOLDERS (PROMPTS_PADS * 2 + 1)   // each pad style by position and by label, then PC
+// A style's name in the log and its NX2NAVI_PROMPTS value.
+static const char *prompts_style(int pick) {
+    return pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation"
+           : pick == PROMPTS_STEAMDECK ? "Steam Deck" : "Xbox";
+}
+static const char *prompts_value(int pick) {
+    return pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation"
+           : pick == PROMPTS_STEAMDECK ? "steamdeck" : "xbox";
+}
 static struct { const char *name; int ready; } prompts_folders[PROMPTS_FOLDERS];
 static const char *prompts_wanted, *prompts_loaded;
 static int prompts_off;
@@ -830,7 +840,7 @@ static void overlay_init(void) {
     // A game resolution that is not 16:9 takes romfs-patches-<w>x<h> instead when it is there: the same overlay with
     // the UI laid out for that shape (make_romfs_patches.py --aspect), when the game version has the camera aspect patch
     // the layout goes with (res_wants_wide_overlay).
-    // With prompts = xbox or playstation, that pad's prompts folder for the pad layout in its place
+    // With prompts = xbox, playstation or steamdeck, that pad's prompts folder for the pad layout in its place
     // (input_prompts_folder): the game's button font and interface textures with that pad's buttons drawn in
     // (tools/pad_prompts.py). The game reads the font and the archives once at boot, so
     // the prompts stay until restart even though the layout itself changes live. Each folder replaces romfs-patches as
@@ -857,7 +867,7 @@ static void overlay_init(void) {
         }
     }
     static const char *const layouts[2] = {"nintendo", "xbox"};   // each pad's two folders, then the PC one
-    static const int pads[2] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION};
+    static const int pads[PROMPTS_PADS] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION, PROMPTS_STEAMDECK};
     for (int i = 0; i < PROMPTS_FOLDERS; i++) {
         int pc = i == PROMPTS_FOLDERS - 1;
         const char *name = pc ? input_prompts_folder(PROMPTS_PC, 0) : input_prompts_folder(pads[i / 2], layouts[i % 2]);
@@ -873,7 +883,7 @@ static void overlay_init(void) {
     }
     const char *layout = cfg_value("NX2NAVI_PAD_LAYOUT");
     int pick = input_prompts_pick(cfg_get("NX2NAVI_PROMPTS"), layout), shaped = wide && pick == PROMPTS_PC;
-    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation" : "Xbox";
+    const char *style = prompts_style(pick);
     prompts_wanted = input_prompts_folder(pick, layout);
     prompts_off = !prompts_wanted                         ? ROMFS_PROMPTS_OK
                   : wide && !shaped                       ? ROMFS_PROMPTS_SHAPE
@@ -895,7 +905,7 @@ static void overlay_init(void) {
         }
     } else if (prompts_wanted) {
         rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay",
-               pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation" : "xbox",
+               prompts_value(pick),
                prompts_off == ROMFS_PROMPTS_SHAPE     ? (shaped ? "the game resolution has no romfs-patches-pc-<w>x<h> "
                                                                   "(tools/make_romfs_patches.py --prompts pc --aspect)"
                                                              : "the game resolution takes its own UI layout")
@@ -1158,6 +1168,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
     open_note(i, p);
+    if (!strcasecmp(p, CAMPACK)) cam_pack_opened();   // its values come into memory at the start's factor (camera_speed.c)
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {

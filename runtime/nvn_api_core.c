@@ -69,6 +69,7 @@ __attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uin
 }
 __attribute__((weak)) int gfx_replay_async(void) { return 0; }
 __attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
+__attribute__((weak)) void gfx_event_signalling(const void *value, uint32_t to) { (void)value, (void)to; }
 
 // ---------- pools: GPU window (section 3.1) and the address index
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;   // guards gva and index
@@ -540,7 +541,10 @@ NVN_API(nvnEventGetValue) { ret_x(c, *((const ev_t *)arg_p(c, 0))->val); }
 NVN_API(nvnEventSignal) {
     const ev_t *e = arg_p(c, 0);
     uint32_t v = (uint32_t)arg_x(c, 2);
-    if ((uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v;
+    int add = (uint32_t)arg_x(c, 1) == NVN_EVENT_SIGNAL_MODE_ADD;
+    // before the write: the replay tells a signal that came after a submission's copies from one before them
+    gfx_event_signalling((const void *)e->val, add ? *e->val + v : v);
+    if (add) *e->val += v;
     else *e->val = v;
 }
 
@@ -660,6 +664,9 @@ NVN_API(nvnQueueSubmitCommands) {
     // point). Copies of the data at submit made it worse, a mix of two frames' versions.
     // NX2NAVI_SUBMIT_FINISH=<mask>: bit i waits after the i-th submission of a frame (default 0x1); a plain 1 waits
     // after every submission, 0 never.
+    // The wait is for the submission's passes, which is what the rewrite races with: exec_wait leaves out the
+    // write-backs of what they wrote (vk_sync.c exec_tl), which nothing here needs before the game goes on. The fences
+    // the game itself waits on cover them as before.
     static long long finish_mask = -2;
     if (finish_mask == -2) {
         const char *e = cfg_get("NX2NAVI_SUBMIT_FINISH");
@@ -667,7 +674,7 @@ NVN_API(nvnQueueSubmitCommands) {
         if (e && *e && finish_mask == 1 && !(e[0] == '0' && (e[1] == 'x' || e[1] == 'X'))) finish_mask = -1;   // "1": all
     }
     int idx = nvn_submits_in_frame++;
-    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->fence_wait(f, UINT64_MAX);
+    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->exec_wait(f, UINT64_MAX);
 }
 
 // The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
@@ -675,7 +682,7 @@ NVN_API(nvnQueueSubmitCommands) {
 static void obs_release_read(Cpu *c) {
     uint64_t lr = c->x[30], obj = c->x[19];
     rt_original(c);
-    if (lr != 0x70008c70c8ull) return;
+    if (rt_game_version != 121 || lr != 0x70008c70c8ull) return;   // the address is 1.2.1's: no other build has this producer there
     static int on = -1;
     if (on < 0) {
         on = cfg_bool("NX2NAVI_LOD_GUARD");

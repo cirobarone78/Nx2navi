@@ -232,6 +232,12 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         sl::DLSSGOptions o{};
         o.mode = n ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
         o.numFramesToGenerate = n ? (uint32_t)n : 1;
+        // Generation goes off for every menu, cutscene and frame without depth and motion, and on again after it. Off
+        // frees the generator's resources unless this flag is set, and on allocates them again inside the present, with
+        // the queue lock held: a frame of 100 to 150 ms each time, the submitting thread waiting for that lock. With
+        // the flag, off only suspends. Whether frame generation runs at all is fixed for the run (vk_dlssg.c), so
+        // nothing is held for long that would otherwise be given back; Streamline frees it at shutdown.
+        o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         sl::Result r = p_dlssg_options(vp, o);
         if (n) say("dlssg: frame generation on, %dx (%d generated per rendered frame) (%d), output %ux%u", n + 1, n, (int)r, out_w, out_h);
         else say("dlssg: frame generation off (%d), output %ux%u", (int)r, out_w, out_h);

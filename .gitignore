@@ -35,6 +35,11 @@ __pycache__/
 *.bnsh
 *.webm
 
+# The runtime's own shaders compiled to SPIR-V (tools/build_shaders.py builds them from runtime/shaders/ and the
+# tools/make_*.py assemblers when the game is built; tools/check_content.py refuses them in a commit)
+/runtime/*_spv.h
+*.spv
+
 # Build outputs
 *.exe
 *.dll

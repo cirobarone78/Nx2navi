@@ -70,7 +70,7 @@ from pathlib import Path
 
 import check_isa
 import romfs_index
-from build_shaders import stale as stale_shaders
+import build_shaders
 from check_content import GENERATED_MARKER
 
 WIN = os.name == 'nt'
@@ -899,9 +899,7 @@ def main():
     copy_romfs_patches(args.version, out)
     global RUNTIME
     RUNTIME = (args.runtime or RUNTIME).resolve()
-    stale = stale_shaders(RUNTIME)
-    if stale:
-        sys.exit(f'{stale[0]}: its SPIR-V header no longer matches; run python tools/build_shaders.py')
+    build_shaders.build(RUNTIME)   # the runtime's own shaders: the headers the sources below include, when missing or stale
     skip = {s for s in args.skip_runtime.split(',') if s}
     main_out = (ROOT / 'build' / args.version).resolve()
     pairs = None

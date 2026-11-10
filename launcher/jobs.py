@@ -27,7 +27,7 @@ STEPS = {
                                                  'change are kept from the last build.'),
     'shaders': ('Prepare the Shaders', "Building the game's known shaders for your graphics card ahead of time, so "
                                        'play stops for them far less often.'),
-    'prompts': ('Draw the Button Prompts', 'Drawing the Xbox, PlayStation and keyboard and mouse button prompts the '
+    'prompts': ('Draw the Button Prompts', 'Drawing the Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts the '
                                            "game's Controls menu offers under Button prompts."),
     'scan': ('Check the Game Files', 'Decompressing every game file once to find damage, and standing in for damaged '
                                      'textures so the world still loads.'),

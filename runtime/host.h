@@ -23,6 +23,7 @@ void rt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rt_vlogf(const char *fmt, va_list ap);
 void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
+void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
        RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
 extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
@@ -59,6 +60,7 @@ int perf_lock_holds_on(void);                   // NX2NAVI_LOCK_TIME
 void perf_lock_hold(void *site, uint64_t ns);   // a lock held ns from site (vk_texture.c, holds over 1 ms)   // NX2NAVI_LOCK_TIME: this thread's lock waits go into the frame-time summary
 extern void (*perf_rec_waits)(uint64_t *full_ns, uint64_t *drain_ns);   // set by the back end (vk_rec.c totals)
 void perf_present(uint64_t frame);
+void perf_cpu_start(void);   // the process's logical processors (NX2NAVI_CACHE_DIE, NX2NAVI_ONE_PER_CORE), at start
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
@@ -183,6 +185,20 @@ int mem_frozen(uint64_t a);                                // the 2 MiB region o
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
+// NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
+// NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
+int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
+                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
+uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx);
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t out[][2], int max);
+int mem_lazy_armed(uint64_t a, uint64_t n);
+void mem_lazy_window(int open);
+void mem_lazy_release(uint64_t a, uint64_t n);
+void mem_lazy_report(uint64_t frame, uint64_t skipped);
+int mem_lazy_pick(uint64_t *addr, int max);                // test: addresses of armed pages
+int mem_probe(uint64_t a, uint64_t n);                     // the 2 MiB regions inside [a, a+n) fault on their next access
+int mem_probing(void);                                     // the probe is on
+void mem_probe_report(uint64_t frame);                     // logs the accesses since the last report
                                                            // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 
@@ -207,9 +223,10 @@ extern const int rt_exefs_sha256_count;
 extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
 extern const unsigned long long rt_app_pool_bytes;        // the title's application memory pool (GetInfo 6)
 extern const int rt_nvn_api_version[2];                   // NVN_DEVICE_INFO_API_{MAJOR,MINOR}_VERSION the title requires
-extern const int rt_game_version;                          // the game build: 110 (1.1.0), 121 (1.2.1) or 143 (1.4.3)
+extern const int rt_game_version;                          // the game build: 111 (1.1.1, make_game.py), 110 (1.1.0), 121 (1.2.1) or 143 (1.4.3)
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
 #define RT_V110 (rt_game_version == 110)                    // 1.1.0: its own boot constants and data slots
+#define RT_V111 (rt_game_version == 111)                    // 1.1.1: its own boot constants (boot.c)
 #define RT_V143 (rt_game_version >= 143)
 
 // ---- kernel (kernel.c)
@@ -275,6 +292,8 @@ float cam_speed_applied(void);                             // the factor in effe
 int cam_pack_build(const void *in, size_t n, const void *zsdic, size_t zsdic_n, void **out, size_t *out_n);
                                                            // Pack/Actor/PlayerCamera.pack.zs with the camera speeds
                                                            // multiplied, malloc'd; 0 = factor 1 or cannot (logged)
+void cam_pack_opened(void);                                // romfs.c: the game opened the camera's pack
+void cam_speed_tick(void);                                 // every present: a changed setting goes into the game's memory
 void cam_pack_served(void);                                // romfs.c serves the multiplied pack
 // ---- game resolution (resolution.c): NX2NAVI_OUTPUT_RES, NX2NAVI_RENDER_SCALE
 uint64_t res_heap_extra_bytes(void);                       // added to the application pool (mem_init), 2 MiB steps
@@ -365,7 +384,13 @@ int probe_window(void);                                    // gfx_window_probe.c
 int probe_shader(void);                                    // gfx_shader.c
 int probe_census_dir(char *dir, size_t n);                 // gfx_shader_probe.c: build/<version>/shaders for the probes
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
+int probe_zstd(void);                                      // ov_zstd.c
+int probe_gamepad(void);                                   // input.c
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
+// vk_device.c: the drivers' own shader caches beside the exe (MESA_SHADER_CACHE_DIR, on NVIDIA's Linux driver
+// __GL_SHADER_DISK_CACHE_PATH and _SIZE) in the environment, once; before any thread can load a Vulkan driver
+void vk_driver_cache_env(void);
 int vk_pipeline_spirv_selftest(void);                      // vk_pipeline.c: --selftest, the SPIR-V rewrites without a device

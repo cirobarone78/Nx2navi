@@ -33,6 +33,30 @@ Display: the launcher decodes it from the player's dump or built game into `data
 `runtime/menu_assets.c` does for the in-game menu) and uses the system's interface font until then. Every picture is
 drawn in code (`launcher/ui/art.py`); no texture, font or sound of the game is in the repository or the release.
 
+Customize Launcher (on the home screen) makes the look the player's own:
+
+- Color Scheme: Forest (the colours above), Volcano, Lake, Desert, Temple and Shadow. A scheme is the first one with
+  its woods, accents, backdrop and glow turned to other hues (`art.THEMES`, `art.recolor`), so each keeps the same
+  light and dark steps and the same readable text. The window is drawn again in the new colours at once. The names
+  are plain words, not the game's.
+- Background: a picture of the player's own behind the panels instead of the scheme's backdrop (`launcher/ui/picture.py`:
+  PNG, JPEG, WebP, BMP, GIF or TIFF, read with Pillow). It is cut to the window's shape around its middle and kept as
+  `data/background.npy`, so the launcher needs the file no more; Background Dimming darkens it (0 to 80 %) for the
+  text over it, the list panel and the description box turn a little see-through, and Remove Background brings the
+  scheme's backdrop back.
+- Animations (on by default): the cursor glides from row to row, a new screen slides into place, sparks drift up
+  over the backdrop and Navi bobs in the title band with a pulsing halo (`App.animate`). They move by the time that
+  passed, stand still while the window is hidden or minimised, and Off stops them all.
+- Sounds (Low by default; Off, Medium or High): two of the game's own interface sounds, the decide and cancel sounds
+  of its menus, when a row is chosen or a choice changes and when the player goes back. The launcher decodes them
+  from the player's built game or dump into `data/cache/sounds` (`gamefiles.extract_sounds`:
+  `Sound/Resource/Stream/SE_Sys_Do00.bwav` and `SE_Sys_Cancel00.bwav`, the files `runtime/menu_sound.c` plays in the
+  in-game menu). No sound is in the repository, the release or the setup, and the launcher makes none of its own:
+  it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
+  (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
+
+The choices are `theme`, `background`, `background_dim`, `animations` and `sounds` in `data/launcher.json`.
+
 Navi (`art.NAVI`, 22 x 21 pixels, drawn in whole pixels at every size) is also the icon of `NX2navi.exe`,
 `NX2navi-Setup.exe`, the window and its taskbar button (`art.navi_ico`, written into the release by
 `tools/make_launcher.py`). The window sets that icon on itself, and the setup's shortcuts carry the window's taskbar
@@ -40,8 +64,10 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Import Saves,
-Rebuild the Game, Settings); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
+last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
+Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
+Dimming and Remove Background, Animations, Sounds, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
+Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
 Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
 
@@ -65,9 +91,11 @@ app/<version>/           launcher/, runtime/, recomp/, tools/, bin/nx2navi_xlate
 pydeps/                  zbic, downloaded from PyPI on this PC
 toolchain/msys64/ucrt64  MSYS2's clang and libraries, downloaded from the MSYS2 repository on this PC
 toolchain/pkgs/          the downloaded package files
-data/launcher.json       settings; data/logs/launcher.log (and crash.log); data/cache/fonts
+data/launcher.json       settings; data/logs/launcher.log (and crash.log); data/cache/fonts and data/cache/sounds
+                         (the game's font and interface sounds, decoded from the player's game);
+                         data/background.npy (the player's background picture, fitted to the window)
 game/                    the built game, unless another folder was chosen (its layout: README-BuildKit.md), with
-                         saves/ for saves to import (below)
+                         saves/ for saves to import and the backups imports make (below)
 ```
 
 A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the toolchain then goes to
@@ -105,7 +133,7 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    3 minutes without a count moving it says so, and that the step is still running.
 4. **Draw the Button Prompts**, only when the version holds button art (`app/<version>/prompt-art`, a release made
    with `--prompt-art`; `build.has_prompt_art`): make_game.py's last step runs `tools/pad_prompts.py` on that art
-   and writes the Xbox, PlayStation and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
+   and writes the Xbox, PlayStation, Steam Deck and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
    30 s), which the game's Controls > Button prompts loads. The keyboard and mouse prompts show the keys of
    `nx2navi.ini`'s `bind_` lines, so Rebuild the Game after rebinding keys draws them again; the step's key names
    all it reads (the RomFS, the art, the tools, those lines), so it runs again only when one changed or a folder is
@@ -196,8 +224,9 @@ The stub swaps `python.next` in while no Python runs, then starts the new versio
      The lifted code includes only `cpu.h` and `simd.h`: a change there compiles it all again, which is rare.
    - An object an earlier version recorded under its own key form is taken over when its compile and its files are
      the same (`ObjectCache.adopt`): 0.6.0's keys, and 0.5.0's, which named the kit's folder. An update keeps the
-     x86-64 level the game's code was compiled for (`build-cache/obj/lifted-build.json`; generic for the objects of
-     0.5.0 and earlier); Rebuild the Game compiles it for this processor's (`--retune`).
+     x86-64 level the game's code was compiled for (`build-cache/obj/lifted-build.json`; generic for the lifted
+     objects of 0.5.0 and earlier); Rebuild the Game compiles it for this processor's (`--retune`), and runs the
+     compile step for that even when nothing else changed (`retune_due`).
 6. **Swap In the New Build**: lld links `ocarina.exe.new`, which replaces `ocarina.exe` only once it is complete. A
    failed rebuild leaves the old build playable; Rebuild the Game tries again.
 7. **Prepare the Shaders** is skipped once shaders were prepared before (`shader-prepared.bin`): the game keeps using
@@ -213,15 +242,53 @@ When the new version fails to start (exit code 86 from `start.pyw`, or any error
 runs. Keep Build Cache off deletes the lifted C and the objects (about 5 GB) after each build but keeps
 `build-cache/state.json`, so updates still rebuild without the dump (compiling everything).
 
-## Importing a save
+## Sharing a save
 
-Import Saves (home, under Game Folder; `launcher/saves.py`) makes another save the game's own. The game folder has
-a `saves` folder with a README for it: a save put there (its files, or the folder that holds them) is taken first,
-and the row then reads "From the Saves Folder"; otherwise selecting the row asks for the folder. It recognises a
-Switch save backup (the save's files), an emulator's save folder (nested folders named by user and title ids), and
-another NX2navi game folder or its profile folder (the account folder inside). A folder with `progress.sav` at its
-top is one save slot: it replaces that slot (`slot_00` to `slot_05`, by the folder's name, else `slot_00`) and the rest
-of the current save stays. A folder with more than 4,000 files or 1 GB is refused as picked by mistake.
+A bug report from a place in the game the developer has not reached yet is quickest to reproduce with the reporter's
+save. Saves (home, under Game Folder; `launcher/saves.py`) and the Saves rows of the game's settings menu (Game tab;
+`runtime/save_share.c`) write and read the same zip.
+
+**Export.** Export Save writes `NX2navi-save-<date>_<time>.zip` into the Downloads folder (Export To chooses another
+folder) and opens the folder with the zip selected, ready to drag into a bug report. With Add Log and Settings on (the
+default) it is `...-bug-report.zip` and also holds the game's latest log and its `nx2navi.ini`. In the game, Export
+save and Export save for a bug report write the same two zips into Downloads; the second holds the log of the run in
+progress. The zip:
+
+```
+manifest.json   format "nx2navi-save", format_version 1, the game, its title id and version (1.1.1), the NX2navi
+                version, the export time (UTC), exported_by (launcher or game), the number of save files, bug_report
+save/           the save the game would load next (a finished commit still waiting in profile/save-tx, else
+                profile/save/<account>): account.sav, option.sav, slot_00 to slot_05
+bug-report/     nx2navi.log and nx2navi.ini, in a bug report
+```
+
+Key files (any `*.keys`, also one left in a save folder) and game files never go in.
+
+**Import.** Import a Save takes such a zip: put it into the game folder's `saves` folder (the row then reads "From the
+Saves Folder", and the home's Saves row "Import Waiting") or select the row and choose it. Before anything changes it
+checks the manifest (the format, a format version it knows, the game's title id: a newer NX2navi's zip or another
+game's save is refused), every path (inside the save, no links), the size (4,000 files, 256 MB), that the save is
+this game's (`account.sav`, `option.sav` or a `slot_NN/progress.sav`), and each file's CRC as it unpacks. Then the
+zip's save replaces the whole save, every slot, as a save folder does (below): the save the game would load now goes
+to `saves/backup <date time>` first. It refuses while the game runs. A zip taken from the saves folder moves to
+`saves/imported <date time>`.
+
+The game's menu imports at the next start instead of at once: the game keeps its progress in memory and writes it back
+at its next save, over files replaced under it, and the save's working copy is made when the game mounts its save.
+Import a save checks the zip as the launcher does and puts its save in `profile/save-import`; the row then reads "at
+next start", and Cancel the import drops it. The next start (the menu's Restart, or quitting and starting again)
+copies the current save to `saves/backup <date time>` and makes the import the save before the game reads it
+(`runtime/fs_host.c` `import_pending`), and the menu says where the old save went. An import in the launcher replaces
+one still waiting from the menu.
+
+## Importing a save folder
+
+Import a Save Folder (Saves) makes another save the game's own. A save put into the game folder's `saves` folder (its
+files, or the folder that holds them) is taken first by Import a Save; otherwise this row asks for the folder. It
+recognises a Switch save backup (the save's files), an emulator's save folder (nested folders named by user and title
+ids), and another NX2navi game folder or its profile folder (the account folder inside). A folder with `progress.sav`
+at its top is one save slot: it replaces that slot (`slot_00` to `slot_05`, by the folder's name, else `slot_00`) and
+the rest of the current save stays. A folder with more than 4,000 files or 1 GB is refused as picked by mistake.
 
 The game keeps its save in `profile/save/<account>`, named after `profile/account.uid` (made as the game would when
 it never ran). The import copies the save the game would load now (a finished commit still waiting in
@@ -310,7 +377,9 @@ certificates made with the `openssl` command), the GitHub and URL feeds, staging
 pruning, unsafe archives, the background update (a release staged beside the running version without switching, the
 `staged.json` marker, a staged release installed after a restart, no install while the game runs, the install once
 it exited, nothing by itself with Install Updates Automatically off, a failed staging tried again after the next
-check), the font decoding on a system font wrapped like the game's, `make_game.py` on a synthetic
+check), the font decoding on a system font wrapped like the game's, the look (every colour scheme complete, the
+background picture cut to the window's shape and kept, the sound effects as WAVs and low by default), `make_game.py`
+on a synthetic
 `.nup` (events, skipped steps, `--rebuild` without the dump, step keys, the shaders key following the translator the
 build uses), the RomFS step beside the lift and compile
 and its failure stopping the build, the prompts step with a stand-in prompt tool (when it runs again, and that it
@@ -318,7 +387,10 @@ makes no other step run), the button art a release copies and the packages and t
 the compile step's object cache with the system's C compiler and its
 largest-first order, its windres call under folders with spaces in their names, CLANG64's clang in the lock and the
 install, the save import (the account folder, the save folders it recognises, backup, the commit journal, the saves
-folder, refusals), the install job with a fake
+folder, refusals), the shared save's zip (export of the save the game would load, the bug report files, no key
+files, the import of a zip with its backup, a zip in the saves folder, the menu's waiting import dropped, the zips it
+refuses: no manifest, another format or game, a newer format, paths outside the save, links, damage), the install
+job with a fake
 `make_game.py` (with and without the prompts row), and the window's selftest when a display is there.
 
 ## Requirements and limits

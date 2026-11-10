@@ -695,7 +695,7 @@ static void update_build(Update *u, int first) {
     memcpy(w, &h, sizeof h);
     w += sizeof h + h.behavior + h.memory_pools + h.voice_resources;
     for (int i = 0; i < p->voice_count; i++) {
-        AudrenVoiceIn v = {.id = (uint32_t)i};
+        AudrenVoiceIn v = {0};   // the client leaves the id of an unused slot zero
         if (i == 0) {   // one PCM16 voice with a 100 ms buffer: consumed after 20 frames
             v = (AudrenVoiceIn){.id = 0, .is_new = (uint8_t)first, .in_use = 1, .play_state = PLAY_STARTED,
                                 .sample_format = FMT_PCM16, .sample_rate = 48000, .channel_count = 1, .pitch = 1,
