@@ -613,6 +613,8 @@
 # Default: every one off.
 # The two Wolfos in the Forest Temple's first room appear when Link is about 4 m away, not 12 m.
 # restore_wolfos_ambush = 0
+# The long sinking platform of the Fire Trial in Ganon's Castle sinks at the original's pace, about 1.6 times as fast.
+# restore_fire_trial_sinking = 0
 
 [diagnostics]
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
