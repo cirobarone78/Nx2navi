@@ -2155,8 +2155,8 @@ static int adv_claim(const Adv *a, int h, int p, const AdvEpoch *e, int64_t *cla
 }
 
 // What pool p holds in honest game g's view by the ledger: the claims, pickups and uses in g's epoch of the honest games
-// it counts. held: only those whose record g holds with all their pickups and uses (a record still on its way is lag,
-// not damage; at the end every record has arrived). 0 when none counts.
+// it counts. held: only those whose record g holds as its owner holds it now (a record still on its way is lag, not
+// damage; at the end every record has arrived). 0 when none counts.
 static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
     int64_t b[ADV_H], gg[ADV_H], s[ADV_H], c, debt;
     int n = 0;
@@ -2165,9 +2165,11 @@ static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
         const AdvLed *L = &a->led[h][p];
         const AdvEpoch *e = L->cur.ep == ep ? &L->cur : L->prev.valid && L->prev.ep == ep ? &L->prev : NULL;
         if (!e || !adv_counts(a, g, h) || !adv_claim(a, h, p, e, &c, &debt)) continue;
-        int32_t rb;
-        uint32_t rg, rs;
-        if (held && !(coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs) && rg == e->gain + debt && rs == e->spend)) continue;
+        int32_t rb, ob;
+        uint32_t rg, rs, og, os;
+        if (held && !(coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs) &&
+                      coop_sync_own_record(a->h[h].eng, adv_pool_hash[p], &ob, &og, &os) && rb == ob && rg == og && rs == os))
+            continue;
         b[n] = c, gg[n] = (int64_t)e->gain + debt, s[n] = e->spend, n++;
     }
     if (n) *out = adv_sum(b, gg, s, n, adv_lim(p)).value;
@@ -2485,11 +2487,15 @@ static void adv_replay(Adv *a) {
 // ---- the run
 
 // A pool reset as docs/coop.md says to make one: the maker removes the hostile keys it admitted first; then, after a
-// quiet moment, the ledger takes its carry and the maker resets (sometimes twice).
+// quiet moment in which the players who ask accept the room as it is now (a carry counts the keys a game counts when
+// the reset reaches it), the ledger takes its carry and the maker resets (sometimes twice).
 static void adv_reset(Adv *a) {
     for (int j = 0; j < a->nmkid; j++)
         if (coop_sync_accepted_key(a->h[0].eng, a->mkid[j])) adv_remove(a, j);
     a->now = run_by(&a->net, a->now, 1500, 16);
+    adv_ask_all(a);
+    a->now = run_by(&a->net, a->now, 500, 16);
+    adv_ask_all(a);
     adv_carry(a);
     a->pool_epoch += (uint32_t)coop_sync_reset_pools(a->h[0].eng);
     if (adv_below(a, 3) == 0) {
