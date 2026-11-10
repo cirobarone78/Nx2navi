@@ -26,6 +26,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "perfmon.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -97,14 +98,68 @@ void vk_present_drain(void) {
     perf_end(PERF_DRAIN, p0);
 }
 
+// NX2NAVI_FRAME_HOLD_MS (default 120; 0 = off): a frame whose draws were skipped because a shader or pipeline was
+// still building (vk_exec_draw.c pending_draws) is not shown: the previous picture stays on screen until a frame is
+// complete again. Such a frame lacks what was skipped, which showed for a frame or two as a black or unlit picture with
+// the interface intact (a lighting pass), a light going out, or ground and walls missing and then back. The game runs
+// on meanwhile, so nothing waits. The hold comes from an allowance of this many milliseconds, used up by the time
+// held and filled again at an eighth of the clock's rate: a pipeline that takes longer, or a run of them on a first
+// visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. Not with DLSS
+// Frame Generation, which is told about every frame.
+static struct { int64_t limit_ns, left_ns; uint64_t last_ns, held, runs, shown; int holding; } FH = {.limit_ns = -1};
+
+static void frame_hold_refill(uint64_t now) {
+    if (FH.limit_ns < 0) {
+        long long ms = cfg_int("NX2NAVI_FRAME_HOLD_MS");
+        FH.limit_ns = (int64_t)(ms < 0 ? 0 : ms > 500 ? 500 : ms) * 1000000;
+        FH.left_ns = FH.limit_ns, FH.last_ns = now;
+        if (FH.limit_ns)
+            rt_log("vk: a frame with draws skipped for a pipeline is not shown, the previous picture stays up to %lld ms "
+                   "(NX2NAVI_FRAME_HOLD_MS)", (long long)(FH.limit_ns / 1000000));
+    }
+    if (!FH.holding) FH.left_ns += (int64_t)(now - FH.last_ns) / 8;
+    else FH.left_ns -= (int64_t)(now - FH.last_ns);
+    if (FH.left_ns > FH.limit_ns) FH.left_ns = FH.limit_ns;
+    FH.last_ns = now;
+}
+
+// Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then).
+int vk_frame_hold_left(void) {
+    frame_hold_refill(kern_now_ns());
+    return FH.left_ns > 0 && !vk_dlssg_active();
+}
+
+// 1: this frame is not shown. skipped: the draws it lacks.
+static int frame_hold(uint32_t skipped, uint64_t frame) {
+    frame_hold_refill(kern_now_ns());
+    int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
+    if (hold && !FH.holding) FH.runs++;
+    if (skipped && !hold) FH.shown++;
+    FH.holding = hold;
+    if (hold) FH.held++;
+    static uint64_t logged_at, logged_held, logged_shown;
+    if (!hold && FH.held + FH.shown != logged_held + logged_shown && frame - logged_at >= 600) {
+        rt_log("vk: frame %llu: %llu frames with skipped draws held back so far in %llu runs, %llu shown incomplete "
+               "(allowance used up)", (unsigned long long)frame, (unsigned long long)FH.held,
+               (unsigned long long)FH.runs, (unsigned long long)FH.shown);
+        logged_at = frame, logged_held = FH.held, logged_shown = FH.shown;
+    }
+    if (hold && (rt_trace & RT_TRACE_PRESENT))
+        rt_log("present: frame %llu held back, %u draws skipped", (unsigned long long)frame, skipped);
+    return hold;
+}
+
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
                           uint64_t value) {
     static volatile int32_t n_skipped;
+    static int vram_probe;
+    if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_dlaa_frame();
+    vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);
@@ -112,8 +167,9 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
-    if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
-        if (plat_inc32(&n_skipped) <= 8)
+    int held = frame_hold(vk_exec_pending_draws_take(), frame);
+    if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         if (value) {   // the queued value is still signalled, in order
             vk_present_drain();
@@ -181,6 +237,11 @@ int vk_replay_async(void) {
                on ? "on its own thread, at most one frame behind the game" : "on the submitting thread", on);
     }
     return on;
+}
+
+// With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
+static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
+    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
 }
 
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
@@ -267,8 +328,11 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     return f;
 }
 
+int vk_sub_in_frame;
+
 static void replay_main(void *arg) {
     (void)arg;
+    int sub_idx = 0;   // submissions since the last present, in queue order
     perf_replay_thread();
     plat_mutex_lock(&rl);
     for (;;) {
@@ -280,6 +344,7 @@ static void replay_main(void *arg) {
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
+            vk_sub_in_frame = sub_idx++;
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -293,6 +358,7 @@ static void replay_main(void *arg) {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             vk_dlssg_submitted(frame);   // the frame's submissions were replayed before its present
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+            sub_idx = 0;
         }
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
@@ -475,7 +541,10 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
-    if (!gfx_replay_async()) return submit_sync(handles, n);
+    if (!gfx_replay_async()) {
+        vk_sub_in_frame = nvn_submits_in_frame;   // the front end counts it up after the submit returns
+        return submit_sync(handles, n);
+    }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     if (n > 0) {
@@ -606,6 +675,7 @@ const GfxBackend gfx_vulkan_backend = {
     .program_release = vk_be_program_release,
     .submit = vk_be_submit,
     .fence_wait = vk_sync_fence_wait,
+    .exec_wait = vk_be_exec_wait,
     .fence_done = vk_sync_fence_done,
     .present = vk_be_present,
     .frame_start = vk_dlssg_frame_start,

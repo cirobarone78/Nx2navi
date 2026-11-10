@@ -463,7 +463,8 @@ static tex_t make_tex(pool_t *pool, uint64_t off, int format, uint32_t w, uint32
     t.magic = MAGIC('T', 'E', 'X', 0);
     t.d.target = 1, t.d.format = format, t.d.width = w, t.d.height = h, t.d.depth = 1, t.d.levels = levels;
     nvn_tex_layout(&t.d, &t.L);
-    t.pool = pool, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
+    // pool_flags as nvnTextureInitialize records them: tex_mirrored (vk_texture.c) reads them, not the pool object
+    t.pool = pool, t.pool_flags = (uint16_t)pool->flags, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
     return t;
 }
 
@@ -496,6 +497,35 @@ static int read_back(const tex_t *t, unsigned lv, uint8_t *const *lin, int gpu, 
            t->d.format, ok ? "differs from" : "failed against");
     g_gpu_checks++;
     return 0;
+}
+
+// Level 0 of image (w x h RGBA8) read through a staging buffer after everything recorded so far has run: whether every
+// texel is `want`, the way a draw sampling the image would see it.
+static int image_is_color(VkImage image, uint32_t w, uint32_t h, const uint8_t want[4]) {
+    VkCtx *c = vk_ctx();
+    VkBuffer rb;
+    VmaAllocation ra;
+    size_t n = (size_t)w * h * 4;
+    uint8_t *r = vk_staging(n, &rb, &ra);
+    VkCommandBuffer cb = vk_upload_begin();
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkBufferImageCopy rg = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, rb, 1, &rg);
+    mb = (VkMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_upload_end();
+    vk_upload_flush(1);
+    vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
+    int same = 1;
+    for (size_t i = 0; i < n; i += 4) same &= !memcmp(r + i, want, 4);
+    vmaDestroyBuffer(c->vma, rb, ra);
+    return same;
 }
 
 static int test_textures(pool_t *tpool, pool_t *phys) {
@@ -536,14 +566,28 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_write_texels(&g, NULL, &all, gl[0], 256, 256 * 64);
     if (read_back(&g, 0, gl, 0, "physical-pool RGBA8 WriteTexels")) return 1;
 
-    // a slot of a finalized texture follows the live texture at the same storage
+    // a slot of a finalized texture follows the live texture at the same storage. The slot's own storage is CPU-written
+    // (mirrored), so it follows only a texture holding GPU content its bytes lack (vk_texture.c slot_resolve). The live
+    // texture is cleared on the GPU and noted as rendered into, as a draw into it would be; the slot's image must then
+    // show the clear, which neither the storage bytes nor a recreated image of the slot's own descriptor hold.
     vk_texture_register(5, &b, NULL);
     vk_texture_release(&b);
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
     const VkTexImage *live = vk_texture_get(&b2);
+    GCHECK(live && live->image && live->width == 16 && live->height == 12, "RGBA8 image of the texture at the slot's storage");
+    vk_texture_gpu_written(&b2);   // the clear below is its content, not the storage
+    const float clear[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+    const uint8_t cleared[4] = {0x00, 0xFF, 0xFF, 0xFF};
+    VkClearColorValue cv;
+    memcpy(cv.float32, clear, sizeof cv.float32);
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkCommandBuffer ccb = vk_upload_begin();
+    vkCmdClearColorImage(ccb, live->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
+    vk_upload_end();
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
     const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
     GCHECK(live && slot && slot->image == live_img, "slot 5 does not follow the live texture at its storage");
+    GCHECK(image_is_color(slot->image, 16, 12, cleared), "the image of slot 5 does not hold the clear written into the live texture");
     samp_par sp;
     memset(&sp, 0, sizeof sp);
     sp.minf = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR, sp.magf = NVN_MAG_FILTER_LINEAR, sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_REPEAT;
@@ -551,7 +595,7 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_sampler_register(0, &sp);
     VkSampler s0 = vk_sampler_by_id(0), s1 = vk_sampler_for(&sp);
     GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(1), "sampler slots");
-    g_gpu_checks += 7;
+    g_gpu_checks += 9;
     vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g);
     for (int i = 0; i < 4; i++) free(lin[i]), free(bl[i]);
     free(gl[0]);

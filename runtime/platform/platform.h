@@ -41,6 +41,10 @@ uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id ti
 // The logical processors the process may use (bit n = processor n, the first 64), into *all, and the lowest of each
 // physical core among them into *first; returns the number of physical cores, 0 when unknown.
 int plat_cpu_cores(uint64_t *all, uint64_t *first);
+// The logical processors of the process's set (the first 64) that share the largest L3 cache, when the L3 caches
+// are not all the same size: the die with AMD's 3D V-Cache on a two-die X3D processor. 0 when they are (one die, or
+// equal dies) or the topology is unknown. *l3_kb: that cache's size.
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb);
 int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it
@@ -243,6 +247,10 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
+// A read or write that faulted at addr (write: 1 for a write; ip: the faulting instruction) goes to fn before the
+// write-fault hook; fn returns 1 when it made the page accessible and the access should run again, 0 to let the fault
+// go on. fn sees every access violation of the process and tells its own pages apart. One hook per process.
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);

@@ -4,7 +4,9 @@
                              [--dlss nvngx_dlss.dll | --no-dlss] [--dlssg nx2navi_dlssg.dll [--streamline SDK]]
                              [--prompt-art FOLDER [FOLDER ...]] [--out build/kit] [--zip]
 
-The kit holds this repository's runtime/, recomp/, the build tools, the shader translator built from tools/xlate,
+The kit holds this repository's runtime/ with its shaders compiled (tools/build_shaders.py builds the SPIR-V headers
+here, so a player's PC needs no shader compiler; their sources go along), recomp/, the build tools, the shader
+translator built from tools/xlate,
 NVIDIA's DLSS library with its notice (tools/dlss_pin.py: downloaded from NVIDIA's DLSS SDK repository and checked,
 or --dlss; not with --no-dlss), DLSS Frame Generation in bin/dlssg/ with --dlssg (nx2navi_dlssg.dll from
 tools/build_dlssg.py beside NVIDIA Streamline's runtime, tools/streamline_pin.py: downloaded from NVIDIA's Streamline
@@ -27,8 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 NAME = 'NX2navi-BuildKit'
 TOOLS = ('make_game.py', 'nup.py', 'romfs_index.py', 'check_content.py', 'hostmem.py', 'prepare_shaders.py',
          'shader_census.py', 'shader_list.py', 'zstd_compat.py', 'pad_prompts.py', 'prompt_art.py', 'button_icons.py', 'romfs_check.py',
-         'build_game.py', 'check_isa.py', 'build_shaders.py', 'pack_shader_cache.py')   # make_game.py imports build_game's vma_include on
-# Linux for the VMA header, and build_game.py imports check_isa and build_shaders
+         'build_game.py', 'check_isa.py', 'build_shaders.py', 'make_dlaa_mask.py', 'make_mvobj_fs.py',
+         'pack_shader_cache.py')   # make_game.py imports build_game's vma_include on Linux for the VMA header, and
+# build_game.py imports check_isa and build_shaders, which reads the two make_ scripts' shaders
 TOP = ('LICENSE', 'LICENSE-ADDITIONS', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'nx2navi.ini.example')
 SKIP_DIRS = {'__pycache__', '.pytest_cache'}
 SKIP_SUFFIXES = {'.o', '.obj', '.pyc', '.exe', '.dll', '.a', '.lib'}
@@ -60,6 +63,7 @@ def main():
     ap.add_argument('--zip', action='store_true')
     a = ap.parse_args()
     sys.path.insert(0, str(ROOT / 'tools'))
+    import build_shaders
     import dlss_pin
     import prompt_art
     import streamline_pin
@@ -73,6 +77,7 @@ def main():
     if kit.exists():
         shutil.rmtree(kit)
     kit.mkdir(parents=True)
+    build_shaders.build(ROOT / 'runtime')   # the kit carries the shader headers: build the missing and the stale ones
     for d in ('runtime', 'recomp'):
         copy_tree(ROOT / d, kit / d)
     (kit / 'tools').mkdir()

@@ -263,6 +263,7 @@ static void bc_copy_back(VkExec *ex, const VkExecTarget *t) {
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, bcs[i].level, 0, 1},
                           .dstOffset = {0, 0, (int32_t)t->base_layer},
                           .extent = {bcs[i].w, bcs[i].h, t->layers}};   // texels of the uncompressed source
+        vk_gpu_gap_note(VK_GAP_BC_BACK, 0);
         vkCmdCopyImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, bcs[i].bc, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         memory_barrier(ex->cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -814,6 +815,7 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
+        vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
@@ -844,6 +846,7 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
+        vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
@@ -870,7 +873,8 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // command-buffer state is lost there (bindings and dynamic state: vk_exec_draw_new_cb, ex->dirty); barriers, layouts and
 // queries are not: a barrier's first scope is everything earlier in submission order, image layouts belong to the image,
 // and occlusion queries end with their pass. Fences, completion callbacks and reports stay per submission: only the last
-// part signals the value.
+// part signals the value. The texture pool set a part binds is sealed when the part goes (vk_exec_pool_split): later
+// parts write and bind another, and a part is not split off while no other set is free of this submission.
 // A part also spans at least NX2NAVI_SPLIT_US (1000) of replay time: a split costs about 40 us of the render thread
 // (vkQueueSubmit2, a command buffer, the mirror prologue), and a fight frame of 2,000 draws made 15 parts on the 7900X;
 // a millisecond of recording is a fraction of a millisecond of GPU work, so the GPU still starts early.
@@ -922,8 +926,8 @@ static void maybe_split(VkExec *ex) {
     }
     split_draws = 0;
     split_at = split_n;
-    if (idle && ex->recorded != part_start) n_idle_parts++;
-    if (ex->recorded == part_start) return;
+    if (ex->recorded == part_start || !vk_exec_pool_split(ex->fence)) return;
+    if (idle) n_idle_parts++;
     if (ex->in_pass) vk_exec_pass_end(ex), n_pass_splits++;   // the next draw begins the pass again, in the new part
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
@@ -1320,7 +1324,14 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     vk_exec_pass_end(ex);
     x_here = 0;
-    if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
+    if (ex->recorded) vk_exec_barrier(ex), vk_exec_pool_marks(ex);   // later submissions see this one's writes
+    // The write-backs in a part of their own, after one that signals the executed timeline (vk_sync.c exec_tl): the
+    // wait after a frame's first submission then ends when the submission's passes are through, not its write-backs.
+    if (synced && ex->recorded && vk_sync_wb_split() && vk_mem_mirror_wb_pending() && vk_exec_pool_split(ex->fence)) {
+        ex->cb = vk_sync_split_exec();
+        ex->dirty = VK_EXEC_DIRTY_ALL;
+        vk_exec_draw_new_cb();
+    }
     if (synced) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);

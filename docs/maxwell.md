@@ -89,6 +89,7 @@ Source shorthands:
 | 4.6 | **Compute shared memory**: 48 KiB per block on GM20B. | AMD 64 KiB. | Ours: `QueryComputeSharedMemorySize` from job (`Program.cs`). | OGD `clb1c0.h` |
 | 4.7 | **Virtual memory pools** map physical pool pages; the same bytes reachable at two GPU addresses. | Two `VkBuffer`s over one allocation need alias-aware barriers. | — | — |
 | 4.8 | **Command list calls**: a `CallCommands` / `CallList` is not a GPU subroutine. A call is stored as a control entry; at submit the CPU walks the entries and recurses into the called list, emitting gpfifo entries that point at the command words, which the GPU fetches later (prefetch can be switched off per entry). So list structure is fixed at submit, command words are read when fetched. | n/a | Ours: `OP_CALL` is walked at replay, `CallCommands` inlines the recording at record time (`vk_exec.c` `walk`, `nvn_api_cmd.c` `inline_recording`). Equivalent for control flow; deferred bind handles are the data read late (2.4). | — |
+| 4.9 | **The texture pool is read as the GPU goes** (bindless `TEX.B` handles index it), and the GPU runs a submission right after it is submitted, so it sees the pool as of about the submit; Ocarina registers the next submission's textures right after submitting. | A descriptor a pending command buffer may read must not be updated (update-after-bind allows only unused ones), and on RADV a view of memory allocated after a submit is not in that submit's page tables. | A replay part handed to the queue early (`NX2NAVI_SPLIT_DRAWS`) kept reading the set later parts wrote: GPU page fault (`gfxhub`, TCP read) on the 128×128 probe pass of Kokiri Forest's first world frame, about 40 s in, nearly every run on RX 9070 XT. Ours: one pool set per submission from a ring, sealed when a part goes; the next sync that has entries to write takes another set, and no part is split off while every other set belongs to the same submission (`vk_exec_draw.c` `vk_exec_pool_split`, `pool_take_set`). | — |
 
 ## 5. Fixed function
 
@@ -115,8 +116,11 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    `provokingVertexLast` and chains `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT{LAST_VERTEX}` in
    `create_graphics`; without the feature it logs that flat outputs come from the first vertex. **Fixed.**
 2. **Unwritten vertex outputs.** `spirv_add_outputs` (`vk_pipeline.c`) adds outputs initialised to (0, 0, 0, 1) for
-   FS inputs the VS lacks. Our translator never links stages, so its `InitializeVertexOutputs` would initialise
-   no user output; translator patch 0006 initialises the unlinked outputs. **Fixed.**
+   FS inputs the VS lacks. `gfx_shader.c` reflects the full declared location span of VS output and FS input arrays,
+   not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.
+   The same reflected mask feeds recorded-pipeline prewarm, independent stage-library unions and direct pipeline builds.
+   Our translator never links stages, so its `InitializeVertexOutputs` would initialise no user output;
+   translator patch 0006 initialises the unlinked outputs. **Implemented; array-span runtime validation pending.**
 3. **Masked clears.** `vk_exec.c` skips colour clears with a partial channel mask (`W_CLEAR_MASK`); `clear_ds` skips stencil
    clears with a partial mask (`W_STENCIL_MASK`). NX2navi issues such clears. Check the log for
    `colour clear with channel mask` and `stencil clear with mask`. The hardware recipe (1.3) shows what the replay must do: colour clear = scissor 0 + channel mask, stencil clear = `value & mask` merged under the front write mask; so a draw with `colorWriteMask` / `stencilWriteMask` set to the clear mask is the exact equivalent. **Missing.**

@@ -62,7 +62,7 @@ static struct {
     int n;
     VkSubmitInfo2 si[HOLD_CAP];
     VkCommandBufferSubmitInfo cbi[HOLD_CAP][2];
-    VkSemaphoreSubmitInfo sig[HOLD_CAP];
+    VkSemaphoreSubmitInfo sig[HOLD_CAP][2];
     uint64_t last;                    // the newest timeline value a held submission signals, 0 none
     uint64_t batches, subs;           // vkQueueSubmit2 calls and the submissions they carried
 } H;
@@ -70,6 +70,26 @@ static volatile int32_t held_n;       // H.n, for readers without the lock
 static volatile uint64_t held_t0;     // when the oldest held submission was held (kern_now_ns)
 static volatile uint64_t queued_v;    // the newest timeline value handed to the queue
 static int hold_max = -1;
+
+// ---- the executed timeline
+// A submission's write-backs (vk_memory.c vk_mem_mirror_end: what its shaders wrote into VRAM mirrors goes back to guest
+// memory) are the last thing in it, 3 to 4 ms of GPU time a frame in Ocarina, 60 MiB merged. The wait after a frame's
+// first submission (nvn_api_core.c nvnQueueSubmitCommands) is there so that the GPU has run that submission's passes
+// before the game rewrites what they read; it does not need the write-backs, and waited for them too: 5 ms of every
+// frame with the render thread idle.
+// exec_tl is a second timeline that reaches a submission's value when the GPU has executed its own commands: the
+// replay ends the part before the write-backs (vk_exec.c, vk_sync_split_exec), that part signals exec_tl, and the
+// write-backs follow in a part of their own, which signals the timeline as before. A submission without that split
+// signals both at its end. vk_sync_exec_wait waits on exec_tl; every other wait, the fences the game asks for among
+// them, still covers the write-backs. NX2NAVI_WB_SPLIT=0: no split, and the wait is the fence's.
+static VkSemaphore exec_tl;
+static uint64_t exec_sig;             // sub_lock: the newest value a submitted part signals on exec_tl
+static int wb_split = -1;
+
+int vk_sync_wb_split(void) {
+    if (wb_split < 0) wb_split = cfg_bool("NX2NAVI_WB_SPLIT");
+    return wb_split && exec_tl != VK_NULL_HANDLE;
+}
 
 static void hold_flush_locked(VkCtx *c) {
     if (!H.n) return;
@@ -99,14 +119,22 @@ static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
         hold_max = v < 1 ? 1 : v > HOLD_CAP ? HOLD_CAP : v;
         rt_log("vk: up to %d submissions handed to the queue together (NX2NAVI_SUBMIT_BATCH)", hold_max);
     }
+    // The present holds this lock for its whole flip. A slow flip (frame generation allocating, a swapchain remade) makes
+    // the submitting thread wait here; counted as a present wait, so the slow-frame line no longer shows such a frame
+    // with nothing blocked.
+    uint64_t p0 = perf_begin();
     vk_queue_lock_raw();
+    perf_end(PERF_FENCE, p0);
     if (H.n == HOLD_CAP) hold_flush_locked(c);
     int i = H.n++;
     H.si[i] = *si;
     if (si->commandBufferInfoCount)
         memcpy(H.cbi[i], si->pCommandBufferInfos, sizeof H.cbi[i][0] * si->commandBufferInfoCount);
     H.si[i].pCommandBufferInfos = H.cbi[i];
-    if (si->signalSemaphoreInfoCount) H.sig[i] = si->pSignalSemaphoreInfos[0], H.si[i].pSignalSemaphoreInfos = &H.sig[i];
+    if (si->signalSemaphoreInfoCount) {   // at most two: the timeline and the executed timeline (exec_tl)
+        memcpy(H.sig[i], si->pSignalSemaphoreInfos, sizeof H.sig[i][0] * si->signalSemaphoreInfoCount);
+        H.si[i].pSignalSemaphoreInfos = H.sig[i];
+    }
     if (value) H.last = value;
     uint64_t now = kern_now_ns();
     if (i == 0) __atomic_store_n(&held_t0, now, __ATOMIC_RELEASE);
@@ -425,6 +453,12 @@ void vk_sync_start(void) {
         if (reserved < now) reserved = now;
         stop = 0;
         plat_mutex_unlock(&st_lock);
+        // the executed timeline starts where the timeline is; without it every exec wait is a fence wait
+        VkSemaphoreTypeCreateInfo et = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = now};
+        VkSemaphoreCreateInfo ei = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &et};
+        if (vkCreateSemaphore(c->device, &ei, NULL, &exec_tl) != VK_SUCCESS) exec_tl = VK_NULL_HANDLE;
+        exec_sig = now;
         vk_mem_note_submit(now);
         completion_thread = plat_thread_new(completion_main, c, "vk completion");
         if (!completion_thread) rt_fatal("vk: cannot start the completion thread");
@@ -479,9 +513,15 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     return cb;
 }
 
-VkCommandBuffer vk_sync_split(void) {
+static VkCommandBuffer split_part(int exec);
+VkCommandBuffer vk_sync_split(void) { return split_part(0); }
+// The part that ends here is the last with the submission's own commands: it signals the executed timeline.
+VkCommandBuffer vk_sync_split_exec(void) { return split_part(1); }
+
+static VkCommandBuffer split_part(int exec) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    vk_gpu_passes_part(cb, 1);
     ts_end(cb, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
@@ -490,6 +530,10 @@ VkCommandBuffer vk_sync_split(void) {
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
+    VkSemaphoreSubmitInfo esig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = exec_tl,
+                                  .value = cur_fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    if (exec && exec_tl && exec_sig < cur_fence)
+        si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &esig, exec_sig = cur_fence;
     ts_submitted();
     queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
@@ -500,6 +544,7 @@ VkCommandBuffer vk_sync_split(void) {
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, cur_fence);
     ts_begin(s->cb);
     rec_begin(s->cb, cur_fence);
+    vk_gpu_passes_part(s->cb, 0);
     return s->cb;
 }
 
@@ -533,8 +578,10 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb, fence);
+    vk_gpu_passes_part(s->cb, 0);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
+    vk_gpu_passes_part(s->cb, 1);
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
@@ -547,12 +594,17 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     s = &slots[cur_slot];
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
-    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
-                                 .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    // the timeline, and the executed timeline unless a part of this submission signalled it already (split_part)
+    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
+                                     .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = exec_tl,
+                                     .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    int both = exec_tl && exec_sig < fence;
+    if (both) exec_sig = fence;
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
                         .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
-                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
-                        .pSignalSemaphoreInfos = &sig};
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = both ? 2u : 1u,
+                        .pSignalSemaphoreInfos = sig};
     ts_submitted();
     queue_submit(c, &si, fence);   // held or handed to the queue (submit batching)
     s->fence = recorded ? fence : 0;
@@ -626,6 +678,27 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     return ok;
 }
 
+// Waits until the GPU has executed submission value's own commands (the executed timeline); its write-backs and the
+// CPU side effects of its fence may still be to come. 1 when reached.
+int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
+    vk_sync_start();
+    if (!vk_sync_wb_split()) return vk_sync_fence_wait(value, timeout_ns);
+    if (__atomic_load_n(&done, __ATOMIC_ACQUIRE) >= value) return 1;
+    uint64_t p0 = perf_begin();
+    hold_release(value, 0, 0);   // a held submission the waiter needs goes to the queue now
+    VkCtx *c = vk_ctx();
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                              .pSemaphores = &exec_tl, .pValues = &value};
+    VkResult r = vkWaitSemaphores(c->device, &wi, timeout_ns);
+    if (r != VK_SUCCESS && r != VK_TIMEOUT) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: the wait for a submission's commands failed (%d; device lost?)", (int)r);
+    }
+    perf_end(PERF_FENCE, p0);
+    perf_gpu_wait(p0);
+    return r == VK_SUCCESS;
+}
+
 uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUIRE); }
 
 uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
@@ -652,6 +725,8 @@ void vk_sync_shutdown(void) {
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
+        if (c && exec_tl) vkDestroySemaphore(c->device, exec_tl, NULL);
+        exec_tl = VK_NULL_HANDLE;
         perf_gpu_stats = NULL;
         if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
         ts_pool = VK_NULL_HANDLE;

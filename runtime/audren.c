@@ -307,6 +307,8 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
             }
         } else
             memcpy(&v, voices + i * voice_stride, sizeof v);
+        // An unused slot can have a zero id. Release its own voice and leave voice zero playing.
+        if (!v.in_use) v.id = (uint32_t)i;
         update_voice(r, &v);
         ServerVoice *server = &r->voices[v.id];
         server->use_float_biquads = (uint8_t)float_voices;

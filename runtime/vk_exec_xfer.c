@@ -596,6 +596,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    vk_gpu_gap_note(to_image ? VK_GAP_COPY_B2T : VK_GAP_COPY_T2B, (uint64_t)s.w * s.h);
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by NX2NAVI_SHADOW_SCALE: skipped");
         return;
@@ -619,6 +620,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
     if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
     d.nz = s.nz;
+    vk_gpu_gap_note(VK_GAP_COPY_T2T, (uint64_t)s.w * s.h);
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
@@ -661,6 +663,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
     uint64_t src = p->src, dst = p->dst, left = p->size;
+    vk_gpu_gap_note(VK_GAP_COPY_B2B, p->size);
     int started = 0;
     while (left) {
         VkMemSpan s, d;
@@ -701,6 +704,7 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         return;
     }
     uint64_t dst = p->addr, left = p->size;
+    vk_gpu_gap_note(VK_GAP_CLEAR_BUF, p->size);
     int started = 0;
     while (left) {
         VkMemSpan d;
@@ -751,6 +755,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
+    vk_gpu_gap_note(VK_GAP_CLEAR_TEX, (uint64_t)lw * lh);
     int reformat = p->has_view && p->view.set_format && p->view.format != t->d.format;
     if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat ||
         (is3d && (s.z || s.nz != max1(img->depth >> s.level)))) {

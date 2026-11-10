@@ -769,7 +769,7 @@ static void heapdef_overlay(void) {
 // overlay that replaces the pack (a mod's camera stays), else the RomFS original; the dictionary is the RomFS's own.
 #define CAMPACK "Pack/Actor/PlayerCamera.pack.zs"
 static void camera_overlay(void) {
-    if (cam_speed_wanted() == 1.0f) return;
+    // also at factor 1: cam_pack_build reads the game's own values, which a change during the run needs
     static const char keeps[] = "the camera keeps its own speed";
     Overlay *base, *dic_base;
     size_t n, dn;
@@ -1158,6 +1158,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
     open_note(i, p);
+    if (!strcasecmp(p, CAMPACK)) cam_pack_opened();   // its values come into memory at the start's factor (camera_speed.c)
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {

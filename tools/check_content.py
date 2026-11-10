@@ -1,4 +1,4 @@
-"""Refuse files that look like game content, keys or generated game code.
+"""Refuse files that look like game content, keys, generated game code or compiled shaders.
 
 Runs in CI on every push and pull request, and locally as the pre-commit hook
 (.githooks/pre-commit). With no arguments it checks every tracked file; with
@@ -83,6 +83,14 @@ def problems_for(path: Path, allow_large: bool = False, data: bytes | None = Non
     return found
 
 
+def compiled_shader(path: Path) -> bool:
+    """A SPIR-V binary or a header of SPIR-V words. The repository holds its shaders as source (runtime/shaders/, the
+    tools/make_*.py assemblers) and tools/build_shaders.py builds runtime/<name>_spv.h from them when the game is
+    built. A build kit or a release folder carries the headers, so make_kit.py and make_release.py, which call
+    problems_for, are not held to this."""
+    return path.suffix.lower() == ".spv" or path.name.lower().endswith("_spv.h")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--staged", action="store_true", help="check staged files only")
@@ -92,11 +100,14 @@ def main() -> int:
     for path in list_files(args.staged):
         # --staged checks what the commit takes: a marker staged and then removed from the working copy alone
         # passed when the file on disk was read
-        for problem in problems_for(path, data=staged_bytes(path) if args.staged else None):
+        problems = problems_for(path, data=staged_bytes(path) if args.staged else None)
+        if compiled_shader(path):
+            problems.append("compiled shader: the repository holds the source, tools/build_shaders.py builds this")
+        for problem in problems:
             print(f"{path}: {problem}")
             failed = True
     if failed:
-        print("\nGame content, keys and generated game code never go into the repository.")
+        print("\nGame content, keys, generated game code and compiled shaders never go into the repository.")
         print("See CONTRIBUTING.md.")
         return 1
     return 0

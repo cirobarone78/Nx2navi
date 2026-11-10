@@ -1,8 +1,10 @@
 // HDR output (NX2NAVI_HDR=1): an HDR10 swapchain (Rec. 2020 primaries, PQ) and a game picture tone mapped to the
-// display's range. Settings: NX2NAVI_HDR (read at start); the nits NX2NAVI_HDR_PEAK_NITS (the display's peak),
+// display's range. Settings: NX2NAVI_HDR, off and the tone mapper following the menu during a run (vk_hdr_wanted), the
+// game's own HDR (native) from the start only; the nits NX2NAVI_HDR_PEAK_NITS (the display's peak),
 // NX2NAVI_HDR_GAME_NITS (the picture's white, "paper white") and NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white);
 // NX2NAVI_HDR_GAMMA, NX2NAVI_HDR_TONEMAP and the grading sliders NX2NAVI_HDR_EXPOSURE .. NX2NAVI_HDR_GRADE, all read
-// when the settings change (vk_hdr_support). With NX2NAVI_HDR=0 nothing here runs and the present is what it was.
+// when the settings change (vk_hdr_support). With NX2NAVI_HDR=0 the swapchain is SDR, the spliced tonemap gives the
+// game's own SDR picture (vk_hdr_support, p0.w = -1) and the present is what it was.
 //
 // The game's picture (docs/architecture.md, "HDR"). The game tonemaps its scene into an r11g11b10f target, upscales it
 // and draws the HUD into a second one (float, nothing in these passes clamps), and one last draw copies that into the
@@ -45,24 +47,56 @@
 
 // ---- settings
 
-static int g_wanted = -1;
+// What the start decides for the whole run (hdr_start, first asked when the Vulkan instance is made):
+// - armed: the HDR path is set up, so the menu can switch HDR on and off without a restart: the instance and device
+//   get the HDR extensions (vk_device.c), the game's tonemap is spliced as its shaders load (vk_hdr_shader_swap) and
+//   every draw's support buffer carries the settings (vk_exec_draw.c). While the swapchain is SDR the spliced tonemap
+//   returns the game's own SDR result. Always, unless NX2NAVI_HDR_LIVE = 0 with NX2NAVI_HDR = 0 (the path left out as it
+//   was before the setting followed the menu: HDR then needs a restart) or a probe turned it off (vk_hdr_off).
+// - native: NX2NAVI_HDR = native, the game's own HDR. The display is reported as HDR10 (ov_gfx.c
+//   QueryDisplayHdrStatus, with the peak and paper white of the settings), and the game then renders its HDR picture
+//   itself and presents it as PQ-encoded Rec. 2020 in A2B10G10R10 (format 64), which goes to the HDR10 swapchain as it
+//   is: no tonemap splice, no float picture, no encode (pictures still presented in 8 bits, before the switch, are
+//   encoded as for 1). The game asks once, so a change to or from native waits for a restart (vk_hdr_needs_restart).
+static int g_armed = -1, g_native = -1;
 
+static void hdr_start(void) {
+    if (g_armed >= 0) return;
+    g_native = !strcmp(cfg_value("NX2NAVI_HDR"), "native");
+    g_armed = cfg_bool("NX2NAVI_HDR") || cfg_bool("NX2NAVI_HDR_LIVE");   // last: the mark that both are read
+}
+
+int vk_hdr_armed(void) {
+    hdr_start();
+    return g_armed;
+}
+
+int vk_hdr_native(void) { return vk_hdr_armed() && g_native; }
+
+// HDR is on now: the setting as the menu has it, read again when the settings change. The swapchain follows at the
+// next present (gfx_present.c window_settings_live makes it again) and vk_hdr_active then says what it got. A run that
+// started with the game's own HDR keeps it: the game goes on presenting its PQ picture whatever the menu says.
 int vk_hdr_wanted(void) {
-    if (g_wanted < 0) g_wanted = cfg_bool("NX2NAVI_HDR");
-    return g_wanted;
+    static unsigned seen = ~0u;
+    static int on;
+    if (!vk_hdr_armed()) return 0;
+    if (g_native) return 1;
+    unsigned v = cfg_version();
+    if (__atomic_load_n(&seen, __ATOMIC_ACQUIRE) != v) {
+        __atomic_store_n(&on, cfg_bool("NX2NAVI_HDR") != 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&seen, v, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&on, __ATOMIC_ACQUIRE);
 }
 
-// NX2NAVI_HDR = native: the game's own HDR. The display is reported as HDR10 (ov_gfx.c QueryDisplayHdrStatus, with
-// the peak and paper white of the settings), and the game then renders its HDR picture itself and presents it as
-// PQ-encoded Rec. 2020 in A2B10G10R10 (format 64), which goes to the HDR10 swapchain as it is: no tonemap splice, no
-// float picture, no encode (pictures still presented in 8 bits, before the switch, are encoded as for 1).
-static int g_native = -1;
-int vk_hdr_native(void) {
-    if (g_native < 0) g_native = !strcmp(cfg_value("NX2NAVI_HDR"), "native");
-    return g_native && vk_hdr_wanted();
+// The menu's HDR row: what is set takes a restart. To or from the game's own HDR, and switching HDR on in a run that
+// started without the HDR path (NX2NAVI_HDR_LIVE = 0).
+int vk_hdr_needs_restart(void) {
+    hdr_start();
+    return (!strcmp(cfg_value("NX2NAVI_HDR"), "native")) != g_native || (!g_armed && cfg_bool("NX2NAVI_HDR"));
 }
 
-void vk_hdr_off(void) { g_wanted = 0; }
+void vk_hdr_off(void) { g_native = 0, g_armed = 0; }
 
 // The settings, read again when they change. The replay (every draw's support buffer) and the present thread read
 // them: an update fills the snapshot not in use and then publishes it.
@@ -529,7 +563,8 @@ fail:
 #undef PUT
 
 void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
-    if (!vk_hdr_wanted() || vk_hdr_native() || !*spirv || *words < 5) return;
+    // armed, not wanted: a shader loaded while HDR is off must be ready for the menu switching it on
+    if (!vk_hdr_armed() || vk_hdr_native() || !*spirv || *words < 5) return;
     if (tonemap_splice(spirv, words)) {
         static volatile int32_t spliced;
         rt_log("hdr: the game's tonemap maps its picture onto the display's range (%d shaders so far)",
@@ -618,8 +653,8 @@ void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget i
 
 // ---- swapchain
 
-// With NX2NAVI_HDR=1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0 and the
-// reason logged once.
+// While NX2NAVI_HDR is on (vk_hdr_wanted), the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out
+// set, else 0 and the reason logged once.
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
     if (!vk_hdr_wanted()) return 0;
     static int logged;

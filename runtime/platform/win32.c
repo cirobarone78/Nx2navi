@@ -95,6 +95,32 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
+    DWORD_PTR proc, sys;
+    *l3_kb = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = len ? malloc(len) : NULL;
+    uint64_t die = 0;
+    DWORD big = 0, small = ~0u;
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, buf, &len))
+        for (DWORD off = 0; off < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)((char *)buf + off);
+            const CACHE_RELATIONSHIP *c = &e->Cache;
+            if (c->Level == 3 && c->GroupMask.Group == 0) {   // every L3, also those outside the process's set
+                if (c->CacheSize > big) big = c->CacheSize, die = 0;
+                if (c->CacheSize == big) die |= c->GroupMask.Mask;
+                if (c->CacheSize < small) small = c->CacheSize;
+            }
+            off += e->Size;
+        }
+    free(buf);
+    if (!die || big == small) return 0;
+    *l3_kb = big >> 10;
+    return die & proc;
+}
+
 int plat_process_affinity(uint64_t mask) { return SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)mask) != 0; }
 
 uint64_t plat_thread_cpu_ns(uint32_t tid) {
@@ -807,14 +833,22 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write, uint64_t ip);
 
-// A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+// A read or write access violation (ExceptionInformation[0] 0 or 1) goes to the access hook when there is one, then a
+// write to the write-fault hook; registered first, before the crash handler.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] > 1)
         return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    int write = er->ExceptionInformation[0] == 1;
+    uint64_t addr = (uint64_t)er->ExceptionInformation[1];
+    if (access_hook && access_hook(addr, write, (uint64_t)(uintptr_t)er->ExceptionAddress)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (!write) return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook(addr) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
+
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) { access_hook = fn; }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
@@ -1090,9 +1124,16 @@ void plat_exit(int code) {
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
 #endif
-    fflush(stdout);
-    fflush(stderr);
-    ExitProcess((UINT)code);
+    fflush(NULL);   // every open stream: nothing below runs the C runtime's own exit
+    // The process ends here, without the libraries' detach calls that ExitProcess makes. The callers have saved what
+    // is to be kept (gfx_present.c gfx_window_closed: settings, pipeline cache, profile, saves), and the game's other
+    // threads are still running when this is called. ExitProcess stops them wherever they are and then runs every
+    // library's detach on this thread: NVIDIA's NGX core, which still held the device and the DLSS features, read a
+    // dead pointer in its detach on the window thread after the window was closed (an access violation in
+    // _nvngx.dll after the last save, once in 5 scripted runs that had freed and made a DLSS feature again), and the
+    // crash handler wrote a FATAL for a run that had ended cleanly.
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code);   // not reached
 }
 
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's

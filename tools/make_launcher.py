@@ -57,6 +57,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
+import build_shaders  # noqa: E402
 import check_content  # noqa: E402
 import dlss_pin  # noqa: E402
 import prompt_art  # noqa: E402
@@ -177,6 +178,9 @@ def build_python(py):
 # ---------------------------------------------------------------- app/<version>/
 
 def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None):
+    # The runtime's own shaders are source in the repository and SPIR-V headers in a release: a player's PC compiles
+    # runtime/ (make_game.py) and has no shader compiler. Build the missing and the stale ones before the copy.
+    build_shaders.build(ROOT / 'runtime')
     copy_tree(ROOT / 'launcher', app / 'launcher')
     for d in ('runtime', 'recomp'):
         copy_tree(ROOT / d, app / d)

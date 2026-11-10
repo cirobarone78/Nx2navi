@@ -79,7 +79,7 @@ static struct {
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src, f_full_subgroups;
     int cache_control;                 // pipelineCreationCacheControl: a create can ask for the pipeline caches only
-    int feedback;                      // NX2NAVI_PIPE_FEEDBACK: 1 count pipeline cache hits, 2 also log each compute build
+    int feedback;                      // NX2NAVI_PIPE_FEEDBACK: 1 count pipeline cache hits, 2 also log each compute and graphics build
     uint64_t cache_loaded;             // bytes of pipeline-cache.bin the driver took at boot
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
@@ -130,6 +130,8 @@ typedef struct Pipe {
     VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
     uint8_t fast_tried;
     uint8_t link_queued;               // a waiting draw queued its fast link to the workers (LibJob p), not yet run
+    uint8_t used;                      // compute: a dispatch of this run asked for it (vk_pipeline_compute)
+    uint8_t pre;                       // compute: built and kept by the boot prebuild (lb_compute) or bg_main
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -221,6 +223,8 @@ static struct {
     double from_ms, compile_ms;
 } PB = {.lock = PLAT_MUTEX_INIT};
 static __thread int pb_last;           // 1: the last pipe_create on this thread made its pipeline from binaries
+static __thread int cc_hit;            // compute_create's last pipeline on this thread: 1 from pipeline-cache.bin or
+                                       // the pipeline binaries, 0 not, -1 the driver did not say
 
 static uint64_t pb_hash(uint32_t type, const uint8_t *key, uint32_t n) {
     uint64_t h = fnv(fnv(FNV0, &type, 4), key, n);
@@ -509,11 +513,21 @@ typedef struct { VkStructureType sType; const void *pNext; VkPipelineCreateFlags
 // copy, reading through a null entry, with compute and library builds running beside the autosave.
 static PlatMutex cache_rw = PLAT_MUTEX_INIT;
 
+// A pipeline cache of this thread's own that its creates build into in place of P.cache; VK_NULL_HANDLE (every thread
+// but the background builder of large compute shaders) for P.cache itself. A create into it does not hold cache_rw, so
+// a build of minutes does not keep pipeline-cache.bin from being saved; bg_merge moves its content into P.cache.
+static __thread VkPipelineCache own_cache;
+// New content in P.cache that P.stats does not count, for autosave_once to save: bg_merge's merges, and the compiles
+// of pipelines built for the cache only (lb_compute keep 0).
+static volatile uint32_t cache_merges;
+
 static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
-    if (cache) plat_mutex_lock_shared(&cache_rw);
+    int shared = cache && !own_cache;
+    if (cache && own_cache) cache = own_cache;
+    if (shared) plat_mutex_lock_shared(&cache_rw);
     VkResult r = kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
                            : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
-    if (cache) plat_mutex_unlock_shared(&cache_rw);
+    if (shared) plat_mutex_unlock_shared(&cache_rw);
     return r;
 }
 
@@ -649,6 +663,7 @@ static void nan_preserve_init(VkCtx *c) {
 }
 
 static void keys_open(void);
+static void cu_open(void);
 static void prebuild_start(void);
 
 static int ensure_init(void) {
@@ -723,14 +738,30 @@ static int ensure_init(void) {
     } else {
         rt_log("vk_pipeline: descriptor update templates unavailable: sets are written with write structs");
     }
-    // NX2NAVI_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
-    // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it.
+    // NX2NAVI_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on two drivers:
+    // - Intel's frozen Windows driver for its older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which
+    //   draws nothing with it.
+    // - AMD's driver for RDNA 3 and newer (vk_caps.amd_llpc), which compiles a pipeline with dynamic vertex input again
+    //   at every boot: neither pipeline-cache.bin nor the driver's own disk cache gives it back. Measured on an
+    //   RX 7900 XT (26.10.1) with NX2NAVI_PIPE_FEEDBACK=2, booting one save twice from an empty cache: the second boot
+    //   compiled all 622 recorded non-mesh pipelines again at 83 ms each, with the module and state hashes of the first
+    //   boot (the same with NX2NAVI_GPL=0, so it is not the pipeline libraries or their layouts), while the mesh
+    //   pipelines, which have no vertex input, came from the file. With the vertex layout in the pipeline the second
+    //   boot built 787 pipelines in 170 ms and the third 898 of 898 from the file in 233 ms, with no build left for the
+    //   scene. A player's file of 3,979 records used the whole boot budget (PREWARM_PIPE_MS, 20 s) at every boot; with
+    //   the vertex layout in the pipeline its third boot built 4,273 pipelines in 0.9 s. The price is more pipelines,
+    //   one per vertex layout (787 records against 692 for that boot); records written with dynamic vertex input still
+    //   prebuild, each for the layout of the draw that recorded it. The RDNA 1 and 2 branch (vk_caps.amd_sc) is not
+    //   measured and keeps dynamic vertex input.
     const char *dv = cfg_get("NX2NAVI_VK_DYN_VERTEX");   // no fixed default: it depends on the GPU, see above
     int intel_legacy = c->props.vendorID == 0x8086 && c->props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215);
-    int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy;
+    int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy && !vk_caps.amd_llpc;
     P.dyn_vi = dv_on && c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
     if (!dv_on && c->has_vertex_input_dynamic_state)
-        rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "NX2NAVI_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
+        rt_log("vk_pipeline: dynamic vertex input off (%s)",
+               dv && *dv ? "NX2NAVI_VK_DYN_VERTEX=0"
+               : intel_legacy ? "Intel's older Windows driver draws nothing with it"
+               : "AMD's driver compiles pipelines that have it again at every boot");
     if (c->has_eds3) {
         P.dyn_clamp = e3.extendedDynamicState3DepthClampEnable && P.f_depth_clamp && PROC(set_clamp, "vkCmdSetDepthClampEnableEXT");
         P.dyn_poly = e3.extendedDynamicState3PolygonMode && PROC(set_poly, "vkCmdSetPolygonModeEXT");
@@ -743,12 +774,17 @@ static int ensure_init(void) {
     // RDNA 2 and older (vk_caps.amd_sc), which applies alpha to coverage while the dynamic state says off: on an RX 590
     // (24.9.1) NX2navi, which never turns it on, drew Link and the NPCs with depth but no colour (black silhouettes) and
     // dithered other surfaces into checkerboards (issue #67, RX 470/570/580). Taken out of the dynamic state, it goes
-    // into the pipeline key and the characters draw.
+    // into the pipeline key and the characters draw. With the texture pool marks it stays out of the dynamic state
+    // whatever the setting: a marked fragment shader gets early fragment tests only in a pipeline that has alpha to
+    // coverage off (spirv_pool_mark), so the pipeline has to know.
     const char *da = cfg_get("NX2NAVI_VK_DYN_A2C");   // no fixed default: it depends on the driver, see above
-    int da_on = da && *da ? strcmp(da, "0") != 0 : !vk_caps.amd_sc;
+    int marks = vk_pool_marks_enabled();
+    int da_on = !marks && (da && *da ? strcmp(da, "0") != 0 : !vk_caps.amd_sc);
     if (!da_on && P.dyn_a2c) {
         P.dyn_a2c = 0;
-        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)", da && *da ? "NX2NAVI_VK_DYN_A2C=0" : "AMD's driver for RDNA 2 and older");
+        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)", marks ? "the texture pool marks, NX2NAVI_TEX_DISUSE"
+                                                                  : da && *da ? "NX2NAVI_VK_DYN_A2C=0"
+                                                                              : "AMD's driver for RDNA 2 and older");
     }
 #undef PROC
     static const VkDynamicState core[] = {
@@ -768,12 +804,15 @@ static int ensure_init(void) {
     if (P.dyn_blend_eq) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT;
     if (P.dyn_wmask) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
     if (P.dyn_a2c) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
+    vk_mem_stage_log("device creation");
     cache_load(c);
+    vk_mem_stage_log("the pipeline cache load");
     rt_log("vk_pipeline: max push descriptors %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
            "blend equation %d, write mask %d, alpha to coverage %d; cache %s",
            P.max_push, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
            P.cache_path[0] ? P.cache_path : "<memory only>");
     keys_open();
+    cu_open();
     plat_xchg32(&P.ready, 1);
     plat_mutex_unlock(&P.lock);
     prebuild_start();
@@ -1096,7 +1135,7 @@ static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off) {
     memcpy(o, w, n * 4);
     for (uint64_t i = 5; i < n;) {
         uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
-        if (!len || i + len > n) break;
+        if (!len || i + len > n || op == SPV_OP_FUNCTION) break;
         if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_BINDING && o[i + 3] >= 1) o[i + 3] += off;
         i += len;
     }
@@ -1110,7 +1149,7 @@ static uint32_t *spirv_set(const uint32_t *w, uint64_t n, uint32_t set) {
     memcpy(o, w, n * 4);
     for (uint64_t i = 5; i < n;) {
         uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
-        if (!len || i + len > n) break;
+        if (!len || i + len > n || op == SPV_OP_FUNCTION) break;
         if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_DESCRIPTOR_SET) o[i + 3] = set;
         i += len;
     }
@@ -1435,6 +1474,8 @@ static uint32_t *spirv_nan_preserve(const uint32_t *w, uint64_t n, uint32_t widt
     return o;
 }
 
+static int spirv_mark_list_test(const char *list);   // texture pool marks, below
+
 // --selftest (main.c): spirv_nan_preserve on a small fragment module, without a device. Returns the number of failures.
 int vk_pipeline_spirv_selftest(void) {
     enum { CAP = 2u << 16 | 17, MODE = 4u << 16 | 16 };
@@ -1478,6 +1519,8 @@ int vk_pipeline_spirv_selftest(void) {
         failures++;
     }
     printf("spirv: SignedZeroInfNanPreserve rewrite: %s\n", failures ? "FAIL" : "ok");
+    const char *list = cfg_get("NX2NAVI_SPV_MARK_TEST");
+    if (list && *list) failures += spirv_mark_list_test(list);
     return failures;
 }
 
@@ -1513,10 +1556,11 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
     uint32_t *cval = calloc(bound, sizeof *cval);
     if (!kind || !cval) return free(kind), free(cval), NULL;
     memset(kind, 0xff, bound * sizeof *kind);
+    // Pool variables and their binding decorations are module declarations, all before the first function.
     int any = 0;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > n) break;
+        if (!len || i + len > n || op == SPV_OP_FUNCTION) break;
         if (op == OP_TYPE_IMAGE && len >= 9 && w[i + 1] < bound && w[i + 7] == 1) {   // sampled image
             uint32_t dim = w[i + 3], depth = w[i + 4], arrayed = w[i + 5], ms = w[i + 6];
             if (dim <= 3 && !ms) kind[w[i + 1]] = (int32_t)((depth == 1 ? 8 : 0) + dim * 2 + (arrayed ? 1 : 0));
@@ -1542,7 +1586,7 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
         uint32_t used = 0;
         for (uint64_t i = 5; i < n;) {
             uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
-            if (!len || i + len > n) break;
+            if (!len || i + len > n || op == SPV_OP_FUNCTION) break;
             if (op == SPV_OP_DECORATE && len >= 4 && o[i + 1] < bound && kind[o[i + 1]] >= 2000) {
                 int32_t k = kind[o[i + 1]] - 2000;
                 if (o[i + 2] == SPV_DEC_DESCRIPTOR_SET) o[i + 3] = 2;
@@ -1557,14 +1601,255 @@ static uint32_t *spirv_pool_rebind(const uint32_t *w, uint64_t n) {
     return o;
 }
 
-static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
-    uint64_t fixed_n = 0;
+// ---- texture pool marks (NX2NAVI_TEX_DISUSE, default on; vk_texture.c "disuse" uses them)
+// Ocarina samples nearly every texture through the bindless pool: a shader reads a handle from memory and indexes the
+// pool array with it, so the CPU never learns which of the registered textures a frame samples, and every registered
+// texture counts as in use (vk_texture.c idle). The game keeps the textures of the areas it has loaded registered, so
+// none of them could go, and their memory, which the driver charges to the system's commit, grew to 6 GiB in a session.
+// This rewrite gives each module that indexes the texture pool a storage buffer at set 2, binding VK_POOL_MARK_BINDING
+// (a uint per pool slot, vk_exec_draw.c "pool marks") and, after every access chain into a pool texture array, a store
+// of 1 into the slot it indexes. The stores of one warp to one slot are one memory transaction. The replay copies the
+// buffer out and clears it every few submissions; slots marked mean textures sampled. A module that indexes the pool
+// and cannot be marked (SPIR-V before 1.3 or after 1.6, a stage whose stores the device does not allow, no memory) is
+// counted in vk_pool_marks_missed, which keeps vk_texture.c from evicting by disuse: an unmarked shader could sample a
+// texture the marks call unused. make_module logs the first few by stage, version, size, hash and reason.
+volatile int32_t vk_pool_marks_missed;
+static int marks_on = -1, marks_vs_ok, marks_fs_ok;
+
+int vk_pool_marks_enabled(void) {
+    if (marks_on < 0) {
+        marks_on = rt_knob("TEX_DISUSE", "1") >= 1;   // 2: marks and stand-ins, nothing freed (vk_texture.c "disuse")
+        VkCtx *c = vk_ctx();
+        if (c) {
+            VkPhysicalDeviceFeatures f;
+            vkGetPhysicalDeviceFeatures(c->phys, &f);   // vk_device.c enables every feature the GPU reports
+            marks_vs_ok = f.vertexPipelineStoresAndAtomics, marks_fs_ok = f.fragmentStoresAndAtomics;
+        }
+    }
+    return marks_on;
+}
+
+// A fragment shader that stores to memory runs before the depth test unless it declares EarlyFragmentTests: the GPU
+// must run it for fragments the test then rejects, as the stores are visible. The marks would so take the early depth
+// rejection from every marked fragment shader and make overdraw cost full shading. With early_ok, a fragment shader
+// whose result is the same under early tests gets EarlyFragmentTests along with its marks: one that discards, writes
+// its depth, sample mask or stencil reference, or already writes memory does not, as early tests would change what it
+// does. The caller passes early_ok only for a pipeline without alpha to coverage, which also drops samples after the
+// shader (ensure_init keeps alpha to coverage out of the dynamic state while marks are on, so a pipeline knows).
+// *status: 1 marked, 0 no pool texture access to mark, -1 one that could not be marked (*why says what stopped it).
+// NULL unless marked.
+static uint32_t *spirv_pool_mark(const uint32_t *w, uint64_t n, int early_ok, uint64_t *out_n, int *status,
+                                 const char **why) {
+    enum { OP_TYPE_RUNTIME_ARRAY = 29, OP_TYPE_STRUCT_ = 30, OP_ACCESS_CHAIN_ = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
+           OP_STORE_ = 62, OP_MEMBER_DECORATE_ = 72, OP_DECORATION_GROUP = 73, OP_GROUP_DECORATE = 74,
+           OP_GROUP_MEMBER_DECORATE = 75, OP_DECORATE_ID = 332, OP_DECORATE_STRING = 5632, OP_MEMBER_DECORATE_STRING = 5633,
+           OP_EXECUTION_MODE = 16, OP_EXECUTION_MODE_ID = 331, OP_IMAGE_WRITE = 99, OP_ATOMIC_FIRST = 227,
+           OP_ATOMIC_LAST = 242, OP_KILL = 252, OP_TERMINATE_INVOCATION = 4416, OP_DEMOTE_TO_HELPER = 5380,
+           EM_EARLY_FRAGMENT_TESTS = 9, BI_SAMPLE_MASK = 20, BI_FRAG_DEPTH = 22, BI_FRAG_STENCIL_REF = 5014,
+           SC_STORAGE_BUFFER = 12, DEC_BLOCK = 2, DEC_ARRAY_STRIDE = 6, DEC_OFFSET_ = 35 };
+    *status = 0, *why = NULL;
+    if (n < 5) return NULL;
+    uint32_t bound = w[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint32_t *bind = calloc(bound, sizeof *bind);   // per id: its Binding + 1 when its DescriptorSet is 2, else 0
+    uint8_t *set2 = calloc(bound, 1);
+    if (!bind || !set2) return free(bind), free(set2), *status = -1, *why = "no memory", NULL;
+    uint64_t ann_end = 0, fn_start = 0, em_end = 0;   // em_end: past the entry points and execution modes
+    uint32_t uint_t = 0, c0 = 0, c1 = 0, ptr_u = 0, fs_entry = 0;
+    int vertex_stage = 0, fragment_stage = 0, entries = 0, early = early_ok;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (!l || i + l > n) return free(bind), free(set2), *status = -1, *why = "an instruction past the module's end", NULL;
+        if (op == SPV_OP_FUNCTION) { fn_start = i; break; }
+        if (op == SPV_OP_ENTRY_POINT || op == OP_EXECUTION_MODE || op == OP_EXECUTION_MODE_ID) em_end = i + l;
+        if (op == SPV_OP_ENTRY_POINT && l >= 3) {
+            entries++;
+            if (w[i + 1] <= 3) vertex_stage = 1;   // Vertex, TessellationControl, TessellationEvaluation, Geometry
+            else if (w[i + 1] == 4) fragment_stage = 1, fs_entry = w[i + 2];
+        } else if (op == OP_EXECUTION_MODE && l >= 3 && w[i + 2] == EM_EARLY_FRAGMENT_TESTS) {
+            early = 0;   // has them already
+        } else if (op == SPV_OP_DECORATE && l >= 4 && w[i + 1] < bound) {
+            if (w[i + 2] == SPV_DEC_DESCRIPTOR_SET && w[i + 3] == 2) set2[w[i + 1]] = 1;
+            else if (w[i + 2] == SPV_DEC_BINDING) bind[w[i + 1]] = w[i + 3] + 1;
+            else if (w[i + 2] == SPV_DEC_BUILTIN &&
+                     (w[i + 3] == BI_SAMPLE_MASK || w[i + 3] == BI_FRAG_DEPTH || w[i + 3] == BI_FRAG_STENCIL_REF))
+                early = 0;
+        } else if (op == SPV_OP_VARIABLE && l >= 4 && w[i + 3] == SC_STORAGE_BUFFER) {
+            early = 0;   // the guest's own storage buffers: its stores would change under early tests
+        } else if (op == SPV_OP_TYPE_INT && l == 4 && w[i + 2] == 32 && w[i + 3] == 0) {
+            uint_t = w[i + 1];
+        } else if (op == SPV_OP_CONSTANT && l == 4 && uint_t && w[i + 1] == uint_t) {
+            if (w[i + 3] == 0 && !c0) c0 = w[i + 2];
+            if (w[i + 3] == 1 && !c1) c1 = w[i + 2];
+        } else if (op == SPV_OP_TYPE_POINTER && l == 4 && w[i + 2] == SC_STORAGE_BUFFER && uint_t && w[i + 3] == uint_t) {
+            ptr_u = w[i + 1];
+        }
+        if (op == SPV_OP_DECORATE || op == OP_MEMBER_DECORATE_ || op == OP_DECORATION_GROUP || op == OP_GROUP_DECORATE ||
+            op == OP_GROUP_MEMBER_DECORATE || op == OP_DECORATE_ID || op == OP_DECORATE_STRING || op == OP_MEMBER_DECORATE_STRING)
+            ann_end = i + l;
+        i += l;
+    }
+    // pool texture variables: set 2, a binding below VK_POOL_KINDS (spirv_pool_rebind); one already at the marks
+    // binding means the module was marked before
+    uint64_t sites = 0;
+    int marked = 0;
+    for (uint32_t id = 0; id < bound; id++)
+        if (set2[id] && bind[id] == VK_POOL_MARK_BINDING + 1) marked = 1;
+    for (uint64_t i = fn_start; fn_start && !marked && i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (!l || i + l > n) break;
+        if ((op == OP_ACCESS_CHAIN_ || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && w[i + 3] < bound && set2[w[i + 3]] &&
+            bind[w[i + 3]] && bind[w[i + 3]] - 1 < VK_POOL_KINDS)
+            sites++;
+        else if (op == OP_KILL || op == OP_TERMINATE_INVOCATION || op == OP_DEMOTE_TO_HELPER || op == OP_IMAGE_WRITE ||
+                 (op >= OP_ATOMIC_FIRST && op <= OP_ATOMIC_LAST))
+            early = 0;
+        i += l;
+    }
+    if (marked || !sites) return free(bind), free(set2), NULL;
+    *why = w[1] < 0x00010300 || w[1] > 0x00010600 ? "a SPIR-V version before 1.3 or after 1.6"
+         : !ann_end || !fn_start              ? "no decorations or no function"
+         : vertex_stage && !marks_vs_ok       ? "the GPU allows no stores in vertex-pipeline shaders"
+         : fragment_stage && !marks_fs_ok     ? "the GPU allows no stores in fragment shaders"
+                                              : NULL;
+    if (*why) return free(bind), free(set2), *status = -1, NULL;
+    early = early && fragment_stage && entries == 1 && em_end && em_end < ann_end;
+    // From SPIR-V 1.4 on an entry point lists every global variable its functions use, not only the inputs and outputs
+    // (the translator's mesh shaders are 1.4): each entry point gets the marks variable, a word more.
+    int iface = w[1] >= 0x00010400;
+    // the mode, a word per entry point, decorations, at most 30 words of new types and the variable, 9 a site
+    uint64_t on = n + 3 + (uint64_t)entries + 20 + 30 + 9 * sites;
+    uint32_t *o = malloc(on * 4);
+    if (!o) return free(bind), free(set2), *status = -1, *why = "no memory", NULL;
+    uint32_t next = bound;
+    uint32_t new_uint = uint_t ? 0 : (uint_t = next++), new_c0 = c0 ? 0 : (c0 = next++), new_c1 = c1 ? 0 : (c1 = next++);
+    uint32_t rta = next++, st = next++, ptr_st = next++, var = next++, new_ptr_u = ptr_u ? 0 : (ptr_u = next++);
+    uint64_t p = 5;
+    memcpy(o, w, 5 * 4);
+    for (uint64_t i = 5; i < ann_end;) {   // the header up to the annotations' end: entry points widened, the mode added
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (early && i == em_end) o[p++] = 3u << 16 | OP_EXECUTION_MODE, o[p++] = fs_entry, o[p++] = EM_EARLY_FRAGMENT_TESTS;
+        memcpy(o + p, w + i, l * 4);
+        if (iface && op == SPV_OP_ENTRY_POINT && l >= 3) o[p] = (l + 1) << 16 | op, o[p + l] = var, p++;
+        p += l;
+        i += l;
+    }
+    o[p++] = 4u << 16 | SPV_OP_DECORATE, o[p++] = rta, o[p++] = DEC_ARRAY_STRIDE, o[p++] = 4;
+    o[p++] = 5u << 16 | OP_MEMBER_DECORATE_, o[p++] = st, o[p++] = 0, o[p++] = DEC_OFFSET_, o[p++] = 0;
+    o[p++] = 3u << 16 | SPV_OP_DECORATE, o[p++] = st, o[p++] = DEC_BLOCK;
+    o[p++] = 4u << 16 | SPV_OP_DECORATE, o[p++] = var, o[p++] = SPV_DEC_DESCRIPTOR_SET, o[p++] = 2;
+    o[p++] = 4u << 16 | SPV_OP_DECORATE, o[p++] = var, o[p++] = SPV_DEC_BINDING, o[p++] = VK_POOL_MARK_BINDING;
+    memcpy(o + p, w + ann_end, (fn_start - ann_end) * 4), p += fn_start - ann_end;
+    if (new_uint) o[p++] = 4u << 16 | SPV_OP_TYPE_INT, o[p++] = uint_t, o[p++] = 32, o[p++] = 0;
+    if (new_c0) o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c0, o[p++] = 0;
+    if (new_c1) o[p++] = 4u << 16 | SPV_OP_CONSTANT, o[p++] = uint_t, o[p++] = c1, o[p++] = 1;
+    o[p++] = 3u << 16 | OP_TYPE_RUNTIME_ARRAY, o[p++] = rta, o[p++] = uint_t;
+    o[p++] = 3u << 16 | OP_TYPE_STRUCT_, o[p++] = st, o[p++] = rta;
+    o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_st, o[p++] = SC_STORAGE_BUFFER, o[p++] = st;
+    if (new_ptr_u) o[p++] = 4u << 16 | SPV_OP_TYPE_POINTER, o[p++] = ptr_u, o[p++] = SC_STORAGE_BUFFER, o[p++] = uint_t;
+    o[p++] = 4u << 16 | SPV_OP_VARIABLE, o[p++] = ptr_st, o[p++] = var, o[p++] = SC_STORAGE_BUFFER;
+    for (uint64_t i = fn_start; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        memcpy(o + p, w + i, l * 4), p += l;
+        if ((op == OP_ACCESS_CHAIN_ || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && w[i + 3] < bound && set2[w[i + 3]] &&
+            bind[w[i + 3]] && bind[w[i + 3]] - 1 < VK_POOL_KINDS) {
+            uint32_t at = next++;   // marks[slot] = 1, slot being the pool index of this access
+            o[p++] = 6u << 16 | OP_ACCESS_CHAIN_, o[p++] = ptr_u, o[p++] = at, o[p++] = var, o[p++] = c0, o[p++] = w[i + 4];
+            o[p++] = 3u << 16 | OP_STORE_, o[p++] = at, o[p++] = c1;
+        }
+        i += l;
+    }
+    o[3] = next;
+    free(bind), free(set2);
+    *out_n = p;
+    *status = 1;
+    return o;
+}
+
+// --selftest with NX2NAVI_SPV_MARK_TEST=<list>: each line "<in.spv> <out.spv>"; the module is moved to the pools
+// (spirv_pool_rebind) and marked, and written to <out> when marked, for spirv-val. Prints the counts; 0 failures unless
+// a file cannot be read or written.
+static int spirv_mark_list_test(const char *list) {
+    marks_vs_ok = marks_fs_ok = 1;
+    FILE *f = fopen(list, "rb");
+    if (!f) return printf("spirv: pool marks test: %s cannot be read\n", list), 1;
+    char line[2048];
+    int marked = 0, none = 0, missed = 0, bad = 0;
+    while (fgets(line, sizeof line, f)) {
+        char in[1024], out[1024];
+        if (sscanf(line, "%1023s %1023s", in, out) != 2) continue;
+        FILE *g = fopen(in, "rb");
+        if (!g) { bad++; continue; }
+        fseek(g, 0, SEEK_END);
+        long sz = ftell(g);
+        fseek(g, 0, SEEK_SET);
+        uint32_t *w = sz > 20 ? malloc((size_t)sz) : NULL;
+        if (!w || fread(w, 1, (size_t)sz, g) != (size_t)sz) { fclose(g), free(w), bad++; continue; }
+        fclose(g);
+        uint64_t n = (uint64_t)sz / 4, mn = 0;
+        uint32_t *pooled = spirv_pool_rebind(w, n);
+        int st;
+        const char *why;
+        uint32_t *m = spirv_pool_mark(pooled ? pooled : w, n, 1, &mn, &st, &why);
+        if (st > 0) {
+            marked++;
+            if (!plat_file_write_atomic(out, m, (size_t)mn * 4)) {
+                if (!bad) printf("spirv: pool marks test: %s cannot be written\n", out);
+                bad++;
+            }
+        } else if (st < 0) {
+            missed++;
+            printf("spirv: pool marks test: %s not markable: %s\n", in, why);
+        } else {
+            none++;
+        }
+        free(m), free(pooled), free(w);
+    }
+    fclose(f);
+    printf("spirv: pool marks test: %d marked, %d without pool texture accesses, %d not markable, %d file errors\n", marked,
+           none, missed, bad);
+    return bad;
+}
+
+// early_ok: a fragment shader whose pipeline has no alpha to coverage (spirv_pool_mark)
+static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_ok) {
+    const uint32_t *orig_w = w;   // for the log of a module the marks cannot take
+    uint64_t orig_words = words, fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
     uint32_t *pooled = spirv_pool_rebind(w, words);
     if (pooled) {
         free(fixed);
         w = fixed = pooled;
+        if (vk_pool_marks_enabled()) {
+            uint64_t mk_n = 0;
+            int st;
+            const char *why;
+            uint32_t *mk = spirv_pool_mark(w, words, early_ok, &mk_n, &st, &why);
+            if (mk) {
+                free(fixed);
+                w = fixed = mk, words = mk_n;
+            } else if (st < 0) {
+                int nth = plat_inc32(&vk_pool_marks_missed);
+                // the hash is FNV-1a of the words make_module got, as vk_dump hashes a shader's SPIR-V; it differs
+                // from the translation's only where the pipeline patched the module first (added vertex outputs)
+                if (nth <= 8) {
+                    uint32_t model = ~0u;
+                    for (uint64_t i = 5; i < words;) {
+                        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+                        if (!l) break;
+                        if (op == SPV_OP_ENTRY_POINT && l >= 2) { model = w[i + 1]; break; }
+                        i += l;
+                    }
+                    const char *stage = model == 0 ? "vertex" : model <= 3 ? "tessellation or geometry" : model == 4 ? "fragment"
+                                      : model == 5 ? "compute" : model == 5364 ? "task" : model == 5365 ? "mesh" : "other";
+                    rt_log("vk_pipeline: a %s shader that indexes the texture pool could not be marked (SPIR-V %u.%u, %llu "
+                           "words, hash %016llx): %s%s", stage, w[1] >> 16 & 0xff, w[1] >> 8 & 0xff,
+                           (unsigned long long)words, (unsigned long long)fnv(FNV0, orig_w, (size_t)orig_words * 4), why,
+                           nth == 1 ? "; textures are not evicted by disuse this run (NX2NAVI_TEX_DISUSE)" : "");
+                }
+            }
+        }
     }
     uint64_t rc_n = 0;
     uint32_t *rc = P.reconverge ? spirv_reconverge(w, words, &rc_n) : NULL;
@@ -1977,7 +2262,8 @@ static VkPipelineCreateFlags noopt_flag(void) {
 // with the prewarm, the stage library prebuild and every cache save, so a log tells whether a slow boot compiled or
 // read its pipelines: on NVIDIA the driver's own disk cache is kept per executable, so a renamed or new exe gets nothing
 // from it, and only pipeline-cache.bin can make its first boot quick. =2 also logs every compute build with a hash of
-// its final module, so two runs can be compared for a module that changes between them.
+// its final module, and every graphics pipeline build with the hashes of its final modules and of its fixed state, so
+// two runs can be compared for a module or a state that changes between them.
 enum { FB_GRAPHICS, FB_LIBRARY, FB_COMPUTE, FB_KINDS };
 static struct {
     PlatMutex lock;
@@ -2125,7 +2411,7 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
 
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
-    uint64_t vw, fw;
+    uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
     int mesh = is_mesh(s);
@@ -2135,7 +2421,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
         uint32_t toff = fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
         uint32_t *t = tcode && toff ? spirv_rebind(tcode, tw, toff) : NULL;
-        tm = make_module(t ? t : tcode, tw);
+        tm = make_module(t ? t : tcode, tw, 0);
         free(t);
     }
     if (l->set1 && !mesh) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
@@ -2176,9 +2462,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw);
+        if (fcode) fm = make_module(fcode, fw, !k->a2c), fm_hash = mm_hash;
     }
-    vm = make_module(vcode, vw);
+    vm = make_module(vcode, vw, 0), vm_hash = mm_hash;
     free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm) || (mesh && s->ts && !tm)) goto out;
@@ -2281,6 +2567,21 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     } else {
         perf_count(PERF_CNT_PIPE_BUILT);
         fb_note(FB_GRAPHICS, &fb);
+        if (P.feedback >= 2) {   // the state hash: what the create info takes from the key besides the modules
+            uint64_t st = fnv(fnv(FNV0, cba, sizeof cba), k->color, sizeof k->color);
+            if (!P.dyn_vi)   // the vertex layout is pipeline state then (zero in a mesh pipeline's key)
+                st = fnv(fnv(fnv(fnv(st, k->attr_fmt, sizeof k->attr_fmt), k->attr_off, sizeof k->attr_off),
+                             k->attr_bind, sizeof k->attr_bind), k->rate, sizeof k->rate);
+            uint32_t bits[] = {(uint32_t)mesh, k->topo_class, k->minus_w, k->clamp, k->poly_mode, k->samples, k->a2c,
+                               k->logic_op, k->n_color, k->fbl, k->dsb, l->set1 != 0, fs_off, pi.flags, k->depth, k->stencil};
+            rt_log("vk_pipeline: graphics: modules %016llx %016llx, state %016llx (mesh %d, topology class %u, samples %u, "
+                   "colors %u, feedback loop %u, depth format %u, stage-independent layout %d, flags 0x%x), %s, %.1f ms",
+                   (unsigned long long)vm_hash, (unsigned long long)fm_hash, (unsigned long long)fnv(st, bits, sizeof bits),
+                   mesh, (unsigned)k->topo_class, (unsigned)k->samples, (unsigned)k->n_color, (unsigned)k->fbl,
+                   (unsigned)k->depth, l->set1 != 0, (unsigned)pi.flags,
+                   pb_last ? "from pipeline-binaries.bin" : fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT ? "from pipeline-cache.bin" : "compiled",
+                   (double)fb.duration / 1e6);
+        }
     }
 out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
@@ -2387,7 +2688,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         sw = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(vcode, vw))) goto out;
+        if (!(m = make_module(vcode, vw, 0))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -2404,7 +2705,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d);
-            if (!patched || !(m = make_module(patched, fw))) goto out;
+            if (!patched || !(m = make_module(patched, fw, !k->a2c))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -3434,6 +3735,7 @@ static void prewarm_run(void) {
     __atomic_store_n(&pw_phase, 1, __ATOMIC_RELEASE);
     gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus, procs < 1 ? 1 : procs);
     double t1 = now_ms();
+    vk_mem_stage_log("the shader prewarm");
 
     if (P.indep) {   // vertex output unions first: workers may take a job before the queue is complete
         uint64_t pair = 0, uni = 0, pairs = 0;
@@ -3524,6 +3826,7 @@ static void prewarm_run(void) {
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
     fb_log("after the boot prewarm");
+    vk_mem_stage_log("the recorded pipelines' prebuild");
     vk_pipeline_prewarm_marker_clear();   // the boot's share is done; what the pool builds later runs during play
     lb_start(pr_hist, fs_hist);
 }
@@ -3718,7 +4021,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     if (over) code = over, words = ow;
     uint32_t *fog = spirv_fog_keep_froxels(code, words);
     if (fog) free(over), over = fog, code = fog;
-    VkShaderModule m = make_module(code, words);
+    VkShaderModule m = make_module(code, words, 0);
     if (!m) return free(over), VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -3741,6 +4044,9 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     if (pipe_create(2, &ci, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_crash_context(NULL);
     if (pipe) fb_note(FB_COMPUTE, &fb);
+    cc_hit = !pipe ? -1 : pb_last ? 1
+           : !P.feedback || !P.cache || !(fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) ? -1
+           : (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
     if (P.feedback >= 2 && (pipe || !cached_only))
         rt_log("vk_pipeline: compute %016llx: %llu words, module %016llx, %s, %.1f ms", (unsigned long long)fnv(FNV0, code, words * 4),
                (unsigned long long)words, (unsigned long long)mm_hash,
@@ -3768,12 +4074,15 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 //   stays is the driver's own disk cache: on AMD a library built again in a later process takes 0.1 ms instead of
 //   55 ms (vertex) / 28 ms (fragment). Our pipeline-cache.bin is not written there:
 //   it would grow by about 10 KB per library (~240 MB) and be read into memory at every boot.
-// - boot (lb_worker), after the pipeline-key prewarm, on cpus/4 threads at PLAT_PRIO_IDLE (the short P.lock
-//   sections and shader loads at normal priority, so a preempted thread never holds the lock the replay needs):
-//   compute pipelines of every recorded and prepared compute shader, kept (vk_pipeline_compute builds compute
-//   synchronously on the replay thread; 163 prepared), and the libraries of the first NX2NAVI_LIB_PREBUILD_KEEP variants
-//   play recorded (priority 0), kept in libs[] with their shaders. KEEP defaults to 0: a kept library costs 140-460 KB
-//   of process memory (10,000 kept took 9 GB in run 1) to save a rebuild the driver cache makes 0.1 ms.
+// - boot (lb_worker), after the pipeline-key prewarm, on two threads (lb_start) at PLAT_PRIO_IDLE (the short P.lock
+//   sections and shader loads at normal priority, so a preempted thread never holds the lock the replay needs; a
+//   compute pipeline's compile below normal priority, lb_compute):
+//   compute pipelines of every recorded and prepared compute shader (vk_pipeline_compute builds compute
+//   synchronously on the replay thread; 163 prepared): those of the shaders dispatched most recently stay, the others
+//   are built into the pipeline cache and destroyed (comment at compute-used.bin). Then the libraries of the first
+//   NX2NAVI_LIB_PREBUILD_KEEP variants play recorded (priority 0), kept in libs[] with their shaders. KEEP defaults to
+//   0: a kept library costs 140-460 KB of process memory (10,000 kept took 9 GB in run 1) to save a rebuild the driver
+//   cache makes 0.1 ms.
 // Library state: the vertex output union known now (vs_union_peek; the prewarm fills it from pipeline-keys.bin, the
 // preparation has none), the clamp, polygon mode and depth mode most recorded pipelines use (defaults without a key
 // file: clamp 0, fill, -w..w), single-sampled, no dual source; the state dynamic on this GPU is 0 in every key.
@@ -3793,6 +4102,7 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 static struct {
     GfxWarmEnt *e;
     size_t n;
+    size_t n_keep;                                     // e[0..n_keep): compute shaders whose pipeline stays (cu_keep)
     volatile int64_t next;
     volatile int32_t stop, running;
     int threads;
@@ -3809,6 +4119,7 @@ static struct {
     int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
     PlatMutex stat;
 } LB = {.stat = PLAT_MUTEX_INIT};
+static __thread int lb_me = -1;        // on a boot prebuild thread (lb_worker): its index in LB.th
 
 // ---- preparation that outlives a driver crash. A bug in the driver's shader compiler can kill the process inside
 // vkCreate*Pipelines: NVIDIA 615.78.08 on an RTX 5080 crashed on the same vertex library at the same point of every
@@ -3950,15 +4261,241 @@ static int cs_flight_has(const GfxShader *cs) {
     return 0;
 }
 
-static int cs_flight_add(const GfxShader *cs) {   // 0 when the table is full (the caller compiles anyway)
+static volatile uint8_t cs_flight_want[CS_FLIGHT];   // a dispatch waits for the slot's pipeline (vk_pipeline_compute)
+static PlatThread *cs_flight_th[CS_FLIGHT];          // the boot prebuild thread compiling it below normal priority
+
+// th: the thread a waiting dispatch raises to normal priority, NULL when it compiles at normal priority already.
+static int cs_flight_add(const GfxShader *cs, PlatThread *th) {   // 0 when the table is full (the caller compiles anyway)
     for (int i = 0; i < CS_FLIGHT; i++)
-        if (!cs_flight[i]) return cs_flight[i] = cs, 1;
+        if (!cs_flight[i]) return cs_flight[i] = cs, cs_flight_want[i] = 0, cs_flight_th[i] = th, 1;
     return 0;
 }
 
-static void cs_flight_remove(const GfxShader *cs) {
+// A dispatch waits for cs's build: a builder that would only have filled the pipeline cache keeps the pipeline. Returns
+// the thread to raise, the first time.
+static PlatThread *cs_flight_wanted(const GfxShader *cs) {
+    PlatThread *th = NULL;
     for (int i = 0; i < CS_FLIGHT; i++)
-        if (cs_flight[i] == cs) cs_flight[i] = NULL;
+        if (cs_flight[i] == cs && !cs_flight_want[i]) cs_flight_want[i] = 1, th = cs_flight_th[i];
+    return th;
+}
+
+// Without P.lock, for the thread that holds cs's slot: whether a dispatch came to wait.
+static int cs_flight_is_wanted(const GfxShader *cs) {
+    for (int i = 0; i < CS_FLIGHT; i++)
+        if (__atomic_load_n(&cs_flight[i], __ATOMIC_RELAXED) == cs) return cs_flight_want[i];
+    return 0;
+}
+
+static int cs_flight_remove(const GfxShader *cs) {   // 1 when a dispatch waited for it
+    int want = 0;
+    for (int i = 0; i < CS_FLIGHT; i++)
+        if (cs_flight[i] == cs) cs_flight[i] = NULL, want |= cs_flight_want[i];
+    return want;
+}
+
+// ---- compute pipelines the boot keeps (compute-used.bin next to pipeline-keys.bin; NX2NAVI_COMPUTE_KEEP)
+// The boot prebuild (lb_compute) used to build the pipeline of every compute shader of the warm list (the ones play
+// recorded and the prepared ones, shader-prepared.bin) and keep all of them for the process. A pipeline that exists
+// holds driver memory whether or not anything dispatches it: on an RTX 5090 (NVIDIA 621.01) the 4,066 compute shaders
+// of an installed copy's list (42,344 variants, 42,142 of them prepared) held 2.3 GiB of device memory and a matching
+// share of the process's commit from the title screen on, while a boot into the first village dispatched 95 of them.
+// That is memory an 8 to 12 GB card needs for textures, and a copy with prepared shaders pays it from its first boot.
+// So the boot keeps only the pipelines of the NX2NAVI_COMPUTE_KEEP (default 512) compute shaders dispatched most
+// recently, and builds every other one into the pipeline cache and destroys it at once (lb_compute keep 0): the cache
+// then holds it, so its first dispatch creates it without compiling, and no pipeline of an unused shader stays. On
+// that machine a compute pipeline came from pipeline-cache.bin in 0.25 ms on average at boot, and 256 first dispatches
+// of pipelines the boot had not kept (--probe-prewarm, with a game running beside it) took 0.19 ms on average and 3 ms
+// at most. Built and destroyed one after the other, they leave nothing behind in the driver either: 372 of them left
+// its device memory where it was. NVIDIA's driver does not hand back the device memory of destroyed pipelines, it
+// keeps it for the next ones (400 test pipelines, destroyed together: no change), so building all of them first and
+// destroying them afterwards would end at the same 2.3 GiB.
+// The record: one entry per compute shader a run dispatched (its input id) with the number of the last run that did;
+// each run that dispatches anything takes the next number. Kept at boot are the keep_n entries with the highest
+// numbers, so a short run does not push out what a long one used, and nothing is forgotten until newer shaders take
+// its place. Without a record (the first run that has one) nothing is kept and the run pays the first dispatches once.
+// NX2NAVI_COMPUTE_KEEP=all keeps every compute shader of the warm list as before; 0 keeps none.
+#define CU_VERSION 1
+typedef struct { char magic[8]; uint32_t version, rec_size, run, pad; } CuHeader;
+typedef struct { uint8_t iid[32]; uint32_t run, pad; } CuRec;
+static struct {
+    PlatMutex lock;
+    int opened, dirty;
+    char path[PLAT_PATH_MAX * 2 + 32];
+    CuRec *rec;
+    uint8_t *keep;                     // per record read at boot: among the keep_n dispatched most recently
+    uint32_t n, cap, n_file;           // n_file: the records read at boot (keep has one byte for each)
+    uint32_t *slot;                    // open addressing by the id's first bytes: record index + 1, 0 empty
+    uint32_t slot_cap;
+    uint32_t run;                      // this run's number
+    int quiet;                         // --probe-prewarm: its dispatches are not the game's, the file stays as it is
+    int32_t keep_n;                    // NX2NAVI_COMPUTE_KEEP; -1: all
+    uint32_t kept;                     // records flagged in keep
+} CU = {.lock = PLAT_MUTEX_INIT};
+
+// What the first dispatches of compute shaders cost this run (under P.lock): each creates its pipeline on the replay
+// thread. burst: the creations that fell into one window of CF_WINDOW_MS, the worst such window kept, which is what a
+// player would feel as one long frame when a new area starts.
+#define CF_WINDOW_MS 33.0
+static struct {
+    uint64_t n, hit, pre_used;         // hit: read from pipeline-cache.bin; pre_used: kept from the boot and dispatched
+    double ms, max_ms, hit_ms;
+    double win_t0, win_ms, worst_ms;
+    uint32_t win_n, worst_n;
+} CF;
+
+static uint32_t *cu_slot(const uint8_t iid[32]) {   // the id's slot, or the empty one it would take. Caller holds CU.lock.
+    uint64_t h;
+    memcpy(&h, iid, 8);
+    for (uint32_t j = (uint32_t)(h * 0x9e3779b97f4a7c15ull >> 32) & (CU.slot_cap - 1);; j = (j + 1) & (CU.slot_cap - 1))
+        if (!CU.slot[j] || !memcmp(CU.rec[CU.slot[j] - 1].iid, iid, 32)) return &CU.slot[j];
+}
+
+// Room for one more record and a table at most half full. 0 when out of memory. Caller holds CU.lock.
+static int cu_room(void) {
+    if (CU.n == CU.cap) {
+        uint32_t cap = CU.cap ? CU.cap * 2 : 1024;
+        CuRec *t = realloc(CU.rec, cap * sizeof *t);
+        if (!t) return 0;
+        CU.rec = t, CU.cap = cap;
+    }
+    if ((CU.n + 1) * 2 > CU.slot_cap) {
+        uint32_t cap = CU.slot_cap ? CU.slot_cap * 2 : 4096;
+        uint32_t *t = calloc(cap, sizeof *t), *old = CU.slot;
+        if (!t) return 0;
+        CU.slot = t, CU.slot_cap = cap;
+        for (uint32_t i = 0; i < CU.n; i++) *cu_slot(CU.rec[i].iid) = i + 1;
+        free(old);
+    }
+    return 1;
+}
+
+static int cu_run_cmp(const void *a, const void *b) {   // {run, index} pairs, the highest run first
+    const uint32_t *x = a, *y = b;
+    return x[0] != y[0] ? (x[0] < y[0] ? 1 : -1) : (x[1] > y[1]) - (x[1] < y[1]);
+}
+
+// The number of records in a compute-used.bin image (f, size) with its header in *h, or -1 when it is not one.
+static long cu_parse(const uint8_t *f, uint64_t size, CuHeader *h) {
+    if (!f || size < sizeof *h) return -1;
+    memcpy(h, f, sizeof *h);
+    if (memcmp(h->magic, "NX2NCUSE", 8) || h->version != CU_VERSION || h->rec_size != sizeof(CuRec)) return -1;
+    return (long)((size - sizeof *h) / sizeof(CuRec));
+}
+
+// Reads the record and marks what the boot keeps. Caller holds P.lock (ensure_init), after keys_open.
+static void cu_open(void) {
+    if (!A.on || !K.path[0]) return;
+    const char *e = cfg_value("NX2NAVI_COMPUTE_KEEP");
+    plat_mutex_lock(&CU.lock);
+    CU.keep_n = !strcmp(e, "all") ? -1 : atoi(e) < 0 ? 0 : atoi(e);
+    snprintf(CU.path, sizeof CU.path, "%s", K.path);
+    char *cut = plat_last_sep(CU.path);
+    snprintf(cut ? cut + 1 : CU.path, sizeof CU.path - (size_t)(cut ? cut + 1 - CU.path : 0), "compute-used.bin");
+    uint64_t size = 0;
+    uint8_t *f = plat_file_read(CU.path, &size);
+    CuHeader h;
+    long n = cu_parse(f, size, &h);
+    if (n >= 0) {
+        for (long i = 0; i < n && cu_room(); i++) {
+            CuRec r;
+            memcpy(&r, f + sizeof h + (size_t)i * sizeof r, sizeof r);
+            uint32_t *s = cu_slot(r.iid);
+            if (*s) continue;          // an id twice: the first entry stands
+            CU.rec[CU.n] = r, *s = ++CU.n;
+        }
+        CU.run = h.run;
+    } else if (f) {
+        rt_log("vk_pipeline: %s has another format or version; it is rewritten", CU.path);
+    }
+    free(f);
+    CU.n_file = CU.n, CU.run++;
+    uint32_t (*order)[2] = CU.n ? malloc(CU.n * sizeof *order) : NULL;
+    CU.keep = CU.n ? calloc(CU.n, 1) : NULL;
+    if (order && CU.keep) {
+        for (uint32_t i = 0; i < CU.n; i++) order[i][0] = CU.rec[i].run, order[i][1] = i;
+        qsort(order, CU.n, sizeof *order, cu_run_cmp);
+        for (uint32_t i = 0; i < CU.n && (CU.keep_n < 0 || i < (uint32_t)CU.keep_n); i++) CU.keep[order[i][1]] = 1, CU.kept++;
+    }
+    free(order);
+    CU.opened = 1;
+    rt_log("vk_pipeline: %s: %u compute shaders dispatched in earlier runs; the boot keeps the pipelines of %s%u "
+           "dispatched most recently (NX2NAVI_COMPUTE_KEEP %s)", CU.path, CU.n,
+           CU.keep_n < 0 ? "every recorded compute shader, among them the " : "the ", CU.kept, e);
+    plat_mutex_unlock(&CU.lock);
+}
+
+// 1 when the boot keeps the pipeline of the compute shader with this input id.
+static int cu_keep(const uint8_t iid[32]) {
+    plat_mutex_lock(&CU.lock);
+    int keep = CU.keep_n < 0 || !CU.opened;   // without the record (no cache folder): as before, every one
+    if (!keep && CU.slot_cap) {
+        uint32_t s = *cu_slot(iid);
+        keep = s && s <= CU.n_file && CU.keep && CU.keep[s - 1];
+    }
+    plat_mutex_unlock(&CU.lock);
+    return keep;
+}
+
+// The first dispatch of cs in this run: its entry takes this run's number. The runtime's own shaders (no input id)
+// are built at their first use every run and are not recorded.
+static void cu_note(const GfxShader *cs) {
+    static const uint8_t none[32];
+    const uint8_t *iid = gfx_shader_input_id(cs);
+    if (!CU.opened || !memcmp(iid, none, 32)) return;
+    plat_mutex_lock(&CU.lock);
+    if (cu_room()) {
+        uint32_t *s = cu_slot(iid);
+        if (!*s) {
+            memset(&CU.rec[CU.n], 0, sizeof *CU.rec);
+            memcpy(CU.rec[CU.n].iid, iid, 32);
+            *s = ++CU.n;
+        }
+        if (CU.rec[*s - 1].run != CU.run) CU.rec[*s - 1].run = CU.run, CU.dirty = 1;
+    }
+    plat_mutex_unlock(&CU.lock);
+}
+
+// Writes the record to path. 1 when written.
+static int cu_write(const char *path) {
+    plat_mutex_lock(&CU.lock);
+    CuHeader h = {{'N', 'X', '2', 'N', 'C', 'U', 'S', 'E'}, CU_VERSION, sizeof(CuRec), CU.run, 0};
+    size_t size = sizeof h + CU.n * sizeof(CuRec);
+    uint8_t *out = malloc(size);
+    if (out) memcpy(out, &h, sizeof h), memcpy(out + sizeof h, CU.rec, CU.n * sizeof(CuRec));
+    CU.dirty = 0;
+    plat_mutex_unlock(&CU.lock);
+    int ok = out && plat_file_write_atomic(path, out, size);
+    free(out);
+    return ok;
+}
+
+// Writes the record when a dispatch changed it (the autosave thread and the save at exit).
+static void cu_flush(void) {
+    if (!CU.opened || CU.quiet || !*(volatile int *)&CU.dirty) return;
+    if (!cu_write(CU.path)) rt_log("vk_pipeline: cannot write %s", CU.path);
+}
+
+// A compute pipeline created at a dispatch took ms. Caller holds P.lock.
+static void cf_note(double ms, int hit) {
+    double now = now_ms();
+    CF.n++, CF.ms += ms;
+    if (ms > CF.max_ms) CF.max_ms = ms;
+    if (hit == 1) CF.hit++, CF.hit_ms += ms;
+    if (now - CF.win_t0 > CF_WINDOW_MS) CF.win_t0 = now, CF.win_n = 0, CF.win_ms = 0;
+    CF.win_n++, CF.win_ms += ms;
+    if (CF.win_ms > CF.worst_ms) CF.worst_ms = CF.win_ms, CF.worst_n = CF.win_n;
+}
+
+static void cf_log(void) {
+    plat_mutex_lock_shared(&P.lock);
+    if (CF.n || CF.pre_used)
+        rt_log("vk_pipeline: compute pipelines created at their first dispatch: %llu (avg %.2f ms, longest %.2f ms; %llu "
+               "of them read from the pipeline cache file, avg %.2f ms); the %.0f ms that held the most of it: %u "
+               "pipelines, %.1f ms; of the compute pipelines kept from the boot, %llu were dispatched",
+               (unsigned long long)CF.n, CF.n ? CF.ms / CF.n : 0.0, CF.max_ms, (unsigned long long)CF.hit,
+               CF.hit ? CF.hit_ms / CF.hit : 0.0, CF_WINDOW_MS, CF.worst_n, CF.worst_ms, (unsigned long long)CF.pre_used);
+    plat_mutex_unlock_shared(&P.lock);
 }
 
 // The background builder of large compute shaders (comment at bg_main).
@@ -3977,13 +4514,17 @@ static struct {
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     if (info) *info = NULL;
     if (!cs || !ensure_init()) return VK_NULL_HANDLE;
-    struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
+    struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
     uint64_t h = key_hash(&k, sizeof k);
     plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&k, sizeof k, h);
     double w0 = !p && cs_flight_has(cs) ? now_ms() : 0;
     int bg = 0;
     while (!p && cs_flight_has(cs)) {   // another thread is compiling it: its result, not a second compile
+        // a build that only fills the pipeline cache keeps its pipeline for this dispatch, and a boot prebuild thread
+        // compiling it below normal priority goes to normal
+        PlatThread *builder = cs_flight_wanted(cs);
+        if (builder) plat_thread_set_priority(builder, PLAT_PRIO_NORMAL);
         if (BG.building == cs && BG.th && !plat_xchg32(&BG.raised, 1))   // the background builder: normal priority now
             plat_thread_set_priority(BG.th, PLAT_PRIO_NORMAL), bg = 1;
         plat_mutex_unlock(&P.lock);
@@ -4005,14 +4546,18 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         Layout *l = compute_layout(cs, &B, &why);
         VkPipeline pipe = VK_NULL_HANDLE;
         if (!why) {
-            int flight = cs_flight_add(cs);
+            int flight = cs_flight_add(cs, NULL);
             plat_mutex_unlock(&P.lock);   // the compile runs without the lock
             uint64_t p0 = perf_begin();
+            double c0 = now_ms();
             pipe = compute_create(cs, l, 0);
+            double cms = now_ms() - c0;
+            int hit = cc_hit;
             perf_end(PERF_PIPE, p0);
             plat_mutex_lock(&P.lock);
             if (flight) cs_flight_remove(cs);
             if (!pipe) why = "pipeline creation failed";
+            else cf_note(cms, hit);
         }
         if ((p = pipe_find(&k, sizeof k, h))) {   // another thread added it meanwhile (no flight slot was free)
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
@@ -4026,6 +4571,11 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             }
             p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
         }
+    }
+    if (p && !p->used) {   // the first dispatch of this run: the boot of the next runs keeps this shader's pipeline
+        p->used = 1;
+        CF.pre_used += p->pre;
+        if (p->info.pipeline) cu_note(cs);
     }
     plat_mutex_unlock(&P.lock);
     if (!p) return VK_NULL_HANDLE;
@@ -4144,6 +4694,25 @@ static double bg_growth_cap(void) {
     return cap;
 }
 
+// The builder compiles into a pipeline cache of its own (own_cache at pipe_create_in), not into P.cache. A create into
+// P.cache holds cache_rw shared from start to end, and the cache is only saved at a moment when nobody holds it: on an
+// RX 7900 XT (26.10.1) the largest of these shaders (4,874,502 SPIR-V words) was still compiling 590 s after the boot,
+// pipeline-cache.bin was not written once in that time, and the game was closed before the build ended, so the next
+// boot found neither that shader nor the pipelines built in play and started the same build again. bg_merge moves the
+// result into P.cache when the build is done, at a moment with no build into P.cache running: the lock is tried as
+// cache_save tries it, because a waiting exclusive request would hold back every new build.
+static void bg_merge(VkPipelineCache own, int built) {
+    int locked = 0;
+    while (built && !LB.stop && !(locked = plat_mutex_trylock(&cache_rw))) plat_sleep_ms(2);
+    if (locked) {
+        VkResult r = vkMergePipelineCaches(P.device, P.cache, 1, &own);
+        plat_mutex_unlock(&cache_rw);
+        if (r == VK_SUCCESS) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);
+        else rt_log("vk_pipeline: background compute build: its cache did not merge into %s (%d)", P.cache_path, (int)r);
+    }
+    vkDestroyPipelineCache(P.device, own, NULL);
+}
+
 static void bg_main(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
@@ -4178,7 +4747,7 @@ static void bg_main(void *arg) {
         plat_mutex_unlock(&LB.stat);
         if (!have) break;
         const uint8_t *iid = idbuf;
-        struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
+        struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
         uint64_t h = key_hash(&k, sizeof k);
         Bindings B = {0};
         const char *why = NULL;
@@ -4208,7 +4777,7 @@ static void bg_main(void *arg) {
         plat_mutex_lock(&P.lock);
         int there = cs_flight_has(cs) || pipe_find(&k, sizeof k, h);   // a dispatch got to it first
         Layout *l = there ? NULL : compute_layout(cs, &B, &why);
-        int flight = l ? cs_flight_add(cs) : 0;
+        int flight = l ? cs_flight_add(cs, NULL) : 0;   // vk_pipeline_compute raises this thread through BG.raised
         if (l) BG.building = cs;
         plat_mutex_unlock(&P.lock);
         if (!l) {
@@ -4216,19 +4785,29 @@ static void bg_main(void *arg) {
             else BG.failed++, rt_log("vk_pipeline: background compute build: %s", why ? why : "no layout");
             continue;
         }
+        VkPipelineCache own = VK_NULL_HANDLE;
+        VkPipelineCacheCreateInfo oci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (P.cache && vkCreatePipelineCache(P.device, &oci, NULL, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
         double t0 = now_ms();
+        own_cache = own;   // without one the build goes into P.cache as before
         VkPipeline pipe = compute_create(cs, l, 0);
+        own_cache = VK_NULL_HANDLE;
         double ms = now_ms() - t0;
+        int keep = cu_keep(iid);
         plat_mutex_lock(&P.lock);
-        if (flight) cs_flight_remove(cs);
+        if (flight && cs_flight_remove(cs)) keep = 1;   // a dispatch waits for it
         BG.building = NULL;
-        if (pipe && !pipe_find(&k, sizeof k, h)) {
-            pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+        Pipe *e = NULL;
+        if (pipe && keep && !pipe_find(&k, sizeof k, h) &&
+            (e = pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0))) {
+            e->pre = 1;
             P.stats.compute++;
-        } else if (pipe) {
+        } else if (pipe) {   // only for the pipeline cache (comment at compute-used.bin), or a dispatch built its own
             vkDestroyPipeline(P.device, pipe, NULL);
+            if (!own) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);   // new content in P.cache to save
         }
         plat_mutex_unlock(&P.lock);
+        if (own) bg_merge(own, pipe != VK_NULL_HANDLE);   // after the entry: a dispatch waiting for it does not wait for this
         if (plat_xchg32(&BG.raised, 0)) plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
         if (pipe) BG.built++, BG.ms += ms;
         else BG.failed++;
@@ -4251,8 +4830,10 @@ static void bg_start(void) {
                "dispatch", BG.n);
 }
 
-static void lb_compute(const GfxShader *cs, const uint8_t iid[32]) {
-    struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
+// keep 0: the pipeline is built for the pipeline cache only and destroyed at once, unless a dispatch came to wait for
+// it meanwhile (comment at compute-used.bin).
+static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
+    struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
     const char *why = NULL;
@@ -4267,31 +4848,48 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32]) {
     lb_lock();
     int busy = cs_flight_has(cs);   // the replay compiles it now (vk_pipeline_compute)
     Layout *l = busy || pipe_find(&k, sizeof k, h) ? NULL : compute_layout(cs, &B, &why);
-    int have = !l && !why, flight = l ? cs_flight_add(cs) : 0;
+    PlatThread *me = LB.idle && lb_me >= 0 ? LB.th[lb_me] : NULL;
+    int have = !l && !why, flight = l ? cs_flight_add(cs, me) : 0;
     lb_unlock();
     if (!l) {
         lb_count(2, have ? 1 : 2, 0);
         return;
     }
     double t0 = now_ms();
-    // at normal priority: while it is in flight a dispatch of the same shader waits for it (vk_pipeline_compute), and an
-    // idle-priority compile under load held that frame for seconds
-    if (LB.idle) plat_thread_priority(PLAT_PRIO_NORMAL);
+    // The compile runs below normal priority: after an update or a driver update every one of these pipelines is
+    // compiled again (about 140 ms each on an RTX 5090's driver, minutes of two threads for a long play history), and
+    // at normal priority those threads took cores from the game's own on a CPU with few of them. While the shader is in
+    // flight a dispatch of it waits for this build (vk_pipeline_compute) and raises the thread to normal: a compile left
+    // at idle priority under load held that frame for seconds. The dispatch may have come between the unlock and the
+    // call below, which would undo its raise, hence the look at the slot after it. Without a slot or a handle nobody
+    // could raise the thread, so it compiles at normal priority.
+    if (LB.idle && flight && me) {
+        plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+        if (cs_flight_is_wanted(cs)) plat_thread_priority(PLAT_PRIO_NORMAL);
+    } else if (LB.idle) {
+        plat_thread_priority(PLAT_PRIO_NORMAL);
+    }
     VkPipeline pipe = compute_create(cs, l, big);
     double ms = now_ms() - t0;
+    int compiled = pipe && cc_hit != 1, kept = 0;
     lb_lock();
-    if (flight) cs_flight_remove(cs);
-    if (pipe && !pipe_find(&k, sizeof k, h)) {
-        pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+    if (flight && cs_flight_remove(cs)) keep = 1;   // a dispatch waits for it
+    Pipe *e = NULL;
+    if (pipe && pipe_find(&k, sizeof k, h)) {
+        vkDestroyPipeline(P.device, pipe, NULL);
+        have = 1;
+    } else if (pipe && keep && (e = pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0))) {
+        e->pre = 1, kept = 1;
         P.stats.compute++;
     } else if (pipe) {
         vkDestroyPipeline(P.device, pipe, NULL);
-        have = 1;
+        // P.stats.compute does not count it, so the autosave would not see what its compile added to P.cache
+        if (compiled) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);
     }
     lb_unlock();
     if (!pipe && big && bg_on()) bg_queue(cs, iid, words);
     else if (!pipe && big) lb_defer(iid, words);
-    else lb_count(2, pipe ? have : 2, ms);
+    else lb_count(2, !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -4383,9 +4981,10 @@ static void lb_report(const char *how) {
     plat_mutex_unlock_shared(&LB.stat);
 }
 
-// Boot: compute pipelines and kept libraries, all entered for the process.
+// Boot: compute pipelines (the first LB.n_keep entered for the process, the others only built into the pipeline
+// cache) and kept libraries.
 static void lb_worker(void *arg) {
-    (void)arg;
+    lb_me = (int)(intptr_t)arg;        // its handle is LB.th[lb_me]
     plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
@@ -4405,7 +5004,7 @@ static void lb_worker(void *arg) {
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh, LB.e[i].iid);
+            lb_compute(sh, LB.e[i].iid, i < LB.n_keep);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
             else lb_skip_lib();
@@ -4417,6 +5016,7 @@ static void lb_worker(void *arg) {
     if (!plat_dec32(&LB.running)) {
         lb_report(LB.stop ? "stopped" : "done");
         fb_log("after the stage library prebuild");
+        vk_mem_stage_log("the compute pipeline prebuild");
         bg_start();
     }
     return;
@@ -4433,12 +5033,190 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.samples = (uint8_t)(1u << bf);
 }
 
-// Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
+// ---- the driver's cache of stage libraries, warmed again during play
+//
+// The preparation (lb_warm_prepared) builds every prepared variant's stage library once, so the driver's disk cache
+// holds it and the library a draw needs later takes a few milliseconds instead of a compile: 3 ms against 100 ms for
+// a vertex and 340 ms for a fragment library on an RX 7900 XT (driver 26.10.1). The driver's cache does not outlive
+// everything, though: a driver update empties it, the AMD driver keeps a limited amount and drops old entries, and a
+// change to what a library is built with (the dynamic states it lists, as when dynamic vertex input was turned off for
+// this driver) gives every library another entry. After any of them each pipeline a draw first needs compiles cold:
+// the draw is skipped for the frames that takes, or waits for it. Measured on that card with the cache cold, a walk
+// through a village not seen before skipped 11,180 draws while their pipelines built and 94 draws waited 5.5 s in
+// all, one of them 1.9 s.
+//
+// So every start checks: a sample of the prepared fragment libraries is built (lw_probe), and when their median time
+// says the cache is cold, the whole prepared list is built again into the driver's cache on a few idle-priority
+// threads while the game runs (lw_worker), as the preparation does but without stopping play. shader-warm.txt beside
+// the caches says where that stands: "warming" while it runs, so a start after a run that ended meanwhile goes on,
+// and "done" with the driver and a count of the times the cache was cold again right after a finished warm. At two in
+// a row the driver does not keep stage libraries at all and warming stops being tried (NX2NAVI_LIB_WARM=0 turns it off;
+// =force warms at every start).
+#define LW_SAMPLE 12
+#define LW_COLD_MS 15.0
+#define LW_MAX_THREADS 6
+static struct {
+    GfxWarmEnt *e;
+    size_t n;
+    volatile int64_t next, done;
+    volatile int32_t running, stop, started;
+    PlatThread *th[LW_MAX_THREADS + 1];
+    int threads, strikes;
+    double t0;
+    char stamp[PLAT_PATH_MAX * 2 + 32], id[64];
+} LW;
+
+static void lw_stamp(const char *state, int strikes) {
+    char line[128];
+    int n = snprintf(line, sizeof line, "%s %s %d\n", state, LW.id, strikes);
+    if (!plat_file_write_atomic(LW.stamp, line, (size_t)n)) rt_log("vk_pipeline: cannot write %s", LW.stamp);
+}
+
+// One prepared vertex or fragment variant's library into the driver's cache; its time in ms, negative when the
+// variant is on the skip list, not in the shader cache or of another stage.
+static double lw_build(const GfxWarmEnt *e) {
+    if (e->stage != GFX_STAGE_VS && e->stage != GFX_STAGE_FS) return -1;
+    if (skip_listed(e->iid)) return -1;
+    int owned = 0;
+    const GfxShader *sh = gfx_shader_load_private(e->iid, &owned);
+    if (!sh) return -1;
+    double t0 = now_ms();
+    int st = gfx_shader_stage(sh);
+    if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) lb_library(sh, st == GFX_STAGE_VS, 0);
+    double ms = now_ms() - t0;
+    if (owned) gfx_shader_release_private(sh);
+    return ms;
+}
+
+static void lw_worker(void *arg) {
+    (void)arg;
+    plat_thread_priority(PLAT_PRIO_IDLE);
+    for (;;) {
+        size_t i = (size_t)plat_inc64(&LW.next) - 1;
+        if (i >= LW.n || LW.stop) break;
+        lw_build(&LW.e[i]);
+        int64_t d = plat_inc64(&LW.done);
+        if (d % 8000 == 0)
+            rt_log("vk_pipeline: library warm: %lld of %zu prepared variants in %.0f s", (long long)d, LW.n,
+                   (now_ms() - LW.t0) / 1000);
+    }
+    if (!plat_dec32(&LW.running) && !LW.stop) {
+        lw_stamp("done", LW.strikes);
+        rt_log("vk_pipeline: library warm: done, %zu prepared variants in %.0f s on %d idle threads; new pipelines "
+               "link from the driver's cache from here on", LW.n, (now_ms() - LW.t0) / 1000, LW.threads);
+    }
+}
+
+// The median time of LW_SAMPLE prepared fragment libraries spread over the list; negative without that many.
+static double lw_probe(void) {
+    double ms[LW_SAMPLE];
+    int got = 0;
+    size_t step = LW.n / LW_SAMPLE ? LW.n / LW_SAMPLE : 1, at = (size_t)(plat_now_ns() / 1000) % step;
+    for (size_t i = at; i < LW.n && got < LW_SAMPLE && !LW.stop; i += step)
+        for (size_t j = i; j < i + step && j < LW.n; j++) {   // the next fragment variant from here
+            if (LW.e[j].stage != GFX_STAGE_FS) continue;
+            double t = lw_build(&LW.e[j]);
+            if (t >= 0) ms[got++] = t;
+            break;
+        }
+    if (got < LW_SAMPLE / 2) return -1;
+    for (int i = 1; i < got; i++)
+        for (int j = i; j > 0 && ms[j] < ms[j - 1]; j--) {
+            double t = ms[j];
+            ms[j] = ms[j - 1], ms[j - 1] = t;
+        }
+    return ms[got / 2];
+}
+
+static void lw_main(void *arg) {
+    (void)arg;
+    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    char was[16] = "", id[64] = "";
+    int strikes = 0;
+    uint64_t size = 0;
+    char *f = (char *)plat_file_read(LW.stamp, &size);
+    if (f && size < 200) {
+        char line[200];
+        memcpy(line, f, size), line[size] = 0;
+        if (sscanf(line, "%15s %63s %d", was, id, &strikes) < 2) was[0] = 0;
+    }
+    free(f);
+    int same = !strcmp(id, LW.id), resume = same && !strcmp(was, "warming");
+    const char *mode = cfg_value("NX2NAVI_LIB_WARM");
+    double median = resume ? 0 : lw_probe();
+    if (LW.stop) return;
+    int cold = median > LW_COLD_MS || !strcmp(mode, "force");
+    if (!resume && !cold) {
+        if (same && strikes) lw_stamp("done", 0);   // the driver kept them this time
+        rt_log("vk_pipeline: library warm: the driver's cache has the prepared libraries (a sample's median %.1f ms)",
+               median);
+        return;
+    }
+    if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
+        rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
+               "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
+               "them (NX2NAVI_LIB_WARM=force warms anyway)", median);
+        return;
+    }
+    LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
+    lw_stamp("warming", LW.strikes);
+    int cpus = (int)plat_cpu_usable(), t = cpus / 4;
+    t = t < 2 ? 2 : t > LW_MAX_THREADS ? LW_MAX_THREADS : t;
+    if (resume)
+        rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
+               "idle threads", LW.n, t);
+    else
+        rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
+               "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
+               "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
+               "compile, which skips that draw for some frames or makes it wait", median, LW.n, t);
+    LW.t0 = now_ms();
+    LW.running = t;
+    int started = 0;
+    for (int i = 0; i < t; i++)
+        if ((LW.th[1 + started] = plat_thread_new(lw_worker, NULL, "lib warm"))) started++;
+    LW.threads = started;
+    if (plat_add32(&LW.running, started - t) == 0 && !started) rt_log("vk_pipeline: library warm: no thread started");
+}
+
+// Boot, once the library state is known (lb_state): the prepared list is read and the check starts on its own thread.
+static void lw_start(void) {
+    const char *mode = cfg_value("NX2NAVI_LIB_WARM");
+    if (!P.gpl || !strcmp(mode, "0") || plat_xchg32(&LW.started, 1)) return;
+    char dir[PLAT_PATH_MAX * 2], path[PLAT_PATH_MAX * 2 + 32];
+    if (!cache_dir(dir, sizeof dir)) return;
+    snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
+    snprintf(LW.stamp, sizeof LW.stamp, "%s/shader-warm.txt", dir);
+    uint64_t size = 0;
+    uint8_t *f = plat_file_read(path, &size);
+    size_t n = f && size >= 16 ? (size_t)(size - 16) / 36 : 0;
+    LW.e = n ? calloc(n, sizeof *LW.e) : NULL;
+    for (size_t i = 0; LW.e && i < n; i++)
+        memcpy(LW.e[i].iid, f + 16 + 36 * i + 4, 32), LW.e[i].stage = f[16 + 36 * i], LW.e[i].prio = f[16 + 36 * i + 1];
+    free(f);
+    if (!LW.e) return;   // nothing prepared (a build without the preparation step)
+    LW.n = n;
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
+    snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
+    LW.th[0] = plat_thread_new(lw_main, NULL, "lib warm check");
+}
+
+static void lw_stop(void) {
+    plat_xchg32(&LW.stop, 1);
+    for (int i = 0; i <= LW_MAX_THREADS; i++)
+        if (LW.th[i]) plat_thread_join(LW.th[i]), LW.th[i] = NULL;
+}
+
+// Boot: compute shaders of the warm list (recorded and prepared), those whose pipeline stays first, then the first
+// KEEP recorded graphics variants.
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("NX2NAVI_LIB_PREBUILD"), *ke = cfg_get("NX2NAVI_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("NX2NAVI_LIB_PREBUILD_THREADS");   // no fixed default: 2 when unset (1 under 4 CPUs)
     const char *be = cfg_get("NX2NAVI_LIB_PREBUILD_BIG");       // SPIR-V words; LB_BIG_WORDS when unset, 0 no limit
     if (!A.on || !cfg_bool("NX2NAVI_LIB_PREBUILD")) return;
+    lb_state(pr_hist, fs_hist);   // the libraries' state, also for lw_start
+    lw_start();
     LB.big_words = be && *be ? strtoull(be, NULL, 10) : LB_BIG_WORDS;
     char dir[PLAT_PATH_MAX * 2];
     if (cache_dir(dir, sizeof dir)) skip_init(dir);
@@ -4446,19 +5224,25 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
     LB.keep_n = ke && *ke ? atoi(ke) : 0;
     LB.e = malloc((total + 1) * sizeof *LB.e);
+    // the compute shaders whose pipeline stays come first: they are the ones the game is about to dispatch
+    uint8_t *kf = total ? malloc(total) : NULL;
+    for (size_t i = 0; LB.e && kf && i < total; i++)
+        if (all[i].stage == GFX_STAGE_CS && (kf[i] = (uint8_t)cu_keep(all[i].iid))) LB.e[n++] = all[i];
+    LB.n_keep = n;
     for (size_t i = 0; LB.e && i < total; i++)
-        if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
+        if (all[i].stage == GFX_STAGE_CS && !(kf && kf[i])) LB.e[n++] = all[i];
+    free(kf);
     n_cs = n;
     for (size_t i = 0; LB.e && i < total && (int32_t)(n - n_cs) < LB.keep_n; i++)
         if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
     free(all);
     if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
+    if (LB.n_keep > n) LB.n_keep = n;
     if (!n) {
         free(LB.e), LB.e = NULL;
         return;
     }
     LB.n = n;
-    lb_state(pr_hist, fs_hist);
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
     // Two threads by default, not half the CPUs. On a 32-thread CPU with NVIDIA's driver, 16 builders kept the driver's
@@ -4473,20 +5257,23 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.running = t;
     int started = 0;
     for (int i = 0; i < t; i++)
-        if ((LB.th[started] = plat_thread_new(lb_worker, NULL, "lib prebuild"))) started++;
+        if ((LB.th[started] = plat_thread_new(lb_worker, (void *)(intptr_t)started, "lib prebuild"))) started++;
     plat_add32(&LB.running, started - t);
     LB.threads = started;
     char big[128];
     if (!LB.big_words) snprintf(big, sizeof big, "compute shaders of every size");
     else snprintf(big, sizeof big, "compute shaders over %llu SPIR-V words %s", (unsigned long long)LB.big_words,
                   P.cache_control ? "only from the pipeline caches" : "left to their first dispatch");
-    rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines and %zu recorded variants' libraries "
-           "(NX2NAVI_LIB_PREBUILD_KEEP %d) on %d idle-priority threads; library state clamp %u, polygon mode %u, depth "
-           "-w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n,
-           started, LB.clamp, LB.poly, LB.minus_w, LB.samples, big);
+    rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines, of which %zu stay (the shaders dispatched most "
+           "recently, NX2NAVI_COMPUTE_KEEP) and the others are built into the pipeline cache and destroyed, to be created "
+           "at their first dispatch; %zu recorded variants' libraries (NX2NAVI_LIB_PREBUILD_KEEP %d); on %d idle-priority "
+           "threads; library state clamp %u, polygon mode %u, depth -w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)",
+           n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly, LB.minus_w,
+           LB.samples, big);
 }
 
 static void lb_stop(void) {
+    lw_stop();
     plat_xchg32(&LB.stop, 1);
     for (int i = 0; i < LB.threads; i++)
         if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
@@ -4626,6 +5413,91 @@ int vk_pipeline_warm_shaders(void) {
     }
     lb_warm_prepared(dir);
     return 0;
+}
+
+// nx2navi.exe --probe-prewarm: the boot's shader and pipeline stages without the game, from the caches next to
+// nx2navi.exe (pipeline-cache.bin, pipeline-keys.bin, shader-answers.bin, the shader cache): the pipeline cache load,
+// the shader prewarm, the recorded pipelines and the compute pipeline prebuild, each followed by vk_mem_stage_log's
+// line, so the log tells what every stage leaves in device memory and in the process's commit. Then up to
+// PROBE_DISPATCHES compute shaders whose pipeline the boot did not keep are asked for as a dispatch would
+// (vk_pipeline_compute), which gives what a first dispatch costs on this machine and how many came from the pipeline
+// cache file. Fails when one of those pipelines is not created, when the prebuild kept a pipeline it should not have,
+// or when the record of dispatched shaders, written to a file of the probe's own and read back, does not hold the
+// probe's dispatches. compute-used.bin itself stays as it is; the pipeline cache is saved as after a boot.
+#define PROBE_DISPATCHES 256
+int vk_pipeline_probe_prewarm(void) {
+    vk_pipeline_async_enable();
+    CU.quiet = 1;
+    vk_pipeline_prewarm();             // brings the device up itself: it has to own the key file before ensure_init runs
+    if (!P.ready) {
+        printf("probe-prewarm: SKIP (no Vulkan device)\n");
+        return 0;
+    }
+    while (__atomic_load_n(&LB.running, __ATOMIC_ACQUIRE) > 0) plat_sleep_ms(50);
+    if (!LB.n) {
+        printf("probe-prewarm: SKIP (no recorded compute shaders next to the executable: %s)\n", P.cache_path);
+        return 0;
+    }
+    VkPipeStats st;
+    vk_pipeline_stats(&st);
+    plat_mutex_lock_shared(&LB.stat);
+    uint64_t kept = LB.built[2], cache_only = LB.warmed[2], failed = LB.fail[2], there = LB.have[2];
+    plat_mutex_unlock_shared(&LB.stat);
+    printf("probe-prewarm: %zu compute shaders, %zu to keep: %llu kept, %llu built into the pipeline cache only, %llu "
+           "there already, %llu failed; %llu graphics pipelines\n", LB.n, LB.n_keep, (unsigned long long)kept,
+           (unsigned long long)cache_only, (unsigned long long)there, (unsigned long long)failed,
+           (unsigned long long)st.graphics);
+    int fails = kept > LB.n_keep;      // a dispatch never waits in this mode, so nothing else may have been kept
+    if (fails) printf("probe-prewarm: FAIL: %llu pipelines kept, %zu expected at most\n", (unsigned long long)kept, LB.n_keep);
+    uint32_t asked = 0, got = 0;
+    double t_all = 0, t_max = 0;
+    for (size_t i = LB.n_keep; i < LB.n && asked < PROBE_DISPATCHES; i++) {
+        const GfxShader *sh = LB.e[i].stage == GFX_STAGE_CS ? gfx_shader_load_input(LB.e[i].iid, 0) : NULL;
+        uint64_t words = 0;
+        if (!sh || gfx_shader_stage(sh) != GFX_STAGE_CS) continue;
+        gfx_shader_spirv(sh, &words);
+        if (LB.big_words && words > LB.big_words) continue;   // those wait for the background builder
+        const VkPipeInfo *info = NULL;
+        double t0 = now_ms();
+        VkPipeline p = vk_pipeline_compute(sh, &info);
+        double ms = now_ms() - t0;
+        asked++, got += p != VK_NULL_HANDLE;
+        t_all += ms;
+        if (ms > t_max) t_max = ms;
+    }
+    vk_mem_stage_log("the probe's first dispatches");
+    plat_mutex_lock_shared(&P.lock);
+    uint64_t hit = CF.hit;
+    plat_mutex_unlock_shared(&P.lock);
+    printf("probe-prewarm: %u first dispatches of pipelines the boot did not keep: %u created, avg %.2f ms, longest %.2f "
+           "ms, %llu read from the pipeline cache file\n", asked, got, asked ? t_all / asked : 0.0, t_max,
+           (unsigned long long)hit);
+    if (got != asked) fails++, printf("probe-prewarm: FAIL: %u pipelines were not created\n", asked - got);
+    if (CU.opened) {
+        char rp[sizeof CU.path + 8];
+        snprintf(rp, sizeof rp, "%s.probe", CU.path);
+        uint64_t rsize = 0;
+        CuHeader rh = {0};
+        uint32_t mine = 0;
+        int wrote = cu_write(rp);
+        uint8_t *rf = wrote ? plat_file_read(rp, &rsize) : NULL;
+        long rn = cu_parse(rf, rsize, &rh);
+        for (long i = 0; i < rn; i++) {
+            CuRec r;
+            memcpy(&r, rf + sizeof rh + (size_t)i * sizeof r, sizeof r);
+            mine += r.run == CU.run;
+        }
+        free(rf);
+        plat_file_delete(rp);
+        printf("probe-prewarm: the record of dispatched compute shaders: %ld entries, %u of this run (run %u)\n", rn, mine,
+               CU.run);
+        if (!wrote || rn < 0 || rh.run != CU.run || mine != got)
+            fails++, printf("probe-prewarm: FAIL: the record does not hold the %u shaders dispatched here\n", got);
+    }
+    lb_stop();
+    vk_pipeline_save();
+    printf("probe-prewarm: %s\n", fails ? "FAILED" : "passed");
+    return fails ? 1 : 0;
 }
 
 // ---- dynamic state
@@ -4802,7 +5674,7 @@ static int cache_save(uint32_t wait_ms) {
 #define SAVE_WAIT_MS 5000
 
 static void save_with(uint32_t wait_ms) {
-    if (P.ready) keys_flush(), pb_flush();
+    if (P.ready) keys_flush(), pb_flush(), cu_flush(), cf_log();
     if (P.ready && P.gpl) {
         rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers; avg %.2f ms, max %.2f ms, %llu failed), %llu draws "
                "lookups found shader libraries missing (left to a worker), %llu optimised pipelines swapped in (%llu queued "
@@ -4848,19 +5720,21 @@ static void autosave_once(void) {
         last_keys = now;
         if (*(volatile uint32_t *)&K.pend_n) keys_flush();
         pb_flush();
+        cu_flush();
     }
     gfx_shader_record_flush(0);
     if (now - last_ms < 20000) return;
     VkPipeStats s;
     vk_pipeline_stats(&s);
-    if (s.graphics + s.compute == last_n) return;
+    uint64_t n = s.graphics + s.compute + cache_merges;   // a merge comes after its pipeline was counted (bg_main)
+    if (n == last_n) return;
     // Only at a moment with no build running (cache_save): while one runs the save waits for the next tick, 500 ms
     // on, before it logs or flushes anything, so a busy stretch does not repeat the statistics lines every tick.
     if (P.cache && P.cache_path[0]) {
         if (!plat_mutex_trylock(&cache_rw)) return;
         plat_mutex_unlock(&cache_rw);
     }
-    last_n = s.graphics + s.compute, last_ms = now;
+    last_n = n, last_ms = now;
     save_with(0);
 }
 

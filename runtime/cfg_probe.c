@@ -221,6 +221,20 @@ int probe_cfg(void) {
     cfg_set("NX2NAVI_VOLUME", "60");
     CHECK(cfg_save_to(path) == 1, "reset: volume 60 again for the environment case");
 
+    // a file saved as UTF-16 (little and big endian, with a line ending of two characters) reads as the same lines
+    static const char wtext[] = "[audio]\r\nvolume = 35\r\n[input]\r\nmotion = 0\r\n";
+    for (int be = 0; be < 2; be++) {
+        uint8_t wbuf[2 + 2 * sizeof wtext];
+        size_t wn = 0;
+        wbuf[wn++] = be ? 0xFE : 0xFF, wbuf[wn++] = be ? 0xFF : 0xFE;
+        for (size_t i = 0; i + 1 < sizeof wtext; i++)
+            wbuf[wn++] = be ? 0 : (uint8_t)wtext[i], wbuf[wn++] = be ? (uint8_t)wtext[i] : 0;
+        CHECK(plat_file_write("cfg-probe-utf16.ini", wbuf, wn) && cfg_load("cfg-probe-utf16.ini") == 1 &&
+              EQ(cfg_get("NX2NAVI_VOLUME"), "35") && EQ(cfg_get("NX2NAVI_MOTION"), "0"),
+              be ? "an ini saved as UTF-16, big endian, is not read" : "an ini saved as UTF-16, little endian, is not read");
+    }
+    plat_file_delete("cfg-probe-utf16.ini");
+
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_VOLUME"), "60"), "reset: reload");
     cfg_setenv("NX2NAVI_VOLUME", "70");

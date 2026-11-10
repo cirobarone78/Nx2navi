@@ -145,6 +145,9 @@ static uint8_t g_gpu_luid[8];
 static int g_gpu_luid_ok;
 static int g_gpu_bus = -1;
 static float g_vram_total_mb = -1;
+static float (*g_vram_game)(void);
+
+void perfmon_set_vram_game(float (*used_mb)(void)) { __atomic_store_n(&g_vram_game, used_mb, __ATOMIC_RELEASE); }
 
 void perfmon_set_gpu(const char *name, const uint8_t *luid, int pci_bus, float vram_total_mb) {
     plat_mutex_lock(&g_lock);
@@ -308,6 +311,7 @@ static void machine_clear(PerfStats *s) {
     s->cpu_total_pct = s->cpu_game_pct = s->cpu_temp_c = -1;
     s->ram_used_mb = s->ram_total_mb = s->ram_game_mb = -1;
     s->gpu_pct = s->gpu_temp_c = s->gpu_power_w = s->gpu_clock_mhz = s->vram_used_mb = s->vram_total_mb = -1;
+    s->vram_game_mb = -1;
 }
 
 static void machine_copy(PerfStats *d, const PerfStats *s) {
@@ -317,6 +321,7 @@ static void machine_copy(PerfStats *d, const PerfStats *s) {
     d->ram_used_mb = s->ram_used_mb, d->ram_total_mb = s->ram_total_mb, d->ram_game_mb = s->ram_game_mb;
     d->gpu_pct = s->gpu_pct, d->gpu_temp_c = s->gpu_temp_c, d->gpu_power_w = s->gpu_power_w;
     d->gpu_clock_mhz = s->gpu_clock_mhz, d->vram_used_mb = s->vram_used_mb, d->vram_total_mb = s->vram_total_mb;
+    d->vram_game_mb = s->vram_game_mb;
 }
 
 static void sampler(void *arg) {
@@ -343,6 +348,8 @@ static void sampler(void *arg) {
         plat_mem_info(&s.ram_used_mb, &s.ram_total_mb, &s.ram_game_mb);
         plat_gpu_load(l, &s.gpu_pct, &s.vram_used_mb);
         s.vram_total_mb = vram_total;
+        float (*game)(void) = __atomic_load_n(&g_vram_game, __ATOMIC_ACQUIRE);
+        if (game) s.vram_game_mb = game();
         nvml_sample(&s);
         adl_sample(&s);
         plat_mutex_lock(&g_lock);
