@@ -575,7 +575,7 @@ static void check_maker(const Input &in) {
     // a player who never said who they are: by member id, and only while the same session holds it
     carol_unidentified();
     frames(3);
-    CHECK(shows_text("Players in the room who have not said"), "the maker's page does not say Carol is not identified");
+    CHECK(shows_text("Players in the room who are not identified"), "the maker's page does not say Carol is not identified");
     press_row(in, "##coop_member3");
     CHECK(g_open && g_page == P_REMOVE && !strcmp(nav_name(), "Cancel##no") && shows(UI_MENU_COOP_NOT_IDENTIFIED),
           "Remove Carol: cursor on %s, not identified said %d", nav_name(), shows(UI_MENU_COOP_NOT_IDENTIFIED));
@@ -664,18 +664,20 @@ static void check_maker(const Input &in) {
     printf("  Leave: act, act / held: stays; right, act: %d leave\n", n_leave);
 }
 
-// A player in the room who never said who they are: the page names them and says why, the Accept window says it too
-// with Accept greyed (right does not reach it, act does nothing); once they are identified Accept works.
+// A player in the room who is not identified: their game never said who they are, or two keys present themselves for
+// their session (the engine disputes it: heard 0, counted in unidentified, the same to the page). The page names them
+// and says why, the Accept window says it too with Accept greyed (right does not reach it, act does nothing); once they
+// are identified Accept works.
 static void check_unidentified(const Input &in) {
     printf("%s not identified:\n", in.name);
     in_room_as(false, 0x3333333u, false);
     carol_unidentified();
     counters_clear();
     frames(4);
-    CHECK(shows(UI_MENU_COOP_NOT_IDENTIFIED) && shows_text("Carol (") && shows_text("Players in the room who have not said"),
+    CHECK(shows(UI_MENU_COOP_NOT_IDENTIFIED) && shows_text("Carol (") && shows_text("Players in the room who are not identified"),
           "the page does not say Carol is not identified and why the room cannot be accepted");
     press_row(in, "##coop_answer");
-    CHECK(g_open && !strcmp(nav_name(), "Not now##no") && shows_text("Players in the room who have not said"),
+    CHECK(g_open && !strcmp(nav_name(), "Not now##no") && shows_text("Players in the room who are not identified"),
           "Accept window with Carol not identified: cursor on %s", nav_name());
     tap(in.right);
     tap(in.act);
@@ -690,6 +692,40 @@ static void check_unidentified(const Input &in) {
     tap(in.act);
     CHECK(n_accept == 1 && last_accept == 0x3333334u, "Carol identified, right, act: %d accepts", n_accept);
     printf("  Accept greyed while Carol is not identified; 1 accept once she is\n");
+}
+
+// A key the player accepted that now signs another name (the seventh review: it took another member's place in the
+// room): Dave holds member 3 with the key the player accepted as Carol. The engine makes it a new offer
+// (CoopOfferMember.accepted_as); the page says the name it was accepted as in the offer, in Dave's row and in the Accept
+// window, and Accept takes the new offer only.
+static void check_moved_key(const Input &in) {
+    printf("%s a key accepted under another name:\n", in.name);
+    static const char kCarolKey[] = "c4r0-0000-0000-0003";
+    in_room_as(false, 0x4444444u, false);
+    member(g_fake, 3, "Dave", false, 800);
+    g_fake.version++;
+    offer_member_add(3, "Dave", kCarolKey, false, true);
+    snprintf(g_fake_offer.member[1].accepted_as, sizeof g_fake_offer.member[1].accepted_as, "Carol");
+    counters_clear();
+    frames(4);
+    char moved[96], in_offer[128], in_row[160], note[400];
+    snprintf(moved, sizeof moved, menu_text(UI_MENU_COOP_ACCEPTED_AS), "Carol");
+    snprintf(in_offer, sizeof in_offer, "Dave (%s)", moved);
+    snprintf(in_row, sizeof in_row, menu_text(UI_MENU_COOP_KEY), kCarolKey);
+    snprintf(in_row + strlen(in_row), sizeof in_row - strlen(in_row), "  ·  %s", moved);
+    // the row's note is drawn into the draw list, not logged as text: it is checked as the page builds it
+    member_note(g_fake.member[2], offer_member(g_fake_offer, 3), false, note, sizeof note);
+    CHECK(shows_text(in_offer), "the offer does not say Dave's key was accepted as Carol");
+    CHECK(strstr(note, in_row) != nullptr, "Dave's row does not say his key was accepted as Carol: '%s'", note);
+    press_row(in, "##coop_answer");
+    CHECK(g_open && g_page == P_ACCEPT && !strcmp(nav_name(), "Not now##no") && shows_text(in_offer),
+          "Accept window with Carol's key under Dave: cursor on %s", nav_name());
+    tap(in.right);
+    tap(in.act);
+    CHECK(n_accept == 1 && last_accept == 0x4444444u, "Carol's key under Dave, right, act: %d accepts of %08x", n_accept,
+          last_accept);
+    printf("  the offer, Dave's row and the Accept window say 'a key you accepted as Carol'; %d accept of the new offer\n",
+           n_accept);
 }
 
 // The relay's states the page says in words: its limit on joins from one network, and a room it lost.
@@ -725,7 +761,7 @@ static void conversions(const char *f, char *out, size_t cap) {
 // and named, not failed: they are not this page's.
 static void check_catalog(void) {
     static const char *const langs[] = {"en", "ru", "pt-BR", "zh-Hans"};
-    for (int id = UI_MENU_TAB_COOP; id <= UI_MENU_COOP_NOT_ACCEPTED; id++) {
+    for (int id = UI_MENU_TAB_COOP; id <= UI_MENU_COOP_ACCEPTED_AS; id++) {
         char en[32], other[32];
         conversions(ui_text_in("en", (UiTextId)id), en, sizeof en);
         for (const char *l : langs) {
@@ -736,7 +772,7 @@ static void check_catalog(void) {
         }
     }
     printf("catalog: the %d co-op texts in en, ru, pt-BR and zh-Hans, with English's conversions\n",
-           UI_MENU_COOP_NOT_ACCEPTED - UI_MENU_TAB_COOP + 1);
+           UI_MENU_COOP_ACCEPTED_AS - UI_MENU_TAB_COOP + 1);
     int gaps = 0;
     for (int id = UI_MENU_FIRST; id < UI_MENU_TAB_COOP; id++)
         for (const char *l : langs)
@@ -770,6 +806,8 @@ int main(void) {
     check_maker(kPad);
     check_unidentified(kKeyboard);
     check_unidentified(kPad);
+    check_moved_key(kKeyboard);
+    check_moved_key(kPad);
     check_states();
     check_catalog();
 

@@ -125,12 +125,14 @@ The menu (F1, or the pad's combo) has a Co-op tab, usable with the keyboard, the
   case, with or without dashes, and a Paste button that takes the clipboard's text), a line that says what the layer is
   doing or why it stopped (no answer from the relay, no room with that secret, refused), the rules of a room you make,
   and the co-op switch. Make and Join turn co-op on when it is off.
-- **In a room:** while the room waits for your answer, who is in it (a player whose game has not said who it is is
-  marked "not identified"), what its rules share, the fingerprint of the key that signs the rules, to compare with the
-  one the maker reads out to you by voice or chat, and Accept or not; while any player is not identified the tab says
-  so and why the room cannot be accepted, and Accept is greyed. Then the players, with who made the room, how long ago
-  each was last heard and each one's key; the maker sees its own key to read out, and Remove on each other player's
-  row, which removes by the key (a player who never said who they are has no key and is removed by member number,
+- **In a room:** while the room waits for your answer, who is in it (a player whose game has not said who it is, or
+  whose session two keys present at once, is marked "not identified"; a player whose key you accepted under another
+  name is marked "a key you accepted as <that name>", and that is a new offer), what its rules share, the fingerprint
+  of the key that signs the rules, to compare with the one the maker reads out to you by voice or chat, and Accept or
+  not; while any player is not identified the tab says so and why the room cannot be accepted, and Accept is greyed.
+  Then the players, with who made the room, how long ago each was last heard and each one's key (and the name you
+  accepted it as, when it now signs another); the maker sees its own key to read out, and Remove on each other
+  player's row, which removes by the key (a player who is not identified has no key and is removed by member number,
   only while the same session still holds it). The maker also has a Pools group: every key that took more from the
   pools than it brought, in the room or not, with what it took and a Remove of that key, and Reset the pools, which
   says to remove such a player first. What it took can change, up or down, when the maker removes a player or a
@@ -529,8 +531,8 @@ line per datagram.
 
 Progress sync: `coop: sync: playing a save: N progress flags, ...` when a save is being played (and `... nothing is read
 or written until a save is played` when it stops), `a room to accept; in the room: ...; rules: ...` followed by `put
-coop_accept = <number> into nx2navi.ini [coop]` (or, while a member never said who it is, `N member(s) in the room never
-said who they are`; when the members carry rules of different keys, a line that says so), `room accepted`, `the save
+coop_accept = <number> into nx2navi.ini [coop]` (or, while a member is not identified, `N member(s) in the room are
+not identified`; when the members carry rules of different keys, a line that says so), `room accepted`, `the save
 as it was before this room is in <folder>`, `the key this game signs the room's rules with is kept in <folder>` (the
 maker), `the room's rules: progress shared, ...`, `took N values from the room (progress a, items b)` at most every
 5 s, `N values from the room were refused`, `member N sent values this game does not take; nothing more is taken from
@@ -615,7 +617,8 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   events: typing a name, a relay and a secret (Q and E are letters there, not tab keys), Make, Join with a wrong secret
   and a pasted one, the offer accepted and declined, the maker's key to compare, the three warnings before the first
   Accept only, a player not identified (Accept greyed, removed by member number only while the same session holds
-  it), Remove by key, a pool contributor's key removed, Reset the pools, Leave, the relay's join limit and a lost room,
+  it), a key accepted under another name (said in the offer, the row and the Accept window), Remove by key, a pool
+  contributor's key removed, Reset the pools, Leave, the relay's join limit and a lost room,
   the maker's rules and the others' read-only ones; Accept, Remove, Reset and Leave never act on a second press, a held
   button or a double tap, and a new offer under an open Accept window puts the cursor back on Not now. It then runs
   again with a deliberate fault (each such window opens with the cursor moved onto its acting button) and passes only

@@ -668,8 +668,9 @@ static void offer_update(uint64_t now) {
             rt_log("coop: sync: members carry rules signed by different keys: before accepting, compare the key that signs these rules with the "
                    "maker's, by voice or chat");
         if (o.unidentified)
-            rt_log("coop: sync: %d member(s) in the room never said who they are: the room cannot be accepted while they are in it (the maker "
-                   "can remove them, or everyone moves to a new room)", o.unidentified);
+            rt_log("coop: sync: %d member(s) in the room are not identified (never said who they are, or two keys present themselves for "
+                   "one): the room cannot be accepted while they are in it (the maker can remove them, or everyone moves to a new room)",
+                   o.unidentified);
         else
             rt_log("coop: sync: nothing from the room is applied to this game until you accept it: put coop_accept = %08x into nx2navi.ini "
                    "[coop] while the game runs (the number is new at each start of the game and changes with the room); the save is copied "

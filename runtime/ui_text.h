@@ -314,7 +314,9 @@ typedef enum {
     UI_MENU_COOP_SPENT_NONE, UI_MENU_COOP_SPENT_DESC,
     UI_MENU_COOP_RESET, UI_MENU_COOP_RESET_DESC, UI_MENU_COOP_RESET_CONFIRM,
     UI_MENU_COOP_REMOVE_KEY_CONFIRM /* "%s": the player's name, "%s": the key's fingerprint */, UI_MENU_COOP_NOT_ACCEPTED,
-    UI_MENU_LAST_ID = UI_MENU_COOP_NOT_ACCEPTED,
+    // a key the player accepted, now signed under another name: a new offer (CoopOfferMember.accepted_as)
+    UI_MENU_COOP_ACCEPTED_AS /* "%s": the name it was accepted under */,
+    UI_MENU_LAST_ID = UI_MENU_COOP_ACCEPTED_AS,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total

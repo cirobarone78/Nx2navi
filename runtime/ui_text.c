@@ -651,8 +651,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                    "compare it with this one.",
     [UI_MENU_COOP_MY_KEY] = "Your key, which signs this room's rules: %s. Read it to the others, by voice or chat, so that "
                             "they can compare it before they accept.",
-    [UI_MENU_COOP_UNIDENTIFIED] = "Players in the room who have not said who they are: %d. Nobody can accept the room while "
-                                  "they are in it: the maker can remove them, or everyone moves to a new room.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Players in the room who are not identified: %d (they have not said who they are, or two "
+                                  "keys say they are the same player). Nobody can accept the room while they are in it: the "
+                                  "maker can remove them, or everyone moves to a new room.",
     [UI_MENU_COOP_DISAGREE] = "The players carry rules signed by different keys: ask the room's maker which key is theirs "
                               "before you accept.",
     [UI_MENU_COOP_NEW_SAVE] = "Another save is played in this room: it gets the room's progress, which holds what the last "
@@ -681,8 +682,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                 "drained a pool and is still in the room keeps what they took: remove them first, then reset.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Reset the pools for everyone in the room?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remove %s, key %s, from the room?",
-    [UI_MENU_COOP_NOT_ACCEPTED] = "Not accepted: the room changed or a player in it has not said who they are. Look at the "
-                                  "offer again.",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Not accepted: the room changed or a player in it is not identified. Look at the offer "
+                                  "again.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "a key you accepted as %s",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
@@ -1363,8 +1365,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                    "чате и сравните его с этим.",
     [UI_MENU_COOP_MY_KEY] = "Ваш ключ, которым подписаны правила этой комнаты: %s. Прочитайте его остальным голосом или в "
                             "чате, чтобы они могли сравнить его, прежде чем принять.",
-    [UI_MENU_COOP_UNIDENTIFIED] = "Игроков в комнате, которые не назвались: %d. Пока они в ней, никто не может принять "
-                                  "комнату: создатель может удалить их, или все переходят в новую комнату.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Игроков в комнате, которые не опознаны: %d (не назвались, или два ключа называют себя одним "
+                                  "и тем же игроком). Пока они в ней, никто не может принять комнату: создатель может удалить "
+                                  "их, или все переходят в новую комнату.",
     [UI_MENU_COOP_DISAGREE] = "У игроков правила, подписанные разными ключами: прежде чем принять, спросите создателя "
                               "комнаты, какой ключ его.",
     [UI_MENU_COOP_NEW_SAVE] = "В этой комнате играют другое сохранение: оно получает прогресс комнаты, в котором есть то, "
@@ -1394,7 +1397,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                 "опустошивший запас и оставшийся в комнате, сохраняет взятое: сначала удалите его, потом сбросьте.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Сбросить запасы для всех в комнате?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Удалить %s (ключ %s) из комнаты?",
-    [UI_MENU_COOP_NOT_ACCEPTED] = "Не принято: комната изменилась или кто-то в ней не назвался. Посмотрите предложение ещё раз.",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Не принято: комната изменилась или кто-то в ней не опознан. Посмотрите предложение ещё раз.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "ключ, который вы приняли как %s",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_TAB_RESTORE] = "Восстановления",
@@ -2061,8 +2065,9 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                    "chat, e compare-a com esta.",
     [UI_MENU_COOP_MY_KEY] = "Sua chave, que assina as regras desta sala: %s. Leia-a para os outros, por voz ou chat, para "
                             "que possam compará-la antes de aceitar.",
-    [UI_MENU_COOP_UNIDENTIFIED] = "Jogadores na sala que não disseram quem são: %d. Ninguém pode aceitar a sala enquanto eles "
-                                  "estiverem nela: o criador pode removê-los, ou todos vão para uma nova sala.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Jogadores na sala que não estão identificados: %d (não disseram quem são, ou duas chaves "
+                                  "dizem ser o mesmo jogador). Ninguém pode aceitar a sala enquanto eles estiverem nela: o "
+                                  "criador pode removê-los, ou todos vão para uma nova sala.",
     [UI_MENU_COOP_DISAGREE] = "Os jogadores trazem regras assinadas por chaves diferentes: pergunte ao criador da sala qual "
                               "chave é a dele antes de aceitar.",
     [UI_MENU_COOP_NEW_SAVE] = "Outro save é jogado nesta sala: ele recebe o progresso da sala, que inclui o que o último "
@@ -2092,7 +2097,8 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                 "que esvaziou um estoque e ainda está na sala fica com o que pegou: remova-o primeiro, depois redefina.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Redefinir os estoques para todos na sala?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remover %s, chave %s, da sala?",
-    [UI_MENU_COOP_NOT_ACCEPTED] = "Não aceito: a sala mudou ou alguém nela não disse quem é. Veja a oferta de novo.",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Não aceito: a sala mudou ou alguém nela não está identificado. Veja a oferta de novo.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "uma chave que você aceitou como %s",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_TAB_RESTORE] = "Restaurações",
@@ -2827,8 +2833,8 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_OFFER_KEY] = "规则由身份指纹为 %s 的玩家签署。",
     [UI_MENU_COOP_OFFER_COMPARE] = "接受之前，请房主通过语音或聊天把他的身份指纹读给你，并与这里的比对。",
     [UI_MENU_COOP_MY_KEY] = "你的身份指纹（用于签署此房间的规则）：%s。请通过语音或聊天读给其他人，以便他们在接受前比对。",
-    [UI_MENU_COOP_UNIDENTIFIED] = "房间中未表明身份的玩家：%d。只要他们还在房间里，任何人都无法接受此房间：房主可以移除他们，"
-                                  "或者大家换到新房间。",
+    [UI_MENU_COOP_UNIDENTIFIED] = "房间中未确认身份的玩家：%d（尚未表明身份，或有两个身份指纹自称是同一名玩家）。只要他们还在"
+                                  "房间里，任何人都无法接受此房间：房主可以移除他们，或者大家换到新房间。",
     [UI_MENU_COOP_DISAGREE] = "玩家们携带的规则由不同的身份签署：接受之前，请向房主确认哪个身份指纹是他的。",
     [UI_MENU_COOP_NEW_SAVE] = "此房间中正在玩另一个存档：它会得到房间的进度，其中包含上一个存档带来的内容。",
     [UI_MENU_COOP_WARNINGS] = "与陌生人进入房间之前",
@@ -2851,7 +2857,8 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
                                 "标记保持不变。掏空了共用且仍在房间中的玩家会保留已取走的东西：先移除，再重置。",
     [UI_MENU_COOP_RESET_CONFIRM] = "为房间中的所有人重置共用？",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "将 %s（身份指纹 %s）移出房间？",
-    [UI_MENU_COOP_NOT_ACCEPTED] = "未接受：房间已变化，或其中有玩家未表明身份。请重新查看提议。",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "未接受：房间已变化，或其中有玩家未确认身份。请重新查看提议。",
+    [UI_MENU_COOP_ACCEPTED_AS] = "你曾以“%s”之名接受的身份指纹",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_TAB_RESTORE] = "原版还原",
