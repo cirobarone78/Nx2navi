@@ -464,9 +464,12 @@ static int resolve_check_on(void) {
     return on;
 }
 
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out);
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touch);
 
-int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
+// touch: the GPU may read the pool's buffer in the submission being recorded, so its shadow goes on the touched list
+// (shadow storage). A lookup (vk_mem_lookup) leaves it off: the caller reads guest memory itself or only asks what
+// backs the address. A pool in the device address table is touched either way, as shaders reach it through pointers.
+static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
     const ResolveHit *h = rhit_slot(addr);
@@ -478,19 +481,23 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->cls = h->cls;
         out->pool = h->pool;
         if (h->alloc) out->alloc_offset = out->offset;
-        if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
+        if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched && (touch || ((PoolRec *)h->pool)->gpa_rec))
+            shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
-            if (!resolve_locked(addr, size, &s) || memcmp(&s, out, sizeof s))
+            if (!resolve_locked(addr, size, &s, touch) || memcmp(&s, out, sizeof s))
                 rt_fatal("vk: resolve cache of 0x%llx differs from the pool index", (unsigned long long)addr);
         }
         return 1;
     }
-    return resolve_locked(addr, size, out);
+    return resolve_locked(addr, size, out, touch);
 }
 
+int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) { return mem_resolve(addr, size, out, 1); }
+int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out) { return mem_resolve(addr, size, out, 0); }
+
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
@@ -512,7 +519,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
-        if (r->smap && !r->stouched) shadow_touch(r);
+        if (r->smap && !r->stouched && (touch || r->gpa_rec)) shadow_touch(r);
         ok = 1;
     } else if (r && r->kind == POOL_PHYS) {
         out->buffer = r->buf;
@@ -548,7 +555,7 @@ uint64_t vk_mem_gen(void) {
 
 int vk_mem_class_of(uint64_t addr) {
     VkMemSpan m;
-    return vk_mem_resolve(addr, 1, &m) ? m.cls : VK_MCLS_NONE;
+    return vk_mem_lookup(addr, 1, &m) ? m.cls : VK_MCLS_NONE;
 }
 
 // ---------------------------------------------------------------- census
@@ -1096,8 +1103,8 @@ static inline void store_bytes(uint8_t *dst, uint64_t v, uint64_t m) {
 }
 
 // n bytes of one page with base copy b: the bytes where src differs from the base go into dst and into the base. src
-// and dst are guest memory and the shadow, one way or the other; each src byte is read once, as its side may be writing
-// it. Returns the bytes moved.
+// and dst are guest memory and the shadow, one way or the other; each src byte that moves is read once, as its side
+// may be writing it. Returns the bytes moved.
 static uint64_t merge_page(uint8_t *dst, const uint8_t *src, uint8_t *b, uint64_t n) {
     uint64_t moved = 0, i = 0;
     for (; i < n && ((uintptr_t)(src + i) & 7); i++) {
@@ -1105,6 +1112,20 @@ static uint64_t merge_page(uint8_t *dst, const uint8_t *src, uint8_t *b, uint64_
         if (v != b[i]) dst[i] = b[i] = v, moved++;
     }
     for (; i + 8 <= n; i += 8) {
+        // Most of a page is unchanged: a 64-byte block equal to its base is passed over with one vector compare. A
+        // byte its side writes after the compare is a later write, which the next copy-in or write-back takes.
+        if (!((uintptr_t)(src + i) & 63) && i + 64 <= n) {
+            uint64_t x = 0;
+            for (int k = 0; k < 64; k += 8) {
+                uint64_t sv, ov;
+                memcpy(&sv, src + i + k, 8), memcpy(&ov, b + i + k, 8);
+                x |= sv ^ ov;
+            }
+            if (!x) {
+                i += 56;
+                continue;
+            }
+        }
         uint64_t s = *(const volatile uint64_t *)(src + i), o;
         memcpy(&o, b + i, 8);
         uint64_t m = byte_mask(s ^ o);
@@ -1303,7 +1324,7 @@ void vk_gpu_written_back(uint64_t addr, uint64_t size) {
 
 int vk_mem_mirrored(uint64_t addr, uint64_t size) {
     VkMemSpan sp;
-    if (!vk_mirror_on || !size || !vk_mem_resolve(addr, size, &sp) || !sp.pool) return 0;
+    if (!vk_mirror_on || !size || !vk_mem_lookup(addr, size, &sp) || !sp.pool) return 0;
     const PoolRec *r = sp.pool;
     return r->mstate == MS_ON && addr >= r->import_lo && addr + size <= r->import_hi;
 }
