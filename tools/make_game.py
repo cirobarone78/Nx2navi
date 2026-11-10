@@ -1,4 +1,4 @@
-"""Build Ocarina of Time (Switch 2, game 1.1.1) for Windows on the player's PC, from the player's own game files.
+"""Build Ocarina of Time (Switch 2, game 1.1.1) natively for Windows or Linux from the player's own game files.
 
     python -I tools/make_game.py --nup "C:\\path\\game.nup" --out "C:\\Games\\Ocarina"
     python -I tools/make_game.py --exefs "C:\\path\\exefs" --romfs "C:\\path\\romfs" --out "C:\\Games\\Ocarina"
@@ -47,10 +47,11 @@ version (fast_clang: the same objects, about a fifth faster).
 On Linux the same steps make <out>/ocarina with the clang, clang++ and lld on PATH and the system's libraries
 (Vulkan, SDL3, Opus, libvpx, dav1d, zstd; libstdc++ static, rpath $ORIGIN), as tools/build_game.py's Linux
 build does: the runtime's *_sdl.* and platform/linux.c take the place of its *_win.*, platform/win32.c and
-nx2navi.rc, and --msys is not used. README-BuildKit.md, "Linux", lists the packages.
+nx2navi.rc, and --msys is not used. VMA_INCLUDE can name the directory holding vk_mem_alloc.h; otherwise the
+system header or the pinned download is used. README-BuildKit.md, "Linux", lists the packages.
 
-Nothing is written outside --out (but for --make-runtime-lib DIR, which writes DIR). The game folder then holds
-only what this PC built from the player's files: never
+Game content is written only to --out; a downloaded VMA header is cached in toolchain/vma, and --make-runtime-lib
+writes DIR. The game folder holds only what this PC built from the player's files: never
 share it. Needs Python 3.10+ with numpy, lz4, zstandard and zbic (pip), with fonttools and pillow too when the kit has
 button art, and MSYS2 UCRT64's clang and libraries (README-BuildKit.md lists the commands). Delete <out>/build-cache
 afterwards to free about 5 GB; the next build then compiles everything again.
@@ -70,6 +71,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -514,19 +516,23 @@ def pe_imports(path):
 
 
 def copy_if_changed(src, dst):
-    """Copy src over dst unless dst already has its size and modification time. A file the running game holds open
-    cannot be replaced on Windows: that stops the build with a message instead of a traceback."""
+    """Atomically replace dst unless its contents match, even when source modification times are normalized.
+    A same-directory temporary copy preserves modes, replaces read-only files on POSIX and leaves dst intact on copy failure."""
+    dst = Path(dst)
     s = os.stat(src)
     try:
         d = os.stat(dst)
-        if d.st_size == s.st_size and int(d.st_mtime) == int(s.st_mtime):
+        if d.st_size == s.st_size and sha256_file(src) == sha256_file(dst):
             return False
     except FileNotFoundError:
         pass
     try:
-        shutil.copy2(src, dst)
+        with tempfile.TemporaryDirectory(dir=dst.parent, prefix='.nx2navi-copy-') as tmp:
+            replacement = Path(tmp) / dst.name
+            shutil.copy2(src, replacement)
+            os.replace(replacement, dst)
     except PermissionError:
-        fail(f'{dst} is in use: close the game and try again')
+        fail(f'cannot replace {dst}: close the game and check output-directory permissions')
     return True
 
 
@@ -894,8 +900,14 @@ def cpu_level(clang, env):
     tell. The game runs on the PC that builds it, so it takes this CPU's level, as tools/build_game.py --cpu does by
     hand. Without one the lifted code would be generic x86-64: every fused multiply-add of the game a call to
     runtime/fma.c's software fma, and a level the differential tests do not cover."""
+    # Compiler wrappers can discard -march=native, even for this read-only host probe. Only the probe opts out:
+    # the actual compiles keep their environment and use the explicit, supported x86-64 level selected below.
+    probe_env = dict(env, NIX_ENFORCE_NO_NATIVE='0')
+    for name in env:
+        if name.startswith('NIX_ENFORCE_NO_NATIVE_'):
+            probe_env[name] = '0'
     p = subprocess.run([str(clang), '-march=native', '-E', '-dM', '-x', 'c', os.devnull], capture_output=True,
-                       text=True, env=env, errors='replace')
+                       text=True, env=probe_env, errors='replace')
     have = set(re.findall(r'^#define (__\w+) ', p.stdout, re.M)) if p.returncode == 0 else set()
     return 3 if CPU_V3 <= have else 2 if CPU_V2 <= have else 0
 
@@ -950,12 +962,11 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     dest.mkdir(parents=True, exist_ok=True)
     obj = Path(obj).resolve() if obj else dest / 'obj'
     obj.mkdir(parents=True, exist_ok=True)
-    clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
-    env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    clang, clangxx, env, vma = toolchain(msys)
     rt = KIT / 'runtime'
     tainted = per_install_names()
     srcs = [(p, obj / name) for p, name in runtime_sources() if not per_install(p, tainted)]
-    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(msys / 'include' / 'vma')]
+    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma)]
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
     t0 = time.time()
     compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc), cache, jobs, env,
@@ -969,7 +980,9 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     lib.unlink(missing_ok=True)
     rsp = dest / 'ar.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for _, o in srcs), encoding='utf-8')
-    ar = os.environ.get('NX2NAVI_AR') or str(msys / 'bin' / 'ar.exe')
+    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else shutil.which('ar'))
+    if not ar:
+        fail('ar is not on PATH: install binutils or set NX2NAVI_AR')
     if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
         fail('the runtime library could not be archived')
     meta = {'runtime': runtime_digest(), 'compiler': clang_version(clang, env),
@@ -1088,13 +1101,22 @@ def compile_resources(msys, rt, obj, env, lld=False):
 
 def toolchain(msys):
     """(clang, clang++, environment, the folder holding vk_mem_alloc.h): MSYS2 UCRT64's on Windows, the ones on PATH
-    elsewhere, with tools/build_game.py's VMA lookup (the system's header, else the pinned one fetched into
-    toolchain/vma)."""
+    elsewhere. VMA_INCLUDE overrides tools/build_game.py's VMA lookup (the system's header, else the pinned one
+    fetched into toolchain/vma)."""
     if WIN:
         return (msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe',
                 dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', '')), msys / 'include' / 'vma')
-    from build_game import vma_include
-    return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma_include()
+    for tool in ('clang', 'clang++', 'ld.lld'):
+        if not shutil.which(tool):
+            fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
+    if os.environ.get('VMA_INCLUDE'):
+        vma = Path(os.environ['VMA_INCLUDE'])
+        if not (vma / 'vk_mem_alloc.h').is_file():
+            fail(f'{vma / "vk_mem_alloc.h"} is missing: correct VMA_INCLUDE')
+    else:
+        from build_game import vma_include
+        vma = vma_include()
+    return Path(shutil.which('clang')), Path(shutil.which('clang++')), dict(os.environ), vma
 
 
 def xlate_source():

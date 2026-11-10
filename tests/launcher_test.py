@@ -1338,6 +1338,11 @@ class MakeGameTest(Tmp):
         moving, and passes its other lines on to the log."""
         kit = self.tmp / 'kit'
         (kit / 'tools').mkdir(parents=True)
+        (kit / 'bin').mkdir()
+        self.out.mkdir()
+        for name in (self.mg.XLATE_NAME, 'nx2navi_xlate.id'):
+            (kit / 'bin' / name).write_bytes(b'current translator')
+            (self.out / name).write_bytes(b'old translator')
         (kit / 'tools' / 'prepare_shaders.py').write_text(
             'import time\n'
             'print("reading the inventory", flush=True)\n'
@@ -1354,6 +1359,8 @@ class MakeGameTest(Tmp):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.mg.step_shaders(self.out)
+        for name in (self.mg.XLATE_NAME, 'nx2navi_xlate.id'):
+            self.assertEqual((self.out / name).read_bytes(), b'current translator')
         lines = buf.getvalue().splitlines()
         events = [json.loads(ln[2:]) for ln in lines if ln.startswith('@@')]
         self.assertIn('reading the inventory', lines)
@@ -1577,6 +1584,23 @@ class MakeGameTest(Tmp):
     def test_parse_deps(self):
         text = 'C:/o/x.o: C:/src/x.c C:/inc/a\\ b.h \\\n  C:/inc/c.h\n'
         self.assertEqual(self.mg.parse_deps(text), ['C:/src/x.c', 'C:/inc/a b.h', 'C:/inc/c.h'])
+
+    def test_copy_if_changed_equal_metadata(self):
+        # Windows has no POSIX executable mode and cannot replace read-only destinations.
+        modes = (0o666,) if os.name == 'nt' else (0o444, 0o555)
+        for mode in modes:
+            with self.subTest(mode=oct(mode)):
+                src, dst = self.tmp / f'source-{mode}.id', self.tmp / f'installed-{mode}.id'
+                for path, data in ((src, b'7' * 64 + b'\n'), (dst, b'1' * 64 + b'\n')):
+                    path.write_bytes(data)
+                    os.utime(path, (1, 1))  # Build artifacts can share a normalized modification time.
+                    path.chmod(mode)
+                self.assertEqual(src.stat().st_size, dst.stat().st_size)
+                self.assertEqual(src.stat().st_mtime_ns, dst.stat().st_mtime_ns)
+                self.assertTrue(self.mg.copy_if_changed(src, dst))
+                self.assertEqual(dst.read_bytes(), src.read_bytes())
+                self.assertEqual(dst.stat().st_mode & 0o777, src.stat().st_mode & 0o777)
+                self.assertFalse(self.mg.copy_if_changed(src, dst))
 
     @unittest.skipUnless(shutil.which('cc'), 'needs a C compiler')
     def test_object_cache(self):
