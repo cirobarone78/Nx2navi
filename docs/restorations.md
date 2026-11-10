@@ -87,6 +87,9 @@ static const RestoreEdit edits[] = {
                         "Pack/Actor/Obj_V.pack.zs", "Component/LiftableParam/Obj_V.game__component__LiftableParam.bgyml"),
     // make a file the game does not have as a copy of one it has; the file's other edits then change the copy
     RESTORE_NEW_FILE("Pack/Actor/Obj_N.pack.zs", "Pack/Actor/Obj_W.pack.zs"),
+    // add a row to a table whose rows are in the order of a text key (an RSDB table): a copy of a row, under a new
+    // key, with fields set (RESTORE_ADD_ROW_AS: none); here the table is the file's root (NULL), not a pack member
+    RESTORE_ADD_ROW("RSDB/ActorInfo.Product.111.rstbl.byml.zs", NULL, NULL, "__RowId", "Obj_W", "Obj_N", obj_n_fields),
 };
 
 RESTORATION(name, "KEY", "Menu label", "One-line description for the menu.", edits);
@@ -98,15 +101,19 @@ RESTORATION(name, "KEY", "Menu label", "One-line description for the menu.", edi
 - A copy (`RESTORE_ADD`, `RESTORE_ADD_FROM`) gets the new Hash in `Phive/Placement/ID` too and leaves out `Links` and
   `SRTHash`; pick a Hash the area's files do not use. Edits on one file apply in their order, so a `RESTORE_SET` after
   the copy (by its new Hash and Translate) changes the copy, and a `RESTORE_SET_MEMBER` can change a member just added.
-- A new key goes into a dict that is already there (`Dynamic/Extra` needs `Dynamic`); the engine adds no dicts or
-  array items and changes no value's type. The BYML writer rebuilds the key and string tables, so new keys and texts
-  need nothing else.
+- A new key goes into a dict that is already there (`Dynamic/Extra` needs `Dynamic`); the engine adds no dicts and
+  changes no value's type, and adds array items only as table rows. The BYML writer rebuilds the key and string
+  tables, so new keys and texts need nothing else.
 - An added member's bytes come from the player's files (a copy) or from the restoration's declaration; declared bytes
   must be our own, never data taken from the game.
 - A new file (`RESTORE_NEW_FILE`) is made only when the game's RomFS lacks that path; it is a copy of the file named,
   packed as that one is, served as a file added to the RomFS (with an estimated resource size table entry). Where the
   path exists the edit is skipped and the file's other edits apply to what is there, each by its own checks.
+- A row (`RESTORE_ADD_ROW`, fields as `static const RestoreField obj_n_fields[] = {{"InstanceHeapSize", 2000000},
+  {"Name", 0, "text"}};`) goes in only when the table is in the byte order of its key with no two rows alike, has the
+  row it copies and lacks the new one, and the copy has every field named, of its kind (a number keeps its type); it
+  goes where that order puts it.
 - Run `--probe-restore` on a game build: every edit of the new restoration should say what it did.
 
-Not yet possible: removing a key or a pack member, adding dicts or array items, editing logic graphs (`.ainb`), text
-(`Mals/`) or binary files (models, textures, collision).
+Not yet possible: removing a key or a pack member, adding dicts or array items other than table rows, editing logic
+graphs (`.ainb`), text (`Mals/`) or binary files (models, textures, collision).

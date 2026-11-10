@@ -536,6 +536,50 @@ static void new_file(void) {
     free(dic);
 }
 
+// Rows added to tables ordered by a text key (ADD_ROW); the script checks the tables.
+static void add_row(void) {
+    size_t n, out_n;
+    uint8_t *in = load("table.zs", &n);
+#define T "test/table.zs"
+    static const RestoreField set3[] = {{"Size", 99, NULL}, {"Name", 0, "c"}, {"Box/X", 2.5, NULL}};
+    static const RestoreField missing[] = {{"Size", 1, NULL}, {"Nope", 1, NULL}};
+    static const RestoreField text_on_number[] = {{"Size", 0, "x"}};
+    static const RestoreField number_on_text[] = {{"Name", 3, NULL}};
+    static const RestoreField too_big[] = {{"Size", 1e12, NULL}};
+    static const RestoreEdit edits[] = {
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Beta", "Charlie", set3),        // 0 applies, between Beta and Delta
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Alpha", "Charlie", set3),       // 1 the row is there now
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Nope", "Echo", set3),           // 2 no row to copy
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Beta", "Echo", missing),        // 3 a field the row lacks
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Beta", "Echo", text_on_number), // 4 not a text
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Beta", "Echo", number_on_text), // 5 not a number
+        RESTORE_ADD_ROW(T, NULL, NULL, "__RowId", "Beta", "Echo", too_big),        // 6 does not fit an int
+        RESTORE_ADD_ROW_AS(T, NULL, NULL, "__RowId", "Alpha", "Zulu"),             // 7 applies, at the end
+        RESTORE_ADD_ROW_AS(T, NULL, NULL, "__RowId", "Delta", "Aaron"),            // 8 applies, at the start
+        RESTORE_ADD_ROW_AS(T, NULL, NULL, "Name", "a", "b"),                       // 9 rows not in Name's order
+        RESTORE_ADD_ROW_AS(T, NULL, NULL, "Size", "a", "b"),                       // 10 Size is not a text
+        RESTORE_ADD_ROW_AS(T, NULL, "Meta", "__RowId", "Alpha", "Bravo"),          // 11 not a table
+    };
+    static const int want[] = {1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0};
+    _Static_assert(sizeof want / sizeof *want == sizeof edits / sizeof *edits, "one expectation per edit");
+    void *out = run("rows", edits, (int)(sizeof edits / sizeof *edits), in, n, NULL, 0, want, &out_n);
+    if (out) save("table.out.zs", out, out_n);
+    free(out);
+    free(in);
+    // A table below a key, in a pack member; and a table out of order.
+    in = load("tables.zs", &n);
+    static const RestoreEdit nested[] = {
+        RESTORE_ADD_ROW_AS("test/tables.zs", "R/rows.bgyml", "Rows", "__RowId", "Beta", "Bz"),   // 0 applies
+        RESTORE_ADD_ROW_AS("test/tables.zs", "R/mixed.bgyml", NULL, "__RowId", "Beta", "Bz"),    // 1 out of order
+    };
+    static const int want2[] = {1, 0};
+    out = run("rows, in a pack", nested, 2, in, n, NULL, 0, want2, &out_n);
+    if (out) save("tables.out.zs", out, out_n);
+    free(out);
+    free(in);
+#undef T
+}
+
 static void put32le(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
@@ -759,6 +803,7 @@ int main(int argc, char **argv) {
     pack_more();
     others();
     new_file();
+    add_row();
     order();
     switches();
     printf("restore_check.c: %s (%d failures)\n", fails ? "FAILED" : "passed", fails);

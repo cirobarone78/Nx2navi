@@ -295,6 +295,89 @@ static int add_key(const Ctx *c, int k, BymlNode *obj, const char *path, BymlNod
     return 1;
 }
 
+// The text key of row i of the table rows, NULL when the row has none.
+static const char *row_id(const BymlNode *rows, uint32_t i, const char *key) {
+    const BymlNode *v = byml_get(&rows->items[i], key);
+    return v && v->type == BYML_STRING ? v->str : NULL;
+}
+
+// 0 after saying why when the rows are not in byte order of their key, no two alike.
+static int rows_ordered(const Ctx *c, int k, const BymlNode *rows, const char *key) {
+    for (uint32_t i = 0; i < rows->n; i++) {
+        const char *id = row_id(rows, i, key), *prev = i ? row_id(rows, i - 1, key) : NULL;
+        if (!id) {
+            say(c, k, "skipped: row %u has no text %s", i, key);
+            return 0;
+        }
+        if (prev && strcmp(prev, id) >= 0) {
+            say(c, k, "skipped: the rows are not in the order of %s (row %u, \"%s\" after \"%s\")", key, i, id, prev);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// An ADD_ROW on the document below obj (restore.h).
+static int add_row(Ctx *c, BymlNode *obj, const RestoreEdit *e, int k) {
+    BymlNode *rows = e->path && *e->path ? byml_path(obj, e->path) : obj;
+    const char *where = e->path && *e->path ? e->path : "the document";
+    if (!rows || rows->type != BYML_ARRAY) {
+        say(c, k, "skipped: %s is not a table (an array of rows)", where);
+        return 0;
+    }
+    if (!rows_ordered(c, k, rows, e->row_key)) return 0;
+    uint32_t from = UINT32_MAX, at = rows->n;
+    for (uint32_t i = 0; i < rows->n; i++) {
+        const char *id = row_id(rows, i, e->row_key);
+        if (!strcmp(id, e->text_now)) {
+            say(c, k, "skipped: %s has a row %s already", where, e->text_now);
+            return 0;
+        }
+        if (!strcmp(id, e->text_was)) from = i;
+        if (at == rows->n && strcmp(id, e->text_now) > 0) at = i;
+    }
+    if (from == UINT32_MAX) {
+        say(c, k, "skipped: %s has no row %s to copy", where, e->text_was);
+        return 0;
+    }
+    BymlNode copy;
+    if (!byml_copy(&copy, &rows->items[from])) {
+        say(c, k, "skipped: out of memory");
+        return 0;
+    }
+    byml_get(&copy, e->row_key)->str = e->text_now;
+    for (int f = 0; f < e->nfields; f++) {
+        const RestoreField *fd = &e->fields[f];
+        BymlNode *v = fd->path ? byml_path(&copy, fd->path) : NULL;
+        const char *bad = !v                                    ? "is not in the row"
+                          : fd->text && v->type != BYML_STRING  ? "is not a text"
+                          : !fd->text && isnan(byml_number(v))  ? "is not a number"
+                          : !fd->text && !byml_set_number(v, fd->number) ? "cannot hold the value"
+                                                                          : NULL;
+        if (bad) {
+            say(c, k, "skipped: the field %s of row %s %s", fd->path ? fd->path : "(none)", e->text_was, bad);
+            byml_node_free(&copy);
+            return 0;
+        }
+        if (fd->text) v->str = fd->text;
+    }
+    if (!byml_append(rows, NULL, copy)) {
+        byml_node_free(&copy);
+        say(c, k, "skipped: out of memory");
+        return 0;
+    }
+    BymlNode moved = rows->items[rows->n - 1];   // from the end to where the order puts it
+    memmove(&rows->items[at + 1], &rows->items[at], sizeof *rows->items * (rows->n - 1 - at));
+    rows->items[at] = moved;
+    if (!rows_ordered(c, k, rows, e->row_key)) {   // cannot happen: the place was found by the same order
+        byml_remove(rows, at);
+        return 0;
+    }
+    say(c, k, "added the row %s at %u of %u, a copy of %s with %d field%s set", e->text_now, at, rows->n, e->text_was,
+        e->nfields, e->nfields == 1 ? "" : "s");
+    return 1;
+}
+
 static int apply_one(Ctx *c, Byml *b, const RestoreEdit *e, int k) {
     BymlNode *obj = &b->root, *actors = NULL;
     uint32_t idx = 0;
@@ -441,6 +524,9 @@ static int apply_one(Ctx *c, Byml *b, const RestoreEdit *e, int k) {
         break;
     case RESTORE_KIND_NEW_FILE:   // restore_file makes the file before any document is edited
         break;
+    case RESTORE_KIND_ADD_ROW:
+        if (!e->row_key || !e->text_was || !e->text_now) break;
+        return add_row(c, obj, e, k);
     }
     say(c, k, "skipped: an edit of this kind needs %s", e->kind == RESTORE_KIND_ADD_MEMBER ? "a pack" : "more fields");
     return 0;

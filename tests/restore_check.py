@@ -364,6 +364,20 @@ def placement_kinds_expected():
     return t
 
 
+def table():
+    """A table as the game's RSDB files are: rows in the byte order of their __RowId."""
+    return [{'__RowId': 'Alpha', 'Size': 10, 'Name': 'a', 'Box': {'X': F32(1.0), 'Y': F32(2.0)}, 'List': [{'P': 'x'}]},
+            {'__RowId': 'Beta', 'Size': 20, 'Name': 'b', 'Box': {'X': F32(3.0), 'Y': F32(4.0)}, 'List': []},
+            {'__RowId': 'Delta', 'Size': 40, 'Name': 'd', 'Box': {'X': F32(5.0), 'Y': F32(6.0)}},
+            {'__RowId': 'Meta', 'Size': 0, 'Name': 'z'}]
+
+
+def table_expected():
+    t = table()
+    charlie = dict(t[1], __RowId='Charlie', Size=99, Name='c', Box={'X': F32(2.5), 'Y': F32(4.0)})
+    return [dict(t[2], __RowId='Aaron'), t[0], t[1], charlie, t[2], t[3], dict(t[0], __RowId='Zulu')]
+
+
 def pack_members():
     one = byml_encode({'MoveSpeed': F32(0.15), 'Other': 3})
     three = byml_encode({'Params': {'Speed': F32(1.5), 'Count': 4, 'Flag': True}})
@@ -433,6 +447,11 @@ def main():
     (OUT / 'compound.bphsc').write_bytes(b'static compound ' + struct.pack('<Q', 1003) + b' rest')
     x_member = byml_encode({'Liftable': True, 'Pos': [F32(0.0), F32(0.5), F32(0.0)]})
     (OUT / 'pack2.zs').write_bytes(compress(sarc_encode([('X/x.bgyml', x_member)], {'X/x.bgyml': 0x40})))
+    (OUT / 'table.zs').write_bytes(compress(byml_encode(table())))
+    rows_member = byml_encode({'Rows': table()[:3], 'Count': 3})
+    mixed = byml_encode([table()[1], table()[0]])
+    (OUT / 'tables.zs').write_bytes(compress(sarc_encode([('R/rows.bgyml', rows_member), ('R/mixed.bgyml', mixed)],
+                                                         {'R/rows.bgyml': 8, 'R/mixed.bgyml': 8})))
 
     r = subprocess.run([str(exe), str(OUT)], env=env, capture_output=True, text=True, timeout=120)
     print(r.stdout, end='')
@@ -506,6 +525,15 @@ def main():
     want['Actors'][2]['Dynamic']['Count'] = 13
     check(same(byml_decode(decompress(made, dics)), want), 'new file, packed with a dictionary: the tree')
     check(_frame_dict(made) == id2, 'new file, packed with a dictionary: not packed with the copied file\'s')
+
+    # rows added to tables (ADD_ROW)
+    check(same(byml_decode(decompress((OUT / 'table.out.zs').read_bytes(), {})), table_expected()),
+          'rows: the table is not the expected one')
+    m4 = sarc_decode(decompress((OUT / 'tables.out.zs').read_bytes(), {}))
+    t = table()
+    check(same(byml_decode(m4['R/rows.bgyml'][1]), {'Rows': [t[0], t[1], dict(t[1], __RowId='Bz'), t[2]], 'Count': 3}),
+          'rows, in a pack: the table below Rows')
+    check(m4['R/mixed.bgyml'][1] == byml_encode([t[1], t[0]]), 'rows, in a pack: the table out of order was changed')
 
     fails = [f for f in fails if f]
     for f in fails:

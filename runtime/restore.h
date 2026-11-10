@@ -20,8 +20,16 @@
 
 typedef enum {
     RESTORE_KIND_SET = 1, RESTORE_KIND_REMOVE, RESTORE_KIND_ADD, RESTORE_KIND_SET_TEXT, RESTORE_KIND_ADD_MEMBER,
-    RESTORE_KIND_NEW_FILE,
+    RESTORE_KIND_NEW_FILE, RESTORE_KIND_ADD_ROW,
 } RestoreKind;
+
+// A field an ADD_ROW sets in its copy: path below the row (keys and array indices separated by '/'), to number (in the
+// value's own type: an int stays an int) or, with text set, to that text. The row copied must have the field.
+typedef struct {
+    const char *path;
+    double number;
+    const char *text;
+} RestoreField;
 
 typedef struct {
     RestoreKind kind;
@@ -54,6 +62,12 @@ typedef struct {
     const char *from_member;
     // NEW_FILE: file is not there, and is made as a copy of the file from (its bytes as stored, packed as that one is);
     // the file's other edits then apply to the copy. from (above) names the file copied.
+    // ADD_ROW: a table, the array at path (NULL: the document's root) of rows (dicts) in the order of their text
+    // row_key (byte order, no two alike): a copy of the row text_was goes in as the row text_now, where that order puts
+    // it, with fields[0..nfields) set. The table must be in that order and lack a row text_now.
+    const char *row_key;
+    const RestoreField *fields;
+    int nfields;
 } RestoreEdit;
 
 typedef struct {
@@ -104,6 +118,14 @@ typedef struct {
     {.kind = RESTORE_KIND_ADD_MEMBER, .file = file_, .member = member_, .from = src, .from_member = src_member}
 // Make the file, which the game does not have, as a copy of the file src; the file's other edits apply to the copy.
 #define RESTORE_NEW_FILE(file_, src) {.kind = RESTORE_KIND_NEW_FILE, .file = file_, .from = src}
+// Add the row new_row to the table at array (NULL: the root) of the BYML file (or pack member_) whose rows are ordered
+// by their text key: a copy of the row from_row with the fields (an array of RestoreField) set; _AS sets none.
+#define RESTORE_ADD_ROW(file_, member_, array_, key_, from_row, new_row, fields_)                                   \
+    {.kind = RESTORE_KIND_ADD_ROW, .file = file_, .member = member_, .path = array_, .row_key = key_,               \
+     .text_was = from_row, .text_now = new_row, .fields = fields_, .nfields = (int)(sizeof fields_ / sizeof *fields_)}
+#define RESTORE_ADD_ROW_AS(file_, member_, array_, key_, from_row, new_row)                                         \
+    {.kind = RESTORE_KIND_ADD_ROW, .file = file_, .member = member_, .path = array_, .row_key = key_,               \
+     .text_was = from_row, .text_now = new_row}
 
 // The registry: every RESTORATION of the linked objects meets in one section (as host.h's HOST_OVERRIDE entries do),
 // which restore.c walks: on PE/COFF ".rst$m", sorted between restore.c's ".rst$a" and ".rst$z" markers; on ELF
