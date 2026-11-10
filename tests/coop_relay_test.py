@@ -579,6 +579,31 @@ class RelayTest(unittest.TestCase):
         info, _ = a.join(self.relay, cr.SILENT_DROP + 3)
         self.assertEqual(info[0], 1)                        # with the cookie: the same member, at its new address
 
+    def test_a_rejoin_that_changes_the_session_needs_the_cookie_even_from_the_members_address(self):
+        (a, b), secret = self.room_of(2)
+        # someone on the path saw the member's CONNECT (client id, token, address): a spoofed one with a new session
+        a.seq += 1
+        a.nonce = 11
+        old = a.session
+        a.session = random.getrandbits(64)
+        out = parsed(self.relay.handle(a.connect(cr.INTENT_JOIN), a.addr, 1))
+        self.assertEqual([dg.type for to, dg in out], [cr.T_CHALLENGE])
+        self.assertEqual(self.relay.rooms[a.room].members[1].session, old)   # the member's session stays
+        info, _ = a.join(self.relay, 2)                     # with the cookie (the member itself rejoining): taken
+        self.assertEqual(info[0], 1)
+        self.assertEqual(self.relay.rooms[a.room].members[1].session, a.session)
+
+    def test_a_session_used_in_the_room_is_refused(self):
+        (a, b), secret = self.room_of(2)
+        b.send(self.relay, cr.T_LEAVE, now=1)
+        m = Client('M', ip='10.7.0.1')
+        m.session = b.session        # the session of a member that left, which the rosters showed
+        e, _ = m.join(self.relay, 2, cr.INTENT_JOIN, secret)
+        self.assertEqual(len(e), 3, f'a newcomer took a session used in the room before: {e}')   # an ERROR, not JOINED
+        m.session = random.getrandbits(64)
+        info, _ = m.join(self.relay, 3, cr.INTENT_JOIN, secret)
+        self.assertEqual(len(info), 2)                      # with a session of its own it joins
+
     # -- time
 
     def test_silence_marks_away_then_drops_and_the_id_is_kept_for_a_rejoin(self):
@@ -721,6 +746,22 @@ class RelayTest(unittest.TestCase):
             if t % 25 == 0:
                 relay.tick(now)
         self.assertEqual(got, 10)
+
+    def test_idle_rooms_do_not_shrink_the_forwarding_share_of_a_busy_one(self):
+        relay = cr.Relay(egress_rate=80000, max_rooms=2000)
+        for i in range(300):   # rooms of one member each that send nothing, each from a network of its own
+            Client(f'I{i}', ip=f'10.{100 + i // 250}.{i % 250}.1').join(relay, 0, cr.INTENT_CREATE)
+        q1, q2 = Client('Q1', ip='10.9.0.1'), Client('Q2', ip='10.9.1.1')
+        q1.join(relay, 0, cr.INTENT_CREATE)
+        q2.join(relay, 0, cr.INTENT_JOIN, q1.secret)
+        relay.tick(1)
+        got = 0
+        for t in range(100):   # one second of 200-byte datagrams every 10 ms: 20 KB/s, a quarter of the relay's budget
+            now = 2 + t / 100
+            got += len(q1.send(relay, cr.T_DATA, bytes(200), dst=q2.id, now=now)[0])
+            if t % 25 == 0:
+                relay.tick(now)
+        self.assertGreaterEqual(got, 95, f'{got} of 100 forwarded beside 300 idle rooms')
 
     def test_garbage_is_ignored(self):
         rnd = random.Random(7)

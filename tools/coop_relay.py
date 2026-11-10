@@ -24,12 +24,14 @@ A datagram is a 24-byte header, little-endian, then a payload:
 Joining is a cookie exchange, so a spoofed source address cannot make the relay send anything larger than it received:
 a CONNECT is answered with a CHALLENGE holding a cookie of the sender's address and the minute; the CONNECT that carries
 the cookie joins. Every answer echoes the CONNECT's nonce. JOINED hands the member a rejoin token: a later CONNECT of the
-same client that carries it gets the same member id back (from the member's own address without a cookie, from another
-only with one), one without it is a new member.
+same client that carries it gets the same member id back (from the member's own address and in its own session without
+a cookie, from another address or with another session only with one), one without it is a new member. A session that
+was in the room before is refused: the players' games bind a member's signed identity to its session.
 
 Limits: per member (datagrams and bytes, a forwarded datagram counted once for each receiver), per network (/24 for
 IPv4, /48 for IPv6: challenges, joins, rooms made; at most MAX_NETWORKS of them are tracked), per room (an equal share
-of the bytes the relay forwards), and for the whole relay (challenges, bytes sent).
+of the bytes the relay forwards among the rooms that forwarded in the last ACTIVE seconds), and for the whole relay
+(challenges, bytes sent).
 """
 from __future__ import annotations
 
@@ -64,7 +66,7 @@ ENV_V1, ENV_HDR, ENV_MAC = 1, 13, 16
 
 T_CONNECT, T_CHALLENGE, T_JOINED, T_ERROR, T_ROSTER, T_PING, T_PONG, T_LEAVE, T_KICK, T_DATA = 1, 2, 3, 5, 6, 7, 8, 9, 11, 0x10
 INTENT_CREATE, INTENT_JOIN = 1, 2
-E_NO_ROOM, E_ROOM_FULL, E_PROTO, E_RATE, E_BAD_TAG, E_SERVER_FULL, E_ROOM_EXISTS, E_REMOVED = 1, 2, 3, 4, 5, 6, 7, 8
+E_NO_ROOM, E_ROOM_FULL, E_PROTO, E_RATE, E_BAD_TAG, E_SERVER_FULL, E_ROOM_EXISTS, E_REMOVED, E_SESSION_USED = 1, 2, 3, 4, 5, 6, 7, 8, 9
 FLAG_AWAY, FLAG_MAKER = 1, 2
 
 # ---- timing (seconds)
@@ -75,6 +77,8 @@ ROOM_EMPTY_TTL = 600  # a room with nobody in it is deleted after this; one nobo
 ROSTER_EVERY = 5      # the roster is sent again this often: a lost update repairs itself
 ROSTER_AGAIN = (0.25, 0.75)   # and after a change, again this long after it: three chances against loss, as in coop.c's CONNECT bursts
 MAX_NETWORKS = 4096   # networks whose challenge or join budget is tracked at once; a budget that is full again is forgotten
+SESSIONS_KEPT = 4096  # sessions a room remembers having seen, so that none is taken twice (the oldest forgotten first)
+ACTIVE = 2           # a room that forwarded within this many seconds shares the forwarding budget; an idle one does not
 
 
 def normalize_secret(text):
@@ -302,7 +306,8 @@ class Member:
 
 
 class Room:
-    __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared', 'egress')
+    __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared', 'egress',
+                 'sessions', 'forwarded_at')
 
     def __init__(self, rid, locator, prefix, now):
         self.id, self.locator, self.prefix = rid, locator, prefix
@@ -313,6 +318,13 @@ class Room:
         self.banned = set()  # client ids and addresses the maker removed
         self.shared = False  # someone besides its maker joined it once
         self.egress = None   # its share of the bytes the relay forwards (Relay.share_egress)
+        self.sessions = {}   # sessions its members used (insertion order: the oldest first), never taken again
+        self.forwarded_at = None   # when it last forwarded: a room that did recently shares the budget
+
+    def use_session(self, session):
+        self.sessions[session] = True
+        if len(self.sessions) > SESSIONS_KEPT:
+            del self.sessions[next(iter(self.sessions))]
 
     @property
     def key(self):
@@ -440,8 +452,10 @@ class Relay:
         return mine is not None and mine.take(1, now) and self.challenges.take(1, now)
 
     def share_egress(self, now):
-        """Each room's share of the forwarding budget: equal, so a busy room cannot take what another needs."""
-        share = self.egress_rate / max(1, len(self.rooms))
+        """Each room's share of the forwarding budget: equal among the rooms that forwarded in the last ACTIVE seconds, so a
+        busy room cannot take what another needs and rooms that send nothing take nothing."""
+        active = sum(1 for r in self.rooms.values() if r.forwarded_at is not None and now - r.forwarded_at < ACTIVE)
+        share = self.egress_rate / max(1, active)
         for room in self.rooms.values():
             if room.egress is None:
                 room.egress = Bucket(share, share, now)
@@ -453,7 +467,9 @@ class Relay:
     def take_egress(self, room, n, now):
         if self.egress is None:
             self.egress = Bucket(self.egress_rate, self.egress_rate, now)
-        if room.egress is None:
+        idle = room.forwarded_at is None or now - room.forwarded_at >= ACTIVE
+        room.forwarded_at = now
+        if room.egress is None or idle:   # it counts among the rooms that share from now on
             self.share_egress(now)
         return room.egress.take(n, now) and self.egress.take(n, now)
 
@@ -562,9 +578,10 @@ class Relay:
         rejoin = None
         if room is not None and any(token):   # a member of the room again: its token is its proof
             rejoin = next((m for m in room.members.values() if m.cid == cid and hmac.compare_digest(m.token, token)), None)
-        # no cookie needed only from the member's own address: from another one the token would aim the room's traffic at
-        # an address that never showed it receives there
-        if (rejoin is None or rejoin.addr != addr) and not self.cookie_ok(addr, cookie, now):
+        # no cookie needed only from the member's own address and in its own session: from another address the token
+        # would aim the room's traffic at an address that never showed it receives there, and with another session
+        # someone who saw the member's CONNECT on the way would take its place
+        if (rejoin is None or rejoin.addr != addr or rejoin.session != session) and not self.cookie_ok(addr, cookie, now):
             # not yet proven to receive at its address: only a challenge, and only if that is no larger than the request
             if len(data) < CONNECT_MIN or not self.take_challenge(addr, now):
                 return []
@@ -598,6 +615,11 @@ class Relay:
             room = self.make_room(locator, net, now)
         if cid in room.banned or addr in room.banned:
             return self.error(addr, E_REMOVED, nonce, 'removed by the room\'s maker', key)
+        if session in room.sessions and (rejoin is None or session != rejoin.session):
+            # a session is the member's identity to the others (their games bind its signature to it): one that was in
+            # the room before is someone else's, replayed
+            return self.error(addr, E_SESSION_USED, nonce, 'a session used in this room before', key)
+        room.use_session(session)
         if known and known[0] is not room:
             out += self.leave(known[0], known[1], now, 'moved to another room')   # same address, new room: it left the old
         member = rejoin
