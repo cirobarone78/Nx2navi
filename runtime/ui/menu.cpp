@@ -1371,6 +1371,9 @@ static void tab_controls(float scale) {
     opt_slider("NX2NAVI_RSTICK_DEADZONE", UI_MENU_RSTICK_DEADZONE, 0, 50, UI_MENU_STICK_DEADZONE_DESC, 1, "%.0f %%",
                pad ? stick_note[1] : nullptr, "NX2NAVI_STICK_DEADZONE");
     opt_slider("NX2NAVI_STICK_SENS", UI_MENU_STICK_SENS, 0.1f, 3, UI_MENU_STICK_SENS_DESC, 0.05f, "%.2f");
+    // The keyboard's sticks are all or nothing: the walk key scales them to the walk scale while it is held (input.c)
+    row_walk_key();
+    opt_slider("NX2NAVI_WALK_SCALE", UI_MENU_WALK_SCALE, 0.2f, 0.9f, UI_MENU_WALK_SCALE_DESC, 0.01f, "%.2f");
     binds_rows(scale);
     opt_end();
     binds_after_page();
