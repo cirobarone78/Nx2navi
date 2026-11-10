@@ -27,7 +27,8 @@ the cookie joins. Every answer echoes the CONNECT's nonce. JOINED hands the memb
 same client that carries it gets the same member id back (and needs no cookie), one without it is a new member.
 
 Limits: per member (datagrams and bytes, a forwarded datagram counted once for each receiver), per network (/24 for
-IPv4, /64 for IPv6: challenges, joins, rooms made), and for the whole relay (challenges, bytes sent).
+IPv4, /48 for IPv6: challenges, joins, rooms made; at most MAX_NETWORKS of them are tracked), per room (an equal share
+of the bytes the relay forwards), and for the whole relay (challenges, bytes sent).
 """
 from __future__ import annotations
 
@@ -72,6 +73,7 @@ REJOIN_KEEP = 60      # a dropped member's id is kept this long after its last d
 ROOM_EMPTY_TTL = 600  # a room with nobody in it is deleted after this; one nobody but its maker ever joined, at REJOIN_KEEP
 ROSTER_EVERY = 5      # the roster is sent again this often: a lost update repairs itself
 ROSTER_AGAIN = (0.25, 0.75)   # and after a change, again this long after it: three chances against loss, as in coop.c's CONNECT bursts
+MAX_NETWORKS = 4096   # networks whose challenge or join budget is tracked at once; a budget that is full again is forgotten
 
 
 def normalize_secret(text):
@@ -248,14 +250,15 @@ def parse_kick(payload):
 
 
 def prefix_of(addr):
-    """The network an address belongs to for the limits: its /24 for IPv4 (and IPv4 in IPv6), its /64 for IPv6."""
+    """The network an address belongs to for the limits: its /24 for IPv4 (and IPv4 in IPv6), its /48 for IPv6 (the
+    smallest block a provider usually hands one customer, who may hold every /64 in it)."""
     try:
         ip = ipaddress.ip_address(addr[0].split('%')[0])
     except ValueError:
         return addr[0]
     if ip.version == 6 and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
-    bits = 24 if ip.version == 4 else 64
+    bits = 24 if ip.version == 4 else 48
     return str(ipaddress.ip_network(f'{ip}/{bits}', strict=False))
 
 
@@ -268,13 +271,21 @@ class Bucket:
     def __init__(self, rate, burst, now):
         self.rate, self.burst, self.tokens, self.stamp = rate, burst, burst, now
 
-    def take(self, n, now):
+    def refill(self, now):
         self.tokens = min(self.burst, self.tokens + max(0.0, now - self.stamp) * self.rate)
         self.stamp = max(self.stamp, now)
+
+    def take(self, n, now):
+        self.refill(now)
         if self.tokens < n:
             return False
         self.tokens -= n
         return True
+
+    def full(self, now):
+        """Refilled to its burst: the same as a new bucket, so it need not be kept."""
+        self.refill(now)
+        return self.tokens >= self.burst
 
 
 class Member:
@@ -290,7 +301,7 @@ class Member:
 
 
 class Room:
-    __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared')
+    __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared', 'egress')
 
     def __init__(self, rid, locator, prefix, now):
         self.id, self.locator, self.prefix = rid, locator, prefix
@@ -300,6 +311,7 @@ class Room:
         self.again = []     # when the roster goes out once more after a change
         self.banned = set()  # client ids and addresses the maker removed
         self.shared = False  # someone besides its maker joined it once
+        self.egress = None   # its share of the bytes the relay forwards (Relay.share_egress)
 
     @property
     def key(self):
@@ -340,6 +352,7 @@ class Relay:
         self.prefix_rooms = {}       # network prefix -> rooms it made that are open
         self.challenges = None
         self.egress = None
+        self.next_prune = 0
         self.seq = 0
         self.stats = {k: 0 for k in ('rx', 'malformed', 'bad_tag', 'no_member', 'wrong_addr', 'rate_limited',
                                      'challenges', 'joins', 'rejoins', 'leaves', 'drops', 'forwarded', 'rooms_made',
@@ -396,23 +409,52 @@ class Relay:
         if self.by_addr.get(member.addr[:2], (None, None))[1] is member:
             del self.by_addr[member.addr[:2]]
 
+    def prune(self, now):
+        """Forgets the networks whose budgets are full again (as good as new): the tables hold only networks that sent
+        something in the last seconds."""
+        for table in (self.join_buckets, self.challenge_buckets):
+            for k in [k for k, b in table.items() if b.full(now)]:
+                del table[k]
+
     def bucket(self, table, key, rate, burst, now):
+        """The budget of network key, or None when MAX_NETWORKS networks are tracked and none of them is done."""
         b = table.get(key)
         if b is None:
+            if len(self.join_buckets) + len(self.challenge_buckets) >= MAX_NETWORKS:
+                self.prune(now)
+                if len(self.join_buckets) + len(self.challenge_buckets) >= MAX_NETWORKS:
+                    return None
             b = table[key] = Bucket(rate, burst, now)
         return b
 
     def take_challenge(self, addr, now):
-        """A challenge (or an answer to another protocol version) for addr: its network's budget, then the relay's."""
+        """A challenge (or an answer to another protocol version) for addr: the relay's budget first (a flood it refuses
+        leaves no state behind), then its network's."""
         if self.challenges is None:
             self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
+        self.challenges.refill(now)
+        if self.challenges.tokens < 1:
+            return False
         mine = self.bucket(self.challenge_buckets, prefix_of(addr), *self.prefix_challenge, now)
-        return mine.take(1, now) and self.challenges.take(1, now)
+        return mine is not None and mine.take(1, now) and self.challenges.take(1, now)
 
-    def take_egress(self, n, now):
+    def share_egress(self, now):
+        """Each room's share of the forwarding budget: equal, so a busy room cannot take what another needs."""
+        share = self.egress_rate / max(1, len(self.rooms))
+        for room in self.rooms.values():
+            if room.egress is None:
+                room.egress = Bucket(share, share, now)
+            else:
+                room.egress.refill(now)
+                room.egress.rate, room.egress.burst = share, share
+                room.egress.tokens = min(room.egress.tokens, share)
+
+    def take_egress(self, room, n, now):
         if self.egress is None:
             self.egress = Bucket(self.egress_rate, self.egress_rate, now)
-        return self.egress.take(n, now)
+        if room.egress is None:
+            self.share_egress(now)
+        return room.egress.take(n, now) and self.egress.take(n, now)
 
     def delete_room(self, room, why):
         self.rooms.pop(room.id, None)
@@ -484,7 +526,7 @@ class Relay:
         if extra and not member.bytes.take(extra, now):
             self.stats['rate_limited'] += 1
             return []
-        if not self.take_egress(len(data) * len(targets), now):
+        if not self.take_egress(room, len(data) * len(targets), now):
             self.stats['egress_limited'] += 1
             return []
         self.stats['forwarded'] += len(targets)
@@ -517,9 +559,11 @@ class Relay:
         key = locator   # the tag proves the sender knows the locator, which an observer of a CONNECT does too
         room = self.locators.get(locator)
         rejoin = None
-        if room is not None and any(token):   # a member of the room again: its token is its proof, no cookie needed
+        if room is not None and any(token):   # a member of the room again: its token is its proof
             rejoin = next((m for m in room.members.values() if m.cid == cid and hmac.compare_digest(m.token, token)), None)
-        if rejoin is None and not self.cookie_ok(addr, cookie, now):
+        # no cookie needed only from the member's own address: from another one the token would aim the room's traffic at
+        # an address that never showed it receives there
+        if (rejoin is None or rejoin.addr != addr) and not self.cookie_ok(addr, cookie, now):
             # not yet proven to receive at its address: only a challenge, and only if that is no larger than the request
             if len(data) < CONNECT_MIN or not self.take_challenge(addr, now):
                 return []
@@ -534,7 +578,7 @@ class Relay:
             return self.joined(known[0], known[1], nonce)
         net = prefix_of(addr)
         bucket = self.bucket(self.join_buckets, net, *self.join_limit, now)
-        if not bucket.take(1, now):
+        if bucket is None or not bucket.take(1, now):
             self.stats['rate_limited'] += 1
             return self.error(addr, E_RATE, nonce, 'too many joins, try again later', key)
         name = clean_name(raw_name) or b'Player'
@@ -595,6 +639,7 @@ class Relay:
         self.rooms[rid] = room
         self.locators[locator] = room
         self.prefix_rooms[prefix] = self.prefix_rooms.get(prefix, 0) + 1
+        self.share_egress(now)
         self.stats['rooms_made'] += 1
         self.log(f'room {room.label} created ({len(self.rooms)} rooms)')
         return room
@@ -643,10 +688,10 @@ class Relay:
             if changed or again or now >= room.next_roster:
                 out += self.roster_to_all(room, changed_at=now if changed else None)
                 room.next_roster = now + ROSTER_EVERY
-        for table in (self.join_buckets, self.challenge_buckets):
-            for k, b in list(table.items()):
-                if now - b.stamp > 120:
-                    del table[k]
+        if now >= self.next_prune:
+            self.next_prune = now + 1
+            self.prune(now)
+            self.share_egress(now)
         return out
 
 
@@ -702,7 +747,7 @@ def main():
     ap.add_argument('--port', type=int, default=24680, help='UDP port (default 24680; 0 picks a free one)')
     ap.add_argument('--log-addrs', action='store_true', help="write the players' addresses to the log (off by default)")
     ap.add_argument('--max-rooms', type=int, default=1000, help='rooms at most (default 1000)')
-    ap.add_argument('--rooms-per-network', type=int, default=8, help='open rooms one /24 or /64 may make (default 8)')
+    ap.add_argument('--rooms-per-network', type=int, default=8, help='open rooms one /24 or /48 may make (default 8)')
     a = ap.parse_args()
 
     def log(text):

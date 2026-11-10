@@ -560,16 +560,24 @@ class RelayTest(unittest.TestCase):
         out, _ = a.send(self.relay, cr.T_PING, b'\0\0\0\0', now=2)
         self.assertEqual(out[0][0], a.addr)               # the maker's traffic still goes to the maker
 
-    def test_a_member_rejoins_with_its_token_from_a_new_address_without_a_cookie(self):
+    def test_a_member_rejoins_with_its_token_from_its_address_without_a_cookie_and_from_another_after_one(self):
         (a, b), secret = self.room_of(2)
         self.relay.tick(cr.SILENT_DROP + 1)
-        a.addr = ('10.0.0.1', a.addr[1] + 1000)
         a.seq += 1
         a.nonce = 9
         out = parsed(self.relay.handle(a.connect(cr.INTENT_JOIN), a.addr, cr.SILENT_DROP + 2))
         mine = [dg for to, dg in out if to == a.addr]
-        self.assertEqual(mine[0].type, cr.T_JOINED)        # no challenge needed: the token proves it
+        self.assertEqual(mine[0].type, cr.T_JOINED)        # its own address: the token proves it, no challenge
         self.assertEqual(cr.parse_joined(mine[0].payload)[0], 1)
+        # from another address: a challenge first, so a token cannot aim the room's traffic at an address that never answered
+        a.addr = ('10.0.0.1', a.addr[1] + 1000)
+        a.seq += 1
+        a.nonce = 10
+        out = parsed(self.relay.handle(a.connect(cr.INTENT_JOIN), a.addr, cr.SILENT_DROP + 3))
+        self.assertEqual([dg.type for to, dg in out], [cr.T_CHALLENGE])
+        self.assertEqual(self.relay.rooms[a.room].members[1].addr[1], a.addr[1] - 1000)   # not moved yet
+        info, _ = a.join(self.relay, cr.SILENT_DROP + 3)
+        self.assertEqual(info[0], 1)                        # with the cookie: the same member, at its new address
 
     # -- time
 
@@ -663,9 +671,10 @@ class RelayTest(unittest.TestCase):
         other.seq = 1
         self.assertEqual(len(relay.handle(other.connect(cr.INTENT_CREATE), other.addr, 0)), 1)
 
-    def test_ipv6_addresses_of_one_64_share_their_limits(self):
+    def test_ipv6_addresses_of_one_48_share_their_limits(self):
         self.assertEqual(cr.prefix_of(('2001:db8:1:2::1', 5)), cr.prefix_of(('2001:db8:1:2:ffff::9', 6)))
-        self.assertNotEqual(cr.prefix_of(('2001:db8:1:2::1', 5)), cr.prefix_of(('2001:db8:1:3::1', 5)))
+        self.assertEqual(cr.prefix_of(('2001:db8:1:2::1', 5)), cr.prefix_of(('2001:db8:1:ff03::1', 5)))
+        self.assertNotEqual(cr.prefix_of(('2001:db8:1:2::1', 5)), cr.prefix_of(('2001:db8:2:2::1', 5)))
         self.assertEqual(cr.prefix_of(('::ffff:10.0.0.7', 5)), cr.prefix_of(('10.0.0.9', 6)))
         relay = cr.Relay(prefix_challenge_rate=5, prefix_challenge_burst=5)
         n = sum(len(relay.handle(Client(ip=f'2001:db8::{i:x}').connect(cr.INTENT_CREATE), (f'2001:db8::{i:x}', 7, 0, 0), 0))
@@ -677,6 +686,41 @@ class RelayTest(unittest.TestCase):
         results = [Client(f'P{i}', ip=f'10.0.0.{i + 1}').join(relay, 0, cr.INTENT_CREATE)[0][0] for i in range(5)]
         self.assertEqual(results, [1, 1, 1, cr.E_RATE, cr.E_RATE])
         self.assertEqual(Client(ip='10.0.1.1').join(relay, 0, cr.INTENT_CREATE)[0][0], 1)
+
+    def test_one_ipv6_48_opens_no_more_rooms_than_one_network(self):
+        relay = cr.Relay(rooms_per_prefix=3, join_burst=100)
+        results = [Client(f'P{i}', ip=f'2001:db8:7:{i:x}::1').join(relay, 0, cr.INTENT_CREATE)[0][0] for i in range(5)]
+        self.assertEqual(results, [1, 1, 1, cr.E_RATE, cr.E_RATE])   # five /64s of one /48
+
+    def test_a_flood_from_many_networks_keeps_the_relay_state_small(self):
+        relay = cr.Relay(challenge_rate=1000)
+        for i in range(20000):   # spoofed CONNECTs, each from another /24, over two seconds
+            ip = f'10.{i >> 8 & 255}.{i & 255}.1'
+            c = Client(ip=ip)
+            relay.handle(c.connect(cr.INTENT_CREATE), (ip, 5), i / 10000)
+        self.assertLessEqual(len(relay.challenge_buckets) + len(relay.join_buckets), 4096)
+        relay.tick(2.5)
+        other = Client(ip='192.0.2.1')   # and a new player still gets a challenge a moment later
+        self.assertEqual(len(relay.handle(other.connect(cr.INTENT_CREATE), other.addr, 4)), 1)
+
+    def test_one_room_cannot_take_the_forwarding_budget_of_another(self):
+        relay = cr.Relay(egress_rate=40000, pkt_rate=10000, pkt_burst=10000, byte_rate=1 << 22, byte_burst=1 << 22)
+        busy, _ = self.room_of(8, relay=relay)
+        q1, q2 = Client('Q1', ip='10.9.0.1'), Client('Q2', ip='10.9.1.1')
+        q1.join(relay, 0, cr.INTENT_CREATE)
+        q2.join(relay, 0, cr.INTENT_JOIN, q1.secret)
+        relay.tick(1)
+        got = 0
+        for t in range(100):   # one second: the busy room sends small datagrams as fast as it can, the quiet one 200 bytes every 100 ms
+            now = 2 + t / 100
+            for c in busy:
+                for _ in range(50):
+                    c.send(relay, cr.T_DATA, b'x', dst=busy[0].id if c is not busy[0] else busy[1].id, now=now)
+            if t % 10 == 0:
+                got += len(q1.send(relay, cr.T_DATA, bytes(200), dst=q2.id, now=now)[0])
+            if t % 25 == 0:
+                relay.tick(now)
+        self.assertEqual(got, 10)
 
     def test_garbage_is_ignored(self):
         rnd = random.Random(7)
