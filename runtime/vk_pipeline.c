@@ -48,6 +48,7 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#include "vk_warm_hint.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -5062,6 +5063,7 @@ static struct {
     volatile int32_t running, stop, started;
     PlatThread *th[LW_MAX_THREADS + 1];
     int threads, strikes;
+    uint32_t vendor;   // the GPU's vendor id, for what a cold cache's log line adds (vk_warm_hint.h)
     double t0;
     char stamp[PLAT_PATH_MAX * 2 + 32], id[64];
 } LW;
@@ -5155,7 +5157,8 @@ static void lw_main(void *arg) {
     if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
         rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
                "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway)", median);
+               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
+               lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
         return;
     }
     LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
@@ -5165,11 +5168,15 @@ static void lw_main(void *arg) {
     if (resume)
         rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
                "idle threads", LW.n, t);
-    else
+    else   // cold right after a finished warm on this driver says more than a first cold (vk_warm_hint.h)
         rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
                "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
                "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
-               "compile, which skips that draw for some frames or makes it wait", median, LW.n, t);
+               "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
+               lw_cold_hint(LW.vendor,
+                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                            : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
+                            LW_ON_WINDOWS));
     LW.t0 = now_ms();
     LW.running = t;
     int started = 0;
@@ -5199,6 +5206,7 @@ static void lw_start(void) {
     VkPhysicalDeviceProperties pp;
     vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
     snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
+    LW.vendor = pp.vendorID;
     LW.th[0] = plat_thread_new(lw_main, NULL, "lib warm check");
 }
 
