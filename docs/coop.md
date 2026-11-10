@@ -5,8 +5,8 @@ game has no multiplayer of its own and its `nn::socket` stays offline: the layer
 (`runtime/coop.c`) with its own UDP socket.
 
 What exists so far: rooms, the relay, a sealed channel for messages between the players, progress sync (below) and the
-menu's Co-op tab (below), which makes, joins, accepts and leaves a room. Showing the other players in the world is not
-there yet.
+menu's Co-op tab (below), which makes, joins, accepts and leaves a room. Showing the other players in the world is in
+progress and off by default (below: the games exchange where their Links are, but the puppet actor is not drawn yet).
 
 ## What joining a room means for your save
 
@@ -78,7 +78,7 @@ Read this before you join a room.
 | Who | Sees | Cannot |
 |---|---|---|
 | The relay's operator, and anyone on the network path | that a room exists (a random id and the locator, a value derived from the secret that does not give the secret back), the players' names, their IP addresses, when and how much they send | read, change or make any message between the players; learn the secret; change anyone's save or the room's rules (moving the relay's maker mark changes nothing for a player who accepted) |
-| The other players in the room | your name, your progress (what the rules share), your messages | your IP address (the relay forwards everything), your account or profile (the id the relay knows you by is random for each start of the game and never shown to them) |
+| The other players in the room | your name, your progress (what the rules share), your messages, and with `NX2NAVI_COOP_PUPPETS=1` where your Link is (area, position, animation) | your IP address (the relay forwards everything), your account or profile (the id the relay knows you by is random for each start of the game and never shown to them) |
 | Your log and "Copy system info" | the room's first three characters and the offer's number; system info shows that `coop_room`, `coop_server`, `coop_name` and `coop_accept` are set, not their values | the secret, the relay's address (it appears only with `NX2NAVI_TRACE=coop`) |
 
 ### Going back to your save from before a session
@@ -419,6 +419,21 @@ What nothing can prevent: everyone who knows the secret can join and read the ro
 it (leave messages out, flood within its limits, keep the rules from being agreed, change the offer so that nothing
 is applied until you accept again, or keep the room unaccepted by never saying who it is); and the relay sees who
 plays with whom and when, with names and addresses. None of that changes a save.
+
+## Other players in the world (in progress, game 1.1.1)
+
+Off by default. With `NX2NAVI_COOP_PUPPETS=1`, while the game is in a room with others, it sends where its Link is
+about 15 times a second as a sealed message (POS in `runtime/coop_proto.h`: the current area's name, child or adult,
+position, facing, and the node and frame each of Link's animation slots plays; a POS with a name that is not printable
+ASCII or a number that is not finite is dropped), so the other players see where your Link is, and it shows each other
+player whose Link is in the same area as a puppet (`runtime/coop_puppet.c`): an actor made from the pause menu's Link
+with Link's world animations (`CoopPuppet_Child` / `_Adult`, files made at start while co-op is on,
+`runtime/coop_puppet_files.c`), put at that player's pose of about 100 ms ago and playing his animation; it goes when
+he leaves the area or the room or is not heard for 3 s. Not working yet: the actor is made and posed but stays in an
+inactive state and is not drawn, so the switch is off by default. With the switch or co-op off, or alone in a room,
+the game runs its original per-frame call and nothing of this is sent or logged. Log lines start with `coop: puppet:`
+(`member N is in <area>: asking for CoopPuppet_Child`, `... made after N frames`, `member N's puppet goes (<why>)`,
+`release ...`).
 
 ## In the log
 

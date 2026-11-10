@@ -46,6 +46,7 @@
 #include "cfg.h"
 #include "coop.h"
 #include "coop_game.h"
+#include "coop_puppet.h"
 #include "host.h"
 #include "logq.h"
 #include "prof.h"
@@ -640,6 +641,7 @@ int main(int argc, char **argv) {
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
         coop_init();      // the co-op thread (coop.c); the same, idle while the COOP setting is off
         coop_game_init(); // progress sync's hooks on that thread and the game's frames (coop_game.c)
+        coop_puppet_init(); // the puppets' hooks on that thread: the other players' poses (coop_puppet.c)
         rt_boot();
         return 0;
     }
