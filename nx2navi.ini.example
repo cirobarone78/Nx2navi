@@ -490,6 +490,26 @@
 # The key of the application's uploaded art asset (Rich Presence > Art Assets) shown as the status's large image.
 # discord_image = nx2navi_512x512
 
+[coop]
+# Co-op: your own game and save, with the other players' progress and positions shared through a relay (docs/coop.md).
+# 0 = off: no thread work, no socket. Takes effect at once.
+# coop = 0
+# Your name for the other players, at most 24 bytes. Default: Player- and four hex digits of your id.
+# coop_name =
+# The relay, host or host:port (default port 24680): run one with `python tools/coop_relay.py` and forward its UDP port, or
+# use one a friend runs. No default: with none set the session stays idle and the log says why.
+# coop_server =
+# The local UDP port, 0 = any. For a firewall rule or a port forward when testing on a LAN. Takes effect at the next start.
+# coop_port = 0
+# For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
+# room code of 6 characters from 23456789BCDFGHJKMNPRSTVWXYZ). A relay started with --allow-chosen-codes makes the room
+# of a create that names a code, or lets the create join it when it exists. While the session runs, a room the relay
+# lost (a restart) is made again or waited for. off = no session at launch.
+# coop_auto = off
+# coop_room =
+# Test: percent of received co-op datagrams thrown away, 0 to 100.
+# coop_drop = 0
+
 [audio]
 # none mixes without opening an audio device.
 # audio = default

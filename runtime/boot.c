@@ -16,6 +16,7 @@
 
 #include "cfg.h"
 #include "cheats.h"
+#include "coop.h"
 #include "fs.h"
 #include "kernel.h"
 #include "ipc.h"
@@ -323,6 +324,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
+    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();
     vk_pipeline_save();   // no-op without the Vulkan back end
     prof_write();

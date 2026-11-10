@@ -41,6 +41,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "coop.h"
 #include "host.h"
 #include "logq.h"
 #include "prof.h"
@@ -168,13 +169,13 @@ static void parse_trace(void) {
     static const struct { const char *name; unsigned bit; } names[] = {
         {"svc", RT_TRACE_SVC}, {"host", RT_TRACE_HOSTCALL}, {"ipc", RT_TRACE_IPC}, {"fs", RT_TRACE_FS},
         {"gfx", RT_TRACE_GFX}, {"perf", RT_TRACE_PERF}, {"sched", RT_TRACE_SCHED}, {"audio", RT_TRACE_AUDIO},
-        {"present", RT_TRACE_PRESENT}, {"all", ~0u}};
+        {"present", RT_TRACE_PRESENT}, {"coop", RT_TRACE_COOP}, {"all", ~0u}};
     for (const char *p = e; *p;) {
         size_t n = strcspn(p, ",");
         int known = 0;
         for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
             if (strlen(names[i].name) == n && !strncmp(p, names[i].name, n)) rt_trace |= names[i].bit, known = 1;
-        if (!known && n) rt_log("NX2NAVI_TRACE: unknown item '%.*s' (svc, host, ipc, fs, gfx, perf, sched, audio, present, all)", (int)n, p);
+        if (!known && n) rt_log("NX2NAVI_TRACE: unknown item '%.*s' (svc, host, ipc, fs, gfx, perf, sched, audio, present, coop, all)", (int)n, p);
         p += n + (p[n] == ',');
     }
 }
@@ -631,6 +632,7 @@ int main(int argc, char **argv) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
+        coop_init();      // the co-op thread (coop.c); the same, idle while the COOP setting is off
         rt_boot();
         return 0;
     }
