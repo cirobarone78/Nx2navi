@@ -597,7 +597,9 @@ static void shadow(Cpu *c, uint64_t player) {
 // between the two poses received around then (their senders' clocks put on ours by the smallest delay seen). A
 // puppet goes when its player leaves the area, the room or the world, or goes silent for 3 s. A pose counts only above
 // the last one taken from the same member in the same session (coop_pos_fresh): the session layer can deliver a
-// message again (coop.h), and an old pose must not move a puppet back.
+// message again (coop.h), and an old pose must not move a puppet back while the player's own keep arriving. After 3 s
+// with none taken, the next is taken whatever its counter, so a relay that held a player's datagrams back that long can
+// replay the player's recorded poses: the puppet walks an old path, and nothing else (progress, saves) follows from it.
 
 #define HIST 8
 #define SILENT_MS 3000

@@ -190,8 +190,11 @@ int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out);
 
 // The receiver's counter of one POS sender (coop.h: a handler is not called once only). A pose is taken only above the
 // last one taken from the same member id in the same session, so neither a pose sent again nor one recorded earlier
-// in the session moves the puppet back; the first pose of another session (another player given the id, or the member
-// back in a new session) starts the counter again. Someone with the room's secret can seal a POS in a member's name with
+// in the session moves the puppet back while that sender's poses keep being taken; the first pose of another session
+// (another player given the id, the member back in a new session, or a roster that lists an earlier session) starts the
+// counter again. After COOP_POS_QUIET_MS with none taken (below), whoever holds the sender's datagrams back that long can
+// send its recorded poses of the session again (no secret needed), and they are taken: only the puppet moves. Someone
+// with the room's secret can seal a POS in a member's name with
 // a counter far ahead, which would keep that member's own poses out for the session: once nothing was taken from the
 // sender for COOP_POS_QUIET_MS (its puppet is gone by then for want of poses), the next pose is taken whatever its
 // counter and starts the counter again. session: the one the roster lists for the member (CoopView). Returns 0 to drop
