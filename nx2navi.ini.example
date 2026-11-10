@@ -494,7 +494,7 @@
 # Co-op: your own game and save, with the other players' progress and positions shared through a relay (docs/coop.md).
 # 0 = off: no thread work, no socket. Takes effect at once.
 # coop = 0
-# Your name for the other players, at most 24 bytes. Default: Player- and four hex digits of your id.
+# Your name for the other players, at most 24 bytes. Default: Player- and four random hex digits.
 # coop_name =
 # The relay, host or host:port (default port 24680): run one with `python tools/coop_relay.py` and forward its UDP port, or
 # use one a friend runs. No default: with none set the session stays idle and the log says why.
@@ -502,16 +502,14 @@
 # The local UDP port, 0 = any. For a firewall rule or a port forward when testing on a LAN. Takes effect at the next start.
 # coop_port = 0
 # For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
-# room code of 6 characters from 23456789BCDFGHJKMNPRSTVWXYZ). A relay started with --allow-chosen-codes makes the room
-# of a create that names a code, or lets the create join it when it exists. While the session runs, a room the relay
-# lost (a restart) is made again or waited for. off = no session at launch.
+# room's secret of 18 characters from 23456789BCDFGHJKMNPRSTVWXYZ, XXXXXX-XXXXXX-XXXXXX; a create without it makes a new
+# one). While the session runs, a room the relay lost (a restart) is made again or waited for, and a create that finds
+# the room open joins it. Joining is not accepting: nothing from the room is applied before you accept it in the menu.
+# off = no session at launch.
 # coop_auto = off
 # coop_room =
 # Test: percent of received co-op datagrams thrown away, 0 to 100.
 # coop_drop = 0
-# Test, no menu row: sets flags by hash at given frames of play, "hash=value@frame,..." (hash in hex, frames counted from
-# when a save is being played), for automated tests of progress sync.
-# coop_test_set =
 # The rules of a room you make (a room you join uses its maker's; the log names them). Take effect at once.
 # Story, world and dungeon progress: shared or own.
 # coop_progress = shared
@@ -526,10 +524,11 @@
 # Rupees and ammunition: own, or pool = one count every player adds to and spends from.
 # coop_rupees = own
 # coop_ammo = own
-# Nothing from a room is applied to your game before you accept who is in it and its rules, and before your save is copied
-# to coop-backup in the profile folder (docs/coop.md: going back). ask = the log names the room's offer and its number,
-# which you put here (or accept in the menu); a new member or other rules make a new offer. always = accept every room
-# (the save is still copied first).
+# Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
+# your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = accept each offer in the
+# menu; a new member, other rules or another save loaded make a new offer. Accepting every room (always) is taken from
+# the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a
+# room for you.
 # coop_accept = ask
 
 [audio]

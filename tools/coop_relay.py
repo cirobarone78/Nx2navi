@@ -24,7 +24,8 @@ A datagram is a 24-byte header, little-endian, then a payload:
 Joining is a cookie exchange, so a spoofed source address cannot make the relay send anything larger than it received:
 a CONNECT is answered with a CHALLENGE holding a cookie of the sender's address and the minute; the CONNECT that carries
 the cookie joins. Every answer echoes the CONNECT's nonce. JOINED hands the member a rejoin token: a later CONNECT of the
-same client that carries it gets the same member id back (and needs no cookie), one without it is a new member.
+same client that carries it gets the same member id back (from the member's own address without a cookie, from another
+only with one), one without it is a new member.
 
 Limits: per member (datagrams and bytes, a forwarded datagram counted once for each receiver), per network (/24 for
 IPv4, /48 for IPv6: challenges, joins, rooms made; at most MAX_NETWORKS of them are tracked), per room (an equal share
