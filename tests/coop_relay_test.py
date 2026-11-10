@@ -879,6 +879,85 @@ class RelayTest(unittest.TestCase):
         out = parsed(relay.handle(a.connect(cr.INTENT_JOIN), a.addr, 5))
         self.assertEqual(([dg.type for to, dg in out], challenged >= 9 * 8), ([cr.T_CHALLENGE], True))
 
+    def full_relay(self, members, rooms=1000):
+        """A relay with rooms open rooms: ours, with members members, each from its own /24, and rooms - 1 others, each
+        with its maker in it, eight to a /24 (the per-network limit). (relay, our members)"""
+        relay = cr.Relay()
+        a = Client('A', ip='10.0.0.1')
+        a.join(relay, 0, cr.INTENT_CREATE)
+        ours = [a]
+        for i in range(1, members):
+            c = Client(f'P{i}', ip=f'10.0.{i}.1')
+            c.join(relay, 0, cr.INTENT_JOIN, a.secret)
+            ours.append(c)
+        for i in range(rooms - 1):
+            net = 100 + i // 8
+            Client(f'R{i}', ip=f'10.{net >> 8}.{net & 255}.{i % 8 + 1}').join(relay, 0, cr.INTENT_CREATE)
+        self.assertEqual(len(relay.rooms), rooms)
+        return relay, ours
+
+    def test_a_flood_of_rejoins_with_a_members_token_on_a_full_relay_keeps_neither_its_messages_nor_its_own_rejoin_out(self):
+        """The flood of test_a_flood_of_rejoins_with_a_members_token_takes_neither_its_packets_nor_its_own_rejoin (250
+        CONNECTs a second with the member's seen token from another network, for ten seconds) on a relay that holds its
+        full 1000 rooms: the member's messages pass, and its rejoin in a new session from its own network gets its
+        challenge."""
+        relay, (a, b) = self.full_relay(2)
+        flood = Client(ip='10.66.0.9', cid=a.cid, secret=a.secret)
+        flood.token = a.token
+        passed = sent = 0
+        for i in range(2500):
+            now = 1 + i / 250
+            flood.seq, flood.nonce = flood.seq + 1, i
+            relay.handle(flood.connect(cr.INTENT_JOIN), flood.addr, now)
+            if i % 25 == 0 and i >= 2000:
+                out, _ = a.send(relay, cr.T_DATA, b'\x01sealed', dst=cr.DST_ALL, now=now)
+                sent, passed = sent + 1, passed + any(to == b.addr for to, d in out)
+        a.session = random.getrandbits(64)
+        a.seq, a.nonce = a.seq + 1, 77
+        out = parsed(relay.handle(a.connect(cr.INTENT_JOIN), a.addr, 11))
+        self.assertEqual((passed, [dg.type for to, dg in out]), (sent, [cr.T_CHALLENGE]))
+
+    def test_a_paced_flood_with_every_token_of_a_room_keeps_no_members_own_rejoin_out_also_on_a_full_relay(self):
+        """Someone who saw the CONNECTs of all eight members of a room sends CONNECTs with each token, in new sessions, from
+        another network at the 2 a second each member's own challenges for other networks allow; and one member of the
+        room sends CONNECTs with its own token from its own network at the 2 a second its own challenges allow. For a
+        minute, on a relay with one room and on one with its full 1000. Member A joins again in a new session from its
+        own network as coop.c does (a burst of four CONNECTs 250 ms apart, then waits of 1, 2, 4, 8 and 15 s) and answers
+        the first challenge: its first CONNECT gets one."""
+        for rooms in (1, 1000):
+            relay, ours = self.full_relay(8, rooms)
+            a, b = ours[0], ours[1]
+            events = []   # (time, what, index): 0 a seen token from another network, 1 b's own from its network, 2 a
+            for k, m in enumerate(ours):
+                f = Client(ip=f'10.66.{k}.9', cid=m.cid, secret=a.secret)
+                f.token = m.token
+                ours[k] = (m, f)
+                events += [(0.01 + k * 1e-3, 0, k)] * 8 + [(0.5 + k / 16 + j / 2, 0, k) for j in range(120)]
+            own = Client(ip=b.addr[0], cid=b.cid, secret=a.secret)   # b's own network, another port
+            own.token = b.token
+            events += [(0.02, 1, 0)] * 8 + [(0.53 + j / 2, 1, 0) for j in range(120)]
+            at, wait = 1.37, 1.0
+            while at < 60:
+                events += [(at + k * 0.25, 2, 0) for k in range(4)]
+                at += 0.75 + wait
+                wait = min(wait * 2, 15)
+            events.sort()
+            a.session = random.getrandbits(64)
+            first = None
+            for i, (now, what, k) in enumerate(events):
+                if what == 0:
+                    f = ours[k][1]
+                    f.seq, f.nonce, f.session = f.seq + 1, i, random.getrandbits(64)
+                    relay.handle(f.connect(cr.INTENT_JOIN), f.addr, now)
+                elif what == 1:
+                    own.seq, own.nonce, own.session = own.seq + 1, i, random.getrandbits(64)
+                    relay.handle(own.connect(cr.INTENT_JOIN), own.addr, now)
+                elif first is None:
+                    a.seq, a.nonce = a.seq + 1, 1000 + i
+                    if [dg.type for to, dg in parsed(relay.handle(a.connect(cr.INTENT_JOIN), a.addr, now))] == [cr.T_CHALLENGE]:
+                        first = now
+            self.assertEqual((rooms, first), (rooms, 1.37))
+
     def test_challenges_are_limited_per_network_so_one_cannot_lock_out_the_rest(self):
         relay = cr.Relay(challenge_rate=100, prefix_challenge_rate=10, prefix_challenge_burst=10)
         flood = sum(len(relay.handle(Client(ip=f'10.1.0.{i}').connect(cr.INTENT_CREATE), (f'10.1.0.{i}', 5), 0)) for i in range(200))

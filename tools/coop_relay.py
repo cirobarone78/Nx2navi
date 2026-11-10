@@ -301,7 +301,7 @@ class Bucket:
 
 class Member:
     __slots__ = ('id', 'cid', 'session', 'name', 'addr', 'last_seen', 'away', 'live', 'connect_seq', 'pkts', 'bytes',
-                 'token', 'maker', 'home_challenges', 'away_challenges')
+                 'token', 'maker', 'home_challenges', 'away_challenges', 'home_rejoins')
 
     def __init__(self, mid, cid, session, name, addr, now, connect_seq, pkts, bytes_, maker):
         self.id, self.cid, self.session, self.name, self.addr = mid, cid, session, name, addr
@@ -312,6 +312,7 @@ class Member:
         # its own challenges, apart from its packets: anyone who saw its join has its token, and a flood of CONNECTs with
         # it from another network takes neither the member's messages nor the challenge of its own rejoin from its network
         self.home_challenges, self.away_challenges = Bucket(*MEMBER_CHALLENGES, now), Bucket(*MEMBER_CHALLENGES, now)
+        self.home_rejoins = None   # its share of the challenges set aside for rejoins from its own network (Relay.take_rejoin)
 
 
 class Room:
@@ -329,7 +330,7 @@ class Room:
         self.egress = None   # its share of the bytes the relay forwards (Relay.share_egress)
         self.sessions = {}   # sessions its members used (insertion order: the oldest first), never taken again
         self.forwarded_at = None   # when it last forwarded: a room that did recently shares the budget
-        self.rejoins = None  # its share of the challenges set aside for its members' rejoins (Relay.take_rejoin)
+        self.rejoins = None  # its share of the challenges set aside for its members' rejoins from other networks (Relay.take_rejoin)
 
     def use_session(self, session):
         self.sessions[session] = True
@@ -464,11 +465,12 @@ class Relay:
     def take_challenge(self, addr, now, member=None, room=None):
         """A challenge (or an answer to another protocol version) for addr: the relay's budget first (a flood it refuses
         leaves no state behind), then its network's. A CONNECT that carries a member's valid token (a rejoin) takes from
-        its room's share of those set aside for rejoins, which a flood without a token never reaches, and from that
-        member's own challenges for its network or for the others (MEMBER_CHALLENGES), never from its packets."""
+        that member's own challenges for its network or for the others (MEMBER_CHALLENGES), never from its packets, and
+        then from the share set aside for rejoins (take_rejoin), which a flood without a token never reaches."""
         if member is not None:
-            mine = member.home_challenges if prefix_of(addr) == prefix_of(member.addr) else member.away_challenges
-            return mine.take(1, now) and self.take_rejoin(room, now)
+            home = prefix_of(addr) == prefix_of(member.addr)
+            mine = member.home_challenges if home else member.away_challenges
+            return mine.take(1, now) and self.take_rejoin(room, member, home, now)
         if self.challenges is None:
             self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
         self.challenges.refill(now)
@@ -477,19 +479,29 @@ class Relay:
         mine = self.bucket(self.challenge_buckets, prefix_of(addr), *self.prefix_challenge, now)
         return mine is not None and mine.take(1, now) and self.challenges.take(1, now)
 
-    def take_rejoin(self, room, now):
-        """A challenge from room's share of those set aside for rejoins: rejoin_challenge_rate a second split equally
-        among the open rooms, with MAX_MEMBERS at once at least, so that the members' tokens of rooms someone made to
-        flood with take those rooms' shares and never another room's."""
+    def take_rejoin(self, room, member, home, now):
+        """A challenge from the share set aside for rejoins: rejoin_challenge_rate a second split equally among the open
+        rooms, for CONNECTs from other networks than the member's (a member that moves, or someone with a token it saw),
+        and as much again, split among the rooms and then among the eight member ids of each, for CONNECTs from the
+        member's own network. Each holds MAX_MEMBERS at once at least. So the tokens of rooms someone made to flood with
+        take only those rooms' shares, and nobody without the member's own network (a stranger with a token it saw, or
+        another member of its room) takes the share of the member's own rejoin."""
         share = self.rejoin_challenge_rate / max(1, len(self.rooms))
+        if home:
+            share /= MAX_MEMBERS
         burst = max(share, MAX_MEMBERS)
-        if room.rejoins is None:
-            room.rejoins = Bucket(share, burst, now)
+        b = member.home_rejoins if home else room.rejoins
+        if b is None:
+            b = Bucket(share, burst, now)
+            if home:
+                member.home_rejoins = b
+            else:
+                room.rejoins = b
         else:
-            room.rejoins.refill(now)
-            room.rejoins.rate, room.rejoins.burst = share, burst
-            room.rejoins.tokens = min(room.rejoins.tokens, burst)
-        return room.rejoins.take(1, now)
+            b.refill(now)
+            b.rate, b.burst = share, burst
+            b.tokens = min(b.tokens, burst)
+        return b.take(1, now)
 
     def share_egress(self, now):
         """Each room's share of the forwarding budget: equal among the rooms that forwarded to someone in the last ACTIVE

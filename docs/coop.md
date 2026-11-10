@@ -176,12 +176,17 @@ where each network's joins went.
   budget that is full again, and checks its own challenge budget first, so a flood from spoofed addresses leaves no
   state behind. A member that rejoins with its token from its own address and in its own session needs no challenge;
   from another address, or with a new session (every rejoin draws one), it answers one first, so someone who saw its
-  CONNECT cannot take its place. The challenges for a CONNECT with a member's valid token come from its room's share
-  of 1000 a second set aside for them (split equally among the open rooms, 8 at once at least), so that the tokens of
-  rooms someone made to flood with take only those rooms' shares, and from that member's own challenges (2 a second, 8
-  at once, kept apart for its own network and for the others), never from its packets: a flood of them, with or
-  without a token someone saw, neither
-  drops the member's messages nor keeps its rejoin from its own network out of the room. A game whose roster shows
+  CONNECT cannot take its place. The challenges for a CONNECT with a member's valid token come from that member's own
+  challenges (2 a second, 8 at once, kept apart for its own network and for the others), never from its packets, and
+  from a share set aside for rejoins: 1000 a second split equally among the open rooms for CONNECTs from other networks
+  than the member's, and 1000 a second split among the rooms and then among the eight member numbers of each for
+  CONNECTs from the member's own network (each 8 at once at least, so a member can rejoin eight times at once even on
+  a relay with its full 1000 rooms, and then once every 8 s). So the tokens of rooms someone made to flood with take
+  only those rooms' shares, and a flood of CONNECTs with a member's token, someone else's or seen on the way, from
+  another network neither drops the member's messages nor keeps its rejoin from its own network out of the room. What
+  such a flood can take is the room's share for other networks: a member that comes back from another network (a
+  phone that changed networks) may wait for as long as it lasts, and so may one whose own network someone sends from
+  with its token. A game whose roster shows
   another session for it joins again, at most once
   every 15 s. A session that was in the room before is refused (the last 4096 of each room are kept). A flood from many
   networks can still use up the relay's 5000 challenges a second for newcomers: a relay has finite capacity, and its
