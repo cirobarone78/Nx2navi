@@ -124,6 +124,7 @@ struct CoopSess {
     Window rw[COOP_MAX_MEMBERS + 1];
     char status[96];
     int dirty;
+    int off_applied;                            // a stop was applied: off_done is set once the view saying so is published
     uint64_t rng;
     uint64_t log_at[L_CAUSES];
     uint32_t n_tx, n_rx, n_lost, n_malformed, n_bad_tag, n_sender, n_dup, n_test_drop, n_outbox_full;
@@ -852,7 +853,7 @@ static void apply_settings(CoopSess *s, uint64_t now) {
         set_state(s, COOP_OFF);
         set_status(s, "%s", "");
         s->dirty = 1;
-        plat_event_set(&s->off_done);
+        s->off_applied = 1;
     }
 }
 
@@ -988,6 +989,12 @@ static void publish(CoopSess *s) {
     memcpy(hooks, s->hooks, sizeof hooks);
     plat_mutex_unlock(&s->lock);
     for (int i = 0; i < n; i++) hooks[i].fn(&copy, hooks[i].user);
+    // A stop is signalled only now: whoever it wakes (coop_shutdown's caller, a page that switched co-op off) reads the
+    // view that says the session is off, and every view hook has been told of it.
+    if (s->off_applied) {
+        s->off_applied = 0;
+        plat_event_set(&s->off_done);
+    }
 }
 
 void coop_sess_step(CoopSess *s) {

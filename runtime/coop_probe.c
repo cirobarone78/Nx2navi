@@ -957,6 +957,41 @@ static int in_room(Player *p, int members) {
     return v.state == COOP_JOINED && v.n == members;
 }
 
+// A stop is signalled only once the view that says the session is off is published, so that whoever waited for it
+// (coop_shutdown's caller, a page that switched co-op off) cannot read the view of the step before. One session stepped
+// on this thread, no relay: a view hook that sees "off" notes whether the stop was signalled already.
+typedef struct {
+    CoopSess *sess;
+    int off_seen, signalled_before;
+} StopOrder;
+
+static void on_view_stop_order(const CoopView *v, void *user) {
+    StopOrder *o = user;
+    if (v->state != COOP_OFF || o->off_seen) return;
+    o->off_seen = 1;
+    o->signalled_before = coop_sess_wait_off(o->sess, 0);
+}
+
+static void probe_stop_order(void) {
+    CoopParams cp = {.tag = "Stop", .server = "", .name = "Stop", .client_id = 0x5709, .on = 1};
+    StopOrder o = {0};
+    o.sess = coop_sess_new(&cp);
+    if (!o.sess) FAIL_RET("a session did not start");
+    coop_sess_on_view(o.sess, on_view_stop_order, &o);
+    CoopView v;
+    coop_sess_view(o.sess, &v);
+    CHECK(v.state == COOP_LEFT && !coop_sess_wait_off(o.sess, 0), "stop order: a session that is on is in no room and not stopped (state %d)", v.state);
+    coop_sess_stop(o.sess);
+    coop_sess_step(o.sess);
+    coop_sess_view(o.sess, &v);
+    CHECK(o.off_seen && !o.signalled_before,
+          "stop order: the stop is signalled only after the view that says the session is off is published (a view hook saw off %d, the stop already signalled then %d)",
+          o.off_seen, o.signalled_before);
+    CHECK(coop_sess_wait_off(o.sess, 0) && v.state == COOP_OFF, "stop order: after the step the stop is signalled and the view says off (state %d)", v.state);
+    coop_sess_free(o.sess);
+    printf("coop-probe: stop order: a stop wakes its waiter only once the view says the session is off\n");
+}
+
 // n numbered messages from a to b, 15 ms apart, until b has got the number a count asks for (or they ran out).
 // to: the member id they are addressed to, or 0 for all.
 static unsigned send_messages(Player *a, Player *b, int to, int n, uint32_t first) {
@@ -1378,6 +1413,7 @@ int probe_coop(void) {
     probe_vectors();
     probe_fuzz();
     fails += probe_coop_sync();   // 4. progress sync (coop_sync_probe.c)
+    probe_stop_order();
     probe_sessions();
     printf("coop-probe: %s\n", fails ? "FAILED" : "passed");
     return fails != 0;
