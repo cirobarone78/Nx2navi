@@ -585,8 +585,63 @@ static VkImageMemoryBarrier2 layout_barrier(VkImage img, VkImageAspectFlags aspe
 
 // Full barrier. The images in the feedback layout become want[] (pass begin) or none (every other barrier): the others
 // go back to GENERAL and the new ones leave it, in the same command.
+// NX2NAVI_BARRIER_GAME (default 1; 0: every pass begin and dispatch a full barrier; ab: in the B blocks): the game's own
+// barriers order its work, as on the Switch. A pass that
+// samples what an earlier one drew, a dispatch that reads what another dispatch wrote, an indirect draw whose arguments
+// a dispatch wrote: on the Switch each needs nvnCommandBufferBarrier (ORDER_* and INVALIDATE_* bits) in the game's
+// command stream, which the replay keeps as a full barrier (OP_BARRIER). What the GPU orders by itself there is kept: a
+// switch between graphics and compute work drains the one before (the 3D and compute classes share the engine). With
+// every pass begin and every dispatch a full barrier, 2.3 ms of a 9.7 ms GPU frame in Kokiri Forest was barriers.
+// With the switch:
+//  - a pass begin after an earlier pass and no dispatch since the last full barrier gets an attachment barrier
+//    (colour and depth/stencil output before the next pass's loads and writes: Vulkan orders attachment access only
+//    inside one pass instance), after neither nothing;
+//  - a dispatch after other dispatches only gets none;
+//  - a pass after a dispatch, and a dispatch after a pass, get a full barrier, the drain of the switch;
+//  - either gets a full barrier as before after one the replay itself asked for (vk_exec_barrier: its copies,
+//    clears, fills, uniform updates and stand-in copies call it before their commands, which sets bar_dirty), and
+//    when feedback-loop targets change layout.
+// Copies, clears and the game's barriers keep their full barriers.
+static int barrier_game(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("BARRIER_GAME", "1");
+        if (mode)
+            rt_log("vk_exec: NX2NAVI_BARRIER_GAME=%s: passes and dispatches are ordered by the game's barriers",
+                   mode == 2 ? "ab" : "1");
+    }
+    return RT_KNOB_ON(mode);
+}
+
+// NX2NAVI_TRACE=perf: barriers per frame by kind (vk_exec_barrier_log)
+enum { BS_FULL, BS_GAME, BS_PASS_FULL, BS_PASS_ATT, BS_PASS_NONE, BS_DISP_FULL, BS_DISP_NONE, BS_N };
+static uint64_t bstat[BS_N];
+static const char *const bs_name[BS_N] = {"replay full", "game", "pass full", "pass attachment", "pass none",
+                                          "dispatch full", "dispatch none"};
+enum { BR_OTHER, BR_GAME, BR_PASS, BR_DISPATCH };
+
+static void barrier_to_why(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int why);
 static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant) {
+    barrier_to_why(ex, want, wasp, nwant, BR_OTHER);
+}
+
+static void attachment_barrier(VkExec *ex) {
+    const VkPipelineStageFlags2 st = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = st,
+                           .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           .dstStageMask = st,
+                           .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded++;
+}
+
+static void barrier_to_why(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int why) {
     vk_exec_pass_end(ex);
+    if (why == BR_OTHER) ex->bar_dirty = 1;   // also when it falls together with the last one: its commands follow
     VkImageMemoryBarrier2 ib[18];
     uint32_t n = 0;
     for (int i = 0; i < ex->nfbl; i++)
@@ -599,6 +654,21 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
     for (int i = 0; i < nwant; i++) ex->fbl_img[i] = want[i], ex->fbl_aspect[i] = wasp[i];
     ex->nfbl = nwant;
     if (ex->barrier_at == ex->recorded && !n) return;
+    if (!n && !ex->bar_dirty && ((why == BR_PASS && !ex->bar_dispatches) || (why == BR_DISPATCH && !ex->bar_passes)) &&
+        barrier_game()) {
+        if (why == BR_DISPATCH) {
+            bstat[BS_DISP_NONE]++;
+        } else if (ex->bar_passes) {
+            attachment_barrier(ex);
+            bstat[BS_PASS_ATT]++;
+        } else {
+            bstat[BS_PASS_NONE]++;
+        }
+        return;
+    }
+    bstat[why == BR_GAME ? BS_GAME : why == BR_PASS ? BS_PASS_FULL : why == BR_DISPATCH ? BS_DISP_FULL : BS_FULL]++;
+    if (why != BR_OTHER) ex->bar_dirty = 0;   // after BR_OTHER the replay's own commands follow: the next pass or
+    ex->bar_passes = ex->bar_dispatches = 0;    // dispatch orders after them
     vk_exec_frame.fb_layouts += n;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -612,6 +682,25 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 }
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
+
+void vk_exec_barrier_dispatch(VkExec *ex) {
+    barrier_to_why(ex, NULL, NULL, 0, BR_DISPATCH);
+    ex->bar_dispatches++;
+}
+
+void vk_exec_barrier_log(uint64_t frame) {
+    static uint64_t last;
+    if (!(rt_trace & RT_TRACE_PERF) || frame % 600) return;
+    double f = frame > last ? (double)(frame - last) : 1.0;
+    last = frame;
+    char s[320];
+    int o = 0;
+    for (int k = 0; k < BS_N; k++) {
+        o += snprintf(s + o, sizeof s - o, "%s%s %.1f", k ? ", " : "", bs_name[k], bstat[k] / f);
+        bstat[k] = 0;
+    }
+    rt_log("vk_exec: frame %llu: barriers per frame: %s", (unsigned long long)frame, s);
+}
 
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
@@ -630,7 +719,8 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (has_image(want, nwant, t->image)) continue;
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
-    barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
+    barrier_to_why(ex, want, wasp, nwant, BR_PASS);   // passes, clears, copies and dispatches see each other's results
+    ex->bar_passes++;
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
     ex->fb_read = 0;
@@ -1390,7 +1480,7 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
-        case OP_BARRIER: vk_exec_barrier(ex); break;
+        case OP_BARRIER: barrier_to_why(ex, NULL, NULL, 0, BR_GAME); break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
