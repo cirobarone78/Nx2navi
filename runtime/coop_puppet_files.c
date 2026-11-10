@@ -20,8 +20,8 @@
 #define AS_INFO_PLAYER "Component/ASInfo/Player.engine__component__ASInfo.bgyml"
 #define AS_INFO_CHILD "Component/ASInfo/Player_Child.engine__component__ASInfo.bgyml"
 
-static const RestoreField child_row[] = {{"InstanceHeapSize", 5692448}};    // Player_Child's
-static const RestoreField adult_row[] = {{"InstanceHeapSize", 10245064}};   // Player_Adult's
+static const RestoreField child_row[] = {{"InstanceHeapSize", 5692448, NULL}};    // Player_Child's
+static const RestoreField adult_row[] = {{"InstanceHeapSize", 10245064, NULL}};   // Player_Adult's
 
 static const RestoreEdit edits[] = {
     RESTORE_NEW_FILE(CHILD, "Pack/Actor/PouchPlayer_Child.pack.zs"),
