@@ -1319,7 +1319,9 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
 void vk_gpu_written(uint64_t addr, uint64_t size) { gpu_written(addr, size, 0); }
 void vk_gpu_written_back(uint64_t addr, uint64_t size) {
     gpu_written(addr, size, 1);
-    mem_probe(addr, size);   // NX2NAVI_WB_PROBE: the bytes are in guest memory now; note who reads them next
+    // NX2NAVI_WB_PROBE: the bytes are in guest memory now; note who reads them next. With shadow storage they get there
+    // later, in the submission's shadow_wb_cb, whose thaw would end the probe at once: that job arms it instead.
+    if (!shadow_on) mem_probe(addr, size);
 }
 
 int vk_mem_mirrored(uint64_t addr, uint64_t size) {
@@ -2238,6 +2240,9 @@ static void shadow_wb_cb(void *arg) {   // completion thread
         }
         if (run) swb_run(run, end);
     }
+    // NX2NAVI_WB_PROBE (vk_gpu_written_back): every range is in guest memory now; a later range's thaw would end the
+    // probe of a region an earlier one armed, so the probes come last
+    for (int i = 0; i < j->n; i++) mem_probe(j->g[i].addr, j->g[i].size);
     free(j);
 }
 
