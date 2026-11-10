@@ -390,14 +390,16 @@ static int create_device(void) {
     if (g_vk.has_mesh_shader) {
         // these two need features that are not enabled (multiview, primitive fragment shading rate)
         c->mesh.multiviewMeshShader = c->mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;
-        // Mesh queries for two diagnoses: NX2NAVI_GPU_PASSES (vk_crumbs.c) and the dump's primitive counts
-        // (vk_dump.c vk_dump_mesh_begin), which also need pipeline statistics and host query reset.
-        const char *gp = cfg_get("NX2NAVI_GPU_PASSES"), *dmp = cfg_get("NX2NAVI_DUMP");
-        int want = (gp && *gp && strcmp(gp, "0")) || (dmp && *dmp);
+        // Mesh query statistics are opt-in through NX2NAVI_GPU_PASSES, including the dump's primitive counts
+        // (vk_dump.c vk_dump_mesh_begin). Image-only dumps must not change the device's query features.
+        const char *gp = cfg_get("NX2NAVI_GPU_PASSES");
+        int want = gp && *gp && strcmp(gp, "0");
         g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
         c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
-        rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
+        rt_log("vk: mesh shaders: %s; diagnostic queries %s",
+               g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)",
+               g_vk.has_mesh_queries ? "on" : "off");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;

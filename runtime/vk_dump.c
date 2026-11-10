@@ -735,7 +735,7 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
     return h;
 }
 
-// ---- mesh primitive counts: with VkCtx.has_mesh_queries, each mesh draw of the dumped frame runs inside a
+// ---- mesh primitive counts: opt in with NX2NAVI_GPU_PASSES=1; with VkCtx.has_mesh_queries, each dumped mesh draw runs inside a
 // VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT query, and mesh_prims.txt (written by vk_dump_present) lists what each
 // draw's mesh shader emitted, with its pass, program and depth state.
 // A pipeline statistics query runs alongside: task and mesh shader invocations, primitives the clipper got and gave

@@ -228,6 +228,14 @@ Before a commit:
   `git config core.hooksPath .githooks` runs it before each local commit.
 - `build\<ver>\nx2navi.exe --selftest`: layout, dispatch table and host-function registry, without game files.
 
+Frame captures (`NX2NAVI_DUMP=<presented-frame>`, output in `NX2NAVI_DUMP_DIR`) do not enable mesh-query
+statistics. Opt in with `NX2NAVI_GPU_PASSES=1` for GPU pass profiling and a capture's optional `mesh_prims.txt`;
+the driver must support mesh queries, pipeline statistics and host query reset. `--probe-vkdevice` reports
+`diagnostic queries on` or `off` during device creation. An unsupported feature stays off even when requested.
+Image-only captures still add recorder checks before the selected frame and GPU readbacks/image encoding during
+it, so their stalls are not normal-play performance measurements. Keep all captured game data under `build/` or
+outside the checkout.
+
 GPU page faults: `NX2NAVI_VA_REPORT=1` keeps the driver's GPU address bind/unbind reports
 (VK_EXT_device_address_binding_report, `runtime/vk_vaddr.c`); `=2` also keeps the host call stack of ranges of 1 MiB
 or more. After a lost device, the log names the reports whose range covered each faulting page, or the nearest ranges
