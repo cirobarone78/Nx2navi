@@ -3346,6 +3346,107 @@ static void probe_h6_carry(void) {
     printf("coop-probe: sync carry: a reset's carry is a claim from the reset on, also when the removal comes in the same charter\n");
 }
 
+// ---- 13. the seventh review's findings
+
+// Finding 3: a key the player accepted, in another member's place and under that member's name. A (who asks) accepted
+// the room with B and M in it. M leaves; B joins again in a new session and the relay holds B's messages to A back; M,
+// who still has the secret, sends A an identity of its own key for member 2 in B's new session under B's name, then a
+// section that key signs there. A must be asked again before anything of it counts, and its log must say so; once B's
+// own identity arrives the two keys are disputed, and that is logged too. And a relay restart that hands the members
+// other numbers, under their own names, is no new offer.
+static void probe_h7_moved_key(void) {
+    {
+        const char *code = "H7F3A";
+        Net net = {0};
+        Game a, b, m;
+        game_init(&a, 1, 0x7101), game_init(&b, 2, 0x7102), game_init(&m, 4, 0x7104);
+        defaults(&a, 1), defaults(&b, 0), defaults(&m, 0);
+        a.ask = 1;
+        net.games[0] = &a, net.games[1] = &b, net.games[2] = &m;
+        net.present[0] = net.present[1] = net.present[2] = 1;
+        uint64_t now = run(&net, (net_roster(&net, code, 1000), 1000), 6000);
+        CoopOffer o;
+        coop_sync_offer(a.eng, &o, now);
+        int took = coop_sync_accept(a.eng, o.token);
+        now = run(&net, now, 2000);
+        net.present[2] = 0;   // M leaves
+        now = run(&net, (net_roster(&net, code, now), now), 2000);
+        b.session ^= 0x5107;   // B joins again; the relay holds its messages back from A
+        net.mute[2] = 1;
+        now = run(&net, (net_roster(&net, code, now), now), 100);
+        CoopSyncStats s0, s1, s2;
+        coop_sync_stats(a.eng, &s0);
+        uint8_t mseed[32], d[COOP_MAX_PAYLOAD];
+        game_key_seed(&m, code, mseed);
+        size_t dn = make_digest(d, code, mseed, 2, b.session, "P2", 2, 0, NULL, 0);   // M's key, member 2, B's session, B's name
+        coop_sync_receive(a.eng, 2, COOP_K_DIGEST, d, dn, now += 8);
+        int ids[2] = {1, 2};
+        uint64_t sess[2] = {a.session, b.session};
+        coop_sync_room(m.eng, code, 2, ids, sess, 2, 1, now);   // M's engine signs as member 2 in B's session
+        uint8_t buf[COOP_MAX_PAYLOAD], *p = buf + 6;
+        *p++ = COOP_R_FLAG, *p++ = COOP_CAT_PROGRESS, p = put_le(p, 250, 4), p = put_le(p, 1, 4);
+        buf[0] = COOP_K_DIGEST_VER, buf[1] = 0xEE, buf[2] = 0xFF, buf[3] = 0xC0, buf[4] = 0, buf[5] = 1;
+        size_t n = coop_sync_sign_section(m.eng, buf, (size_t)(p - buf), COOP_MAX_MESSAGE);
+        coop_sync_receive(a.eng, 2, COOP_K_SECTION, buf, n, now += 8);
+        now = run(&net, now, 1000);
+        coop_sync_offer(a.eng, &o, now);
+        coop_sync_stats(a.eng, &s1);
+        const CoopOfferMember *x = offer_member(&o, 2);
+        uint64_t kid = 0;
+        int as_m = x && x->heard && coop_sync_key_parse(x->key, &kid) && kid == game_kid(&m, code);
+        CHECK(took && as_m && !o.accepted && !coop_sync_open(a.eng) && value_of(&a, 250) == 0,
+              "H7 F3: a key A accepted, in member 2's place under B's name, is a new offer: accepted %d, open %d, its flag applied %d (M's key "
+              "there %d)", o.accepted, coop_sync_open(a.eng), value_of(&a, 250), as_m);
+#ifndef COOP_BEFORE7
+        CHECK(x && !strcmp(x->accepted_as, "P4") && s1.key_moves - s0.key_moves == 1 && s1.key_move_member == 2 && s1.key_move_from == 4,
+              "H7 F3: the offer shows it was accepted as P4 (\"%s\"), and it is counted for the log as member 4's key now member 2's (%u, %d, %d)",
+              x ? x->accepted_as : "-", s1.key_moves - s0.key_moves, s1.key_move_member, s1.key_move_from);
+#endif
+        net.mute[2] = 0;   // B's own identity arrives: two keys for its session
+        now = run(&net, now, 3000);
+        coop_sync_offer(a.eng, &o, now);
+        coop_sync_stats(a.eng, &s2);
+        x = offer_member(&o, 2);
+        CHECK(x && !x->heard && o.unidentified && !coop_sync_open(a.eng), "H7 F3: once B's own identity arrives, member 2 is disputed (heard %d)", x ? x->heard : -1);
+#ifndef COOP_BEFORE7
+        CHECK(s2.key_changes - s1.key_changes == 1 && s2.key_change_member == 2, "H7 F3: the dispute is counted for the log (%u, member %d)",
+              s2.key_changes - s1.key_changes, s2.key_change_member);
+#endif
+        game_free(&a), game_free(&b), game_free(&m);
+        free(net.q);
+    }
+    {
+        const char *code = "H7F3B";
+        Net net = {0};
+        Game a, b, c;
+        game_init(&a, 1, 0x7111), game_init(&b, 2, 0x7112), game_init(&c, 3, 0x7113);
+        defaults(&a, 1), defaults(&b, 0), defaults(&c, 0);
+        a.ask = 1;
+        net.games[0] = &a, net.games[1] = &b, net.games[2] = &c;
+        net.present[0] = net.present[1] = net.present[2] = 1;
+        uint64_t now = run(&net, (net_roster(&net, code, 1000), 1000), 6000);
+        CoopOffer o;
+        coop_sync_offer(a.eng, &o, now);
+        int took = coop_sync_accept(a.eng, o.token);
+        now = run(&net, now, 2000);
+        // the relay restarted: everyone joins again in a new session, and B and C get each other's numbers; their names
+        // go with them (a game's name is its own, the number the relay's)
+        coop_sync_name(b.eng, "P2"), coop_sync_name(c.eng, "P3");
+        b.id = 3, c.id = 2, by_id[2] = &c, by_id[3] = &b;
+        a.session ^= 0x77, b.session ^= 0x77, c.session ^= 0x77;
+        now = run(&net, (net_roster(&net, code, now), now), 6000);
+        b.f[110].value = 1;
+        now = run(&net, now, 3000);
+        coop_sync_offer(a.eng, &o, now);
+        CHECK(took && o.accepted && coop_sync_open(a.eng) && value_of(&a, 111) == 1,
+              "H7 F3: a relay restart that hands B and C each other's numbers is no new offer (accepted %d, open %d), and B's flag arrives (%d)",
+              o.accepted, coop_sync_open(a.eng), value_of(&a, 111));
+        game_free(&a), game_free(&b), game_free(&c);
+        free(net.q);
+    }
+    printf("coop-probe: sync moved key: a key the player accepted under another member's name is a new offer, and a key that changes is said\n");
+}
+
 int probe_coop_sync(void) {
     fails = 0;
     if (getenv("NX2NAVI_COOP_ADVERSARY")) {
@@ -3390,6 +3491,7 @@ int probe_coop_sync(void) {
     probe_h6_digests();
     probe_h6_identity_race();
     probe_h6_carry();
+    probe_h7_moved_key();
     probe_adversary();
     return fails;
 }

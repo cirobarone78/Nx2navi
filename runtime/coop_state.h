@@ -151,12 +151,14 @@ void coop_sync_name(CoopSync *s, const char *name);   // this player's name, sig
 // What joining the room means, for the player to accept: the other members (by the names their identities carry), the
 // rules and the key that signed them. heard: its identity was checked (a member not identified a few seconds after
 // it appeared shows with heard 0, counts in unidentified and keeps the room unaccepted); removed: the maker removed
-// it. No offer (token 0) outside a room, before the rules are known (the members and disagree are filled in), and
-// while a member that just appeared is not identified yet.
+// it. A key the player accepted counts as accepted only under the name it signed then: under another name it is a new
+// offer (accepted_as says the name it was accepted as). No offer (token 0) outside a room, before the rules are known
+// (the members and disagree are filled in), and while a member that just appeared is not identified yet.
 typedef struct {
     int id, heard, maker, removed;
     char name[COOP_NAME_MAX + 1];   // the name it signed; "" until heard (coop_game.c shows the relay's)
     char key[20];                   // its key's fingerprint, xxxx-xxxx-xxxx-xxxx; "" until heard
+    char accepted_as[COOP_NAME_MAX + 1];   // its key was accepted under this other name ("" when not, or under this one)
 } CoopOfferMember;
 typedef struct {
     uint32_t token;     // the offer's number, random for each start of the game; 0: none
@@ -250,6 +252,10 @@ typedef struct {
     unsigned probe_max;             // the longest run of index slots an insert walked
     unsigned own_key;               // identities of another member signed with this game's own key (a copy of its key file)
     int own_key_member;             // the member that sent the last of them
+    unsigned key_changes;           // another key's identity for an identified member's session checked out: a dispute
+    int key_change_member;          // began, or the other key took the place; the member of the last of them
+    unsigned key_moves;             // a key this player accepted identified as another member number or under another
+    int key_move_member, key_move_from;   // name than before: the member it is now, the number it had (0 none)
 } CoopSyncStats;
 void coop_sync_stats(const CoopSync *s, CoopSyncStats *out);
 // The merged value of a flag (0 when absent), and a pool's value (as this game counts it) and whether it is bound.

@@ -18,8 +18,11 @@ Read this before you join a room.
   into nx2navi.ini [coop] while the game runs`. Accept on the tab or do that. Until then your game takes nothing from
   the room. You accept players by
   their keys, not their names: a new player, a player whose game restarted, a removed player who comes back, or a
-  second player with a name you know is a new offer, and so are other rules, rules signed by another key, and another
-  save loaded in the room; nothing more is taken until you accept that one too. A player in the room whose game never
+  second player with a name you know is a new offer, and so are a key you accepted that now carries another name (it
+  is accepted under the name it had when you accepted it), other rules, rules signed by another key, and another
+  save loaded in the room; nothing more is taken until you accept that one too. A key you accepted that comes back
+  under its own name as another member number (the relay numbers players as they come) is no new offer; the log says
+  so, and it says when a member presents another key than the one it was identified by. A player in the room whose game never
   says who it is keeps the room from being accepted at all. The number is random for each start of the game, so nobody
   can put the right one into a file in advance. Accepting every room without asking (`NX2NAVI_COOP_ACCEPT=always`)
   works only from the environment, never from `nx2navi.ini`.
@@ -533,7 +536,9 @@ maker), `the room's rules: progress shared, ...`, `took N values from the room (
 5 s, `N values from the room were refused`, `member N sent values this game does not take; nothing more is taken from
 it`, for the maker `key K (member N, name | not in the room) took N keys ... from the pools beyond what it brought;
 coop_remove = K removes it`, `key K removed`, `coop_remove = N in nx2navi.ini names a member number` (not taken), `the
-pools are reset`, `member N presents this game's own key` and `the room's key file ... is damaged | cannot be read`.
+pools are reset`, `member N presents this game's own key`, `member N presents another key than the one it was identified
+by in its session`, `member N (name, key K) presents a key you accepted as member M | under the name ...: under this
+name it is a new offer`, and `the room's key file ... is damaged | cannot be read`.
 `NX2NAVI_TRACE=coop` adds `sent`,
 `received` and `applied` lines by category, hash and value. With `coop = 0` nothing of this is logged and the game's
 frames do no more than check the setting.

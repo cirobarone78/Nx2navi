@@ -208,6 +208,8 @@ struct CoopSync {
     int accepted, have_pin;
     uint64_t acc_kids[MAX_ACCEPTED];
     int nacc;
+    char acc_name[MAX_ACCEPTED][NAME_CAP];   // the name each key signed when this player accepted it (as signed)
+    uint8_t acc_id[MAX_ACCEPTED];            // the member number each key was last identified as
     uint8_t acc_mode[COOP_CAT_N];
     uint64_t pin_kid;
     uint32_t save_gen, acc_save_gen, copy_gen;
@@ -464,6 +466,13 @@ static void queue_apply(CoopSync *s, int code) {
 // The records of a pool that count in this game: its own, and those of the keys its player accepted in the room. A
 // pool follows this player's acceptance, as flags do; the maker's admission decides who may contribute at all.
 static int kid_counts(const CoopSync *s, uint64_t kid) { return kid == s->kid || in_list(s->acc_kids, s->nacc, kid); }
+
+// The slot of key kid in the list of keys this player accepted, -1 none.
+static int acc_index(const CoopSync *s, uint64_t kid) {
+    for (int i = 0; i < s->nacc; i++)
+        if (s->acc_kids[i] == kid) return i;
+    return -1;
+}
 static int rec_counts(const CoopSync *s, const Rec *r) { return kid_counts(s, r->kid); }
 
 typedef struct { int64_t value, top, in; int n; } PoolSum;   // n: the records counted; top: the highest base; in: what entered
@@ -1149,17 +1158,11 @@ int coop_sync_contributors(const CoopSync *s, CoopContributor *out, int max) {
 
 // ---- the offer
 
-static int cmp_u64(const void *a, const void *b) {
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-    return x < y ? -1 : x > y;
-}
-
 int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
     memset(o, 0, sizeof *o);
     if (now > s->now) s->now = now;
     if (!s->in_room) return 0;
-    uint64_t kids[COOP_MAX_MEMBERS];
-    int nk = 0, waiting = 0;
+    int waiting = 0;
     for (int id = 1; id <= COOP_MAX_MEMBERS; id++) {
         const Peer *p = &s->peer[id];
         if (!p->present) continue;
@@ -1170,7 +1173,9 @@ int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
         if (ident) {
             snprintf(m->name, sizeof m->name, "%s", p->name);
             fingerprint(p->kid, m->key);
-            if (!m->removed) kids[nk++] = p->kid;
+            int a = acc_index(s, p->kid);
+            if (a >= 0 && strcmp(s->acc_name[a], p->raw))
+                coop_name_clean(m->accepted_as, sizeof m->accepted_as, (const uint8_t *)s->acc_name[a], strlen(s->acc_name[a]));
         } else if (!p->ident && s->now - p->seen_at < IDENT_WAIT_MS) {
             waiting = 1;
         } else {
@@ -1188,11 +1193,25 @@ int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
     o->new_save = s->accepted && s->save_gen != s->acc_save_gen;
     o->copy = s->copy_gen == s->save_gen ? s->copy : 0;
     if (waiting) return 0;
-    // the number: keyed with this start's random value, over everything the acceptance covers
-    qsort(kids, (size_t)nk, sizeof kids[0], cmp_u64);
-    uint8_t m[COOP_SECRET_TEXT + 8 * COOP_MAX_MEMBERS + 8 + COOP_CAT_N + 4], *at = m;
+    // the number: keyed with this start's random value, over everything the acceptance covers (each key with the name it
+    // signed: a known key under another name is another offer)
+    const Peer *who[COOP_MAX_MEMBERS];
+    int nw = 0;
+    for (int id = 1; id <= COOP_MAX_MEMBERS; id++)
+        if (s->peer[id].present && s->peer[id].ident && !disputed(s, &s->peer[id]) && !removed(s, s->peer[id].kid)) who[nw++] = &s->peer[id];
+    for (int i = 1; i < nw; i++)
+        for (int j = i; j > 0 && who[j]->kid < who[j - 1]->kid; j--) {
+            const Peer *t = who[j];
+            who[j] = who[j - 1], who[j - 1] = t;
+        }
+    uint8_t m[COOP_SECRET_TEXT + (9 + COOP_NAME_MAX) * COOP_MAX_MEMBERS + 8 + COOP_CAT_N + 4], *at = m;
     putn(&at, s->code, strlen(s->code));
-    for (int i = 0; i < nk; i++) put64(&at, kids[i]);
+    for (int i = 0; i < nw; i++) {
+        size_t nl = strlen(who[i]->raw);
+        put64(&at, who[i]->kid);
+        put8(&at, (uint8_t)nl);
+        putn(&at, who[i]->raw, nl);
+    }
     put64(&at, s->ch.kid);
     putn(&at, s->room.mode, COOP_CAT_N);
     put32(&at, s->save_gen);
@@ -1200,7 +1219,10 @@ int coop_sync_offer(CoopSync *s, CoopOffer *o, uint64_t now) {
     o->token = (uint32_t)(h ^ h >> 32) | 1;
     int ok = s->accepted && s->have_pin && s->pin_kid == s->ch.kid && !memcmp(s->acc_mode, s->room.mode, COOP_CAT_N) &&
              s->acc_save_gen == s->save_gen && !o->unidentified;
-    for (int i = 0; i < nk && ok; i++) ok = in_list(s->acc_kids, s->nacc, kids[i]);
+    for (int i = 0; i < nw && ok; i++) {
+        int a = acc_index(s, who[i]->kid);
+        ok = a >= 0 && !strcmp(s->acc_name[a], who[i]->raw);
+    }
     o->accepted = ok;
     return 1;
 }
@@ -1213,14 +1235,20 @@ int coop_sync_accept(CoopSync *s, uint32_t token) {
     if (!s->accepted) s->nacc = 0;
     for (int id = 1; id <= COOP_MAX_MEMBERS; id++) {
         const Peer *p = &s->peer[id];
-        if (!p->present || !p->ident || removed(s, p->kid) || in_list(s->acc_kids, s->nacc, p->kid)) continue;
-        if (s->nacc == MAX_ACCEPTED) {   // full: the members of this offer are what matters now
-            s->nacc = 0;
-            id = 0;
-            continue;
+        if (!p->present || !p->ident || removed(s, p->kid)) continue;
+        int a = acc_index(s, p->kid);
+        if (a < 0) {
+            if (s->nacc == MAX_ACCEPTED) {   // full: the members of this offer are what matters now
+                s->nacc = 0;
+                id = 0;
+                continue;
+            }
+            a = s->nacc++;
+            s->acc_kids[a] = p->kid;
+            keep_ended_of(s, p->kid);
         }
-        s->acc_kids[s->nacc++] = p->kid;
-        keep_ended_of(s, p->kid);
+        snprintf(s->acc_name[a], sizeof s->acc_name[a], "%s", p->raw);   // accepted as the name it signed now
+        s->acc_id[a] = (uint8_t)id;
     }
     memcpy(s->acc_mode, s->room.mode, COOP_CAT_N);
     s->pin_kid = s->ch.kid, s->have_pin = 1;
@@ -1512,7 +1540,10 @@ static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_
             return;
         }
         if (rival && now - p->ident_at < IDENT_HOLD_MS) {
-            if (!disputed(s, p)) tracef(s, "member %d: another key's identity for its session; neither counts while both are presented", from);
+            if (!disputed(s, p)) {
+                tracef(s, "member %d: another key's identity for its session; neither counts while both are presented", from);
+                s->st.key_changes++, s->st.key_change_member = from;
+            }
             p->rival_at = now;
             return;
         }
@@ -1523,12 +1554,19 @@ static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_
             p->sig_tokens = q.sig_tokens, p->sig_at = q.sig_at, p->bad_sig = q.bad_sig;
             tracef(s, "member %d: the key held for its session was not presented for %d s; another key's identity takes its place", from,
                    IDENT_HOLD_MS / 1000);
+            s->st.key_changes++, s->st.key_change_member = from;
         }
         p->ident = 1, p->kid = kid, p->ident_at = now;
         memcpy(p->pk, pk, COOP_PK_LEN);
         memcpy(p->raw, raw, nl + 1);
         memcpy(p->name, name, sizeof name);
         tracef(s, "member %d is identified (%s)", from, name);
+        // a key this player accepted, now as another member number or under another name than it had: said, and under
+        // another name it is a new offer (coop_sync_offer), so that a name the player knows never carries another key
+        int a = acc_index(s, kid);
+        if (a >= 0 && ((s->acc_id[a] && s->acc_id[a] != from) || strcmp(s->acc_name[a], raw)))
+            s->st.key_moves++, s->st.key_move_member = from, s->st.key_move_from = s->acc_id[a];
+        if (a >= 0) s->acc_id[a] = (uint8_t)from;
         // the session its identity names as the one before ends here: only the key's holder says so, so neither a
         // roster nor a replayed message or identity ends a session the member still holds
         if (prev && prev != p->session) end_pair(s, kid, prev);

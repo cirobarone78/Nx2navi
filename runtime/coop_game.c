@@ -183,6 +183,8 @@ static struct {
     uint64_t spent_seen, spent_at;  // the contributors' spends last logged for the maker, and when
     unsigned own_key_seen;          // digests carrying this game's own key, as last logged
     uint64_t own_key_said;
+    unsigned key_changes_seen, key_moves_seen;   // a member's key that changed within its session, an accepted key
+                                                 // under another number or name: as last logged
     // nx2navi.ini as it is now (cfg reads it at start only), once a second in a room: coop_accept, and the maker's
     // coop_remove and coop_reset_pools as last acted on (the first reading is only noted)
     uint64_t ini_at;
@@ -648,12 +650,13 @@ static void offer_update(uint64_t now) {
     if (o.token && !o.accepted && (o.token != G.logged || o.unidentified != G.logged_unid)) {
         int again = G.logged != 0;
         G.logged = o.token, G.logged_unid = o.unidentified;
-        char who[COOP_MAX_MEMBERS * 96] = "", rules[200];
+        char who[COOP_MAX_MEMBERS * 160] = "", rules[200];
         size_t at = 0;
         for (int i = 0; i < o.n && at < sizeof who; i++) {
             const CoopOfferMember *m = &o.member[i];
-            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d, %s%s%s%s)", i ? ", " : "", m->name, m->id, m->heard ? "key " : "not identified",
-                                   m->key, m->maker ? ", signs the rules" : "", m->removed ? ", removed by the maker: ignored" : "");
+            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d, %s%s%s%s%s%s)", i ? ", " : "", m->name, m->id, m->heard ? "key " : "not identified",
+                                   m->key, m->accepted_as[0] ? ", a key you accepted as " : "", m->accepted_as,
+                                   m->maker ? ", signs the rules" : "", m->removed ? ", removed by the maker: ignored" : "");
         }
         coop_rules_text(&o.rules, rules, sizeof rules);
         rt_log("coop: sync: %s; in the room: %s; rules: %s, signed by key %s",
@@ -946,6 +949,25 @@ static void on_tick(uint64_t now, void *user) {
             rt_log("coop: sync: member %d presents this game's own key for the room: another game holds a copy of this profile's coop-keys "
                    "folder (or of the whole profile) and can act as the room's maker; it stays not identified, so nobody can accept the "
                    "room while it is in it", st.own_key_member);
+        }
+        if (st.key_changes != G.key_changes_seen) {
+            G.key_changes_seen = st.key_changes;
+            rt_log("coop: sync: member %d presents another key than the one it was identified by in its session (%u times in this room): "
+                   "it counts as nobody while both are presented, and the other takes its place 10 s after the first stops; compare the "
+                   "fingerprints the room's offer shows", st.key_change_member, st.key_changes);
+        }
+        if (st.key_moves != G.key_moves_seen) {
+            G.key_moves_seen = st.key_moves;
+            CoopOffer o;
+            const CoopOfferMember *m = NULL;
+            coop_sync_offer(G.eng, &o, now);
+            for (int i = 0; i < o.n; i++)
+                if (o.member[i].id == st.key_move_member) m = &o.member[i];
+            char was[48] = "";
+            if (st.key_move_from && st.key_move_from != st.key_move_member) snprintf(was, sizeof was, " as member %d", st.key_move_from);
+            rt_log("coop: sync: member %d (%s, key %s) presents a key you accepted%s%s%s%s", st.key_move_member, m ? m->name : "?", m ? m->key : "?",
+                   was, m && m->accepted_as[0] ? " under the name " : "", m ? m->accepted_as : "",
+                   m && m->accepted_as[0] ? ": under this name it is a new offer" : "");
         }
         say_spenders(now);
     }
