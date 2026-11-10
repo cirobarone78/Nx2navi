@@ -452,8 +452,10 @@ static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
                                 .viewType = t->view_type, .format = t->format,
                                 .subresourceRange = {t->aspect, t->level, 1, t->base_layer, t->layers}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
-    if (t->blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
+                                      .usage = t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                                   ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    if (t->img && t->img->fb_usage) use.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    ci.pNext = &use;   // attachment views do not inherit storage or sampling requirements of other views
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
         rt_fatal("vk: render target view (format %d, %ux%u) could not be created", (int)t->format, t->width, t->height);

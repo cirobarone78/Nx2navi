@@ -542,8 +542,12 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
     const VkTexImage *live = vk_texture_get(&b2);
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
-    const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
+    view_t slot_view;
+    int has_slot_view;
+    const VkTexImage *slot = vk_texture_by_id(5, &slot_view, &has_slot_view);
     GCHECK(live && slot && slot->image == live_img, "slot 5 does not follow the live texture at its storage");
+    GCHECK(has_slot_view && slot_view.set_format && slot_view.format == (uint32_t)b.d.format,
+           "slot 5 lost its guest format while following a differently formatted live image");
     samp_par sp;
     memset(&sp, 0, sizeof sp);
     sp.minf = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR, sp.magf = NVN_MAG_FILTER_LINEAR, sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_REPEAT;
@@ -551,14 +555,14 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_sampler_register(0, &sp);
     VkSampler s0 = vk_sampler_by_id(0), s1 = vk_sampler_for(&sp);
     GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(1), "sampler slots");
-    g_gpu_checks += 7;
+    g_gpu_checks += 8;
     vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g);
     for (int i = 0; i < 4; i++) free(lin[i]), free(bl[i]);
     free(gl[0]);
     uint64_t images, ups, reups;
     vk_texture_stats(&images, &ups, &reups);
     printf("probe-vkmem: textures: RGBA8 3 levels and BC1 equal to the CPU reference after upload, re-upload after CPU "
-           "writes, physical-pool alias WriteTexels/ReadTexels, slot redirect, samplers (%llu images, %llu uploads, "
+           "writes, physical-pool alias WriteTexels/ReadTexels, slot redirect and format, samplers (%llu images, %llu uploads, "
            "%llu re-uploads)\n", (unsigned long long)images, (unsigned long long)ups, (unsigned long long)reups);
     return 0;
 }

@@ -1997,6 +1997,14 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         else if (!create_budget) create_deferred = 1;
         else if (mem_readable((uint64_t)(uintptr_t)s->t.mem, s->t.L.size)) e = entry_of(&s->t), create_budget--;
     }
+    // Following live storage must preserve the slot's texel interpretation as well as its swizzle. A uint view of a
+    // float render target (and the reverse) is still that guest descriptor, not the producer's descriptor.
+    if (e && e->key.d.format != k.d.format && !(s->has_view && s->v.set_format)) {
+        if (!s->has_view) memset(view, 0, sizeof *view);
+        view->format = k.d.format;
+        view->set_format = 1;
+        *has_view = 1;
+    }
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
     // slot descriptor's swizzle. The UI renders text into RGBA8 and samples it through a (A,A,A,A) descriptor; with the
     // render target's RGBA swizzle the text blur saw R = 1 everywhere and drew solid boxes behind tips and labels.
@@ -2007,7 +2015,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             sw[0] = NVN_TEXTURE_SWIZZLE_R, sw[1] = NVN_TEXTURE_SWIZZLE_G, sw[2] = NVN_TEXTURE_SWIZZLE_B,
             sw[3] = NVN_TEXTURE_SWIZZLE_A;
         if (memcmp(sw, e->pub.swz, 4)) {
-            if (!s->has_view) memset(view, 0, sizeof *view);
+            if (!*has_view) memset(view, 0, sizeof *view);
             memcpy(view->swz, sw, 4);
             view->set_swizzle = 1;
             *has_view = 1;

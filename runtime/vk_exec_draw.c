@@ -22,6 +22,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "tex.h"
 #include "vk.h"
 
 #ifndef NX2NAVI_TONEMAP_STANDIN
@@ -384,8 +385,8 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
     vk_upload_end();
 }
 
-// Storage image stand-ins in the format a shader declares (GfxShaderRes.format: the translator's TextureFormat order); Vulkan wants
-// the view format to match the declaration. Created on first use.
+// Typed descriptor stand-ins (GfxShaderRes.format: the translator's TextureFormat order). Sampled images need the same
+// numeric type contract as storage images, including when a guest slot is missing. Created on first use.
 static const VkFormat tex_format[40] = {
     VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
     VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT,
@@ -396,20 +397,14 @@ static const VkFormat tex_format[40] = {
     VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_UINT,
     VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT,
     VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32, VK_FORMAT_B10G11R11_UFLOAT_PACK32};
-static struct { int used, di; VkFormat fmt; VkImage image; VmaAllocation alloc; VkImageView view, sview; } SD[48];
+static struct { VkImage image; VmaAllocation alloc; VkImageView view, sview; } SD[DV_COUNT][40];
 
-static VkImageView storage_dummy(int di, int code) {
-    VkFormat fmt = code > 0 && code < 40 ? tex_format[code] : VK_FORMAT_R8G8B8A8_UNORM;
-    if (fmt == VK_FORMAT_R8G8B8A8_UNORM || dinfo[di].s != VK_SAMPLE_COUNT_1_BIT) return Z.img[di].sview;
-    for (int i = 0; i < 48; i++) {
-        if (!SD[i].used) {
-            SD[i].used = 1, SD[i].di = di, SD[i].fmt = fmt;
-            make_dummy(di, fmt, &SD[i].image, &SD[i].alloc, &SD[i].view, &SD[i].sview);
-            return SD[i].sview;
-        }
-        if (SD[i].di == di && SD[i].fmt == fmt) return SD[i].sview;
-    }
-    return Z.img[di].sview;
+static VkImageView typed_dummy(int di, int code, int storage) {
+    if (code <= 0 || code >= 40 || tex_format[code] == VK_FORMAT_R8G8B8A8_UNORM)
+        return storage ? Z.img[di].sview : Z.img[di].view;
+    typeof(SD[0][0]) *d = &SD[di][code];
+    if (!d->image) make_dummy(di, tex_format[code], &d->image, &d->alloc, &d->view, &d->sview);
+    return storage ? d->sview : d->view;
 }
 
 static void dummies_init(void) {
@@ -457,11 +452,14 @@ void vk_exec_draw_shutdown(void) {
         vkDestroyImageView(c->device, Z.img[i].view, NULL);
         vmaDestroyImage(c->vma, Z.img[i].image, Z.img[i].alloc);
     }
-    for (int i = 0; i < 48 && SD[i].used; i++) {
-        if (SD[i].sview != SD[i].view) vkDestroyImageView(c->device, SD[i].sview, NULL);
-        vkDestroyImageView(c->device, SD[i].view, NULL);
-        vmaDestroyImage(c->vma, SD[i].image, SD[i].alloc);
-    }
+    for (int di = 0; di < DV_COUNT; di++)
+        for (int code = 0; code < 40; code++) {
+            typeof(SD[0][0]) *d = &SD[di][code];
+            if (!d->image) continue;
+            if (d->sview != d->view) vkDestroyImageView(c->device, d->sview, NULL);
+            vkDestroyImageView(c->device, d->view, NULL);
+            vmaDestroyImage(c->vma, d->image, d->alloc);
+        }
     memset(SD, 0, sizeof SD);
     nvn_hm_clear(&rs_lists, free);
     rs_last = NULL, rs_last_l = NULL;
@@ -542,51 +540,27 @@ typedef struct ViewNode { struct ViewNode *next; ViewKey k; VkImageView view; } 
 static nvn_hmap view_of;                 // ViewKey -> VkImageView
 static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
-// Integer formats a texture view may give an image (nvnTextureViewSetFormat): the Vulkan format and the translator's
-// TextureFormat code (gfx_shader.c fmt_names) the translator declares a storage image with. A shader that packs texels
-// itself writes raw words through such a view (Ocarina's last post-process pass stores R11G11B10 bits through an R32UI
-// view of an R11G11B10F target); through a view of the texture's own format the store converted them (a black picture
-// with red blobs). 0: not an integer format.
-static int int_view_format(uint32_t nvn, VkFormat *vk) {
-    static const struct { uint16_t nvn; uint8_t code; VkFormat vk; } T[] = {
-        {NVN_FORMAT_R8UI, 3, VK_FORMAT_R8_UINT}, {NVN_FORMAT_R8I, 4, VK_FORMAT_R8_SINT},
-        {NVN_FORMAT_R16UI, 8, VK_FORMAT_R16_UINT}, {NVN_FORMAT_R16I, 9, VK_FORMAT_R16_SINT},
-        {NVN_FORMAT_R32UI, 11, VK_FORMAT_R32_UINT}, {NVN_FORMAT_R32I, 12, VK_FORMAT_R32_SINT},
-        {NVN_FORMAT_RG8UI, 15, VK_FORMAT_R8G8_UINT}, {NVN_FORMAT_RG8I, 16, VK_FORMAT_R8G8_SINT},
-        {NVN_FORMAT_RG16UI, 20, VK_FORMAT_R16G16_UINT}, {NVN_FORMAT_RG16I, 21, VK_FORMAT_R16G16_SINT},
-        {NVN_FORMAT_RG32UI, 23, VK_FORMAT_R32G32_UINT}, {NVN_FORMAT_RG32I, 24, VK_FORMAT_R32G32_SINT},
-        {NVN_FORMAT_RGBA8UI, 27, VK_FORMAT_R8G8B8A8_UINT}, {NVN_FORMAT_RGBA8I, 28, VK_FORMAT_R8G8B8A8_SINT},
-        {NVN_FORMAT_RGBA16UI, 32, VK_FORMAT_R16G16B16A16_UINT}, {NVN_FORMAT_RGBA16I, 33, VK_FORMAT_R16G16B16A16_SINT},
-        {NVN_FORMAT_RGBA32UI, 35, VK_FORMAT_R32G32B32A32_UINT}, {NVN_FORMAT_RGBA32I, 36, VK_FORMAT_R32G32B32A32_SINT},
-        {NVN_FORMAT_RGB10A2UI, 38, VK_FORMAT_A2B10G10R10_UINT_PACK32}};
-    for (size_t i = 0; i < sizeof T / sizeof *T; i++)
-        if (T[i].nvn == nvn) {
-            if (vk) *vk = T[i].vk;
-            return T[i].code;
-        }
-    return 0;
-}
-
-// Bytes per texel of the formats a storage view may reinterpret (int_view_format's and the 32/64/128-bit float and
-// unorm ones they alias); 0 unknown.
+// Bytes per texel of the uncompressed colour formats a descriptor view may reinterpret; 0 unknown.
 static int texel_bytes(VkFormat f) {
     switch (f) {
-    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_UNORM: return 1;
-    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM:
-    case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8_UNORM: return 2;
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: return 1;
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: return 2;
     case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R16G16_UINT:
-    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R8G8B8A8_UINT:
-    case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
         return 4;
     case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R16G16B16A16_UINT:
-    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: return 8;
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM: return 8;
     case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
     default: return 0;
     }
 }
 
-// R11G11B10F images written this frame as raw words (storage_view_format chose an integer view): Ocarina's last
+// R11G11B10F images written this frame as raw words (descriptor_view_format chose an integer view): Ocarina's last
 // post-process pass stores shared-exponent RGB9E5 texels into its R11G11B10F scene target that way, and the upscaler
 // that reads them (tensor-core, untranslatable) decodes them itself; the fallback blit must too (raw_9e5).
 static struct { VkImage img; uint64_t frame; } RAW[8];
@@ -620,14 +594,13 @@ static const VkTexImage *raw_9e5_twin(const VkTexImage *t) {
 // vk_dump.c: 1 when img was written as raw RGB9E5 words this frame (dump it decoded as such).
 int vk_exec_raw_9e5(VkImage img, VkFormat f) { return raw_9e5(img, f); }
 
-// The format a storage view of img takes: the view's integer format when it sets one of the image's texel size (the
-// image is MUTABLE_FORMAT, vk_texture.c), else the image's own.
-static VkFormat storage_view_format(const VkTexImage *img, const view_t *v, int hv) {
-    VkFormat f;
-    if (hv && v->set_format && int_view_format(v->format, &f) && texel_bytes(f) && texel_bytes(f) == texel_bytes(img->format)) {
-        if (img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) raw_note(img->image);
-        return f;
-    }
+// Sampled and storage descriptors must agree with the guest's reinterpretation, including native integer textures.
+// Equal-sized uncompressed colour formats share a Vulkan compatibility class; depth/stencil images are not mutable.
+static VkFormat descriptor_view_format(const VkTexImage *img, const view_t *v, int hv) {
+    TexVkFormat f;
+    if (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT && hv && v->set_format && tex_vk_format(v->format, &f) &&
+        texel_bytes(f.vk) && texel_bytes(f.vk) == texel_bytes(img->format))
+        return f.vk;
     return img->format;
 }
 
@@ -681,18 +654,29 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    VkFormat vf = storage ? storage_view_format(img, v, hv) : img->format;
-    ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
+    VkFormat vf = descriptor_view_format(img, v, hv);
+    if (storage && img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+        (vf == VK_FORMAT_R32_UINT || vf == VK_FORMAT_R32_SINT || vf == VK_FORMAT_R16G16_UINT ||
+         vf == VK_FORMAT_R16G16_SINT || vf == VK_FORMAT_R8G8B8A8_UINT || vf == VK_FORMAT_R8G8B8A8_SINT ||
+         vf == VK_FORMAT_A2B10G10R10_UINT_PACK32))
+        raw_note(img->image);
+    // Usage belongs in the cache key: an identity-swizzled sampled view is not a storage view.
+    ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz | (storage ? 0x80000000u : 0)};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, vf, &fp);
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(fp.optimalTilingFeatures & need)) return VK_NULL_HANDLE;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
                                 .format = vf,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                      .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
+                                      .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
+    if (!storage && img->fb_usage) use.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    ci.pNext = &use;   // a sampled sRGB view must not inherit the mutable image's STORAGE usage
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     ViewNode *n = malloc(sizeof *n);
@@ -721,8 +705,10 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image,
                                     .viewType = type, .format = format, .subresourceRange = {aspect, level, 1, base, layers}};
         VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                          .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
-        if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
+                                          .usage = aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                                       ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        if (img->fb_usage) use.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        ci.pNext = &use;
         if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
             rt_fatal("vk: render target view (format %d) could not be created", (int)format);
         if (img->gone) {
@@ -879,12 +865,12 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
 }
 
 // Match the descriptor's actual VkFormat, not only an explicit integer view override: native RG16UI is integer too.
-static uint8_t format_of_handle(uint64_t h, int storage) {
+static uint8_t format_of_handle(uint64_t h) {
     view_t v;
     int hv;
     const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
     if (!img) return 0;
-    VkFormat f = storage ? storage_view_format(img, &v, hv) : img->format;
+    VkFormat f = descriptor_view_format(img, &v, hv);
     if (vk_exec_view_aspect(img, &v, hv) == VK_IMAGE_ASPECT_STENCIL_BIT) return 3;   // stencil is unsigned
     for (uint8_t i = 1; i < sizeof tex_format / sizeof *tex_format; i++)
         if (tex_format[i] == f) return i;
@@ -916,12 +902,12 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         uint64_t tt = tmiss ? token_of(h) : 0, it = imiss ? token_of(hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
         if (tmiss)
-            c->tt[slot] = type_of_handle(h), c->tfmt[slot] = format_of_handle(h, 0), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
+            c->tt[slot] = type_of_handle(h), c->tfmt[slot] = format_of_handle(h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
         if (imiss)
-            c->it[slot] = type_of_handle(hi), c->ifmt[slot] = format_of_handle(hi, 1), c->img[slot] = hi, c->itok[slot] = it,
+            c->it[slot] = type_of_handle(hi), c->ifmt[slot] = format_of_handle(hi), c->img[slot] = hi, c->itok[slot] = it,
             c->igen[slot] = gen;
         if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot] ||
-                      format_of_handle(h, 0) != c->tfmt[slot] || format_of_handle(hi, 1) != c->ifmt[slot]))   // NX2NAVI_SHADER_MEMO=check
+                      format_of_handle(h) != c->tfmt[slot] || format_of_handle(hi) != c->ifmt[slot]))   // NX2NAVI_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
         a->tex_type[slot] = c->tt[slot], a->tex_format[slot] = c->tfmt[slot],
         a->img_type[slot] = c->it[slot], a->img_format[slot] = c->ifmt[slot];
@@ -1616,7 +1602,7 @@ static struct {
     uint64_t h, tok;
     uint32_t gen, epoch, sgen;
     uint16_t type;
-    uint8_t separate, valid;
+    uint8_t separate, valid, format;
     VkImage image;
     VkDescriptorImageInfo out;
 } TD[TD_N];
@@ -1628,7 +1614,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
     if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out, &image);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
     typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 51];
-    if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->sgen == sg &&
+    if (m->valid && m->h == h && m->type == r->type && m->format == r->format && m->separate == separate && m->sgen == sg &&
         slot_still(&m->gen, m->tok, h, gen)) {
         if (m->epoch != ep) {   // the slot's first binding in this submission: only its storage check is due
             vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
@@ -1649,7 +1635,7 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
     uint64_t tok = token_of(h);   // before the lookup
     tex_info_full(ex, r, h, storage, separate, out, &image);
     *m = (typeof(*m)){.h = h, .tok = tok, .gen = gen, .epoch = ep, .sgen = sg, .type = r->type,
-                      .separate = (uint8_t)separate, .valid = 1, .image = image, .out = *out};
+                      .separate = (uint8_t)separate, .valid = 1, .format = r->format, .image = image, .out = *out};
 }
 
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
@@ -1678,7 +1664,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
     }
     if (!view) {
         int di = dummy_index(res_view_type(r->type), ms);
-        view = storage ? storage_dummy(di, r->format) : Z.img[di].view;
+        view = typed_dummy(di, r->format, storage);
     }
     if (!samp) samp = r->type & 0x400 ? Z.samp_shadow : Z.samp;
     *out = (VkDescriptorImageInfo){separate || storage ? VK_NULL_HANDLE : samp, view, layout};

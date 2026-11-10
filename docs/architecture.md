@@ -82,6 +82,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`GfxShaderRes.ptr`, `vk_exec_draw.c ptr_addr`).
 - Bindless textures: the texture and sampler pools are descriptor arrays kept in step with the game's pool writes
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
+- Texture views retain the guest descriptor's format when following live storage. Sampled, storage and attachment
+  views declare only their actual Vulkan usage, with descriptor views checked against that format's capabilities:
+  an sRGB sampled/attachment view never inherits a mutable UNORM image's storage usage.
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
@@ -94,8 +97,8 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
   the whole wait, after which the rest finishes in the background.
   Sampled textures and storage images have independent type and format answers (`GfxShaderAnswers`), selected from
-  the bound descriptor's format, including native integer textures and storage image reinterpretations.
-  Shader keys and recorded inputs
+  the resolved descriptor view (native format or guest reinterpretation), including integer textures without an
+  explicit view override. Shader keys and recorded inputs
   include both format arrays. Adding sampled formats changes shader input ids: `.in` files, `shader-answers.bin`,
   seed answers and prepared shader lists use version 2, and `pipeline-keys.bin` uses version 5. Older inputs and
   warm-up records are rejected rather than guessing their missing formats; prepare shaders again to rebuild them.
