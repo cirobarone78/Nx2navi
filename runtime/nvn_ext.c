@@ -54,10 +54,12 @@ NVN_API(nvnDeviceIsExternalDebuggerAttached) { ret_x(c, 0); }
 // void nvnDeviceSetAutomaticCheckpointsMask(NVNdevice *d, uint32_t mask) (NVN 55, no prototype in nvn.h)
 NVN_API(nvnDeviceSetAutomaticCheckpointsMask) { (void)c; }
 
-// ---------- timestamps: counters are written in Tegra 19.2 MHz ticks, the base of GetSystemTick (rt_ticks)
+// ---------- timestamps: counters are written as 19.2 MHz units of the host clock (vk_exec_xfer.c write_counter), a unit of
+// their own: the game converts them with nvnDeviceGetTimestampInNanoseconds, and the current time of the same clock is
+// kern_now_ns, whatever rate rt_ticks counts at (the game's system tick)
 static uint64_t ticks_to_ns(uint64_t t) { return t / 12 * 625 + t % 12 * 625 / 12; }
 // uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const NVNdevice *d)
-NVN_API(nvnDeviceGetCurrentTimestampInNanoseconds) { ret_x(c, ticks_to_ns(rt_ticks())); }
+NVN_API(nvnDeviceGetCurrentTimestampInNanoseconds) { ret_x(c, kern_now_ns()); }
 // uint64_t nvnDeviceGetTimestampInNanoseconds(const NVNdevice *d, const NVNcounterData *counter)
 NVN_API(nvnDeviceGetTimestampInNanoseconds) { ret_x(c, ticks_to_ns(((const NVNcounterData *)arg_p(c, 1))->timestamp)); }
 

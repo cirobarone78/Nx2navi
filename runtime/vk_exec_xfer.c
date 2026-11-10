@@ -89,7 +89,7 @@ static void event_cb(void *arg) {
     free(e);
 }
 
-// NVNcounterData = {counter, timestamp}; timestamps are Tegra 19.2 MHz ticks (the base of GetSystemTick).
+// NVNcounterData = {counter, timestamp}; timestamps are 19.2 MHz units of the host clock (nvn_ext.c converts them back).
 static void write_counter(uint64_t addr, uint64_t counter) {
     uint64_t rec[2] = {counter, (uint64_t)((unsigned __int128)kern_now_ns() * 12 / 625)};
     memcpy((void *)(uintptr_t)addr, rec, sizeof rec);

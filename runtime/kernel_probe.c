@@ -1,6 +1,7 @@
 // --probe-kernel: the kernel's waits, wake orders, virtual cores, fibers and
 // ExitThread on guest threads whose entries are host functions, then real lifted code on four guest threads: main's
-// PLT stub for nn::os::GetSystemTick, through the lifted sdk function, to rt_ticks.
+// PLT stub for nn::os::GetSystemTick, through the lifted sdk function, to rt_ticks, whose rate is the one the sdk's
+// nn::os::GetSystemTickFrequency answers.
 //
 // Every probe thread is created with SVC 0x08 and drives the kernel through rt_svc, the entry the lifted code uses.
 #include <stdio.h>
@@ -640,6 +641,33 @@ static void test_lifted_ticks(Cpu *c) {
     CHECK(ok && lifted, "lifted GetSystemTick");
 }
 
+// The game's own tick conversions agree with the host clock once rt_ticks_from_sdk has set the rate, as boot.c does
+// before the guest runs: 200 ms of the host clock, measured as the game does (the lifted GetSystemTick, then
+// nn::os::ConvertToTimeSpan), come out as 200 ms; a deadline set as GetSystemTick() + nn::os::ConvertToTick(100 ms)
+// arrives after 100 ms.
+#define CONVERT_TO_TICK "_ZN2nn2os13ConvertToTickENS_8TimeSpanE"
+#define CONVERT_TO_SPAN "_ZN2nn2os17ConvertToTimeSpanENS0_4TickE"
+static void test_tick_rate(Cpu *c) {
+    uint64_t hz = rt_ticks_from_sdk(c), to_tick = ldr_symbol(CONVERT_TO_TICK), to_span = ldr_symbol(CONVERT_TO_SPAN);
+    if (!to_tick || !to_span) {
+        CHECK(0, "%s or %s is not exported", CONVERT_TO_TICK, CONVERT_TO_SPAN);
+        return;
+    }
+    uint64_t n0 = kern_now_ns(), t0 = rt_call(c, tick_stub, 0);
+    plat_sleep_ms(200);
+    uint64_t t1 = rt_call(c, tick_stub, 0), n1 = kern_now_ns();
+    double span = (double)rt_call(c, to_span, 1, t1 - t0), real = (double)(n1 - n0);
+    uint64_t deadline = rt_call(c, to_tick, 1, (uint64_t)100000000), s0 = kern_now_ns(), a = rt_call(c, tick_stub, 0);
+    while (rt_call(c, tick_stub, 0) - a < deadline) plat_pause();
+    double due = (double)(kern_now_ns() - s0);
+    printf("tick rate: the SDK answers %llu Hz; %.1f ms of the host clock read %.1f ms through ConvertToTimeSpan; a 100 ms "
+           "deadline in ticks (%llu) arrived after %.1f ms\n",
+           (unsigned long long)hz, real / 1e6, span / 1e6, (unsigned long long)deadline, due / 1e6);
+    CHECK(span > real * 0.98 && span < real * 1.02, "%.1f ms of the host clock read %.1f ms through the game's conversion",
+          real / 1e6, span / 1e6);
+    CHECK(due > 98e6 && due < 130e6, "a 100 ms deadline in ticks arrived after %.1f ms", due / 1e6);
+}
+
 // svc 0x07 ExitProcess: the path up to the final ExitProcess (logged, pipeline cache saved, logs flushed) runs with the
 // test hook in its place, which must see exit code 0; the SVC then returns to the probe.
 static volatile int32_t exit_calls;
@@ -673,6 +701,7 @@ static void probe_main(Cpu *c) {
     test_fibers(c);
     test_exit(c);
     test_lifted_ticks(c);
+    test_tick_rate(c);
     test_exit_process(c);
 }
 

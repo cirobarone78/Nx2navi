@@ -181,6 +181,9 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     (`nvn_ext.c`). On the hardware, GPU ticks convert at 625/384 ns (614.4 MHz), TIMESTAMP is written when the ROP has retired
     the earlier work, TIMESTAMP_TOP when the command processor reaches it (4.2). Two consequences for the engine's GPU time (dynamic resolution and speed follow it):
     (a) if the game's consumer scales raw report ticks with its own constant rather than the NVN conversion call, our
-    19.2 MHz unit is 32x off from the hardware's; find that consumer before fixing the unit; (b) the delta needs
+    19.2 MHz unit is 32x off from the hardware's. Ocarina 1.1.1 reads report times through
+    `nvnDeviceGetTimestampInNanoseconds` (main+0x5a8f0 and main+0x3b4eb50, the second turning the nanoseconds into
+    system ticks with `nn::os::ConvertToTick`), so the unit stays ours there; no reader of the raw field was found,
+    and other titles are unchecked; (b) the delta needs
     `vkCmdWriteTimestamp2` with `TOP_OF_PIPE` for TIMESTAMP_TOP and `BOTTOM_OF_PIPE` for TIMESTAMP, per submission
-    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.**
+    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit ours for Ocarina 1.1.1, unverified elsewhere.**

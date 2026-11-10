@@ -55,8 +55,8 @@ static void *null_cpu_addr(uint64_t addr, uint64_t size, const char *what) {
     return (void *)(uintptr_t)addr;
 }
 
-// NVNcounterData = {counter, timestamp}. Timestamps are Tegra 19.2 MHz ticks, the base of GetSystemTick; every counter
-// type the null GPU cannot measure (all but the timestamps, samples passed included) reports 0.
+// NVNcounterData = {counter, timestamp}. Timestamps are 19.2 MHz units of the host clock (as vk_exec_xfer.c writes
+// them); every counter type the null GPU cannot measure (all but the timestamps, samples passed included) reports 0.
 static void null_report(uint64_t addr) {
     NVNcounterData *d = null_cpu_addr(addr, sizeof *d, "counter report");
     if (!d) return;

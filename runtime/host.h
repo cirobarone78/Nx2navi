@@ -258,6 +258,9 @@ void kern_clear_system_event(uint64_t ev);                 // any thread; a boun
 int kern_svc(Cpu *c, uint32_t imm);                        // thread/sync SVCs; 1 if handled
 uint64_t kern_now_ns(void);
 extern uint64_t rt_guest_start_ns;   // kern_now_ns when the guest started (boot.c), 0 before
+uint64_t rt_ticks_from_sdk(Cpu *c);                        // sets the rate of rt_ticks (CNTPCT_EL0, nn::os::GetSystemTick) to
+                                                           // nn::os::GetSystemTickFrequency's answer, in ticks a second;
+                                                           // returns it; the guest main thread, before the guest runs
 typedef struct { uint64_t svcs, threads, host_calls; } RtStats;
 RtStats rt_stats(void);                                    // host_calls: hostfn_calls()
 

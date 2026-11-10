@@ -336,6 +336,7 @@ static uint64_t cb_addr[3];
 
 static void guest_main(Cpu *c) {
     uint32_t handle = kern_main_thread(&c);
+    rt_ticks_from_sdk(c);
     uint64_t start = ldr_symbol(SYM_INIT_START);
     if (!start) rt_fatal("boot: %s is not exported", SYM_INIT_START);
     char d[128];

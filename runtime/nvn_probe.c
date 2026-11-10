@@ -60,6 +60,9 @@ static void fv(int i, float f) {   // a float argument: low 32 bits of vi
     cpu.v[i] = b;
 }
 
+// The host clock in the unit of the NVN counter timestamps (vk_exec_xfer.c write_counter, gfx_null.c null_report).
+static uint64_t host_gpu_ticks(void) { return (uint64_t)((unsigned __int128)kern_now_ns() * 12 / 625); }
+
 // ---- the objects, in place like the game's (each type is its NVN reserved size)
 #define OBJ(T, n) static T n __attribute__((aligned(16)))
 OBJ(NVNdevice, dev);
@@ -820,10 +823,10 @@ static void probe_null_effects(void) {
     CHECK(*(uint32_t *)ev_val == 0 && !pmem[OFF_UB + 4] && !pmem[OFF_DST] && pmem[OFF_COUNTER_B] == 0xaa,
           "recording has no side effects");
 
-    uint64_t t0 = rt_ticks(), subs = nvn_submit_count(), fence0 = nvn_fence_last();
+    uint64_t n0 = kern_now_ns(), t0 = host_gpu_ticks(), subs = nvn_submit_count(), fence0 = nvn_fence_last();
     uint64_t hs[2] = {ha, hb};
     CALL(nvnQueueSubmitCommands, U(&queue), 2, U(hs));
-    uint64_t t1 = rt_ticks();
+    uint64_t t1 = host_gpu_ticks(), n1 = kern_now_ns();
     CALL(nvnQueueFenceSync, U(&queue), U(&syncs), NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
     uint64_t wait = CALL(nvnSyncWait, U(&syncs), 1000000000ull);
     CHECK(wait == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || wait == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED, "SyncWait after the submit: %llu",
@@ -838,12 +841,17 @@ static void probe_null_effects(void) {
     // buffer copy in stream order: handle 1's copy, then handle 2's update over its first 8 bytes
     CHECK(!memcmp(pmem + OFF_DST, d2, 8) && !memcmp(pmem + OFF_DST + 8, d1 + 8, 8) && !pmem[OFF_DST + 16],
           "buffer copy and later update in stream order");
-    // counters: NVNcounterData {counter, timestamp}; the null GPU reports 0 and a timestamp in 19.2 MHz ticks
+    // counters: NVNcounterData {counter, timestamp}; the null GPU reports 0 and a timestamp in 19.2 MHz units of the host
+    // clock, which nvnDeviceGetTimestampInNanoseconds converts back (to within one unit, 52 ns)
     uint64_t ca[2], cb[2];
     memcpy(ca, pmem + OFF_COUNTER_A, 16);
     memcpy(cb, pmem + OFF_COUNTER_B, 16);
     CHECK(ca[0] == 0 && ca[1] + 1 >= t0 && ca[1] <= t1 + 1, "timestamp counter {%llu, %llu} outside [%llu, %llu]", (unsigned long long)ca[0],
           (unsigned long long)ca[1], (unsigned long long)t0, (unsigned long long)t1);
+    uint64_t conv = CALL(nvnDeviceGetTimestampInNanoseconds, U(&dev), U(pmem + OFF_COUNTER_A)),
+             cur = CALL(nvnDeviceGetCurrentTimestampInNanoseconds, U(&dev));
+    CHECK(conv + 53 >= n0 && conv <= n1 && cur >= n1, "timestamp counter converts to %llu ns, outside [%llu, %llu] (now %llu)",
+          (unsigned long long)conv, (unsigned long long)n0, (unsigned long long)n1, (unsigned long long)cur);
     CHECK(cb[0] == 0 && cb[1] + 1 >= t0 && cb[1] <= t1 + 1, "samples-passed counter {%llu, %llu}", (unsigned long long)cb[0],
           (unsigned long long)cb[1]);
     CHECK(!memcmp(pmem + OFF_B2B_DST, keep, 16), "a copy out of the GPU window left the target alone");

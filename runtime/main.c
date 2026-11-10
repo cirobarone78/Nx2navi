@@ -194,10 +194,36 @@ void rt_udf(Cpu *c, uint64_t pc) {
              ldr_describe(c->x[30], lr, sizeof lr));
 }
 
-// CNTPCT_EL0: the Switch counter runs at 19.2 MHz. The scale is set before main, so no thread reads it half written.
+// CNTPCT_EL0 and nn::os::GetSystemTick: a counter at the rate the game's own SDK converts ticks at, the value
+// nn::os::GetSystemTickFrequency returns (rt_ticks_from_sdk asks it before the guest runs). The Switch's 19.2 MHz stands
+// until then and for a build that does not answer. The 1.1.1 SDK answers 31.25 MHz and converts ticks to time
+// (nn::os::ConvertToTimeSpan, ConvertToTick) at that rate, so a 19.2 MHz counter made every span the game measured 0.614
+// of the real one, and every deadline it set in ticks 1.63 times too long. The scale is replaced once, on the guest main
+// thread before the guest creates another, so no thread reads it half written.
+// CNTFRQ_EL0 is not part of this: the lifter turns a read of it into the constant 19.2 MHz (recomp/lifter.py), and
+// game 1.1.1's lifted code never reads it (it asks the SDK). A build whose code divides counter deltas by CNTFRQ_EL0
+// while its SDK reports another rate would see two rates and needs the lifter to ask the runtime instead.
 static PlatScale tick_scale;
 
-__attribute__((constructor)) static void tick_scale_init(void) { tick_scale = plat_scale(19200000u, plat_counter_hz()); }
+static void ticks_at(uint64_t hz) { tick_scale = plat_scale(hz, plat_counter_hz()); }
+
+__attribute__((constructor)) static void tick_scale_init(void) { ticks_at(19200000u); }
+
+// An answer outside 1 MHz to 1 GHz (a build whose function needs the SDK initialised first, or no such export) leaves
+// the counter as it was. Returns the rate in use.
+#define SYM_TICK_HZ "_ZN2nn2os22GetSystemTickFrequencyEv"
+uint64_t rt_ticks_from_sdk(Cpu *c) {
+    uint64_t fn = ldr_symbol(SYM_TICK_HZ), hz = fn ? rt_call(c, fn, 0) : 0;
+    if (hz < 1000000ull || hz > 1000000000ull) {
+        if (fn) rt_log("boot: %s returned %llu Hz, outside 1 MHz to 1 GHz; the system tick stays at 19.2 MHz", SYM_TICK_HZ,
+                       (unsigned long long)hz);
+        else rt_log("boot: %s is not exported; the system tick stays at 19.2 MHz", SYM_TICK_HZ);
+        return 19200000u;
+    }
+    ticks_at(hz);
+    rt_log("boot: the system tick runs at %llu Hz, as nn::os::GetSystemTickFrequency says", (unsigned long long)hz);
+    return hz;
+}
 
 uint64_t rt_ticks(void) { return plat_scaled(tick_scale, plat_counter()); }
 

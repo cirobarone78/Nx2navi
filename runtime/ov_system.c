@@ -207,8 +207,8 @@ static PlatCond message_cv = PLAT_COND_INIT;
 static uint32_t messages[32];
 static unsigned head, tail;
 static float balance[2] = {1.0f, 1.0f};
-static uint64_t start_ticks;
-__attribute__((constructor)) static void started(void) { start_ticks = rt_ticks(); }
+static uint64_t start_ns;
+__attribute__((constructor)) static void started(void) { start_ns = kern_now_ns(); }
 
 void oe_push_message(uint32_t message) {
     plat_mutex_lock(&lock);
@@ -239,9 +239,9 @@ static void ov_set_balance(Cpu *c) {
     plat_mutex_unlock(&lock);
 }
 
-// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started (19.2 MHz ticks * 625 / 12)
+// TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started
 static void ov_active_time(Cpu *c) {
-    ret_x(c, (uint64_t)((unsigned __int128)(rt_ticks() - start_ticks) * 625 / 12));
+    ret_x(c, kern_now_ns() - start_ns);
 }
 
 // void SetUserInactivityDetectionTimeExtended[Unsafe](bool): the host never puts the console to sleep
