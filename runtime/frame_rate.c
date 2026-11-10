@@ -33,9 +33,9 @@
 // and in range whichever store it sees.
 //
 // The world clock (frame_step_world_us) sums the steps from the first present that finds the player actor away from
-// the origin, where the title screen keeps it: the end of the first save load. Recorded and scripted input
-// (input.c) runs on it, so a replay presses at the same game time at any frame rate and after a first load of any
-// length; a later load (fast travel) still shifts what follows by its length.
+// the origin, where the title screen keeps it (1.1.1 has no player actor until the save has loaded): the end of the
+// first save load. Recorded and scripted input (input.c) runs on it, so a replay presses at the same game time at any
+// frame rate and after a first load of any length; a later load (fast travel) still shifts what follows by its length.
 //
 // NX2NAVI_TRACE=perf adds a line per 120 presents: fps, the game seconds stepped against wall seconds, and with
 // NX2NAVI_SPEED_PROBE=1 the player's position and ground speed (an independent check: Link runs at the same speed at
@@ -306,12 +306,24 @@ static uint64_t read_ptr(uint64_t a) {
     uint64_t p = 0;
     return read_guest(a, &p, 8) ? p : 0;
 }
-// 1.2.1: [main+0x4728538] (1.1.0: [main+0x4630a68], 1.4.3: [main+0x3add238]) +0x1e8 scene, its component 13 lists the
-// resident actors; the one named "Player" has its position at +0x2b4.
+// 1.1.1: [[main+0x4e371d0] + 0x480] is the Player actor, its name pointer at +0x20 reads "Player" and its position, in
+// metres, is the float triplet at +0x31c. The slot is empty until the first save has loaded and then holds the actor.
+// The other builds: [main+0x4728538] (1.1.0: [main+0x4630a68], 1.4.3: [main+0x3add238]) +0x1e8 scene, its component 13
+// lists the resident actors; the one named "Player" has its position at +0x2b4.
 // The 1.1.0 slot was measured from its own dereference chain: 181 scene accesses in that build
 // read it, and one of them reproduces this walk (the 14-component check, component 13, the 0x70 stride and the name
 // compare) instruction for instruction.
+static int player_name(uint64_t name) {
+    char text[7];
+    return name && read_guest(name, text, 7) && !memcmp(text, "Player", 7);
+}
+
 static int player_pos(float xyz[3]) {
+    if (RT_V111) {
+        uint64_t manager = read_ptr(MOD_MAIN_BASE + 0x4e371d0), actor = manager ? read_ptr(manager + 0x480) : 0;
+        return actor && player_name(read_ptr(actor + 0x20)) && read_guest(actor + 0x31c, xyz, 12) && isfinite(xyz[0]) &&
+               isfinite(xyz[2]);
+    }
     uint64_t module = read_ptr(MOD_MAIN_BASE + (RT_V143 ? 0x3add238 : RT_V110 ? 0x4630a68 : 0x4728538)),
              scene = module ? read_ptr(module + 0x1e8) : 0;
     int32_t count = 0;
@@ -321,9 +333,7 @@ static int player_pos(float xyz[3]) {
     uint64_t links = read_ptr(resident + 0x28);
     for (int i = 0; links && i < count; i++) {
         uint64_t data = read_ptr(links + (uint64_t)i * 0x70 + 8), actor = data ? read_ptr(data + 0x40) : 0;
-        uint64_t name = actor ? read_ptr(actor + 0x218) : 0;
-        char text[7];
-        if (name && read_guest(name, text, 7) && !memcmp(text, "Player", 7))
+        if (actor && player_name(read_ptr(actor + 0x218)))
             return read_guest(actor + 0x2b4, xyz, 12) && isfinite(xyz[0]) && isfinite(xyz[2]);
     }
     return 0;
