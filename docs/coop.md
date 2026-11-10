@@ -518,9 +518,12 @@ the next pose is taken whatever its counter: so the relay, or anyone who can hol
 send from the relay's address, can then send that player's recorded poses of the session, and the puppet walks that
 old path for as long as it keeps doing so (it needs no secret; a forged roster that lists the player's earlier session
 does the same). It moves only the puppet: never progress, a save or the session, and the player's own poses are taken
-again as soon as one gets through. A POS is sealed with the room's key but not signed: someone who knows the
-secret can send poses in a player's name and move that player's puppet while it keeps sending, and one with a counter
-far ahead keeps that player's own poses out until none was taken for 3 s (the puppet goes meanwhile). The counter came
+again as soon as one gets through. A POS is sealed with the room's key but not signed, so someone who knows the
+secret (every player in the room) can send poses in a player's name. One with a counter far ahead becomes that
+player's newest pose: for 3 s the puppet stands where the forger put it (or is hidden, if the pose names another area),
+and the player's own poses are kept out; one such pose every 3 s (21 datagrams a minute) keeps them out for as long
+as the forger goes on, and 3 s after it stops the player's own poses are taken again. A forged pose moves or hides
+only that puppet: it changes no progress, no save and no session. The counter came
 with POS version 2; a game reads only its own version, so a game of an earlier build and one of this build show no
 puppets of each other. Seen in two games on one PC: each makes the other's puppet, and the game that stood showed the
 other's Link walking off along the bridge. Still missing: the puppet's arms stay

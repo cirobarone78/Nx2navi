@@ -194,11 +194,12 @@ int coop_pos_parse(const uint8_t *p, size_t n, CoopPos *out);
 // (another player given the id, the member back in a new session, or a roster that lists an earlier session) starts the
 // counter again. After COOP_POS_QUIET_MS with none taken (below), whoever holds the sender's datagrams back that long can
 // send its recorded poses of the session again (no secret needed), and they are taken: only the puppet moves. Someone
-// with the room's secret can seal a POS in a member's name with
-// a counter far ahead, which would keep that member's own poses out for the session: once nothing was taken from the
-// sender for COOP_POS_QUIET_MS (its puppet is gone by then for want of poses), the next pose is taken whatever its
-// counter and starts the counter again. session: the one the roster lists for the member (CoopView). Returns 0 to drop
-// the pose, 1 to take it, 2 to take it and drop what was kept of the sender's earlier poses.
+// with the room's secret can seal a POS in a member's name with a counter far ahead: it becomes the newest pose, so the
+// puppet stands where it says (or is hidden, if it names another area) and the member's own poses are kept out until
+// nothing was taken from the sender for COOP_POS_QUIET_MS; then the next pose is taken whatever its counter and starts
+// the counter again. One forged pose every COOP_POS_QUIET_MS keeps the member's own out while the forger goes on.
+// session: the one the roster lists for the member (CoopView). Returns 0 to drop the pose, 1 to take it, 2 to take it
+// and drop what was kept of the sender's earlier poses.
 #define COOP_POS_QUIET_MS 3000
 typedef struct {
     uint64_t session, at_ms;    // the session of the last pose taken, and when it was taken
