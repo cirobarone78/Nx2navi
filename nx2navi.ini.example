@@ -504,7 +504,7 @@
 # For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
 # room's secret of 18 characters from 23456789BCDFGHJKMNPRSTVWXYZ, XXXXXX-XXXXXX-XXXXXX; a create without it makes a new
 # one). While the session runs, a room the relay lost (a restart) is made again or waited for, and a create that finds
-# the room open joins it. Joining is not accepting: nothing from the room is applied before you accept it in the menu.
+# the room open joins it. Joining is not accepting: nothing from the room is applied before you accept it (coop_accept).
 # off = no session at launch.
 # coop_auto = off
 # coop_room =
@@ -525,11 +525,19 @@
 # coop_rupees = own
 # coop_ammo = own
 # Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
-# your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = accept each offer in the
-# menu; a new member, other rules or another save loaded make a new offer. Accepting every room (always) is taken from
-# the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a
-# room for you.
+# your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
+# offer with a number (eight hex digits, new at each start of the game); put that number here while the game runs to
+# accept that offer. A new member, other rules or another save loaded make a new offer with a new number. A member who
+# never says who it is keeps the room from being accepted. Accepting every room (always) is taken from the environment
+# only (NX2NAVI_COOP_ACCEPT=always), never from this file, so an ini someone hands you cannot accept a room for you.
 # coop_accept = ask
+# The room's maker, no menu row yet: coop_remove = a member's id (1 to 8) while it is in the room, or its key's
+# fingerprint (xxxx-xxxx-xxxx-xxxx, as the log shows it), also after it left; every game drops that key and what it
+# spent from the pools. coop_reset_pools = any new value (1, 2, ...): every game joins the pools again with what they
+# held for the players in the room. Both act when the value changes while the game runs. The key your game signs the
+# rules of a room you made with is kept in the profile folder (coop-keys), so a restart keeps you the room's maker.
+# coop_remove =
+# coop_reset_pools =
 
 [audio]
 # none mixes without opening an audio device.
