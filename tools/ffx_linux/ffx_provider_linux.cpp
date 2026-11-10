@@ -1,10 +1,16 @@
-// The provider registry of AMD's ffx-api (ffx-api/src/ffx_provider.cpp) for Linux: the FSR 3.1 upscaler only.
-// AMD's own registry also looks for driver providers through amdxc64.dll (D3D12) and lists FSR 2 and frame
-// generation, none of which this build has.
+// The provider registry of AMD's ffx-api (ffx-api/src/ffx_provider.cpp) for Linux: the FSR 3.1 upscaler, frame
+// generation and its Vulkan swapchain. AMD's own registry also looks for driver providers through amdxc64.dll (D3D12)
+// and lists FSR 2, which this build does not have.
 #include "ffx_provider.h"
 #include "ffx_provider_fsr3upscale.h"
+#include "ffx_provider_framegeneration.h"
+#include "vk/ffx_provider_framegenerationswapchain_vk.h"
 
-static const ffxProvider* const providers[] = {&ffxProvider_FSR3Upscale::Instance};
+static const ffxProvider* const providers[] = {
+    &ffxProvider_FSR3Upscale::Instance,
+    &ffxProvider_FrameGeneration::Instance,
+    &ffxProvider_FrameGenerationSwapChain_VK::Instance,
+};
 static constexpr size_t providerCount = sizeof providers / sizeof providers[0];
 
 const ffxProvider* GetffxProvider(ffxStructType_t descType, uint64_t overrideId, void*)

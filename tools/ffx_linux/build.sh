@@ -1,8 +1,8 @@
 #!/bin/bash
 # Builds libamd_fidelityfx_vk.so, the Linux counterpart of AMD's amd_fidelityfx_vk.dll that runtime/vk_ffx.cpp loads from
 # beside the game for FSR 3.1 upscaling. AMD ships that library for Windows only; this builds it from the FidelityFX SDK
-# v1.1.4 release zip (MIT, pinned by SHA-256) with the patches in patches/, the FSR 3.1 upscaler and its Vulkan backend
-# only (no frame generation). See README.md.
+# v1.1.4 release zip (MIT, pinned by SHA-256) with the patches in patches/: the FSR 3.1 upscaler, FSR 3.1 frame generation
+# and its frame interpolation swapchain, and their Vulkan backend. See README.md.
 #
 #   tools/ffx_linux/build.sh <output folder> [download cache]
 #
@@ -29,7 +29,8 @@ unzip -q "$zip" common.cmake docs/license.md 'ffx-api/*' 'sdk/*' -x 'ffx-api/bin
 # the zip's text files have CRLF line ends; the patches are LF
 find "$work/sdk" -type f \( -name '*.h' -o -name '*.cpp' -o -name '*.c' -o -name '*.glsl' -o -name '*.hpp' -o -name '*.txt' \) \
     -exec sed -i 's/\r$//' {} +
-for p in fidelityfx-sdk-v1.1.4-linux.patch fsr-3.1.5-backport.patch nx2navi-ffx-api-linux.patch; do
+for p in fidelityfx-sdk-v1.1.4-linux.patch fsr-3.1.5-backport.patch nx2navi-ffx-api-linux.patch \
+         fidelityfx-sdk-v1.1.4-framegeneration-linux.patch; do
     patch -s -p1 -d "$work/sdk" < "$here/patches/$p"
 done
 cmake -S "$here" -B "$work/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFFX_ROOT="$work/sdk" >/dev/null
@@ -37,4 +38,4 @@ cmake --build "$work/build"
 cp "$work/build/libamd_fidelityfx_vk.so" "$out/"
 { cat "$work/sdk/docs/license.md"; echo; echo 'Built with code from xplane-fsr3 (https://github.com/JonathanOrr/xplane-fsr3):'; echo
   cat "$here/LICENSE.xplane-fsr3"; } > "$out/libamd_fidelityfx_vk-LICENSE.txt"
-echo "built $out/libamd_fidelityfx_vk.so (AMD FidelityFX SDK $version, FSR 3.1 upscaler)"
+echo "built $out/libamd_fidelityfx_vk.so (AMD FidelityFX SDK $version, FSR 3.1 upscaler and frame generation)"
