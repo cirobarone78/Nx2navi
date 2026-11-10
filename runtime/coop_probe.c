@@ -11,6 +11,7 @@
 //    and waits for a line on its input, which tests/coop_relay_test.py answers after restarting it), else a small relay of
 //    this file on a thread, which can also corrupt a forwarded tag and send the garbage. NX2NAVI_COOP_DROP=30 makes both
 //    sessions throw away that percentage of the datagrams they receive.
+// 4. Progress sync's merge engine (coop_state.c) between fake games on a fake network: coop_sync_probe.c.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 
 #include "cfg.h"
 #include "coop.h"
+#include "coop_state.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "sha256.h"
@@ -1000,6 +1002,7 @@ int probe_coop(void) {
     probe_server_parse();
     probe_vectors();
     probe_fuzz();
+    fails += probe_coop_sync();   // 4. progress sync (coop_sync_probe.c)
     probe_sessions();
     printf("coop-probe: %s\n", fails ? "FAILED" : "passed");
     return fails != 0;
