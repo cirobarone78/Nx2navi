@@ -495,9 +495,10 @@ static void window_commit(Window *w, uint64_t session, uint32_t counter) {
 // whoever holds it can seal one message in a member's name with a counter far ahead and leave every later message of
 // that member below the window for the rest of its session. The sender's own next messages then keep arriving below
 // it, each later than the one before: at the WINDOW_AGAIN-th in a row the window starts again from it, which takes this
-// one. Copies of one old message count once. 1 when the window started again.
+// one. One that is not later than the last starts the row again (a copy of one counts once, and one sealed above the
+// sender's own cannot hold the row there). 1 when the window started again.
 static int window_below(Window *w, uint32_t counter) {
-    if (w->low_n && (int32_t)(counter - w->low) <= 0) return 0;
+    if (w->low_n && (int32_t)(counter - w->low) <= 0) w->low_n = 0;
     w->low = counter;
     if (++w->low_n < WINDOW_AGAIN) return 0;
     *w = (Window){.session = w->session, .high = counter, .bits = 1, .valid = 1};
