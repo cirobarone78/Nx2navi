@@ -87,6 +87,7 @@ int cfg_int(const char *key) { return atoi(cfg_value(key)); }
 double cfg_double(const char *key) { return atof(cfg_value(key)); }
 int cfg_bool(const char *key) { return strcmp(cfg_value(key), "0") != 0 && cfg_value(key)[0]; }
 int cfg_from_env(const char *) { return 0; }
+int cfg_pending(const char *) { return 0; }   // the rows' "after restart" note: no setting here waits for a restart
 void cfg_set(const char *key, const char *value) {
     int i = meta_index(key);
     if (i < 0) return;
