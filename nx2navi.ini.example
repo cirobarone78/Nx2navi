@@ -544,8 +544,9 @@
 # room or after it left; every game drops that key and what it took from the pools, and keys others brought while it
 # was in a pool stay theirs. A member number here is not taken: numbers pass to other players as members come and go.
 # coop_reset_pools = a new value (1, then 2, or 0 and then 1 again): every game joins the pools again with what they
-# held for the players in the room. A player who drained a pool and is still in the room when you reset keeps what it
-# took: remove it first, then reset.
+# held for the players in the room, and what each held counts from the reset on. A player who drained a pool and is
+# still in the room when you reset keeps what it took: remove it first, then reset (both in one save of this file act
+# in that order).
 # Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs
 # the rules of a room you made with is kept in the profile folder (coop-keys, readable by your account only), so a
 # restart keeps you the room's maker; never hand out a copy of the profile folder.
