@@ -559,7 +559,8 @@ uint64_t vk_sync_reserve(void) {
     return v;
 }
 
-uint64_t vk_sync_submit(const uint64_t *handles, int n) {
+// probe_record (vk_sync_probe_submit): a probe's own recording in place of the guest's command buffers.
+static uint64_t submit(const uint64_t *handles, int n, void (*probe_record)(VkCommandBuffer, void *), void *arg) {
     vk_sync_start();
     VkCtx *c = vk_ctx();
     plat_mutex_lock(&sub_lock);
@@ -579,7 +580,9 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     ts_begin(s->cb);
     rec_begin(s->cb, fence);
     vk_gpu_passes_part(s->cb, 0);
-    int recorded = vk_exec_record(s->cb, handles, n, fence);
+    int recorded = 1;
+    if (probe_record) probe_record(s->cb, arg);
+    else recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     vk_gpu_passes_part(s->cb, 1);
     if (recorded) ts_end(s->cb, fence);
@@ -623,6 +626,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     plat_mutex_unlock(&sub_lock);
     return fence;
 }
+
+uint64_t vk_sync_submit(const uint64_t *handles, int n) { return submit(handles, n, NULL, NULL); }
+
+// The FSR 3.1 probe (fsr3_probe.c) records its passes here, on the timeline the passes' constant ring waits on.
+uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg) { return submit(NULL, 0, record, arg); }
 
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
     plat_mutex_lock(&st_lock);

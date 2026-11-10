@@ -496,6 +496,7 @@ static void destroy_all(void) {
     gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
+    if (g_vk.device) vk_ffx_release();    // FSR 3.1's contexts: the library's, or the built-in passes' (vk_fsr3.c)
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);

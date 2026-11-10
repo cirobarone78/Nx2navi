@@ -3,12 +3,19 @@
 // headers are in third_party/ffx_api (MIT); they are C++ in places, hence this file. Nothing of it runs unless the
 // upscaler or frame generation asks for FSR 3.1.
 //
+// Where the library does not load, FSR 3.1 upscaling runs on the runtime's own build of the upscaler's passes
+// (vk_fsr3.c): on Linux, which has no such library, always; on Windows when amd_fidelityfx_vk.dll is not beside the
+// executable. The library stays first on Windows because it also brings frame generation and is the version AMD signs;
+// NX2NAVI_FSR3_NATIVE=1 takes the built-in passes there even with the library present (a comparison). Frame generation
+// needs the library either way (vk_ffx_framegen_available).
+//
 // FSR 3.1 takes the same inputs vk_dlaa.c makes for DLSS: the scene's light target (linear HDR), its D32F depth
 // (OpenGL-style, an infinite far plane, not inverted) and the camera motion vectors in render pixels from the current
 // frame to the previous one, the convention both share, so the vectors go in unscaled.
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <atomic>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -24,6 +31,7 @@ extern "C" {
 #include "host.h"
 #include "vk.h"
 #include "vk_ffx.h"
+#include "vk_fsr3.h"
 }
 
 namespace {
@@ -36,7 +44,21 @@ struct Api {
     PfnFfxQuery query = nullptr;
     PfnFfxDispatch dispatch = nullptr;
     int tried = 0, ok = 0;
+    int native = 0;   // vk_ffx_load chose the built-in passes (vk_fsr3.c)
 } A;
+
+// What the settings menu may ask before anything has used FSR 3.1 (vk_ffx_available), from any thread.
+std::atomic<int> g_loaded{-1};    // what vk_ffx_load found: 1 or 0; -1 while it has not run
+std::atomic<int> g_present{-1};   // whether the library file is there: 1 or 0; -1 while not asked
+
+#ifdef _WIN32
+// amd_fidelityfx_vk.dll next to the executable
+void library_path(char *path, size_t size) {
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)size);
+    while (n && path[n - 1] != '\\') n--;
+    snprintf(path + n, size - n, "amd_fidelityfx_vk.dll");
+}
+#endif
 
 void message(uint32_t type, const wchar_t *msg) {
     char s[512];
@@ -127,36 +149,113 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     return slot;
 }
 
+#ifdef _WIN32
+// NX2NAVI_FSR3_NATIVE=1: the built-in passes even where the library is there
+int native_forced() {
+    static int f = -1;
+    if (f < 0) f = rt_knob("FSR3_NATIVE", "0") == 1;
+    return f;
+}
+#endif
+
+// The built-in passes in the library's place; they need the device, so before it exists this answers 0 and leaves
+// vk_ffx_load to ask again.
+int load_native() {
+    int ok = vk_fsr3_init();
+    if (!ok && vk_fsr3_available()) return 0;   // no device yet
+    A.tried = 1, A.native = 1, A.ok = 0;
+    g_loaded.store(ok, std::memory_order_release);
+    return ok;
+}
+
 }  // namespace
 
 extern "C" int vk_ffx_load(void) {
+    if (A.native) return vk_fsr3_init();
     if (A.tried) return A.ok;
-    A.tried = 1;
 #ifdef _WIN32
-    char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-    while (n && path[n - 1] != '\\') n--;
-    snprintf(path + n, sizeof path - n, "amd_fidelityfx_vk.dll");
-    HMODULE m = LoadLibraryA(path);
-    if (!m) {
-        rt_log("ffx: %s not found: FSR 3.1 off", path);
-        return 0;
+    static int no_library;   // the library was not loaded: the built-in passes, asked again until the device exists
+    if (!no_library && native_forced()) {
+        rt_log("ffx: NX2NAVI_FSR3_NATIVE=1: FSR 3.1 upscaling with the built-in passes, not amd_fidelityfx_vk.dll");
+        no_library = 1;
     }
-    A.lib = m;
-    A.create = (PfnFfxCreateContext)(void *)GetProcAddress(m, "ffxCreateContext");
-    A.destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(m, "ffxDestroyContext");
-    A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
-    A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
-    A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
+    if (!no_library) {
+        char path[MAX_PATH];
+        library_path(path, sizeof path);
+        HMODULE m = LoadLibraryA(path);
+        if (!m) {
+            rt_log("ffx: %s not found: FSR 3.1 upscaling with the built-in passes, FSR 3.1 frame generation off", path);
+            no_library = 1;
+        } else {
+            A.tried = 1;
+            A.lib = m;
+            A.create = (PfnFfxCreateContext)(void *)GetProcAddress(m, "ffxCreateContext");
+            A.destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(m, "ffxDestroyContext");
+            A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
+            A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
+            A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
+            A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
+            rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
+            g_loaded.store(A.ok, std::memory_order_release);
+            return A.ok;
+        }
+    }
+#else
+    // AMD publishes its library for Windows only: the built-in passes here (frame generation stays off)
+    static int told;
+    if (!told++) rt_log("ffx: FSR 3.1 upscaling with the built-in passes (vk_fsr3.c); FSR 3.1 frame generation needs "
+                        "amd_fidelityfx_vk.dll, which only the Windows build loads");
 #endif
-    A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
-    rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
-    return A.ok;
+    return load_native();
+}
+
+#ifdef _WIN32
+namespace {
+int library_present() {
+    int present = g_present.load(std::memory_order_relaxed);
+    if (present < 0) {   // the menu asks every frame: look once, and leave the loading to the first use
+        char path[MAX_PATH];
+        library_path(path, sizeof path);
+        DWORD attr = GetFileAttributesA(path);
+        present = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+        g_present.store(present, std::memory_order_relaxed);
+    }
+    return present;
+}
+}  // namespace
+#endif
+
+// Upscaling: what vk_ffx_load found once it ran; before, the library's file (Windows) or else the built-in passes,
+// which every build has (vk_fsr3_available: 1 until the device shows it cannot run them).
+extern "C" int vk_ffx_available(void) {
+    int loaded = g_loaded.load(std::memory_order_acquire);
+    if (loaded >= 0) return loaded;
+#ifdef _WIN32
+    if (!native_forced() && library_present()) return 1;
+#endif
+    return vk_fsr3_available();
+}
+
+// Frame generation runs through the library's own API calls: only where the library loads (or, before the first use,
+// where its file is), and not while the built-in passes upscale in its place.
+extern "C" int vk_ffx_framegen_available(void) {
+#ifdef _WIN32
+    if (A.native || native_forced()) return 0;
+    int loaded = g_loaded.load(std::memory_order_acquire);
+    return loaded >= 0 ? loaded : library_present();
+#else
+    return 0;
+#endif
 }
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                               const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y) {
     if (!vk_ffx_load()) return 0;
+    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1
+    int sharp = cfg_int("NX2NAVI_SHARPNESS");
+    if (A.native)
+        return vk_fsr3_upscale(cb, color, depth, mv, out, jx, jy, reset, dt_ms, fov_y, sharp > 0,
+                               sharp > 100 ? 1.0f : sharp / 100.0f);
     Up *u = context_for(color->width, color->height, out->width, out->height);
     if (!u) return 0;
     ffxDispatchDescUpscale d = {};
@@ -171,8 +270,6 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.motionVectorScale = {1.0f, 1.0f};
     d.renderSize = {color->width, color->height};
     d.upscaleSize = {out->width, out->height};
-    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1
-    int sharp = cfg_int("NX2NAVI_SHARPNESS");
     d.enableSharpening = sharp > 0;
     d.sharpness = sharp > 100 ? 1.0f : sharp / 100.0f;
     d.frameTimeDelta = dt_ms;
@@ -192,7 +289,7 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
 }
 
 extern "C" ffxReturnCode_t vk_ffx_create(ffxContext *ctx, ffxCreateContextDescHeader *desc) {
-    return vk_ffx_load() ? A.create(ctx, desc, nullptr) : FFX_API_RETURN_ERROR;
+    return vk_ffx_load() && A.ok ? A.create(ctx, desc, nullptr) : FFX_API_RETURN_ERROR;   // the library's own: not native
 }
 extern "C" ffxReturnCode_t vk_ffx_destroy(ffxContext *ctx) { return A.ok ? A.destroy(ctx, nullptr) : FFX_API_RETURN_ERROR; }
 extern "C" ffxReturnCode_t vk_ffx_configure(ffxContext *ctx, const ffxConfigureDescHeader *desc) {
@@ -206,6 +303,7 @@ extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDes
 }
 
 extern "C" void vk_ffx_release(void) {
+    vk_fsr3_release();
     if (!A.ok) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u.ctx = nullptr;

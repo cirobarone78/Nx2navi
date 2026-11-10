@@ -23,6 +23,7 @@
 //     --probe-prewarm   the boot's pipeline stages from the caches next to the executable, the memory each leaves and
 //                       what a compute pipeline's first dispatch costs; skips without recorded shaders, runs no game
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
+//     --probe-fsr3      FSR 3.1 upscaling with the built-in passes (vk_fsr3.c) on a synthetic scene; no game files
 //     --probe-zstd      host zstd streams (ov_zstd.c) on frames made here; needs no game files
 //     --probe-input     gamepad polls on a virtual gamepad, also while SDL's update takes long; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
@@ -496,7 +497,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
+                    "--probe-vkexec | --probe-astc | --probe-fsr3 | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
                     "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
@@ -639,6 +640,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
+    if (!strcmp(mode, "--probe-fsr3")) return probe_fsr3();
     if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();

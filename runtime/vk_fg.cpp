@@ -83,10 +83,11 @@ void fail(const char *what, unsigned r) {
 // Streamline's proxies (NVIDIA's frame generation set at the start, vk_dlssg_dpa): AMD's swapchain there crashed in
 // NVIDIA's driver when the menu switched from NVIDIA's frame generation to AMD's. That switch waits for a restart,
 // as the menu says (menu.cpp row_framegen). Not after a failure (fail): the present code then takes AMD's swapchain
-// down as it does for a switch in the menu, and a plain one follows.
+// down as it does for a switch in the menu, and a plain one follows. Only where AMD's library can load
+// (vk_ffx_framegen_available): the built-in upscaler passes bring no frame generation, so not on Linux.
 extern "C" int vk_fg_wanted(void) {
     return !F.failed && !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") && cfg_bool("NX2NAVI_DLAA") && vk_dlaa_wanted() &&
-           !vk_dlssg_dpa();
+           !vk_dlssg_dpa() && vk_ffx_framegen_available();
 }
 
 // Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.

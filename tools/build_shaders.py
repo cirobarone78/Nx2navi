@@ -4,12 +4,14 @@ The repository holds the shaders as source only. Each becomes runtime/<name>_spv
 `static const uint32_t <name>_spv[]`; the headers are build outputs (ignored by git) and tools/build_game.py builds the
 missing and the stale ones before it compiles the runtime. Three kinds of source:
 
-    runtime/shaders/<name>.comp, .vert, .frag   GLSL, compiled with glslc (one name per shader) and checked with spirv-val
+    runtime/shaders/<name>.comp, .vert, .frag   GLSL, compiled with glslc (one name per shader) and checked with spirv-val;
+                                                an #include is looked for beside the file that has it, then in
+                                                runtime/shaders/ffx3 (AMD's FSR 3.1 headers)
     runtime/shaders/<name>.spvasm               SPIR-V assembly, assembled with spirv-as and checked with spirv-val
     tools/make_dlaa_mask.py, make_mvobj_fs.py   shaders assembled in Python (ASSEMBLED); they need no other tool
 
-A compiled or assembled header records the SHA-256 of its source and is stale when that no longer matches; a Python
-one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
+A compiled or assembled header records the SHA-256 of its source (a GLSL one with every file it includes) and is
+stale when that no longer matches; a Python one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
 Windows (packages mingw-w64-ucrt-x86_64-shaderc and mingw-w64-ucrt-x86_64-spirv-tools) and from PATH elsewhere
 (shaderc, spirv-tools). A folder that carries its headers ready-made (the build kit, tools/make_kit.py) needs none of
 them: nothing there is stale.
@@ -21,6 +23,7 @@ import argparse
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,10 +39,36 @@ ASM = '.spvasm'
 ASM_TARGET = 'vulkan1.3'
 # header name -> the script beside this one that assembles it; the script's HEADER is the header's text
 ASSEMBLED = {'dlaa_mask': 'make_dlaa_mask.py', 'mvobj_fs': 'make_mvobj_fs.py'}
+# Folders of runtime/shaders that glslc searches for an #include after the including file's own folder
+INCLUDE_DIRS = ('ffx3',)
+INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.M)
+
+
+def includes(src):
+    """Every file a GLSL source includes, directly or not, found as glslc finds it (beside the including file, then in
+    INCLUDE_DIRS), in a fixed order."""
+    dirs = [src.parent / d for d in INCLUDE_DIRS]
+    found, todo = [], [src]
+    while todo:
+        f = todo.pop(0)
+        for name in INCLUDE.findall(f.read_text(encoding='utf-8')):
+            for base in (f.parent, *dirs):
+                p = (base / name).resolve()
+                if p.is_file():
+                    if p not in found:
+                        found.append(p)
+                        todo.append(p)
+                    break
+    return found
 
 
 def source_hash(src):
-    return hashlib.sha256(src.read_bytes().replace(b'\r\n', b'\n')).hexdigest()   # the same on a CRLF checkout
+    norm = lambda p: p.read_bytes().replace(b'\r\n', b'\n')   # the same on a CRLF checkout
+    h = hashlib.sha256(norm(src))
+    if src.suffix in STAGES:   # and the headers it includes: a change there makes the header stale as well
+        for inc in includes(src):
+            h.update(b'\0' + inc.name.encode() + b'\0' + norm(inc))
+    return h.hexdigest()
 
 
 def header_of(src, words):
@@ -118,7 +147,8 @@ def words_of(src):
             # tonemap, which runtime/vk_hdr.c splices into the game's shader by function)
             target = TARGET
             opt = [] if '// build_shaders: keep functions' in src.read_text(encoding='utf-8') else ['-O']
-            subprocess.run([tool('glslc'), *opt, f'--target-env={target}', f'-fshader-stage={STAGES[src.suffix]}',
+            inc = [f'-I{src.parent / d}' for d in INCLUDE_DIRS if (src.parent / d).is_dir()]
+            subprocess.run([tool('glslc'), *opt, *inc, f'--target-env={target}', f'-fshader-stage={STAGES[src.suffix]}',
                             '-o', str(spv), str(src)], check=True)
         subprocess.run([tool('spirv-val'), '--target-env', target, str(spv)], check=True)
         data = spv.read_bytes()

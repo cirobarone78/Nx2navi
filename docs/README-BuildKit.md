@@ -101,6 +101,12 @@ one run adds at most 1 GiB while the preparation at the end of the build makes a
 and a limit of 8 GiB itself (`__GL_SHADER_DISK_CACHE_PATH` and `__GL_SHADER_DISK_CACHE_SIZE` in the environment take
 precedence). Deleting the folder costs one slow start; `./ocarina --warm-shaders` fills it again.
 
+AMD FSR 3.1 upscaling runs on Linux too, on any GPU: the game carries its own build of FSR 3.1's upscaler passes
+(AMD's GLSL, compiled into the runtime), so it needs no AMD library there. The menu offers the FSR 3.1 modes under
+Upscaling, and `dlaa = 1` with `taa = fsr3` in `nx2navi.ini` selects it (`dlss` picks the mode). FSR 3.1 frame
+generation still needs AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux `framegen = fsr3`
+leaves the game's own swapchain as it is (the log says so).
+
 `tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
 players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
@@ -113,8 +119,11 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
-- **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
-  on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
+- **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Upscaling (DLSS on NVIDIA RTX cards,
+  FSR 3.1 on any card: through `amd_fidelityfx_vk.dll` where it is beside the game, else, and always on Linux, through
+  the game's own build of its upscaler), Frame generation (NVIDIA DLSS
+  on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card where
+  `amd_fidelityfx_vk.dll` loads; it needs
   DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
   display's refresh rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
   resolution. Those marked "after restart" take effect when the game starts again.
