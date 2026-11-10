@@ -93,8 +93,7 @@ With 16 GB of RAM, add `--jobs 4`: the compiles run beside the 26 GB RomFS image
 processor can fill memory and swap until the kernel stops processes of the desktop session (about 10 minutes on a
 12-thread Ryzen with 4 jobs). Do not play or prepare shaders while it builds.
 
-On NVIDIA, start the game with `NX2NAVI_SHADOW=0` if the 3D world stays black while the HUD draws (issue #72). The
-profile, logs and settings are in the `--out` folder as on Windows.
+The profile, logs and settings are in the `--out` folder as on Windows.
 
 `tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
 players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
