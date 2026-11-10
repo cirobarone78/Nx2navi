@@ -674,6 +674,13 @@
 # Default: every cheat off.
 # cheat_0123abcd = 1
 
+[restorations]
+# Things the original game did that this release changed, each switched on (1) or off (0) on its own, also on the
+# Restorations tab of the menu (F1). Read at start: once, as the game starts, it edits its own files on this PC for the
+# ones switched on and logs each edit, or why it skipped one (a mod or another game version changed what it edits),
+# so a change takes effect at the next start. docs/restorations.md.
+# Default: every one off.
+
 [diagnostics]
 # Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
 # Performance log sets perf (frame timings). Default: none.

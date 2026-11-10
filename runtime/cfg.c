@@ -299,7 +299,8 @@ static const CfgMeta metas[] = {
 static int is_known(const char *key) {
     for (size_t i = 0; i < sizeof known / sizeof *known; i++)
         if (!strcmp(known[i], key)) return 1;
-    return !strncmp(key, "CHEAT_", 6);   // cheats.c and the cheat patch sets (tools/cheats.py)
+    return !strncmp(key, "CHEAT_", 6)      // cheats.c and the cheat patch sets (tools/cheats.py)
+           || !strncmp(key, "RESTORE_", 8);   // restore.c: one key per restoration
 }
 
 static void clear(void) {
@@ -761,6 +762,7 @@ static const char *section_of(const char *key) {
     for (size_t i = 0; i < sizeof sections / sizeof *sections; i++)
         if (!strcmp(sections[i].key, key)) return sections[i].section;
     if (!strncmp(key, "CHEAT_", 6)) return "cheats";   // cheats.c: one key per cheat of the cheat file
+    if (!strncmp(key, "RESTORE_", 8)) return "restorations";   // restore.c: one key per restoration
     return NULL;
 }
 

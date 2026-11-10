@@ -24,7 +24,7 @@
 //
 // The resource size table: with a player mod enabled, the game's table is rebuilt at start with the tables the mods
 // ship merged in and the entries of the mods' files raised to what they need (restbl_overlay), and served from
-// <profile>/mods/ in place of the game's or a mod's table.
+// <profile>/mods/ in place of the game's or a mod's table. A file a restoration edited (restore.c) gets the same.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +39,7 @@
 #include "romfs_path.h"
 #include "platform/platform.h"
 #include "restbl.h"
+#include "restore.h"
 #include "sha256.h"
 
 #include <zstd.h>
@@ -54,7 +55,8 @@ _Static_assert(sizeof(Entry) == 24, "index entry layout");
 typedef struct { uint32_t volume, pad; uint64_t file_id, size, write_time, create_time; } Identity;   // no padding
 // prio: which overlay serves a path two of them give (the higher); romfs-patches 0, the NX2NAVI_ROMFS_MODS manifest 1, a
 // player mod 2 + its distance from the bottom of the order. mod: its index in mods_at + 1, 0 for any other overlay.
-typedef struct { uint64_t index, size; char *path, *name; Identity id; int prio, mod; } Overlay;
+// restored: restore_overlay serves it (a restoration's edits), so restbl_overlay sizes it as a mod file.
+typedef struct { uint64_t index, size; char *path, *name; Identity id; int prio, mod, restored; } Overlay;
 
 static uint8_t *index_bytes;
 static size_t index_size;
@@ -297,7 +299,7 @@ static int overlay_load(const char *dir, int optional, int prio) {
         }
         char *copy = strdup(file), *rel = strdup(name);
         need(copy && rel, "overlay path copy");
-        overlays[noverlay++] = (Overlay){i, size, copy, rel, id, prio, 0};
+        overlays[noverlay++] = (Overlay){i, size, copy, rel, id, prio, 0, 0};
         if (!prio) patches_loaded = 1;
         if (noverlay - first <= 16)
             rt_log("RomFS overlay: %s (%llu bytes) %s", name, size, add ? "is added" : "replaces the original");
@@ -455,7 +457,7 @@ static int mod_walk_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
     plat_file_close(f);
     char *copy = strdup(file), *rp = strdup(i == UINT64_MAX ? path : entry_name(entry(i)));
     need(copy && rp, "overlay path copy");
-    overlay_push((Overlay){i == UINT64_MAX ? ADDED : i, id.size, copy, rp, id, w->prio, w->k + 1});
+    overlay_push((Overlay){i == UINT64_MAX ? ADDED : i, id.size, copy, rp, id, w->prio, w->k + 1, 0});
     return 1;
 }
 
@@ -646,13 +648,13 @@ static Restbl *restbl_unpack(const void *z, size_t n) {
     return t;
 }
 
-// With a player mod (or the NX2NAVI_ROMFS_MODS manifest) serving files: the game's table with every shipped table of this
-// version merged in (an entry larger than the game's wins), the entries a mod's table for another version gives for
-// that mod's files, and each served mod file's entry raised to what its size needs (restbl_grow for a file the game
-// has, restbl_estimate for an added one). Never lowers the game's entries.
+// With a player mod (or the NX2NAVI_ROMFS_MODS manifest, or a restoration) serving files: the game's table with every
+// shipped table of this version merged in (an entry larger than the game's wins), the entries a mod's table for another
+// version gives for that mod's files, and each served mod file's entry raised to what its size needs (restbl_grow for
+// a file the game has, restbl_estimate for an added one). Never lowers the game's entries.
 static void restbl_overlay(void) {
     int player = 0;
-    for (size_t k = 0; k < noverlay; k++) player |= overlays[k].mod || overlays[k].prio == 1;
+    for (size_t k = 0; k < noverlay; k++) player |= overlays[k].mod || overlays[k].prio == 1 || overlays[k].restored;
     if (!player || !restbl_rel[0]) return;
     static const char keeps[] = "mod files that grew may fail to load";
     double t0 = now_s();
@@ -697,7 +699,7 @@ static void restbl_overlay(void) {
     for (size_t k = 0; k < noverlay; k++) {
         Overlay *o = &overlays[k];
         if (o->index == gi) served = o;
-        if ((!o->mod && o->prio != 1) || o->index == gi) continue;
+        if ((!o->mod && o->prio != 1 && !o->restored) || o->index == gi) continue;
         char key[4200];
         restbl_key(o->name, key, sizeof key);
         int mc = ends_with(o->name, ".mc");
@@ -780,6 +782,36 @@ static void camera_overlay(void) {
     free(in);
     free(dic);
     if (ok && serve_generated(CAMPACK, base, out, out_n, "camera", "camera speed", keeps)) cam_pack_served();
+}
+
+// The restorations switched on (restore.c): each file their edits name, as the game would read it (base: a mod's
+// version, else the original), edited and written to <profile>/restore/<its folder>/, served in the base's place and
+// marked for restbl_overlay. restore_apply reads a file and serves it before it reads the next one.
+static Overlay *restore_base;
+static const char restore_keeps[] = "the restorations that edit it skip it";
+
+static void *restore_read(const char *rel, size_t *n) { return read_served(rel, &restore_base, n, restore_keeps); }
+
+static int restore_serve(const char *rel, void *out, size_t n) {
+    char sub[512];
+    const char *slash = strrchr(rel, '/');
+    int dir = slash ? (int)(slash - rel) : 0;
+    if (snprintf(sub, sizeof sub, "restore%s%.*s", dir ? "/" : "", dir, rel) >= (int)sizeof sub) {
+        free(out);
+        return 0;
+    }
+    if (!serve_generated(rel, restore_base, out, n, sub, "restorations", restore_keeps)) return 0;
+    uint64_t i = lower(rel);
+    for (size_t k = 0; k < noverlay; k++)
+        if (overlays[k].index == i) overlays[k].restored = 1;
+    return 1;
+}
+
+static void restore_overlay(void) { restore_apply(restore_read, restore_serve); }
+
+void *romfs_read_served(const char *rel, size_t *n) {
+    Overlay *base;
+    return read_served(rel, &base, n, restore_keeps);
 }
 
 // The button prompts' folders (input_prompts_folder) and whether each had a manifest next to romfs-index.bin at start;
@@ -935,6 +967,7 @@ static void overlay_init(void) {
     restbl_collect();
     overlay_contest();
     mods_overlay_log();
+    restore_overlay();   // before restbl_overlay, which raises the entries of the files it grew
     restbl_overlay();
     heapdef_overlay();
     camera_overlay();
