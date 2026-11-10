@@ -1,14 +1,23 @@
 // Co-op session layer (coop.h): the state machine of one player's connection to a relay, and the thread that runs it.
 //
 // States: OFF (the COOP setting is off), LEFT (on, in no room), CONNECTING (reaching the relay to create or join a room),
-// JOINED, RECONNECTING (the relay went silent; joining the same room again as the same client).
+// JOINED, RECONNECTING (the relay went silent; joining the same room again as the same member).
 //
-// Reaching the relay is a cookie exchange (tools/coop_relay.py): a CONNECT padded to 64 bytes is answered by a CHALLENGE
-// with a cookie, a CONNECT that carries the cookie is answered by JOINED or an ERROR. A burst of four CONNECTs 250 ms apart
-// carries the exchange over a lossy path; a burst without an answer is followed by a wait of 1, 2, 4, 8, then 15 s. In a room
-// a PING every 2 s keeps the NAT mapping open and measures the round trip, and 8 s without any datagram from the relay is
-// RECONNECTING. The relay forwards the players' messages (DATA datagrams) unread; each carries the sender's tag, which the
-// receivers check with the room key, and a counter the receivers use to drop duplicates.
+// A room is its secret (coop_proto.h): the relay knows it by the locator derived from it, and the players seal their
+// messages with the message key derived from it, so the relay forwards what it cannot read, change or make.
+//
+// Reaching the relay is a cookie exchange (tools/coop_relay.py): a CONNECT is answered by a CHALLENGE with a cookie, a
+// CONNECT that carries the cookie is answered by JOINED or an ERROR. Every answer carries the nonce of the attempt and
+// the locator's tag, so a datagram someone else sends from the relay's address does not end or redirect the attempt.
+// A burst of four CONNECTs 250 ms apart carries the exchange over a lossy path; a burst without an answer is followed by
+// a wait of 1, 2, 4, 8, then 15 s. In a room a PING every 2 s keeps the NAT mapping open and measures the round trip,
+// and 8 s without any datagram from the relay is RECONNECTING. JOINED hands out a rejoin token, which a later CONNECT of
+// the same member carries: the relay gives a member's id back only to it.
+//
+// Every join is a new session: a random number the CONNECT tells the relay, which lists it in the roster. A player's
+// messages carry its session and a counter from 1 in the sealed envelope; the others take a message only of the session
+// the roster names for its sender and only once (a window of 64 counters), so a message recorded before a rejoin, or
+// sent twice, is refused.
 //
 // One thread owns the socket, the DNS lookup and the state. Other threads reach it through a mailbox (commands, settings), an
 // outbox (messages to send) and a copy of the state they may read; all three sit behind one lock that the thread holds only
@@ -24,7 +33,6 @@
 #include "coop_app.h"
 #include "host.h"
 #include "platform/platform.h"
-#include "sha256.h"
 
 enum {
     PING_MS = 2000, SILENCE_MS = 8000, BURST_GAP_MS = 250, BACKOFF_FIRST_MS = 1000, BACKOFF_MAX_MS = 15000,
@@ -38,17 +46,17 @@ enum {
     TICK_HOOKS = 4,
 };
 
-typedef struct { uint8_t dst; uint16_t len; uint8_t data[COOP_MAX_PAYLOAD]; } OutMsg;
+typedef struct { uint8_t dst, kind; uint16_t len; uint8_t data[COOP_MAX_MESSAGE]; } OutMsg;
 typedef struct { CoopMsgFn fn; void *user; } MsgHandler;
 typedef struct { CoopViewFn fn; void *user; } ViewHook;
 typedef struct { CoopTickFn fn; void *user; } TickHook;
 
 // A cause that logs at most once per LOG_EVERY_MS.
-enum { L_MALFORMED, L_SENDER, L_TAG, L_OUTBOX, L_NO_SERVER, L_RESOLVE, L_SOCKET, L_CAUSES };
+enum { L_MALFORMED, L_SENDER, L_TAG, L_REPLAY, L_OUTBOX, L_NO_SERVER, L_RESOLVE, L_SOCKET, L_CAUSES };
 
-// A window of the last 64 counters of one sender, to drop a datagram the network delivered twice. A counter far outside the
-// window (a sender that restarted) starts a new window; a replayed old datagram is harmless, every message is idempotent.
-typedef struct { uint32_t high; uint64_t bits; int valid; } Window;
+// The counters of one sender's session seen last: a counter at most 64 below the highest is taken once, an older one
+// never. A new session (the roster names it) starts a new window.
+typedef struct { uint64_t session; uint32_t high; uint64_t bits; int valid; } Window;
 
 struct CoopSess {
     // ---- settings, set by coop_sess_new and coop_sess_configure
@@ -65,13 +73,14 @@ struct CoopSess {
     PlatMutex lock;
     PlatEvent off_done;
     int cmd;                                    // a command waiting (COOP_CMD_*), 0 none; a later one replaces it
-    char cmd_code[COOP_CODE_LEN + 1];
+    char cmd_secret[COOP_SECRET_LEN + 1];
+    int cmd_remove;                             // a member the maker removes, 0 none
     int cfg_pending;                            // pending holds settings the thread has not applied
     struct { char server[160], name[COOP_NAME_MAX + 1]; uint64_t client_id; uint16_t local_port; unsigned drop_pct; int retry, on; } pending;
     OutMsg *out;
     unsigned out_head, out_tail;
     CoopView view;
-    uint64_t heard_at[COOP_MAX_MEMBERS + 1];    // last message of each member, by id; 0 never
+    uint64_t heard_at[COOP_MAX_MEMBERS + 1];    // last message of each member that opened, by id; 0 never
     MsgHandler msg[256];
     ViewHook hooks[VIEW_HOOKS];
     int n_hooks;
@@ -85,20 +94,21 @@ struct CoopSess {
     PlatUdp *sock;
     PlatAddr relay;
     int relay_known;
-    char relay_text[64];                        // the relay's resolved address, for the log
-    int intent, made_room, have_key;            // CONNECT's intent; this player created the room; key is valid
-    char want[COOP_CODE_LEN + 1];               // the room being joined or made ("" a create without a chosen code)
-    uint8_t key[COOP_KEY_LEN];                  // of want
-    uint8_t cookie[COOP_COOKIE_LEN];
-    int have_cookie, said_answer, heard_relay;
-    uint32_t connect_seq, out_seq;
+    char relay_text[64];                        // the relay's resolved address, for the trace
+    int intent, made_room;                      // CONNECT's intent; this player made the room (the relay says so)
+    char want[COOP_SECRET_LEN + 1];             // the secret of the room being joined or made
+    uint8_t locator[COOP_KEY_LEN];              // of want: the relay's name of the room and the tags' key
+    uint8_t msg_key[COOP_MSG_KEY_LEN];          // of want: seals the players' messages
+    uint64_t session, nonce;                    // this join's session (in the roster); this attempt's nonce
+    uint8_t cookie[COOP_COOKIE_LEN], token[COOP_COOKIE_LEN];
+    int have_cookie, have_token, said_answer, heard_relay;
+    uint32_t connect_seq, out_seq, out_counter;
     uint64_t next_tx, last_connect_tx, last_rx, next_ping, next_stats, rename_at;
     uint32_t backoff;
     int burst_left;
     uint32_t room;
     int self;
-    char code[COOP_CODE_LEN + 1];
-    uint8_t room_key[COOP_KEY_LEN];
+    char secret[COOP_SECRET_LEN + 1];           // of the room we are in
     CoopRoster roster;
     uint32_t roster_seq;
     Window rw[COOP_MAX_MEMBERS + 1];
@@ -144,6 +154,7 @@ static const char *type_name(unsigned t) {
     case COOP_T_PING: return "PING";
     case COOP_T_PONG: return "PONG";
     case COOP_T_LEAVE: return "LEAVE";
+    case COOP_T_KICK: return "KICK";
     case COOP_T_DATA: return "DATA";
     default: return "?";
     }
@@ -156,8 +167,22 @@ static uint32_t rnd(CoopSess *s) {   // xorshift64*: for the test drop and nothi
     return (uint32_t)((s->rng * 0x2545F4914F6CDD1Dull) >> 32);
 }
 
+// 64 random bits from the system's source (sessions, nonces); never 0.
+static uint64_t random64(CoopSess *s) {
+    uint64_t v = 0;
+    if (!plat_random(&v, sizeof v)) v = ((uint64_t)rnd(s) << 32 | rnd(s)) ^ plat_now_ns();
+    return v ? v : 1;
+}
+
 static void copy_str(char *dst, size_t cap, const char *src) {
     snprintf(dst, cap, "%s", src ? src : "");
+}
+
+// "XXX…" of a secret, for the log: the whole secret never goes there.
+static const char *label_of(const char *secret, char out[8]) {
+    if (secret[0]) coop_secret_short(secret, out);
+    else copy_str(out, 8, "");
+    return out;
 }
 
 static void set_status(CoopSess *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -221,35 +246,39 @@ int coop_server_parse(const char *text, char *host, size_t cap, uint16_t *port) 
 
 // ---- sending
 
-// One datagram to the relay. key NULL gives a zero tag.
+// One datagram to the relay, tagged with the locator.
 static void send_dgram(CoopSess *s, uint8_t type, uint32_t room, uint8_t src, uint8_t dst, uint32_t seq,
-                       const void *payload, size_t n, const uint8_t *key) {
+                       const void *payload, size_t n) {
     uint8_t d[COOP_MAX_DGRAM];
     CoopHdr h = {.ver = COOP_PROTO, .type = type, .src = src, .dst = dst, .room = room, .seq = seq};
-    size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, key);
+    size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, s->locator);
     if (!k || !s->sock || !s->relay_known) return;
     plat_udp_send(s->sock, &s->relay, d, k);
     s->n_tx++;
-    if (rt_trace & RT_TRACE_COOP) {
-        if (type == COOP_T_DATA && n) say(s, "tx DATA kind %u to %u, %zu bytes", ((const uint8_t *)payload)[0], dst, k);
-        else say(s, "tx %s, %zu bytes", type_name(type), k);
-    }
+    TRACE(s, "tx %s to %u, %zu bytes", type_name(type), dst, k);
 }
 
 // A datagram of the room we are in.
 static void send_room(CoopSess *s, uint8_t type, uint8_t dst, const void *payload, size_t n) {
-    send_dgram(s, type, s->room, (uint8_t)s->self, dst, s->out_seq++, payload, n, s->room_key);
+    send_dgram(s, type, s->room, (uint8_t)s->self, dst, s->out_seq++, payload, n);
+}
+
+// A player message, sealed with the room's message key under this session and the next counter.
+static void send_sealed(CoopSess *s, uint8_t dst, uint8_t kind, const void *bytes, size_t n) {
+    uint8_t payload[COOP_MAX_PAYLOAD];
+    size_t k = coop_seal(payload, sizeof payload, s->msg_key, (uint8_t)s->self, dst, s->session, ++s->out_counter, kind, bytes, n);
+    if (k) send_room(s, COOP_T_DATA, dst, payload, k);
 }
 
 static void send_connect(CoopSess *s, uint64_t now) {
-    CoopConnect c = {.intent = (uint8_t)s->intent, .client_id = s->client_id};
-    uint8_t payload[96];
-    copy_str(c.code, sizeof c.code, s->want);
+    CoopConnect c = {.intent = (uint8_t)s->intent, .client_id = s->client_id, .session = s->session, .nonce = s->nonce};
+    uint8_t payload[128];
+    memcpy(c.locator, s->locator, COOP_KEY_LEN);
     copy_str(c.name, sizeof c.name, s->name);
     if (s->have_cookie) memcpy(c.cookie, s->cookie, COOP_COOKIE_LEN);
+    if (s->have_token) memcpy(c.token, s->token, COOP_COOKIE_LEN);
     size_t n = coop_connect_pack(payload, sizeof payload, &c);
-    // the first CONNECT has no cookie and a zero tag; the one that carries the cookie is tagged when there is a code
-    send_dgram(s, COOP_T_CONNECT, 0, 0, 0, s->connect_seq, payload, n, s->have_cookie && s->have_key ? s->key : NULL);
+    send_dgram(s, COOP_T_CONNECT, 0, 0, 0, s->connect_seq, payload, n);
     if (!s->have_cookie) s->last_connect_tx = now;
 }
 
@@ -263,10 +292,8 @@ static void close_socket(CoopSess *s) {
 // Tells the others and the relay, twice (a datagram may be lost): BYE to every member, then LEAVE.
 static void say_goodbye(CoopSess *s) {
     if (!s->sock || !s->relay_known || !s->room) return;
-    uint8_t bye[1];
-    size_t n = coop_peer_pack(bye, sizeof bye, COOP_K_BYE, NULL, 0);
     for (int i = 0; i < 2; i++) {
-        if (s->state == COOP_JOINED) send_room(s, COOP_T_DATA, COOP_DST_ALL, bye, n);
+        if (s->state == COOP_JOINED) send_sealed(s, COOP_DST_ALL, COOP_K_BYE, NULL, 0);
         send_room(s, COOP_T_LEAVE, 0, NULL, 0);
     }
 }
@@ -279,8 +306,9 @@ static void go_left(CoopSess *s, const char *why, int log_it) {
         else say(s, "no room: %s", why);
     }
     close_socket(s);
-    s->room = 0, s->self = 0;
+    s->room = 0, s->self = 0, s->made_room = 0;
     s->roster.n = 0;
+    s->have_token = 0;
     memset(s->rw, 0, sizeof s->rw);
     set_state(s, COOP_LEFT);
     set_status(s, "%s", why);
@@ -300,10 +328,11 @@ static int ensure_socket(CoopSess *s, uint64_t now) {
         }
     }
     if (!s->relay_known) {
-        say(s, "connecting to %s", s->server);
+        say(s, "connecting to the relay");
+        TRACE(s, "the relay is %s", s->server);
         if (!plat_net_resolve(s->host, s->port, &s->relay)) {
-            set_status(s, "cannot find the server %s", s->host);
-            SAY_LIMITED(s, L_RESOLVE, now, "cannot resolve %s", s->host);
+            set_status(s, "cannot find the relay's address");
+            SAY_LIMITED(s, L_RESOLVE, now, "cannot resolve the relay's name");
             return 0;
         }
         plat_addr_str(&s->relay, s->relay_text, sizeof s->relay_text);
@@ -318,20 +347,22 @@ static void schedule_backoff(CoopSess *s, uint64_t now) {
     s->backoff = s->backoff * 2 > s->backoff_max_ms ? s->backoff_max_ms : s->backoff * 2;
 }
 
-// A new attempt to get into a room: intent, the room's code ("" none), and whether it is a rejoin of the room we were in.
-static void begin_episode(CoopSess *s, int intent, const char *code, int rejoin, uint64_t now) {
+// A new attempt to get into a room: intent, the room's secret, and whether it is a rejoin of the room we were in (which
+// keeps the rejoin token). Every attempt is a new session and a new nonce.
+static void begin_episode(CoopSess *s, int intent, const char *secret, int rejoin, uint64_t now) {
     s->intent = intent;
-    if (code != s->want) copy_str(s->want, sizeof s->want, code);   // a rejoin passes the code it already holds
-    s->have_key = s->want[0] != 0;
-    if (s->have_key) coop_room_key(s->want, s->key);
+    if (secret != s->want) copy_str(s->want, sizeof s->want, secret);   // a rejoin passes the secret it already holds
+    coop_room_keys(s->want, s->locator, s->msg_key);
+    s->session = random64(s), s->nonce = random64(s), s->out_counter = 0;
     s->connect_seq = s->out_seq++;
     s->have_cookie = s->said_answer = s->heard_relay = 0;
+    if (!rejoin) s->have_token = 0;
     s->burst_left = 0;
     s->next_tx = now;
     s->backoff = s->backoff_first_ms;
     s->relay_known = 0;   // looked up again: the name may point elsewhere by now
     if (!rejoin) {
-        s->room = 0, s->self = 0;
+        s->room = 0, s->self = 0, s->made_room = 0;
         s->roster.n = 0;
     }
     set_state(s, rejoin ? COOP_RECONNECTING : COOP_CONNECTING);
@@ -357,11 +388,6 @@ static void connect_timers(CoopSess *s, uint64_t now) {
 
 // ---- the roster
 
-static void format_code(const char *code, char out[COOP_CODE_LEN + 2]) {
-    if (code[0]) coop_code_format(code, out);
-    else out[0] = 0;
-}
-
 // 1 when every id of r is 1..8 and none repeats: what the rest of the code indexes by.
 static int roster_valid(const CoopRoster *r) {
     unsigned seen = 0;
@@ -373,18 +399,30 @@ static int roster_valid(const CoopRoster *r) {
     return 1;
 }
 
+static const CoopMemberInfo *member_of(const CoopSess *s, int id) {
+    for (int i = 0; i < s->roster.n; i++)
+        if (s->roster.m[i].id == id) return &s->roster.m[i];
+    return NULL;
+}
+
 // The roster the relay sent replaces ours; the log tells who came, went, changed name or went away.
 static void apply_roster(CoopSess *s, const CoopRoster *r) {
     for (int i = 0; i < r->n; i++) {
-        const CoopMemberInfo *m = &r->m[i], *old = NULL;
-        for (int j = 0; j < s->roster.n; j++)
-            if (s->roster.m[j].id == m->id) old = &s->roster.m[j];
-        if (m->id == s->self) continue;
+        const CoopMemberInfo *m = &r->m[i], *old = member_of(s, m->id);
+        if (m->id == s->self) {
+            s->made_room = (m->flags & COOP_FLAG_MAKER) != 0;
+            continue;
+        }
         if (!old) say(s, "%s (member %u) joined the room", m->name, m->id);
         else if (strcmp(old->name, m->name)) say(s, "member %u is now %s", m->id, m->name);
         else if ((old->flags ^ m->flags) & COOP_FLAG_AWAY)
             say(s, "%s (member %u) %s", m->name, m->id, m->flags & COOP_FLAG_AWAY ? "is away" : "is back");
-        if (!old) s->rw[m->id] = (Window){0};   // a new member starts a new counter
+        if (!old || old->session != m->session) {   // a new member, or a new session of it: nothing heard from it yet
+            s->rw[m->id] = (Window){0};
+            plat_mutex_lock(&s->lock);
+            s->heard_at[m->id] = 0;
+            plat_mutex_unlock(&s->lock);
+        }
     }
     for (int j = 0; j < s->roster.n; j++) {
         int id = s->roster.m[j].id, found = 0;
@@ -402,42 +440,51 @@ static void apply_roster(CoopSess *s, const CoopRoster *r) {
 
 // ---- receiving
 
-// 1 when seq is new for this sender's window; 0 when it is a duplicate.
-static int window_accept(Window *w, uint32_t seq) {
-    if (!w->valid) {
-        *w = (Window){.high = seq, .bits = 1, .valid = 1};
-        return 1;
-    }
-    int32_t d = (int32_t)(seq - w->high);
-    if (d > 0) {
-        w->bits = d >= 64 ? 0 : w->bits << d;
-        w->bits |= 1;
-        w->high = seq;
-        return 1;
-    }
-    if (d <= -64) {   // far behind: the sender restarted
-        *w = (Window){.high = seq, .bits = 1, .valid = 1};
-        return 1;
-    }
-    uint64_t bit = 1ull << (unsigned)-d;
-    if (w->bits & bit) return 0;
-    w->bits |= bit;
-    return 1;
+// 1 when counter of session is new in the window; nothing changes (commit after the message opened).
+static int window_check(const Window *w, uint64_t session, uint32_t counter) {
+    if (!w->valid || w->session != session) return 1;
+    int32_t d = (int32_t)(counter - w->high);
+    if (d > 0) return 1;
+    if (d <= -64) return 0;   // too old to tell: refused, as a replay would be
+    return !(w->bits >> (unsigned)-d & 1);
 }
 
-// The on_* handlers return 1 for a datagram that passed its tag check and made sense: only those show the relay is there.
-static int on_challenge(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
-    if ((s->state != COOP_CONNECTING && s->state != COOP_RECONNECTING) || h->len != COOP_COOKIE_LEN) return 0;
-    if (s->have_key ? !coop_dgram_verify(d, n, s->key) : !coop_dgram_tag_zero(d)) {
+static void window_commit(Window *w, uint64_t session, uint32_t counter) {
+    if (!w->valid || w->session != session) {
+        *w = (Window){.session = session, .high = counter, .bits = 1, .valid = 1};
+        return;
+    }
+    int32_t d = (int32_t)(counter - w->high);
+    if (d > 0) {
+        w->bits = d >= 64 ? 1 : w->bits << d | 1;
+        w->high = counter;
+    } else {
+        w->bits |= 1ull << (unsigned)-d;
+    }
+}
+
+// The answers to a CONNECT: the attempt's nonce and the locator's tag.
+static int answer_ok(CoopSess *s, const uint8_t *d, size_t n, uint64_t nonce) {
+    if (nonce != s->nonce || !coop_dgram_verify(d, n, s->locator)) {
         s->n_bad_tag++, s->n_lost++;
         return 0;
     }
-    memcpy(s->cookie, p, COOP_COOKIE_LEN);
+    return 1;
+}
+
+// The on_* handlers return 1 for a datagram that passed its checks and made sense: only those show the relay is there.
+static int on_challenge(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
+    uint64_t nonce;
+    uint8_t cookie[COOP_COOKIE_LEN];
+    if ((s->state != COOP_CONNECTING && s->state != COOP_RECONNECTING) || !coop_challenge_parse(p, h->len, &nonce, cookie)) return 0;
+    if (!answer_ok(s, d, n, nonce)) return 0;
+    memcpy(s->cookie, cookie, COOP_COOKIE_LEN);
     s->have_cookie = 1;
     s->heard_relay = 1;
     if (!s->said_answer) {
         s->said_answer = 1;
-        say(s, "relay %s answered in %u ms", s->relay_text, (unsigned)(now - s->last_connect_tx));
+        say(s, "the relay answered in %u ms", (unsigned)(now - s->last_connect_tx));
+        TRACE(s, "the relay is at %s", s->relay_text);
     }
     send_connect(s, now);   // the CONNECT with the cookie, at once
     return 1;
@@ -446,71 +493,44 @@ static int on_challenge(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *
 static int on_joined(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
     if (s->state != COOP_CONNECTING && s->state != COOP_RECONNECTING) return 0;
     CoopJoined j;
-    uint8_t key[COOP_KEY_LEN];
     if (!coop_joined_parse(p, h->len, &j) || !h->room || j.member < 1 || j.member > COOP_MAX_MEMBERS || !roster_valid(&j.roster)) {
         s->n_malformed++, s->n_lost++;
         return 0;
     }
-    coop_room_key(j.code, key);
-    // a join is for the room asked for; a create takes the code the relay made (or the one it allowed us to choose)
-    if (!coop_dgram_verify(d, n, key) || (s->intent == COOP_INTENT_JOIN && memcmp(j.code, s->want, COOP_CODE_LEN))) {
-        s->n_bad_tag++, s->n_lost++;
-        return 0;
-    }
+    if (!answer_ok(s, d, n, j.nonce)) return 0;   // the room asked for (our locator), this attempt (our nonce)
     int rejoined = s->state == COOP_RECONNECTING;
     s->room = h->room;
     s->self = j.member;
-    memcpy(s->code, j.code, sizeof s->code);
-    memcpy(s->room_key, key, COOP_KEY_LEN);
-    copy_str(s->want, sizeof s->want, j.code);   // a later rejoin asks for this room
-    memcpy(s->key, key, COOP_KEY_LEN);
-    s->have_key = 1;
-    s->roster = j.roster;
+    memcpy(s->secret, s->want, sizeof s->secret);
+    memcpy(s->token, j.token, COOP_COOKIE_LEN);
+    s->have_token = 1;
+    s->roster.n = 0;
+    apply_roster(s, &j.roster);
     s->roster_seq = h->seq;
-    memset(s->rw, 0, sizeof s->rw);
     s->last_rx = now;
     s->next_ping = now + s->ping_ms;
     s->next_stats = now + STATS_MS;
-    plat_mutex_lock(&s->lock);
-    memset(s->heard_at, 0, sizeof s->heard_at);
-    plat_mutex_unlock(&s->lock);
-    char shown[COOP_CODE_LEN + 2];
-    coop_code_format(s->code, shown);
-    if (rejoined) say(s, "rejoined room %s as member %u", shown, s->self);
-    else if (s->intent == COOP_INTENT_CREATE) say(s, "room %s created (member %u)", shown, s->self);
-    else say(s, "joined room %s as member %u", shown, s->self);
-    if (!rejoined) s->made_room = s->intent == COOP_INTENT_CREATE;
-    for (int i = 0; i < s->roster.n; i++)
-        if (s->roster.m[i].id != s->self) say(s, "%s (member %u) is in the room", s->roster.m[i].name, s->roster.m[i].id);
+    char label[8];
+    label_of(s->secret, label);
+    if (rejoined) say(s, "rejoined room %s as member %u", label, s->self);
+    else if (s->intent == COOP_INTENT_CREATE) say(s, "room %s created (member %u)", label, s->self);
+    else say(s, "joined room %s as member %u", label, s->self);
     set_state(s, COOP_JOINED);
     set_status(s, "%s", "");
     s->dirty = 1;
     return 1;
 }
 
-static int on_error(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
-    if (s->state != COOP_CONNECTING && s->state != COOP_RECONNECTING) return 0;
-    CoopError e;
-    if (!coop_error_parse(p, h->len, &e)) {
-        s->n_malformed++, s->n_lost++;
-        return 0;
-    }
-    // tagged with the room key when the CONNECT had a code; the relay cannot tag what it answers to a create without one,
-    // nor a protocol mismatch
-    int ok = (s->have_key && coop_dgram_verify(d, n, s->key)) || (coop_dgram_tag_zero(d) && (!s->have_key || e.reason == COOP_E_PROTO));
-    if (!ok) {
-        s->n_bad_tag++, s->n_lost++;
-        return 0;
-    }
-    char shown[COOP_CODE_LEN + 2];
-    format_code(s->want, shown);
-    switch (e.reason) {
+static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
+    char label[8];
+    label_of(s->want, label);
+    switch (reason) {
     case COOP_E_NO_ROOM:
         if (s->state == COOP_RECONNECTING) {   // the relay lost the room: a restart
-            say(s, "room %s is gone from the relay", shown);
+            say(s, "room %s is gone from the relay", label);
             if (!s->retry) go_left(s, "the room is closed", 0);
             else if (s->made_room) {
-                say(s, "creating room %s again", shown);
+                say(s, "creating room %s again", label);
                 begin_episode(s, COOP_INTENT_CREATE, s->want, 0, now);
                 set_status(s, "the room was lost; creating it again");
             } else {
@@ -519,7 +539,7 @@ static int on_error(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, c
             }
         } else if (s->retry) {   // not made yet, perhaps: wait and ask again
             s->heard_relay = 1;
-            set_status(s, "room %s not found; waiting for it", shown);
+            set_status(s, "room %s not found; waiting for it", label);
             if (s->burst_left || now >= s->next_tx) {   // the first answer of a burst ends it; a CONNECT sent twice is answered twice
                 s->burst_left = 0;
                 schedule_backoff(s, now);
@@ -530,18 +550,34 @@ static int on_error(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, c
         break;
     case COOP_E_ROOM_FULL: go_left(s, "the room is full", 1); break;
     case COOP_E_PROTO: go_left(s, "update required: the relay speaks another protocol version", 1); break;
-    case COOP_E_RATE: go_left(s, "too many joins from this address; try again in a minute", 1); break;
-    case COOP_E_BAD_TAG: go_left(s, "the relay did not accept the room code", 1); break;
+    case COOP_E_RATE: go_left(s, "too many joins from this network; try again in a minute", 1); break;
+    case COOP_E_BAD_TAG: go_left(s, "the relay did not accept the room's tag", 1); break;
     case COOP_E_SERVER_FULL: go_left(s, "the relay is full", 1); break;
+    case COOP_E_ROOM_EXISTS: go_left(s, "a room with this secret is already open on the relay: join it", 1); break;
+    case COOP_E_REMOVED: go_left(s, "the room's maker removed this player", 1); break;
     default: go_left(s, "the relay refused", 1); break;
     }
+}
+
+static int on_error(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
+    int connecting = s->state == COOP_CONNECTING || s->state == COOP_RECONNECTING;
+    CoopError e;
+    if (!coop_error_parse(p, h->len, &e)) {
+        s->n_malformed++, s->n_lost++;
+        return 0;
+    }
+    // an answer to this attempt; in a room, only a removal (nonce 0, the room's tag)
+    if (connecting ? !answer_ok(s, d, n, e.nonce) : s->state != COOP_JOINED || e.reason != COOP_E_REMOVED || h->room != s->room ||
+                                                        !answer_ok(s, d, n, 0))
+        return 0;
+    refused(s, e.reason, now);
     return 1;
 }
 
 static int on_roster(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p) {
     CoopRoster r;
     if (s->state != COOP_JOINED || h->room != s->room) return 0;
-    if (!coop_dgram_verify(d, n, s->room_key)) {
+    if (!coop_dgram_verify(d, n, s->locator)) {
         s->n_bad_tag++, s->n_lost++;
         return 0;
     }
@@ -559,7 +595,7 @@ static int on_roster(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, 
 static int on_pong(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
     uint32_t token;
     if (s->state != COOP_JOINED || h->room != s->room || !coop_u32_parse(p, h->len, &token)) return 0;
-    if (!coop_dgram_verify(d, n, s->room_key)) {
+    if (!coop_dgram_verify(d, n, s->locator)) {
         s->n_bad_tag++, s->n_lost++;
         return 0;
     }
@@ -573,32 +609,37 @@ static int on_pong(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, co
 }
 
 static int on_data(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, uint64_t now) {
+    (void)d, (void)n;
     if (s->state != COOP_JOINED || h->room != s->room) return 0;
-    if (h->src < 1 || h->src > COOP_MAX_MEMBERS || h->src == s->self || (h->dst != COOP_DST_ALL && h->dst != s->self)) {
+    const CoopMemberInfo *m = h->src != s->self ? member_of(s, h->src) : NULL;
+    uint64_t session;
+    uint32_t counter;
+    if (!m || (h->dst != COOP_DST_ALL && h->dst != s->self)) {
         s->n_sender++, s->n_lost++;
-        SAY_LIMITED(s, L_SENDER, now, "a DATA datagram from member %u to %u was thrown away", h->src, h->dst);
+        SAY_LIMITED(s, L_SENDER, now, "a message from member %u to %u was thrown away: not a member the roster names", h->src, h->dst);
         return 0;
     }
-    if (!coop_dgram_verify(d, n, s->room_key)) {
-        s->n_bad_tag++, s->n_lost++;
-        SAY_LIMITED(s, L_TAG, now, "a DATA datagram with a wrong tag was thrown away");
-        return 0;
-    }
-    uint8_t kind;
-    const uint8_t *bytes;
-    size_t nb;
-    if (!coop_peer_parse(p, h->len, &kind, &bytes, &nb)) {
+    if (!coop_envelope_peek(p, h->len, &session, &counter)) {
         s->n_malformed++, s->n_lost++;
         return 0;
     }
-    if (!window_accept(&s->rw[h->src], h->seq)) {
+    if (session != m->session || !window_check(&s->rw[h->src], session, counter)) {   // an earlier session's, or seen
         s->n_dup++, s->n_lost++;
+        SAY_LIMITED(s, L_REPLAY, now, "a message of member %u that is not of its present session, or seen before, was thrown away", h->src);
         return 0;
     }
+    uint8_t kind, bytes[COOP_MAX_PAYLOAD];
+    size_t nb;
+    if (!coop_open(p, h->len, s->msg_key, h->src, h->dst, &kind, bytes, sizeof bytes, &nb)) {
+        s->n_bad_tag++, s->n_lost++;
+        SAY_LIMITED(s, L_TAG, now, "a message that does not open with the room's key was thrown away");
+        return 0;
+    }
+    window_commit(&s->rw[h->src], session, counter);
     plat_mutex_lock(&s->lock);
     s->heard_at[h->src] = now;
     plat_mutex_unlock(&s->lock);
-    TRACE(s, "rx DATA kind %u from member %u, %zu bytes", kind, h->src, nb);
+    TRACE(s, "rx message kind %u from member %u, %zu bytes", kind, h->src, nb);
     CoopMsgFn fn = __atomic_load_n(&s->msg[kind].fn, __ATOMIC_ACQUIRE);
     if (fn) fn(h->src, bytes, nb, s->msg[kind].user);
     return 1;
@@ -621,7 +662,16 @@ static void handle_datagram(CoopSess *s, size_t n, const PlatAddr *from, uint64_
         SAY_LIMITED(s, L_SENDER, now, "a datagram from an address that is not the relay was thrown away");
         return;
     }
-    if (h.ver != COOP_PROTO && h.type != COOP_T_ERROR) return;
+    if (h.ver != COOP_PROTO) {
+        // a relay of another version answers a CONNECT with an untagged ERROR it cannot word in our format: taken only
+        // as the first answer of an attempt, so a stray one does not end a session
+        if (h.type == COOP_T_ERROR && coop_dgram_tag_zero(s->rx) && !s->heard_relay &&
+            (s->state == COOP_CONNECTING || s->state == COOP_RECONNECTING)) {
+            s->n_rx++;
+            refused(s, COOP_E_PROTO, now);
+        }
+        return;
+    }
     TRACE(s, "rx %s, %zu bytes", type_name(h.type), n);
     int ok = 0;
     switch (h.type) {
@@ -650,16 +700,16 @@ static void flush_outbox(CoopSess *s) {
             return;
         }
         OutMsg *slot = &s->out[s->out_tail];
-        m.dst = slot->dst, m.len = slot->len;
+        m.dst = slot->dst, m.kind = slot->kind, m.len = slot->len;
         memcpy(m.data, slot->data, slot->len);
         s->out_tail = (s->out_tail + 1) % OUT_SLOTS;
         plat_mutex_unlock(&s->lock);
-        if (s->state == COOP_JOINED) send_room(s, COOP_T_DATA, m.dst, m.data, m.len);   // anywhere else it is dropped
+        if (s->state == COOP_JOINED) send_sealed(s, m.dst, m.kind, m.data, m.len);   // anywhere else it is dropped
     }
 }
 
 int coop_sess_send(CoopSess *s, int member, uint8_t kind, const void *bytes, size_t n) {
-    if (!__atomic_load_n(&s->pub_joined, __ATOMIC_ACQUIRE) || n + 1 > COOP_MAX_PAYLOAD || member < 0 ||
+    if (!__atomic_load_n(&s->pub_joined, __ATOMIC_ACQUIRE) || n > COOP_MAX_MESSAGE || member < 0 ||
         (member > COOP_MAX_MEMBERS && member != COOP_DST_ALL))
         return 0;
     plat_mutex_lock(&s->lock);
@@ -671,7 +721,9 @@ int coop_sess_send(CoopSess *s, int member, uint8_t kind, const void *bytes, siz
     }
     OutMsg *slot = &s->out[s->out_head];
     slot->dst = member ? (uint8_t)member : COOP_DST_ALL;
-    slot->len = (uint16_t)coop_peer_pack(slot->data, sizeof slot->data, kind, bytes, n);
+    slot->kind = kind;
+    slot->len = (uint16_t)n;
+    if (n) memcpy(slot->data, bytes, n);
     s->out_head = next;
     plat_mutex_unlock(&s->lock);
     return 1;
@@ -701,7 +753,7 @@ static void apply_settings(CoopSess *s, uint64_t now) {
         s->relay_known = 0;
         s->host[0] = 0;
         if (s->server[0] && !coop_server_parse(s->server, s->host, sizeof s->host, &s->port))
-            say(s, "the server \"%s\" is not host or host:port", s->server);
+            say(s, "the coop_server setting is not host or host:port");
         if (s->state == COOP_JOINED || s->state == COOP_RECONNECTING) {
             say_goodbye(s);
             go_left(s, "the server changed", 1);
@@ -722,7 +774,7 @@ static void apply_settings(CoopSess *s, uint64_t now) {
             say(s, "left room (co-op turned off)");
         }
         close_socket(s);
-        s->room = 0, s->self = 0, s->roster.n = 0;
+        s->room = 0, s->self = 0, s->made_room = 0, s->roster.n = 0;
         s->rename_at = 0;
         set_state(s, COOP_OFF);
         set_status(s, "%s", "");
@@ -731,7 +783,7 @@ static void apply_settings(CoopSess *s, uint64_t now) {
     }
 }
 
-static void do_command(CoopSess *s, int cmd, const char *code, uint64_t now) {
+static void do_command(CoopSess *s, int cmd, const char *secret, uint64_t now) {
     if (s->state == COOP_OFF) return;
     switch (cmd) {
     case COOP_CMD_LEAVE:
@@ -752,9 +804,22 @@ static void do_command(CoopSess *s, int cmd, const char *code, uint64_t now) {
             break;
         }
         if (s->state == COOP_JOINED || s->state == COOP_RECONNECTING) say_goodbye(s);
-        begin_episode(s, cmd == COOP_CMD_CREATE ? COOP_INTENT_CREATE : COOP_INTENT_JOIN, code, 0, now);
+        begin_episode(s, cmd == COOP_CMD_CREATE ? COOP_INTENT_CREATE : COOP_INTENT_JOIN, secret, 0, now);
         break;
     }
+}
+
+// The maker's KICK of a member, with the member's session so that a KICK sent again later cannot remove whoever has the id then.
+static void do_remove(CoopSess *s, int member) {
+    const CoopMemberInfo *m = member_of(s, member);
+    uint8_t payload[16];
+    if (s->state != COOP_JOINED || !s->made_room || !m || member == s->self) {
+        say(s, "only the room's maker can remove a member, and only one that is in the room");
+        return;
+    }
+    size_t k = coop_kick_pack(payload, sizeof payload, (uint8_t)member, m->session);
+    for (int i = 0; i < 2; i++) send_room(s, COOP_T_KICK, 0, payload, k);
+    say(s, "removing %s (member %d) from the room", m->name, member);
 }
 
 // ---- the step
@@ -792,7 +857,7 @@ static void timers(CoopSess *s, uint64_t now) {
             uint32_t seen = s->n_rx + s->n_tx + s->n_lost + s->n_test_drop;
             if (seen != s->stats_seen) {
                 s->stats_seen = seen;
-                say(s, "stats: sent %u, accepted %u, thrown away %u (tag %u, sender %u, not co-op %u, duplicate %u), dropped by the test %u, outbox full %u",
+                say(s, "stats: sent %u, accepted %u, thrown away %u (tag %u, sender %u, not co-op %u, replay %u), dropped by the test %u, outbox full %u",
                     s->n_tx, s->n_rx, s->n_lost, s->n_bad_tag, s->n_sender, s->n_malformed, s->n_dup, s->n_test_drop,
                     __atomic_load_n(&s->n_outbox_full, __ATOMIC_RELAXED));
             }
@@ -807,16 +872,20 @@ static void view_rebuild(CoopSess *s) {
     plat_mutex_lock(&s->lock);
     CoopView *v = &s->view;
     int in_room = s->state == COOP_JOINED || s->state == COOP_RECONNECTING;
+    const char *secret = in_room ? s->secret : s->state == COOP_CONNECTING ? s->want : "";
     v->state = s->state;
-    if (in_room) format_code(s->code, v->code);
-    else if (s->state == COOP_CONNECTING) format_code(s->want, v->code);
+    if (secret[0]) coop_secret_format(secret, v->code);
     else v->code[0] = 0;
+    label_of(secret, v->label);
     v->self = in_room ? s->self : 0;
     v->made = in_room && s->made_room;
+    v->maker = 0;
     v->n = in_room ? s->roster.n : 0;
     for (int i = 0; i < v->n; i++) {
         v->member[i].id = s->roster.m[i].id;
         v->member[i].away = s->roster.m[i].flags & COOP_FLAG_AWAY ? 1 : 0;
+        v->member[i].maker = s->roster.m[i].flags & COOP_FLAG_MAKER ? 1 : 0;
+        if (v->member[i].maker) v->maker = v->member[i].id;
         copy_str(v->member[i].name, sizeof v->member[i].name, s->roster.m[i].name);
     }
     copy_str(v->status, sizeof v->status, s->status);
@@ -842,13 +911,14 @@ static void publish(CoopSess *s) {
 void coop_sess_step(CoopSess *s) {
     uint64_t now = plat_now_ms();
     plat_mutex_lock(&s->lock);
-    int cmd = s->cmd;
-    char code[sizeof s->cmd_code];
-    memcpy(code, s->cmd_code, sizeof code);
-    s->cmd = 0;
+    int cmd = s->cmd, remove = s->cmd_remove;
+    char secret[sizeof s->cmd_secret];
+    memcpy(secret, s->cmd_secret, sizeof secret);
+    s->cmd = 0, s->cmd_remove = 0;
     plat_mutex_unlock(&s->lock);
     apply_settings(s, now);
-    if (cmd) do_command(s, cmd, code, now);
+    if (cmd) do_command(s, cmd, secret, now);
+    if (remove) do_remove(s, remove);
     flush_outbox(s);
     publish(s);   // what a command or a setting changed shows before this thread waits for a datagram
     uint32_t wait = s->state == COOP_JOINED ? 8 : s->state == COOP_CONNECTING || s->state == COOP_RECONNECTING ? 50 : 250;
@@ -938,13 +1008,26 @@ void coop_sess_stop(CoopSess *s) {
     plat_mutex_unlock(&s->lock);
 }
 
-int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *code) {
-    char canon[COOP_CODE_LEN + 1] = "";
+int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *secret) {
+    char canon[COOP_SECRET_LEN + 1] = "";
     if (cmd != COOP_CMD_CREATE && cmd != COOP_CMD_JOIN && cmd != COOP_CMD_LEAVE) return 0;
-    if ((cmd == COOP_CMD_JOIN || (cmd == COOP_CMD_CREATE && code && *code)) && (!code || !coop_code_normalize(code, canon))) return 0;
+    if (cmd == COOP_CMD_JOIN || (cmd == COOP_CMD_CREATE && secret && *secret)) {
+        if (!secret || !coop_secret_normalize(secret, canon)) return 0;
+    } else if (cmd == COOP_CMD_CREATE) {   // a new room: a new secret, which only this player knows until it passes it on
+        uint8_t r[32];
+        if (!plat_random(r, sizeof r) || !coop_secret_from_random(r, canon)) return 0;
+    }
     plat_mutex_lock(&s->lock);
     s->cmd = (int)cmd;
-    copy_str(s->cmd_code, sizeof s->cmd_code, canon);
+    copy_str(s->cmd_secret, sizeof s->cmd_secret, canon);
+    plat_mutex_unlock(&s->lock);
+    return 1;
+}
+
+int coop_sess_remove(CoopSess *s, int member) {
+    if (member < 1 || member > COOP_MAX_MEMBERS || !__atomic_load_n(&s->pub_joined, __ATOMIC_ACQUIRE)) return 0;
+    plat_mutex_lock(&s->lock);
+    s->cmd_remove = member;
     plat_mutex_unlock(&s->lock);
     return 1;
 }
@@ -1005,26 +1088,17 @@ static CoopSess *process_session(void) {
     return g_sess;
 }
 
-// The player's identity on the wire: 8 bytes of SHA-256 over the local account and the profile folder. The account alone
-// would make two copies of one profile the same player; with the folder they differ, and a game that stays in its folder
-// keeps its id.
+// The player's id towards the relay: random for each start of the game, so that nothing ties one session to another,
+// and never sent to the other players. The default name's digits are random too, not taken from it.
 static uint64_t g_client_id;
+static unsigned g_name_digits;
 static PlatOnce g_client_once = PLAT_ONCE_INIT;
 static void make_client_id(void *arg) {
     (void)arg;
-    uint64_t uid[2];
-    account_uid(uid);
-    Sha256 h;
-    uint8_t digest[32];
-    const char *profile = rt_config()->profile ? rt_config()->profile : "";
-    sha256_init(&h);
-    sha256_update(&h, "nx2navi-coop", 12);
-    sha256_update(&h, uid, sizeof uid);
-    sha256_update(&h, profile, strlen(profile));
-    sha256_final(&h, digest);
-    uint64_t id;
-    memcpy(&id, digest, sizeof id);
-    g_client_id = id ? id : 1;
+    uint64_t r[2] = {0, 0};
+    if (!plat_random(r, sizeof r)) r[0] = plat_now_ns(), r[1] = r[0] >> 17;
+    g_client_id = r[0] ? r[0] : 1;
+    g_name_digits = (unsigned)(r[1] & 0xFFFF);
 }
 
 uint64_t coop_client_id(void) {
@@ -1038,7 +1112,7 @@ static void coop_main(void *arg) {
     unsigned seen = ~0u;
     int on = 0;
     uint64_t client_id = 0;
-    char name[COOP_NAME_MAX + 1] = "", server[160] = "";
+    char name[COOP_NAME_MAX + 1] = "", server[160] = "", removed[16] = "";
     for (;;) {
         unsigned v = cfg_version();
         if (v != seen && !__atomic_load_n(&g_final, __ATOMIC_ACQUIRE)) {   // the settings changed (the menu writes them)
@@ -1047,26 +1121,30 @@ static void coop_main(void *arg) {
             const char *auto_mode = cfg_get("NX2NAVI_COOP_AUTO"), *drop = cfg_get("NX2NAVI_COOP_DROP");
             int automatic = auto_mode && (!strcmp(auto_mode, "create") || !strcmp(auto_mode, "join"));
             if (want) {
-                if (!client_id) client_id = coop_client_id();   // the account is read once the player turns co-op on
+                if (!client_id) client_id = coop_client_id();
                 const char *n = cfg_value("NX2NAVI_COOP_NAME");
                 coop_name_clean(name, sizeof name, (const uint8_t *)n, strlen(n));
-                if (!name[0]) snprintf(name, sizeof name, "Player-%04x", (unsigned)(client_id & 0xFFFF));
+                if (!name[0]) snprintf(name, sizeof name, "Player-%04x", g_name_digits);
                 copy_str(server, sizeof server, cfg_value("NX2NAVI_COOP_SERVER"));
             }
             CoopParams p = {.server = server, .name = name, .client_id = client_id, .on = want, .retry = automatic,
                             .local_port = (uint16_t)cfg_int("NX2NAVI_COOP_PORT"), .drop_pct = drop ? (unsigned)atoi(drop) : 0};
             coop_sess_configure(s, &p);
             if (want && !on && auto_mode && *auto_mode && strcmp(auto_mode, "off") && !automatic)
-                rt_log("coop: COOP_AUTO must be off, create or join, not '%s'", auto_mode);
+                rt_log("coop: COOP_AUTO must be off, create or join");
             if (want && !on && automatic) {   // a session at launch, for tests and LAN parties
                 const char *room = cfg_get("NX2NAVI_COOP_ROOM");
-                char code[COOP_CODE_LEN + 1] = "";
-                int has = room && *room && coop_code_normalize(room, code);
+                char secret[COOP_SECRET_LEN + 1] = "";
+                int has = room && *room && coop_secret_normalize(room, secret);
                 int join = !strcmp(auto_mode, "join");
-                if (room && *room && !has) rt_log("coop: COOP_ROOM '%s' is not a room code", room);
+                if (room && *room && !has) rt_log("coop: COOP_ROOM is not a room secret (18 characters, XXXXXX-XXXXXX-XXXXXX)");
                 if (join && !has) rt_log("coop: COOP_AUTO=join needs COOP_ROOM");
-                else coop_sess_command(s, join ? COOP_CMD_JOIN : COOP_CMD_CREATE, code);
+                else coop_sess_command(s, join ? COOP_CMD_JOIN : COOP_CMD_CREATE, secret);
             }
+            // the maker removes a member: COOP_REMOVE = its member id (until the menu has a row for it)
+            const char *rm = cfg_get("NX2NAVI_COOP_REMOVE");
+            if (want && rm && *rm && strcmp(rm, removed)) coop_sess_remove(s, atoi(rm));
+            copy_str(removed, sizeof removed, rm);
             on = want;
         }
         coop_sess_step(s);
@@ -1089,10 +1167,15 @@ void coop_shutdown(void) {
     coop_sess_wait_off(s, 400);
 }
 
-int coop_command(CoopCmd cmd, const char *code) {
+int coop_command(CoopCmd cmd, const char *secret) {
     CoopSess *s = process_session();
     if (!s || __atomic_load_n(&s->pub_state, __ATOMIC_ACQUIRE) == COOP_OFF) return 0;
-    return coop_sess_command(s, cmd, code);
+    return coop_sess_command(s, cmd, secret);
+}
+
+int coop_remove_member(int member) {
+    CoopSess *s = process_session();
+    return s && coop_sess_remove(s, member);
 }
 
 void coop_view_get(CoopView *out) {

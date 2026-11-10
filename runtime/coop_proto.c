@@ -1,14 +1,15 @@
-// The co-op wire format (coop_proto.h): room codes, HMAC tags, the datagram header, the client and relay messages and
-// the peer message envelope. Pure functions on bytes.
+// The co-op wire format (coop_proto.h): room secrets and their keys, HMAC tags, the datagram header, the client and
+// relay messages and the sealed player messages. Pure functions on bytes.
 #include "coop_proto.h"
 
 #include <string.h>
 
 #include "sha256.h"
+#include "third_party/monocypher/monocypher.h"
 
-static const char code_alphabet[] = "23456789BCDFGHJKMNPRSTVWXYZ";
+static const char secret_alphabet[] = "23456789BCDFGHJKMNPRSTVWXYZ";
 
-static int code_char(char c) { return c && strchr(code_alphabet, c) != NULL; }
+static int secret_char(char c) { return c && strchr(secret_alphabet, c) != NULL; }
 
 // The length of the string at s, at most max.
 static size_t bounded_len(const char *s, size_t max) {
@@ -17,28 +18,43 @@ static size_t bounded_len(const char *s, size_t max) {
     return n;
 }
 
-int coop_code_normalize(const char *text, char out[COOP_CODE_LEN + 1]) {
+int coop_secret_normalize(const char *text, char out[COOP_SECRET_LEN + 1]) {
     size_t n = 0;
     for (const char *p = text; *p; p++) {
         char c = *p;
         if (c == '-' || c == ' ') continue;
         if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        if (n == COOP_CODE_LEN || !code_char(c)) return 0;
+        if (n == COOP_SECRET_LEN || !secret_char(c)) return 0;
         out[n++] = c;
     }
-    if (n != COOP_CODE_LEN) return 0;
+    if (n != COOP_SECRET_LEN) return 0;
     out[n] = 0;
     return 1;
 }
 
-void coop_code_format(const char code[COOP_CODE_LEN], char out[COOP_CODE_LEN + 2]) {
-    memcpy(out, code, 3);
-    out[3] = '-';
-    memcpy(out + 4, code + 3, 3);
-    out[7] = 0;
+void coop_secret_format(const char secret[COOP_SECRET_LEN], char out[COOP_SECRET_TEXT + 1]) {
+    for (int g = 0, at = 0; g < 3; g++) {
+        if (g) out[at++] = '-';
+        memcpy(out + at, secret + 6 * g, 6);
+        at += 6;
+    }
+    out[COOP_SECRET_TEXT] = 0;
 }
 
-// ---- tags
+int coop_secret_from_random(const uint8_t random[32], char out[COOP_SECRET_LEN + 1]) {
+    int n = 0;
+    for (int i = 0; i < 32 && n < COOP_SECRET_LEN; i++)
+        if (random[i] < 243) out[n++] = secret_alphabet[random[i] % 27];   // 243 = 9 x 27: every symbol as likely
+    out[n] = 0;
+    return n == COOP_SECRET_LEN;
+}
+
+void coop_secret_short(const char secret[COOP_SECRET_LEN], char out[8]) {
+    memcpy(out, secret, 3);
+    memcpy(out + 3, "\xe2\x80\xa6", 4);   // U+2026 and the NUL
+}
+
+// ---- keys and tags
 
 static void sha_two(Sha256 *s, const void *a, size_t an, const void *b, size_t bn) {
     if (an) sha256_update(s, a, an);
@@ -62,13 +78,12 @@ void coop_hmac_sha256(const void *key, size_t klen, const void *a, size_t an, co
     sha256_final(&s, out);
 }
 
-void coop_room_key(const char code[COOP_CODE_LEN], uint8_t key[COOP_KEY_LEN]) {
-    uint8_t full[32];
-    Sha256 s;
-    sha256_init(&s);
-    sha_two(&s, "nx2navi-coop/1", 14, code, COOP_CODE_LEN);
-    sha256_final(&s, full);
-    memcpy(key, full, COOP_KEY_LEN);
+void coop_room_keys(const char secret[COOP_SECRET_LEN], uint8_t locator[COOP_KEY_LEN], uint8_t msg_key[COOP_MSG_KEY_LEN]) {
+    static const char room[] = "nx2navi-coop/2 room", messages[] = "nx2navi-coop/2 messages";
+    if (locator) crypto_blake2b_keyed(locator, COOP_KEY_LEN, (const uint8_t *)secret, COOP_SECRET_LEN, (const uint8_t *)room, sizeof room - 1);
+    if (msg_key)
+        crypto_blake2b_keyed(msg_key, COOP_MSG_KEY_LEN, (const uint8_t *)secret, COOP_SECRET_LEN, (const uint8_t *)messages,
+                             sizeof messages - 1);
 }
 
 static void make_tag(const uint8_t key[COOP_KEY_LEN], const uint8_t *hdr16, const uint8_t *payload, size_t n,
@@ -149,19 +164,27 @@ static size_t utf8_len(const uint8_t *p, size_t n) {
     return len;
 }
 
+// A character a log or a console may act on: C0, DEL, C1 (U+0080-U+009F), and the bidi controls U+061C, U+200E,
+// U+200F, U+202A-U+202E and U+2066-U+2069.
+static int control_char(const uint8_t *p, size_t len) {
+    if (len == 1) return p[0] < 0x20 || p[0] == 0x7F;
+    if (len == 2) return (p[0] == 0xC2 && p[1] < 0xA0) || (p[0] == 0xD8 && p[1] == 0x9C);
+    if (len == 3 && p[0] == 0xE2 && p[1] == 0x80) return p[2] == 0x8E || p[2] == 0x8F || (p[2] >= 0xAA && p[2] <= 0xAE);
+    if (len == 3 && p[0] == 0xE2 && p[1] == 0x81) return p[2] >= 0xA6 && p[2] <= 0xA9;
+    return 0;
+}
+
 // At most max bytes of raw as valid UTF-8 into out (cap bytes, NUL-terminated): a control character and each byte that is
 // not valid UTF-8 become '?', and the text is cut before the character that would not fit.
 static size_t text_clean(char *out, size_t cap, const uint8_t *raw, size_t n, size_t max) {
     size_t at = 0, i = 0;
     if (!cap) return 0;
     while (i < n) {
-        size_t len = utf8_len(raw + i, n - i);
-        if (len == 1 && (raw[i] < 0x20 || raw[i] == 0x7F)) len = 0;
-        size_t take = len ? len : 1;
-        if (at + take > max || at + take + 1 > cap) break;
-        if (len) memcpy(out + at, raw + i, len);
-        else out[at] = '?';
-        at += take;
+        size_t len = utf8_len(raw + i, n - i), take = len ? len : 1;
+        int bad = !len || control_char(raw + i, len);
+        if (at + (bad ? 1 : take) > max || at + (bad ? 1 : take) + 1 > cap) break;
+        if (bad) out[at++] = '?';
+        else memcpy(out + at, raw + i, len), at += len;
         i += take;
     }
     out[at] = 0;
@@ -174,37 +197,53 @@ size_t coop_name_clean(char *out, size_t cap, const uint8_t *raw, size_t n) {
 
 // ---- client and relay messages
 
+enum { CONNECT_FIXED = 43 };   // the fields before the name
+
 size_t coop_connect_pack(uint8_t *out, size_t cap, const CoopConnect *c) {
     size_t nlen = bounded_len(c->name, COOP_NAME_MAX);
-    size_t len = 17 + nlen + COOP_COOKIE_LEN;
+    size_t len = CONNECT_FIXED + nlen + 2 * COOP_COOKIE_LEN;
     size_t padded = len < COOP_CONNECT_MIN - COOP_HDR_LEN ? COOP_CONNECT_MIN - COOP_HDR_LEN : len;
     if (cap < padded) return 0;
     memset(out, 0, padded);
     out[0] = c->intent, out[1] = c->flags;
-    if (c->code[0]) memcpy(out + 2, c->code, COOP_CODE_LEN);
-    put64(out + 8, c->client_id);
-    out[16] = (uint8_t)nlen;
-    memcpy(out + 17, c->name, nlen);
-    memcpy(out + 17 + nlen, c->cookie, COOP_COOKIE_LEN);
+    memcpy(out + 2, c->locator, COOP_KEY_LEN);
+    put64(out + 18, c->client_id);
+    put64(out + 26, c->session);
+    put64(out + 34, c->nonce);
+    out[42] = (uint8_t)nlen;
+    memcpy(out + CONNECT_FIXED, c->name, nlen);
+    memcpy(out + CONNECT_FIXED + nlen, c->cookie, COOP_COOKIE_LEN);
+    memcpy(out + CONNECT_FIXED + nlen + COOP_COOKIE_LEN, c->token, COOP_COOKIE_LEN);
     return padded;
 }
 
 int coop_connect_parse(const uint8_t *p, size_t n, CoopConnect *c) {
-    if (n < 17) return 0;
-    size_t nlen = p[16];
-    if (nlen > COOP_NAME_MAX || 17 + nlen + COOP_COOKIE_LEN > n) return 0;
+    if (n < CONNECT_FIXED) return 0;
+    size_t nlen = p[42];
+    if (nlen > COOP_NAME_MAX || CONNECT_FIXED + nlen + 2 * COOP_COOKIE_LEN > n) return 0;
     memset(c, 0, sizeof *c);
     c->intent = p[0], c->flags = p[1];
-    static const uint8_t zero[COOP_CODE_LEN];
-    if (memcmp(p + 2, zero, COOP_CODE_LEN)) {
-        char raw[COOP_CODE_LEN + 1];
-        memcpy(raw, p + 2, COOP_CODE_LEN);
-        raw[COOP_CODE_LEN] = 0;
-        if (!coop_code_normalize(raw, c->code) || memcmp(raw, c->code, COOP_CODE_LEN)) return 0;   // canonical only
-    }
-    c->client_id = get64(p + 8);
-    coop_name_clean(c->name, sizeof c->name, p + 17, nlen);
-    memcpy(c->cookie, p + 17 + nlen, COOP_COOKIE_LEN);
+    memcpy(c->locator, p + 2, COOP_KEY_LEN);
+    c->client_id = get64(p + 18);
+    c->session = get64(p + 26);
+    c->nonce = get64(p + 34);
+    coop_name_clean(c->name, sizeof c->name, p + CONNECT_FIXED, nlen);
+    memcpy(c->cookie, p + CONNECT_FIXED + nlen, COOP_COOKIE_LEN);
+    memcpy(c->token, p + CONNECT_FIXED + nlen + COOP_COOKIE_LEN, COOP_COOKIE_LEN);
+    return 1;
+}
+
+size_t coop_challenge_pack(uint8_t *out, size_t cap, uint64_t nonce, const uint8_t cookie[COOP_COOKIE_LEN]) {
+    if (cap < 8 + COOP_COOKIE_LEN) return 0;
+    put64(out, nonce);
+    memcpy(out + 8, cookie, COOP_COOKIE_LEN);
+    return 8 + COOP_COOKIE_LEN;
+}
+
+int coop_challenge_parse(const uint8_t *p, size_t n, uint64_t *nonce, uint8_t cookie[COOP_COOKIE_LEN]) {
+    if (n != 8 + COOP_COOKIE_LEN) return 0;
+    *nonce = get64(p);
+    memcpy(cookie, p + 8, COOP_COOKIE_LEN);
     return 1;
 }
 
@@ -214,10 +253,12 @@ size_t coop_roster_pack(uint8_t *out, size_t cap, const CoopRoster *r) {
     out[0] = r->n;
     for (int i = 0; i < r->n; i++) {
         size_t nlen = bounded_len(r->m[i].name, COOP_NAME_MAX);
-        if (at + 3 + nlen > cap) return 0;
-        out[at] = r->m[i].id, out[at + 1] = r->m[i].flags, out[at + 2] = (uint8_t)nlen;
-        memcpy(out + at + 3, r->m[i].name, nlen);
-        at += 3 + nlen;
+        if (at + 11 + nlen > cap) return 0;
+        out[at] = r->m[i].id, out[at + 1] = r->m[i].flags;
+        put64(out + at + 2, r->m[i].session);
+        out[at + 10] = (uint8_t)nlen;
+        memcpy(out + at + 11, r->m[i].name, nlen);
+        at += 11 + nlen;
     }
     return at;
 }
@@ -228,49 +269,66 @@ int coop_roster_parse(const uint8_t *p, size_t n, CoopRoster *r, size_t *used) {
     memset(r, 0, sizeof *r);
     r->n = p[0];
     for (int i = 0; i < r->n; i++) {
-        if (at + 3 > n) return 0;
-        size_t nlen = p[at + 2];
-        if (nlen > COOP_NAME_MAX || at + 3 + nlen > n) return 0;
+        if (at + 11 > n) return 0;
+        size_t nlen = p[at + 10];
+        if (nlen > COOP_NAME_MAX || at + 11 + nlen > n) return 0;
         r->m[i].id = p[at], r->m[i].flags = p[at + 1];
-        coop_name_clean(r->m[i].name, sizeof r->m[i].name, p + at + 3, nlen);
-        at += 3 + nlen;
+        r->m[i].session = get64(p + at + 2);
+        coop_name_clean(r->m[i].name, sizeof r->m[i].name, p + at + 11, nlen);
+        at += 11 + nlen;
     }
     if (used) *used = at;
     return 1;
 }
 
 size_t coop_joined_pack(uint8_t *out, size_t cap, const CoopJoined *j) {
-    if (cap < 1 + COOP_CODE_LEN) return 0;
+    if (cap < 9 + COOP_COOKIE_LEN) return 0;
     out[0] = j->member;
-    memcpy(out + 1, j->code, COOP_CODE_LEN);
-    size_t k = coop_roster_pack(out + 1 + COOP_CODE_LEN, cap - 1 - COOP_CODE_LEN, &j->roster);
-    return k ? 1 + COOP_CODE_LEN + k : 0;
+    put64(out + 1, j->nonce);
+    memcpy(out + 9, j->token, COOP_COOKIE_LEN);
+    size_t k = coop_roster_pack(out + 9 + COOP_COOKIE_LEN, cap - 9 - COOP_COOKIE_LEN, &j->roster);
+    return k ? 9 + COOP_COOKIE_LEN + k : 0;
 }
 
 int coop_joined_parse(const uint8_t *p, size_t n, CoopJoined *j) {
-    if (n < 1 + COOP_CODE_LEN) return 0;
-    char raw[COOP_CODE_LEN + 1];
-    memcpy(raw, p + 1, COOP_CODE_LEN);
-    raw[COOP_CODE_LEN] = 0;
+    if (n < 9 + COOP_COOKIE_LEN) return 0;
     memset(j, 0, sizeof *j);
-    if (!coop_code_normalize(raw, j->code) || memcmp(raw, j->code, COOP_CODE_LEN)) return 0;
     j->member = p[0];
-    return coop_roster_parse(p + 1 + COOP_CODE_LEN, n - 1 - COOP_CODE_LEN, &j->roster, NULL);
+    j->nonce = get64(p + 1);
+    memcpy(j->token, p + 9, COOP_COOKIE_LEN);
+    return coop_roster_parse(p + 9 + COOP_COOKIE_LEN, n - 9 - COOP_COOKIE_LEN, &j->roster, NULL);
 }
 
 size_t coop_error_pack(uint8_t *out, size_t cap, const CoopError *e) {
     size_t tlen = bounded_len(e->text, sizeof e->text - 1);
-    if (cap < 2 + tlen) return 0;
-    out[0] = e->reason, out[1] = (uint8_t)tlen;
-    memcpy(out + 2, e->text, tlen);
-    return 2 + tlen;
+    if (cap < 10 + tlen) return 0;
+    out[0] = e->reason;
+    put64(out + 1, e->nonce);
+    out[9] = (uint8_t)tlen;
+    memcpy(out + 10, e->text, tlen);
+    return 10 + tlen;
 }
 
 int coop_error_parse(const uint8_t *p, size_t n, CoopError *e) {
-    if (n < 2 || 2u + p[1] > n) return 0;
+    if (n < 10 || 10u + p[9] > n) return 0;
     memset(e, 0, sizeof *e);
     e->reason = p[0];
-    text_clean(e->text, sizeof e->text, p + 2, p[1], sizeof e->text - 1);   // for the log: printable UTF-8 only
+    e->nonce = get64(p + 1);
+    text_clean(e->text, sizeof e->text, p + 10, p[9], sizeof e->text - 1);   // for the log: printable UTF-8 only
+    return 1;
+}
+
+size_t coop_kick_pack(uint8_t *out, size_t cap, uint8_t member, uint64_t session) {
+    if (cap < 9) return 0;
+    out[0] = member;
+    put64(out + 1, session);
+    return 9;
+}
+
+int coop_kick_parse(const uint8_t *p, size_t n, uint8_t *member, uint64_t *session) {
+    if (n != 9) return 0;
+    *member = p[0];
+    *session = get64(p + 1);
     return 1;
 }
 
@@ -286,17 +344,51 @@ int coop_u32_parse(const uint8_t *p, size_t n, uint32_t *v) {
     return 1;
 }
 
-// ---- peer messages
+// ---- sealed player messages
 
-size_t coop_peer_pack(uint8_t *out, size_t cap, uint8_t kind, const void *bytes, size_t n) {
-    if (n + 1 > COOP_MAX_PAYLOAD || cap < n + 1) return 0;
-    if (n) memmove(out + 1, bytes, n);
-    out[0] = kind;
-    return n + 1;
+static void env_nonce(uint8_t nonce[24], uint64_t session, uint32_t counter, uint8_t src) {
+    memset(nonce, 0, 24);
+    put64(nonce, session);
+    put32(nonce + 8, counter);
+    nonce[12] = src;
 }
 
-int coop_peer_parse(const uint8_t *p, size_t n, uint8_t *kind, const uint8_t **bytes, size_t *nbytes) {
-    if (n < 1) return 0;
-    *kind = p[0], *bytes = p + 1, *nbytes = n - 1;
+size_t coop_seal(uint8_t *out, size_t cap, const uint8_t key[COOP_MSG_KEY_LEN], uint8_t src, uint8_t dst, uint64_t session,
+                 uint32_t counter, uint8_t kind, const void *bytes, size_t n) {
+    size_t total = COOP_ENV_OVERHEAD + 1 + n;
+    if (n > COOP_MAX_MESSAGE || cap < total) return 0;
+    uint8_t nonce[24], ad[2] = {dst, COOP_ENV_V1};
+    out[0] = COOP_ENV_V1;
+    put64(out + 1, session);
+    put32(out + 9, counter);
+    uint8_t *plain = out + COOP_ENV_HDR;
+    if (n) memmove(plain + 1, bytes, n);
+    plain[0] = kind;
+    env_nonce(nonce, session, counter, src);
+    crypto_aead_lock(plain, out + COOP_ENV_HDR + 1 + n, key, nonce, ad, sizeof ad, plain, 1 + n);
+    return total;
+}
+
+int coop_envelope_peek(const uint8_t *p, size_t n, uint64_t *session, uint32_t *counter) {
+    if (n < COOP_ENV_OVERHEAD + 1 || p[0] != COOP_ENV_V1) return 0;
+    *session = get64(p + 1);
+    *counter = get32(p + 9);
+    return 1;
+}
+
+int coop_open(const uint8_t *p, size_t n, const uint8_t key[COOP_MSG_KEY_LEN], uint8_t src, uint8_t dst, uint8_t *kind,
+              uint8_t *out, size_t cap, size_t *nout) {
+    uint64_t session;
+    uint32_t counter;
+    if (!coop_envelope_peek(p, n, &session, &counter)) return 0;
+    size_t len = n - COOP_ENV_OVERHEAD;   // kind and bytes
+    uint8_t plain[COOP_MAX_PAYLOAD], nonce[24], ad[2] = {dst, COOP_ENV_V1};
+    if (len > sizeof plain || cap < len - 1) return 0;
+    env_nonce(nonce, session, counter, src);
+    if (crypto_aead_unlock(plain, p + n - COOP_ENV_MAC, key, nonce, ad, sizeof ad, p + COOP_ENV_HDR, len)) return 0;
+    *kind = plain[0];
+    if (len > 1) memcpy(out, plain + 1, len - 1);
+    *nout = len - 1;
+    crypto_wipe(plain, len);
     return 1;
 }

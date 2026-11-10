@@ -1,16 +1,19 @@
 // --probe-coop: the co-op layer without a window, a Vulkan device or game files.
 //
 // 1. The platform's UDP sockets and addresses on 127.0.0.1.
-// 2. The wire format (coop_proto.c): HMAC against known values, the byte vectors of tests/coop_vectors.txt (the file named by
-//    NX2NAVI_COOP_VECTORS; the Python of tools/coop_relay.py is checked against the same file), and random bytes into every
-//    parser.
-// 3. Two sessions (coop.c) in this process, Alice and Bob, through a relay: they create and join a room, exchange peer messages
-//    both ways, are hit with garbage and forged datagrams from the relay's address, lose the relay for good (a restart) and
-//    find each other again, and leave. The relay is the real tools/coop_relay.py when NX2NAVI_COOP_RELAY=host:port names one
-//    (started with --allow-chosen-codes; with NX2NAVI_COOP_RESTART=stdin the probe prints "coop-probe: restart the relay now"
-//    and waits for a line on its input, which tests/coop_relay_test.py answers after restarting it), else a small relay of
-//    this file on a thread, which can also corrupt a forwarded tag and send the garbage. NX2NAVI_COOP_DROP=30 makes both
-//    sessions throw away that percentage of the datagrams they receive.
+// 2. The wire format (coop_proto.c): HMAC against known values, XChaCha20-Poly1305 against a known answer, sealing and
+//    opening (a changed byte, another sender or receiver, another key: nothing opens), the byte vectors of
+//    tests/coop_vectors.txt (the file named by NX2NAVI_COOP_VECTORS; the Python of tools/coop_relay.py is checked against
+//    the same file), and random bytes into every parser.
+// 3. Two sessions (coop.c) in this process, Alice and Bob, through a relay: Alice makes a room of a secret, Bob joins it,
+//    they exchange messages both ways, are hit with garbage and forged datagrams from the relay's address (a changed tag,
+//    a message the relay sealed itself, a message of Bob's recorded before he joined again, answers with a wrong nonce
+//    while a player connects), lose the relay for good (a restart) and find each other again, the maker removes a
+//    member, and they leave. The relay is the real tools/coop_relay.py when NX2NAVI_COOP_RELAY=host:port names one (with
+//    NX2NAVI_COOP_RESTART=stdin the probe prints "coop-probe: restart the relay now" and waits for a line on its input,
+//    which tests/coop_relay_test.py answers after restarting it), else a small relay of this file on a thread, which can
+//    also do what a hostile relay would. NX2NAVI_COOP_DROP=30 makes both sessions throw away that percentage of the
+//    datagrams they receive.
 // 4. Progress sync's merge engine (coop_state.c) between fake games on a fake network: coop_sync_probe.c.
 #include <stdint.h>
 #include <stdio.h>
@@ -22,7 +25,7 @@
 #include "coop_state.h"
 #include "host.h"
 #include "platform/platform.h"
-#include "sha256.h"
+#include "third_party/monocypher/monocypher.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; fprintf(stderr, "FAIL coop: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -32,12 +35,15 @@ static int fails;
 #define FAIL_RET(...) do { CHECK(0, __VA_ARGS__); return; } while (0)
 #define WAIT_FOR(cond, ms) ({ uint64_t t_ = plat_now_ms() + (ms); int ok_; while (!(ok_ = (cond)) && plat_now_ms() < t_) plat_sleep_ms(10); ok_; })
 
+static const char ROOM_SECRET[] = "H7K3WMBCDFGH234567";   // the probe's room (tests/coop_vectors.txt uses it too)
+
 // ---- hex and a random source
 
 static int hex_digit(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
 // "-" is empty. The bytes into out (cap), their count, -1 when text is not hex or does not fit.
 static int unhex(const char *text, uint8_t *out, size_t cap) {
+    if (!text) return -1;
     if (!strcmp(text, "-")) return 0;
     size_t n = strlen(text);
     if (n % 2 || n / 2 > cap) return -1;
@@ -95,9 +101,8 @@ static void probe_sockets(void) {
     CHECK(plat_udp_port(u1) && plat_udp_port(u2) && plat_udp_port(u1) != plat_udp_port(u2), "bound to free ports");
     uint8_t buf[2048], msg[300];
     for (size_t i = 0; i < sizeof msg; i++) msg[i] = (uint8_t)i;
-    PlatAddr to1, to2, from;
+    PlatAddr to1, from;
     plat_net_resolve("127.0.0.1", plat_udp_port(u1), &to1);
-    plat_net_resolve("127.0.0.1", plat_udp_port(u2), &to2);
     uint64_t t0 = plat_now_ms();
     CHECK(plat_udp_recv(u1, buf, sizeof buf, &from, 50) == 0, "nothing to receive is a timeout");
     CHECK(plat_now_ms() - t0 >= 40, "the timeout waited");
@@ -113,11 +118,10 @@ static void probe_sockets(void) {
     plat_udp_send(u2, &to1, msg, sizeof msg);
     n = plat_udp_recv(u1, buf, 100, NULL, 1000);
     CHECK(n == 100, "a datagram longer than the buffer is cut to it (%d)", n);
-    uint8_t big[70000] = {0};
+    static uint8_t big[70000];
     CHECK(!plat_udp_send(u2, &to1, big, sizeof big), "a datagram that is too long can never be sent");
-    uint8_t v6addr[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     PlatAddr far6;
-    plat_addr_set(&far6, v6addr, 9, 0);
+    plat_addr_set(&far6, v6, 9, 0);
     CHECK(!plat_udp_send(u2, &far6, msg, 10), "an IPv4-only socket cannot reach an IPv6 address");
     plat_udp_close(u1);
     plat_udp_close(u2);
@@ -126,23 +130,65 @@ static void probe_sockets(void) {
 
 // ---- 2. the wire format
 
-static void probe_hmac(void) {
+static void probe_crypto(void) {
     // RFC 4231 test cases 1 and 2
     static const uint8_t key1[20] = {0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b};
-    static const char want1[] = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
-    static const char want2[] = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
-    uint8_t mac[32], expect[32];
+    uint8_t mac[32], expect[64];
     coop_hmac_sha256(key1, sizeof key1, "Hi There", 8, NULL, 0, mac);
-    CHECK(unhex(want1, expect, 32) == 32 && !memcmp(mac, expect, 32), "HMAC-SHA256, RFC 4231 case 1");
+    CHECK(unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", expect, 32) == 32 && !memcmp(mac, expect, 32),
+          "HMAC-SHA256, RFC 4231 case 1");
     coop_hmac_sha256("Jefe", 4, "what do ya want ", 16, "for nothing?", 12, mac);   // the message in two pieces
-    CHECK(unhex(want2, expect, 32) == 32 && !memcmp(mac, expect, 32), "HMAC-SHA256, RFC 4231 case 2 (two pieces)");
-    uint8_t key[16], again[16];
-    coop_room_key("H7K3WM", key);
-    uint8_t digest[32];
-    sha256("nx2navi-coop/1H7K3WM", 20, digest);
-    CHECK(!memcmp(key, digest, 16), "the room key is the first 16 bytes of SHA-256 of the label and the code");
-    coop_room_key("H7K3WM", again);
-    CHECK(!memcmp(key, again, 16), "the room key is deterministic");
+    CHECK(unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", expect, 32) == 32 && !memcmp(mac, expect, 32),
+          "HMAC-SHA256, RFC 4231 case 2 (two pieces)");
+    // XChaCha20-Poly1305 (the library's lock) against a known answer from the library's own test vectors
+    uint8_t key[32], nonce[24], out[17], ct[1];
+    unhex("8019e8999c815c5723dbfbde05e6c71f118afc0dedb5b9f8dea398b2d764bca6", key, 32);
+    unhex("8dfc023a9821939d389e38a072cf1b413bb1517c3fe83abe", nonce, 24);
+    unhex("374190382975907a68e8a341faa0772aa0", out, 17);
+    uint8_t plain = 0x86, tag[16];
+    crypto_aead_lock(ct, tag, key, nonce, NULL, 0, &plain, 1);
+    CHECK(!memcmp(tag, out, 16) && ct[0] == out[16], "XChaCha20-Poly1305 known answer");
+
+    // seal and open: the largest message round trips; a changed byte, another sender, receiver or key opens nothing
+    uint8_t lk[COOP_KEY_LEN], mk[COOP_MSG_KEY_LEN], other[COOP_MSG_KEY_LEN];
+    coop_room_keys(ROOM_SECRET, lk, mk);
+    coop_room_keys("23BCDF23BCDF23BCDF", NULL, other);
+    static uint8_t msg[COOP_MAX_MESSAGE], box[COOP_MAX_PAYLOAD], got[COOP_MAX_PAYLOAD];
+    for (size_t i = 0; i < sizeof msg; i++) msg[i] = (uint8_t)(i * 13);
+    size_t n = coop_seal(box, sizeof box, mk, 3, COOP_DST_ALL, 0x1234, 77, 0x42, msg, sizeof msg), ng = 0;
+    uint8_t kind = 0;
+    CHECK(n == COOP_MAX_PAYLOAD, "the largest message fills a datagram (%zu)", n);
+    CHECK(!coop_seal(box, sizeof box, mk, 3, COOP_DST_ALL, 1, 1, 0x42, msg, sizeof msg + 1), "a larger one is refused");
+    CHECK(coop_open(box, n, mk, 3, COOP_DST_ALL, &kind, got, sizeof got, &ng) && kind == 0x42 && ng == sizeof msg && !memcmp(got, msg, ng),
+          "sealed and opened");
+    int opened = 0;
+    for (size_t i = 0; i < n; i += 37) {
+        box[i] ^= 0x10;
+        opened += coop_open(box, n, mk, 3, COOP_DST_ALL, &kind, got, sizeof got, &ng);
+        box[i] ^= 0x10;
+    }
+    CHECK(!opened, "a changed byte anywhere opens nothing (%d did)", opened);
+    CHECK(!coop_open(box, n, mk, 4, COOP_DST_ALL, &kind, got, sizeof got, &ng) && !coop_open(box, n, mk, 3, 2, &kind, got, sizeof got, &ng) &&
+              !coop_open(box, n, other, 3, COOP_DST_ALL, &kind, got, sizeof got, &ng),
+          "another sender, receiver or room key opens nothing");
+    // secrets: from random bytes, every one valid, every symbol about as often
+    unsigned counts[27] = {0}, made = 0;
+    for (int i = 0; i < 2000; i++) {
+        uint8_t r[32];
+        char s[COOP_SECRET_LEN + 1], again[COOP_SECRET_LEN + 1];
+        for (int k = 0; k < 32; k++) r[k] = (uint8_t)rnd32();
+        if (!coop_secret_from_random(r, s)) continue;
+        made++;
+        CHECK(coop_secret_normalize(s, again) && !strcmp(s, again), "a new secret is one");
+        for (int k = 0; k < COOP_SECRET_LEN; k++) counts[strchr("23456789BCDFGHJKMNPRSTVWXYZ", s[k]) - "23456789BCDFGHJKMNPRSTVWXYZ"]++;
+    }
+    unsigned lo = ~0u, hi = 0;
+    for (int k = 0; k < 27; k++) lo = counts[k] < lo ? counts[k] : lo, hi = counts[k] > hi ? counts[k] : hi;
+    CHECK(made > 1990 && lo > hi * 3 / 4, "random secrets: %u made, symbols %u..%u times", made, lo, hi);
+    char text[COOP_SECRET_TEXT + 1], shortened[8];
+    coop_secret_format(ROOM_SECRET, text);
+    coop_secret_short(ROOM_SECRET, shortened);
+    CHECK(!strcmp(text, "H7K3WM-BCDFGH-234567") && !strcmp(shortened, "H7K\xe2\x80\xa6"), "a secret is shown %s, logged %s", text, shortened);
 }
 
 static void probe_server_parse(void) {
@@ -178,18 +224,19 @@ static char *next_token(char **at) {
     return start;
 }
 
-// "id:flags:namehex" entries into r; their count, -1 when malformed.
+// "id:flags:session:namehex" entries into r; their count, -1 when malformed.
 static int entries_parse(char **at, CoopRoster *r) {
     memset(r, 0, sizeof *r);
     char *t;
     while ((t = next_token(at))) {
         unsigned id, flags;
+        unsigned long long session;
         char name_hex[80];
-        if (r->n >= COOP_MAX_MEMBERS || sscanf(t, "%u:%u:%79s", &id, &flags, name_hex) != 3) return -1;
+        if (r->n >= COOP_MAX_MEMBERS || sscanf(t, "%u:%u:%llx:%79s", &id, &flags, &session, name_hex) != 4) return -1;
         uint8_t raw[40];
         int k = unhex(name_hex, raw, sizeof raw);
         if (k < 0 || k > COOP_NAME_MAX) return -1;
-        r->m[r->n].id = (uint8_t)id, r->m[r->n].flags = (uint8_t)flags;
+        r->m[r->n].id = (uint8_t)id, r->m[r->n].flags = (uint8_t)flags, r->m[r->n].session = session;
         memcpy(r->m[r->n].name, raw, (size_t)k);
         r->n++;
     }
@@ -199,136 +246,155 @@ static int entries_parse(char **at, CoopRoster *r) {
 static int roster_equal(const CoopRoster *a, const CoopRoster *b) {
     if (a->n != b->n) return 0;
     for (int i = 0; i < a->n; i++)
-        if (a->m[i].id != b->m[i].id || a->m[i].flags != b->m[i].flags || strcmp(a->m[i].name, b->m[i].name)) return 0;
+        if (a->m[i].id != b->m[i].id || a->m[i].flags != b->m[i].flags || a->m[i].session != b->m[i].session || strcmp(a->m[i].name, b->m[i].name))
+            return 0;
     return 1;
 }
 
+static uint64_t hex64(const char *t) { return t ? strtoull(t, NULL, 16) : 0; }
+
 static void check_vector(const char *kind, char *rest, int line) {
-    uint8_t a[1300], b[1300], c[1300];
+    static uint8_t a[1300], b[1300], c[1300];
     char *name = next_token(&rest);
     if (!strcmp(kind, "hmac")) {
         char *ks = next_token(&rest), *ms = next_token(&rest), *macs = next_token(&rest);
-        int kn = unhex(ks, a, sizeof a), mn = unhex(ms, b, sizeof b), cn = macs ? unhex(macs, c, 32) : -1;
+        int kn = unhex(ks, a, sizeof a), mn = unhex(ms, b, sizeof b), cn = unhex(macs, c, 32);
         uint8_t mac[32];
         if (kn < 0 || mn < 0 || cn != 32) FAIL_RET("vector line %d: bad hmac line", line);
         coop_hmac_sha256(a, (size_t)kn, b, (size_t)mn, NULL, 0, mac);
         CHECK(!memcmp(mac, c, 32), "vector hmac %s (line %d)", name, line);
-    } else if (!strcmp(kind, "code")) {
-        // code <canonical|-> <text, the rest of the line>; name is the canonical form
-        char out[COOP_CODE_LEN + 1] = "";
-        int ok = coop_code_normalize(rest, out);
-        CHECK(!strcmp(name, "-") ? !ok : ok && !strcmp(out, name), "vector code \"%s\" is %s (line %d)", rest, name, line);
-    } else if (!strcmp(kind, "key")) {
-        char *ks = next_token(&rest);
-        uint8_t key[16];
-        coop_room_key(name, key);
-        CHECK(unhex(ks, a, 16) == 16 && !memcmp(key, a, 16), "vector key %s (line %d)", name, line);
+    } else if (!strcmp(kind, "secret")) {   // secret <canonical|-> <text, the rest of the line>
+        char out[COOP_SECRET_LEN + 1] = "";
+        int ok = coop_secret_normalize(rest, out);
+        CHECK(!strcmp(name, "-") ? !ok : ok && !strcmp(out, name), "vector secret \"%s\" is %s (line %d)", rest, name, line);
+    } else if (!strcmp(kind, "keys")) {
+        uint8_t lk[COOP_KEY_LEN], mk[COOP_MSG_KEY_LEN];
+        coop_room_keys(name, lk, mk);
+        CHECK(unhex(next_token(&rest), a, 16) == 16 && !memcmp(lk, a, 16) && unhex(next_token(&rest), b, 32) == 32 && !memcmp(mk, b, 32),
+              "vector keys %s (line %d)", name, line);
     } else if (!strcmp(kind, "dgram") || !strcmp(kind, "badtag")) {
         int bad = !strcmp(kind, "badtag");
-        char *code, *tok[8] = {0};
-        char *dg;
-        if (bad) {   // badtag <name> <code> <datagram>
-            code = next_token(&rest), dg = next_token(&rest);
-        } else {     // dgram <name> <code|-> <ver> <type> <room> <src> <dst> <seq> <payload> <datagram>
-            code = next_token(&rest);
-            for (int i = 0; i < 6; i++) tok[i] = next_token(&rest);
-            tok[6] = next_token(&rest), dg = next_token(&rest);
-        }
-        int n = dg ? unhex(dg, a, sizeof a) : -1;
+        char *secret = next_token(&rest), *tok[7] = {0}, *dg;
+        if (!bad)
+            for (int i = 0; i < 7; i++) tok[i] = next_token(&rest);
+        dg = next_token(&rest);
+        int n = unhex(dg, a, sizeof a);
         CoopHdr h;
         const uint8_t *payload;
         if (n < 0 || !coop_dgram_parse(a, (size_t)n, &h, &payload)) FAIL_RET("vector %s %s does not parse (line %d)", kind, name, line);
-        uint8_t key[16];
-        int keyed = strcmp(code, "-") != 0;
-        if (keyed) coop_room_key(code, key);
+        uint8_t key[COOP_KEY_LEN];
+        int keyed = strcmp(secret, "-") != 0;
+        if (keyed) coop_room_keys(secret, key, NULL);
         if (bad) {
             CHECK(!coop_dgram_verify(a, (size_t)n, key), "vector badtag %s verifies (line %d)", name, line);
             return;
         }
         int pn = unhex(tok[6], b, sizeof b);
-        CHECK(h.ver == atoi(tok[0]) && h.type == atoi(tok[1]) && h.room == (uint32_t)strtoull(tok[2], NULL, 10) &&
-                  h.src == atoi(tok[3]) && h.dst == atoi(tok[4]) && h.seq == (uint32_t)strtoull(tok[5], NULL, 10) &&
-                  pn == (int)h.len && (!pn || !memcmp(payload, b, (size_t)pn)),
+        CHECK(h.ver == atoi(tok[0]) && h.type == atoi(tok[1]) && h.room == (uint32_t)strtoull(tok[2], NULL, 10) && h.src == atoi(tok[3]) &&
+                  h.dst == atoi(tok[4]) && h.seq == (uint32_t)strtoull(tok[5], NULL, 10) && pn == (int)h.len && (!pn || !memcmp(payload, b, (size_t)pn)),
               "vector dgram %s: header fields (line %d)", name, line);
         CHECK(keyed ? coop_dgram_verify(a, (size_t)n, key) : coop_dgram_tag_zero(a), "vector dgram %s: tag (line %d)", name, line);
         size_t k = coop_dgram_pack(c, sizeof c, &h, b, (size_t)(pn < 0 ? 0 : pn), keyed ? key : NULL);
         CHECK(k == (size_t)n && !memcmp(c, a, k), "vector dgram %s: packs to the same bytes (line %d)", name, line);
     } else if (!strcmp(kind, "connect")) {
-        // connect <name> <intent> <flags> <code|-> <client id hex> <namehex|-> <cookie> <payload>
-        char *intent = next_token(&rest), *flags = next_token(&rest), *code = next_token(&rest), *cid = next_token(&rest);
-        char *nm = next_token(&rest), *cookie = next_token(&rest), *payload = next_token(&rest);
-        int pn = unhex(payload, a, sizeof a), nn = unhex(nm, b, 32), kn = unhex(cookie, c, 16);
+        // connect <name> <intent> <flags> <locator> <cid> <session> <nonce> <namehex|-> <cookie> <token> <payload>
+        char *t[10];
+        for (int i = 0; i < 10; i++) t[i] = next_token(&rest);
+        uint8_t loc[16], cookie[16], token[16];
+        int pn = unhex(t[9], a, sizeof a), nn = unhex(t[6], b, 32);
         CoopConnect cn;
-        if (pn < 0 || nn < 0 || kn != 16 || !coop_connect_parse(a, (size_t)pn, &cn)) FAIL_RET("vector connect %s does not parse (line %d)", name, line);
-        CHECK(cn.intent == atoi(intent) && cn.flags == atoi(flags) && !strcmp(cn.code, strcmp(code, "-") ? code : "") &&
-                  cn.client_id == strtoull(cid, NULL, 16) && strlen(cn.name) == (size_t)nn && !memcmp(cn.name, b, (size_t)nn) &&
-                  !memcmp(cn.cookie, c, 16),
+        if (pn < 0 || nn < 0 || unhex(t[2], loc, 16) != 16 || unhex(t[7], cookie, 16) != 16 || unhex(t[8], token, 16) != 16 ||
+            !coop_connect_parse(a, (size_t)pn, &cn))
+            FAIL_RET("vector connect %s does not parse (line %d)", name, line);
+        CHECK(cn.intent == atoi(t[0]) && cn.flags == atoi(t[1]) && !memcmp(cn.locator, loc, 16) && cn.client_id == hex64(t[3]) &&
+                  cn.session == hex64(t[4]) && cn.nonce == hex64(t[5]) && strlen(cn.name) == (size_t)nn && !memcmp(cn.name, b, (size_t)nn) &&
+                  !memcmp(cn.cookie, cookie, 16) && !memcmp(cn.token, token, 16),
               "vector connect %s: fields (line %d)", name, line);
-        uint8_t out[200];
-        size_t k = coop_connect_pack(out, sizeof out, &cn);
-        CHECK(k == (size_t)pn && !memcmp(out, a, k), "vector connect %s: packs to the same bytes (line %d)", name, line);
+        size_t k = coop_connect_pack(c, sizeof c, &cn);
+        CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector connect %s: packs to the same bytes (line %d)", name, line);
+    } else if (!strcmp(kind, "challenge")) {
+        char *payload = next_token(&rest), *nonce = next_token(&rest), *cookie = next_token(&rest);
+        int pn = unhex(payload, a, sizeof a);
+        uint64_t got;
+        uint8_t ck[16], want[16];
+        CHECK(pn > 0 && unhex(cookie, want, 16) == 16 && coop_challenge_parse(a, (size_t)pn, &got, ck) && got == hex64(nonce) && !memcmp(ck, want, 16) &&
+                  coop_challenge_pack(c, sizeof c, got, ck) == (size_t)pn && !memcmp(c, a, (size_t)pn),
+              "vector challenge %s (line %d)", name, line);
     } else if (!strcmp(kind, "roster") || !strcmp(kind, "joined")) {
         int joined = !strcmp(kind, "joined");
-        char *payload = next_token(&rest);   // joined: <member> <code> follow
+        char *payload = next_token(&rest);
         int pn = unhex(payload, a, sizeof a);
-        char *member = joined ? next_token(&rest) : NULL, *code = joined ? next_token(&rest) : NULL;
+        char *member = joined ? next_token(&rest) : NULL, *nonce = joined ? next_token(&rest) : NULL, *token = joined ? next_token(&rest) : NULL;
         CoopRoster want;
-        if (pn < 0 || entries_parse(&rest, &want) < 0 || (joined && (!member || !code))) FAIL_RET("vector %s %s is malformed (line %d)", kind, name, line);
-        uint8_t out[300];
+        if (pn < 0 || entries_parse(&rest, &want) < 0 || (joined && !token)) FAIL_RET("vector %s %s is malformed (line %d)", kind, name, line);
         if (joined) {
             CoopJoined j;
-            CHECK(coop_joined_parse(a, (size_t)pn, &j) && j.member == atoi(member) && !strcmp(j.code, code) && roster_equal(&j.roster, &want),
+            uint8_t tk[16];
+            CHECK(unhex(token, tk, 16) == 16 && coop_joined_parse(a, (size_t)pn, &j) && j.member == atoi(member) && j.nonce == hex64(nonce) &&
+                      !memcmp(j.token, tk, 16) && roster_equal(&j.roster, &want),
                   "vector joined %s: fields (line %d)", name, line);
-            size_t k = coop_joined_pack(out, sizeof out, &j);
-            CHECK(k == (size_t)pn && !memcmp(out, a, k), "vector joined %s: packs to the same bytes (line %d)", name, line);
+            size_t k = coop_joined_pack(c, sizeof c, &j);
+            CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector joined %s: packs to the same bytes (line %d)", name, line);
         } else {
             CoopRoster r;
             size_t used = 0;
             CHECK(coop_roster_parse(a, (size_t)pn, &r, &used) && used == (size_t)pn && roster_equal(&r, &want), "vector roster %s: fields (line %d)", name, line);
-            size_t k = coop_roster_pack(out, sizeof out, &r);
-            CHECK(k == (size_t)pn && !memcmp(out, a, k), "vector roster %s: packs to the same bytes (line %d)", name, line);
+            size_t k = coop_roster_pack(c, sizeof c, &r);
+            CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector roster %s: packs to the same bytes (line %d)", name, line);
         }
     } else if (!strcmp(kind, "error")) {
-        char *payload = next_token(&rest), *reason = next_token(&rest), *text = next_token(&rest);
-        int pn = unhex(payload, a, sizeof a), tn = text ? unhex(text, b, 64) : -1;
+        char *payload = next_token(&rest), *reason = next_token(&rest), *nonce = next_token(&rest), *text = next_token(&rest);
+        int pn = unhex(payload, a, sizeof a), tn = unhex(text, b, 64);
         CoopError e;
         if (pn < 0 || tn < 0 || !coop_error_parse(a, (size_t)pn, &e)) FAIL_RET("vector error %s does not parse (line %d)", name, line);
-        CHECK(e.reason == atoi(reason) && strlen(e.text) == (size_t)tn && !memcmp(e.text, b, (size_t)tn), "vector error %s: fields (line %d)", name, line);
-        uint8_t out[80];
-        size_t k = coop_error_pack(out, sizeof out, &e);
-        CHECK(k == (size_t)pn && !memcmp(out, a, k), "vector error %s: packs to the same bytes (line %d)", name, line);
-    } else if (!strcmp(kind, "peer")) {
-        char *payload = next_token(&rest), *k = next_token(&rest), *bytes = next_token(&rest);
-        int pn = unhex(payload, a, sizeof a), bn = bytes ? unhex(bytes, b, sizeof b) : -1;
-        uint8_t kind_byte = 0;
-        const uint8_t *got = NULL;
-        size_t ngot = 0;
-        int parsed = pn >= 0 && bn >= 0 && coop_peer_parse(a, (size_t)pn, &kind_byte, &got, &ngot);
-        CHECK(parsed && kind_byte == atoi(k) && ngot == (size_t)bn && (!bn || !memcmp(got, b, (size_t)bn)), "vector peer %s: fields (line %d)",
-              name, line);
-        if (!parsed) return;
-        size_t k2 = coop_peer_pack(c, sizeof c, kind_byte, got, ngot);
-        CHECK(k2 == (size_t)pn && !memcmp(c, a, k2), "vector peer %s: packs to the same bytes (line %d)", name, line);
+        CHECK(e.reason == atoi(reason) && e.nonce == hex64(nonce) && strlen(e.text) == (size_t)tn && !memcmp(e.text, b, (size_t)tn),
+              "vector error %s: fields (line %d)", name, line);
+        size_t k = coop_error_pack(c, sizeof c, &e);
+        CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector error %s: packs to the same bytes (line %d)", name, line);
+    } else if (!strcmp(kind, "kick")) {
+        char *payload = next_token(&rest), *member = next_token(&rest), *session = next_token(&rest);
+        int pn = unhex(payload, a, sizeof a);
+        uint8_t m;
+        uint64_t s;
+        CHECK(pn > 0 && coop_kick_parse(a, (size_t)pn, &m, &s) && m == atoi(member) && s == hex64(session) && coop_kick_pack(c, sizeof c, m, s) == (size_t)pn &&
+                  !memcmp(c, a, (size_t)pn),
+              "vector kick %s (line %d)", name, line);
+    } else if (!strcmp(kind, "sealed")) {
+        // sealed <name> <secret> <src> <dst> <session> <counter> <kind> <message> <payload>
+        char *t[8];
+        for (int i = 0; i < 8; i++) t[i] = next_token(&rest);
+        uint8_t mk[COOP_MSG_KEY_LEN], got_kind = 0;
+        coop_room_keys(t[0], NULL, mk);
+        int mn = unhex(t[6], b, sizeof b), pn = unhex(t[7], a, sizeof a);
+        size_t ng = 0;
+        uint8_t src = (uint8_t)atoi(t[1]), dst = (uint8_t)atoi(t[2]), kd = (uint8_t)strtoul(t[5], NULL, 0);
+        if (mn < 0 || pn < 0) FAIL_RET("vector sealed %s is malformed (line %d)", name, line);
+        CHECK(coop_open(a, (size_t)pn, mk, src, dst, &got_kind, c, sizeof c, &ng) && got_kind == kd && ng == (size_t)mn && !memcmp(c, b, ng),
+              "vector sealed %s opens (line %d)", name, line);
+        size_t k = coop_seal(c, sizeof c, mk, src, dst, hex64(t[3]), (uint32_t)strtoul(t[4], NULL, 0), kd, b, (size_t)mn);
+        CHECK(k == (size_t)pn && !memcmp(c, a, k), "vector sealed %s: seals to the same bytes (line %d)", name, line);
     } else if (!strcmp(kind, "reject")) {
-        // reject <kind> <name> <bytes>
         char *what = name, *nm = next_token(&rest), *bytes = next_token(&rest);
-        int n = bytes ? unhex(bytes, a, sizeof a) : -1;
+        int n = unhex(bytes, a, sizeof a);
         if (n < 0) FAIL_RET("vector reject %s: bad hex (line %d)", nm, line);
-        int parsed;
         CoopHdr h;
         const uint8_t *p;
         CoopConnect cn;
         CoopRoster r;
         CoopJoined j;
         CoopError e;
-        uint8_t kb;
-        size_t ng;
+        uint64_t u64;
+        uint32_t u32;
+        uint8_t u8, ck[16];
+        int parsed;
         if (!strcmp(what, "dgram")) parsed = coop_dgram_parse(a, (size_t)n, &h, &p);
         else if (!strcmp(what, "connect")) parsed = coop_connect_parse(a, (size_t)n, &cn);
+        else if (!strcmp(what, "challenge")) parsed = coop_challenge_parse(a, (size_t)n, &u64, ck);
         else if (!strcmp(what, "roster")) parsed = coop_roster_parse(a, (size_t)n, &r, NULL);
         else if (!strcmp(what, "joined")) parsed = coop_joined_parse(a, (size_t)n, &j);
         else if (!strcmp(what, "error")) parsed = coop_error_parse(a, (size_t)n, &e);
-        else parsed = coop_peer_parse(a, (size_t)n, &kb, &p, &ng);
+        else if (!strcmp(what, "kick")) parsed = coop_kick_parse(a, (size_t)n, &u8, &u64);
+        else parsed = coop_envelope_peek(a, (size_t)n, &u64, &u32);
         CHECK(!parsed, "vector reject %s %s parses (line %d)", what, nm, line);
     } else {
         CHECK(0, "vector line %d: unknown kind %s", line, kind);
@@ -366,35 +432,35 @@ static int probe_vectors(void) {
 }
 
 static void probe_fuzz(void) {
-    uint8_t buf[1400], out[1400];
-    uint8_t key[16];
-    coop_room_key("H7K3WM", key);
-    // valid datagrams to start from
-    uint8_t seeds[6][400];
-    size_t seed_len[6];
+    static uint8_t buf[1400], out[1400], opened[1400];
+    uint8_t key[COOP_KEY_LEN], mk[COOP_MSG_KEY_LEN];
+    coop_room_keys(ROOM_SECRET, key, mk);
+    uint8_t seeds[7][400];
+    size_t seed_len[7];
     CoopRoster r = {.n = 2};
-    r.m[0] = (CoopMemberInfo){1, 0, "Alice"}, r.m[1] = (CoopMemberInfo){2, 1, "Bob"};
-    uint8_t payload[300];
-    CoopHdr h = {.ver = 1, .room = 7, .src = 1, .dst = 2, .seq = 5};
+    r.m[0] = (CoopMemberInfo){1, COOP_FLAG_MAKER, 5, "Alice"}, r.m[1] = (CoopMemberInfo){2, 1, 6, "Bob"};
+    uint8_t payload[400];
+    CoopHdr h = {.ver = COOP_PROTO, .room = 7, .src = 1, .dst = 2, .seq = 5};
     size_t n = coop_roster_pack(payload, sizeof payload, &r);
     h.type = COOP_T_ROSTER, seed_len[0] = coop_dgram_pack(seeds[0], sizeof seeds[0], &h, payload, n, key);
-    CoopJoined j = {.member = 2, .roster = r};
-    memcpy(j.code, "H7K3WM", 7);
+    CoopJoined j = {.member = 2, .nonce = 9, .roster = r};
     n = coop_joined_pack(payload, sizeof payload, &j);
     h.type = COOP_T_JOINED, seed_len[1] = coop_dgram_pack(seeds[1], sizeof seeds[1], &h, payload, n, key);
-    CoopConnect c = {.intent = 2, .client_id = 99};
-    memcpy(c.code, "H7K3WM", 7);
+    CoopConnect c = {.intent = 2, .client_id = 99, .session = 3, .nonce = 4};
+    memcpy(c.locator, key, sizeof key);
     strcpy(c.name, "Bob");
     n = coop_connect_pack(payload, sizeof payload, &c);
-    h.type = COOP_T_CONNECT, seed_len[2] = coop_dgram_pack(seeds[2], sizeof seeds[2], &h, payload, n, NULL);
-    CoopError e = {.reason = 1};
+    h.type = COOP_T_CONNECT, seed_len[2] = coop_dgram_pack(seeds[2], sizeof seeds[2], &h, payload, n, key);
+    CoopError e = {.reason = 1, .nonce = 4};
     strcpy(e.text, "no such room");
     n = coop_error_pack(payload, sizeof payload, &e);
     h.type = COOP_T_ERROR, seed_len[3] = coop_dgram_pack(seeds[3], sizeof seeds[3], &h, payload, n, key);
-    n = coop_peer_pack(payload, sizeof payload, COOP_K_TEST, "hello", 5);
+    n = coop_seal(payload, sizeof payload, mk, 1, 2, 5, 1, COOP_K_TEST, "hello", 5);
     h.type = COOP_T_DATA, seed_len[4] = coop_dgram_pack(seeds[4], sizeof seeds[4], &h, payload, n, key);
     h.type = COOP_T_PONG, seed_len[5] = coop_dgram_pack(seeds[5], sizeof seeds[5], &h, "abcd", 4, key);
-    long parsed = 0, tag_ok = 0;
+    n = coop_kick_pack(payload, sizeof payload, 2, 6);
+    h.type = COOP_T_KICK, seed_len[6] = coop_dgram_pack(seeds[6], sizeof seeds[6], &h, payload, n, key);
+    long parsed = 0, tag_ok = 0, open_ok = 0;
     for (int it = 0; it < 400000; it++) {
         size_t len;
         int mode = it % 4;
@@ -402,7 +468,7 @@ static void probe_fuzz(void) {
             len = rnd32() % 1300;
             for (size_t i = 0; i < len; i++) buf[i] = (uint8_t)(rnd32() % 5 ? rnd32() : 0);
         } else {           // a valid datagram with bytes changed, or cut short
-            int s = (int)(rnd32() % 6);
+            int s = (int)(rnd32() % 7);
             len = seed_len[s];
             memcpy(buf, seeds[s], len);
             for (unsigned k = rnd32() % 4; k && len; k--) buf[rnd32() % len] = (uint8_t)rnd32();
@@ -411,8 +477,7 @@ static void probe_fuzz(void) {
         CoopHdr hh;
         const uint8_t *p;
         if (!coop_dgram_parse(buf, len, &hh, &p)) {
-            // the payload parsers on whatever bytes there are
-            p = buf, hh.len = (uint16_t)len;
+            p = buf, hh.len = (uint16_t)len;   // the payload parsers on whatever bytes there are
         } else {
             parsed++;
             tag_ok += coop_dgram_verify(buf, len, key);
@@ -422,43 +487,55 @@ static void probe_fuzz(void) {
         CoopJoined jj;
         CoopError ee;
         uint32_t v;
-        uint8_t kind;
-        const uint8_t *bytes;
-        size_t nb;
-        char nameb[COOP_NAME_MAX + 1], codeb[COOP_CODE_LEN + 1];
+        uint64_t s64;
+        uint8_t kind, ck[16];
+        size_t no;
+        char nameb[COOP_NAME_MAX + 1], secretb[COOP_SECRET_LEN + 1];
         if (coop_connect_parse(p, hh.len, &cn)) coop_connect_pack(out, sizeof out, &cn);
         if (coop_roster_parse(p, hh.len, &rr, NULL)) coop_roster_pack(out, sizeof out, &rr);
         if (coop_joined_parse(p, hh.len, &jj)) coop_joined_pack(out, sizeof out, &jj);
         if (coop_error_parse(p, hh.len, &ee)) coop_error_pack(out, sizeof out, &ee);
+        if (coop_challenge_parse(p, hh.len, &s64, ck)) coop_challenge_pack(out, sizeof out, s64, ck);
+        coop_kick_parse(p, hh.len, &kind, &s64);
         coop_u32_parse(p, hh.len, &v);
-        coop_peer_parse(p, hh.len, &kind, &bytes, &nb);
+        coop_envelope_peek(p, hh.len, &s64, &v);
+        open_ok += coop_open(p, hh.len, mk, hh.src, hh.dst, &kind, opened, sizeof opened, &no);
         coop_name_clean(nameb, sizeof nameb, p, hh.len);
         char text[40];
         size_t tl = len < sizeof text - 1 ? len : sizeof text - 1;
         memcpy(text, buf, tl);
         text[tl] = 0;
-        coop_code_normalize(text, codeb);
+        coop_secret_normalize(text, secretb);
     }
     CHECK(parsed > 1000, "the fuzz reached the payload parsers (%ld datagrams parsed)", parsed);
     CHECK(tag_ok < parsed, "a changed datagram's tag no longer verifies");
-    printf("coop-probe: parser fuzz: 400000 inputs, %ld parsed as datagrams\n", parsed);
+    printf("coop-probe: parser fuzz: 400000 inputs, %ld parsed as datagrams, %ld sealed messages opened (unchanged copies)\n", parsed, open_ok);
 }
 
 // ---- 3a. a relay of this file
 
-typedef struct { int used; uint64_t cid; char name[COOP_NAME_MAX + 1]; PlatAddr addr; uint32_t connect_seq; } MockMember;
-typedef struct { int used; uint32_t id; char code[COOP_CODE_LEN + 1]; uint8_t key[COOP_KEY_LEN]; MockMember m[COOP_MAX_MEMBERS + 1]; } MockRoom;
+typedef struct {
+    int used, maker;
+    uint64_t cid, session;
+    char name[COOP_NAME_MAX + 1];
+    PlatAddr addr;
+    uint32_t connect_seq;
+    uint8_t token[COOP_COOKIE_LEN];
+} MockMember;
+typedef struct { int used; uint32_t id; uint8_t locator[COOP_KEY_LEN]; uint64_t banned[4]; MockMember m[COOP_MAX_MEMBERS + 1]; } MockRoom;
 
 typedef struct {
     PlatUdp *sock;
     PlatThread *thread;
     uint16_t port;
-    volatile int stop, restart, corrupt_next, fuzz;
+    volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay;
     volatile unsigned forwarded;
     MockRoom rooms[4];
     uint8_t secret[32];
     uint32_t seq;
     uint64_t next_roster;
+    uint8_t recorded[COOP_MAX_DGRAM];   // a DATA datagram of member record_from, for a replay later
+    size_t recorded_n;
 } MockRelay;
 
 static void mock_send(MockRelay *r, const PlatAddr *to, uint8_t type, uint32_t room, uint8_t dst, const void *payload, size_t n, const uint8_t *key) {
@@ -466,6 +543,13 @@ static void mock_send(MockRelay *r, const PlatAddr *to, uint8_t type, uint32_t r
     CoopHdr h = {.ver = COOP_PROTO, .type = type, .room = room, .dst = dst, .seq = ++r->seq};
     size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, key);
     if (k) plat_udp_send(r->sock, to, d, k);
+}
+
+static void mock_error(MockRelay *r, const PlatAddr *to, uint8_t reason, uint64_t nonce, const uint8_t *key) {
+    CoopError e = {.reason = reason, .nonce = nonce};
+    strcpy(e.text, "refused");
+    uint8_t payload[80];
+    mock_send(r, to, COOP_T_ERROR, 0, 0, payload, coop_error_pack(payload, sizeof payload, &e), key);
 }
 
 static void mock_cookie(MockRelay *r, const PlatAddr *a, uint8_t out[COOP_COOKIE_LEN]) {
@@ -478,9 +562,9 @@ static void mock_roster_of(const MockRoom *room, CoopRoster *out) {
     memset(out, 0, sizeof *out);
     for (int i = 1; i <= COOP_MAX_MEMBERS; i++)
         if (room->m[i].used) {
-            out->m[out->n].id = (uint8_t)i;
-            memcpy(out->m[out->n].name, room->m[i].name, sizeof out->m[out->n].name);
-            out->n++;
+            CoopMemberInfo *m = &out->m[out->n++];
+            m->id = (uint8_t)i, m->flags = room->m[i].maker ? COOP_FLAG_MAKER : 0, m->session = room->m[i].session;
+            memcpy(m->name, room->m[i].name, sizeof m->name);
         }
 }
 
@@ -490,61 +574,75 @@ static void mock_roster_to_all(MockRelay *r, MockRoom *room, int skip) {
     mock_roster_of(room, &ro);
     size_t n = coop_roster_pack(payload, sizeof payload, &ro);
     for (int i = 1; i <= COOP_MAX_MEMBERS; i++)
-        if (room->m[i].used && i != skip) mock_send(r, &room->m[i].addr, COOP_T_ROSTER, room->id, (uint8_t)i, payload, n, room->key);
+        if (room->m[i].used && i != skip) mock_send(r, &room->m[i].addr, COOP_T_ROSTER, room->id, (uint8_t)i, payload, n, room->locator);
 }
 
 static void mock_connect(MockRelay *r, const uint8_t *d, size_t n, const CoopHdr *h, const uint8_t *p, const PlatAddr *from) {
     CoopConnect c;
     if (n < COOP_CONNECT_MIN || !coop_connect_parse(p, h->len, &c) || (c.intent != COOP_INTENT_CREATE && c.intent != COOP_INTENT_JOIN)) return;
-    uint8_t cookie[COOP_COOKIE_LEN], key[COOP_KEY_LEN];
-    int keyed = c.code[0] != 0;
-    if (keyed) coop_room_key(c.code, key);
-    mock_cookie(r, from, cookie);
-    if (memcmp(cookie, c.cookie, sizeof cookie)) {
-        mock_send(r, from, COOP_T_CHALLENGE, 0, 0, cookie, sizeof cookie, keyed ? key : NULL);
-        return;
-    }
-    if (keyed && !coop_dgram_verify(d, n, key)) return;
     MockRoom *room = NULL;
-    for (int i = 0; i < 4 && keyed; i++)
-        if (r->rooms[i].used && !strcmp(r->rooms[i].code, c.code)) room = &r->rooms[i];
-    if (!room && c.intent == COOP_INTENT_JOIN) {
-        CoopError e = {.reason = COOP_E_NO_ROOM};
-        strcpy(e.text, "no such room");
-        uint8_t payload[80];
-        mock_send(r, from, COOP_T_ERROR, 0, 0, payload, coop_error_pack(payload, sizeof payload, &e), keyed ? key : NULL);
+    for (int i = 0; i < 4; i++)
+        if (r->rooms[i].used && !memcmp(r->rooms[i].locator, c.locator, COOP_KEY_LEN)) room = &r->rooms[i];
+    int id = 0;
+    for (int i = 1; room && i <= COOP_MAX_MEMBERS; i++)   // the same member with its token: its id, no cookie needed
+        if (room->m[i].used && room->m[i].cid == c.client_id && !memcmp(room->m[i].token, c.token, COOP_COOKIE_LEN)) id = i;
+    uint8_t cookie[COOP_COOKIE_LEN];
+    mock_cookie(r, from, cookie);
+    if (!id && memcmp(cookie, c.cookie, sizeof cookie)) {
+        uint8_t payload[32];
+        mock_send(r, from, COOP_T_CHALLENGE, 0, 0, payload, coop_challenge_pack(payload, sizeof payload, c.nonce, cookie), c.locator);
         return;
     }
-    if (!room) {   // a create: the chosen code, or a made-up one
+    if (!coop_dgram_verify(d, n, c.locator)) return;
+    if (r->lie) {   // answers this attempt never asked for: another nonce, no tag, another room; then the real one
+        r->lie = 0;
+        mock_error(r, from, COOP_E_ROOM_FULL, c.nonce ^ 1, c.locator);
+        mock_error(r, from, COOP_E_REMOVED, c.nonce, NULL);
+        uint8_t d2[64], other[COOP_KEY_LEN];
+        CoopHdr eh = {.ver = 1, .type = COOP_T_ERROR, .seq = ++r->seq};
+        size_t k = coop_dgram_pack(d2, sizeof d2, &eh, "\x03\x00", 2, NULL);   // a relay of another version
+        plat_udp_send(r->sock, from, d2, k);
+        coop_room_keys("ZZZZZZZZZZZZZZZZZZ", other, NULL);
+        CoopJoined fake = {.member = 5, .nonce = c.nonce};
+        uint8_t payload[300];
+        size_t pn = coop_joined_pack(payload, sizeof payload, &fake);
+        CoopHdr jh = {.ver = COOP_PROTO, .type = COOP_T_JOINED, .room = 0xBAD, .dst = 5, .seq = ++r->seq};
+        uint8_t d3[400];
+        k = coop_dgram_pack(d3, sizeof d3, &jh, payload, pn, other);
+        plat_udp_send(r->sock, from, d3, k);
+    }
+    if (!room && c.intent == COOP_INTENT_JOIN) return mock_error(r, from, COOP_E_NO_ROOM, c.nonce, c.locator);
+    if (room && c.intent == COOP_INTENT_CREATE && !id) return mock_error(r, from, COOP_E_ROOM_EXISTS, c.nonce, c.locator);
+    if (!room) {
         for (int i = 0; i < 4 && !room; i++)
             if (!r->rooms[i].used) room = &r->rooms[i];
         if (!room) return;
         memset(room, 0, sizeof *room);
         room->used = 1, room->id = 0xC0DE0000u + rnd32() % 0xFFFF + 1;
-        if (keyed) memcpy(room->code, c.code, sizeof room->code);
-        else memcpy(room->code, "BCDFGH", 7);
-        coop_room_key(room->code, room->key);
+        memcpy(room->locator, c.locator, COOP_KEY_LEN);
     }
-    int id = 0;
-    for (int i = 1; i <= COOP_MAX_MEMBERS; i++)   // the same client keeps its id; else the first free one
-        if (room->m[i].used && room->m[i].cid == c.client_id) id = i;
+    for (int i = 0; i < 4; i++)
+        if (room->banned[i] && room->banned[i] == c.client_id) return mock_error(r, from, COOP_E_REMOVED, c.nonce, room->locator);
+    int fresh = !id, maker = 1;
+    for (int i = 1; i <= COOP_MAX_MEMBERS; i++) maker &= !room->m[i].used;
     for (int i = 1; i <= COOP_MAX_MEMBERS && !id; i++)
         if (!room->m[i].used) id = i;
-    if (!id) {
-        CoopError e = {.reason = COOP_E_ROOM_FULL};
-        strcpy(e.text, "room full");
-        uint8_t payload[80];
-        mock_send(r, from, COOP_T_ERROR, 0, 0, payload, coop_error_pack(payload, sizeof payload, &e), room->key);
-        return;
+    if (!id) return mock_error(r, from, COOP_E_ROOM_FULL, c.nonce, room->locator);
+    MockMember *m = &room->m[id];
+    if (fresh) {
+        memset(m, 0, sizeof *m);
+        m->maker = maker && c.intent == COOP_INTENT_CREATE;
+        m->cid = c.client_id;
+        plat_random(m->token, sizeof m->token);
     }
-    int fresh = !room->m[id].used || room->m[id].connect_seq != h->seq;
-    room->m[id] = (MockMember){.used = 1, .cid = c.client_id, .addr = *from, .connect_seq = h->seq};
-    memcpy(room->m[id].name, c.name, sizeof room->m[id].name);
-    CoopJoined j = {.member = (uint8_t)id};
-    memcpy(j.code, room->code, sizeof j.code);
+    fresh |= m->connect_seq != h->seq || !m->used;
+    m->used = 1, m->addr = *from, m->connect_seq = h->seq, m->session = c.session;
+    memcpy(m->name, c.name, sizeof m->name);
+    CoopJoined j = {.member = (uint8_t)id, .nonce = c.nonce};
+    memcpy(j.token, m->token, COOP_COOKIE_LEN);
     mock_roster_of(room, &j.roster);
-    uint8_t payload[300];
-    mock_send(r, from, COOP_T_JOINED, room->id, (uint8_t)id, payload, coop_joined_pack(payload, sizeof payload, &j), room->key);
+    uint8_t payload[400];
+    mock_send(r, from, COOP_T_JOINED, room->id, (uint8_t)id, payload, coop_joined_pack(payload, sizeof payload, &j), room->locator);
     if (fresh) mock_roster_to_all(r, room, id);
 }
 
@@ -557,16 +655,35 @@ static void mock_handle(MockRelay *r, uint8_t *d, size_t n, const PlatAddr *from
     for (int i = 0; i < 4; i++)
         if (r->rooms[i].used && r->rooms[i].id == h.room) room = &r->rooms[i];
     if (!room || h.src < 1 || h.src > COOP_MAX_MEMBERS || !room->m[h.src].used || !plat_addr_eq(&room->m[h.src].addr, from)) return;
-    if (!coop_dgram_verify(d, n, room->key)) return;
+    if (!coop_dgram_verify(d, n, room->locator)) return;
+    uint8_t member;
+    uint64_t session;
     if (h.type == COOP_T_PING) {
-        mock_send(r, from, COOP_T_PONG, room->id, h.src, p, h.len > 4 ? 4 : h.len, room->key);
+        mock_send(r, from, COOP_T_PONG, room->id, h.src, p, h.len > 4 ? 4 : h.len, room->locator);
     } else if (h.type == COOP_T_LEAVE) {
         room->m[h.src].used = 0;
         mock_roster_to_all(r, room, 0);
+    } else if (h.type == COOP_T_KICK && room->m[h.src].maker && coop_kick_parse(p, h.len, &member, &session) && member >= 1 &&
+               member <= COOP_MAX_MEMBERS && room->m[member].used && room->m[member].session == session) {
+        for (int i = 0; i < 4; i++)
+            if (!room->banned[i]) {
+                room->banned[i] = room->m[member].cid;
+                break;
+            }
+        CoopError e = {.reason = COOP_E_REMOVED};
+        uint8_t payload[80];
+        mock_send(r, &room->m[member].addr, COOP_T_ERROR, room->id, member, payload, coop_error_pack(payload, sizeof payload, &e), room->locator);
+        room->m[member].used = 0;
+        mock_roster_to_all(r, room, 0);
     } else if (h.type == COOP_T_DATA) {
+        if (r->record_from == h.src && n <= sizeof r->recorded) {   // kept for a replay after its sender joined again
+            memcpy(r->recorded, d, n);
+            r->recorded_n = n;
+            r->record_from = 0;
+        }
         if (r->corrupt_next) {   // one forwarded datagram with a flipped tag bit: no receiver may deliver it
             r->corrupt_next = 0;
-            d[16] ^= 1;
+            d[n - 1] ^= 1;
         }
         for (int i = 1; i <= COOP_MAX_MEMBERS; i++)
             if (room->m[i].used && i != h.src && (h.dst == COOP_DST_ALL || h.dst == i)) {
@@ -576,32 +693,57 @@ static void mock_handle(MockRelay *r, uint8_t *d, size_t n, const PlatAddr *from
     }
 }
 
+static MockRoom *mock_room_of(MockRelay *r, int member) {
+    for (int i = 0; i < 4; i++)
+        if (r->rooms[i].used && r->rooms[i].m[member].used) return &r->rooms[i];
+    return NULL;
+}
+
+// What a hostile relay can do with what it knows (the locator, every member's session, every datagram it forwards):
+// a message to member 1 in member 2's name and session, sealed with a key it made up, tagged right; and the DATA
+// datagram recorded earlier, sent again.
+static void mock_forge(MockRelay *r) {
+    MockRoom *room = mock_room_of(r, 1);
+    if (!room || !room->m[2].used) return;
+    uint8_t fake_key[COOP_MSG_KEY_LEN], payload[COOP_MAX_PAYLOAD], d[COOP_MAX_DGRAM];
+    plat_random(fake_key, sizeof fake_key);
+    uint8_t m[9] = {'p', 'r', 'o', 'b', 'e', 0};
+    coop_u32_pack(m + 5, 4, 600);
+    size_t n = coop_seal(payload, sizeof payload, fake_key, 2, COOP_DST_ALL, room->m[2].session, 0x7FFFFFF0u, COOP_K_TEST, m, sizeof m);
+    CoopHdr h = {.ver = COOP_PROTO, .type = COOP_T_DATA, .room = room->id, .src = 2, .dst = COOP_DST_ALL, .seq = ++r->seq};
+    size_t k = coop_dgram_pack(d, sizeof d, &h, payload, n, room->locator);
+    plat_udp_send(r->sock, &room->m[1].addr, d, k);
+}
+
+static void mock_replay(MockRelay *r) {
+    MockRoom *room = mock_room_of(r, 1);
+    if (room && r->recorded_n) plat_udp_send(r->sock, &room->m[1].addr, r->recorded, r->recorded_n);
+}
+
 // Datagrams of every kind to member 1 of the first room from the relay's own address, as a hostile or broken relay would: bytes
-// at random, valid ones changed or cut, and ones carrying the room's tag with a random payload (stale roster counters and
-// kinds nothing listens to, so a delivered one changes nothing the probe measures).
+// at random, valid ones changed or cut, and ones carrying the room's tag with a random payload (stale roster counters, and
+// DATA no key opens).
 static void mock_fuzz(MockRelay *r) {
-    MockRoom *room = NULL;
-    for (int i = 0; i < 4 && !room; i++)
-        if (r->rooms[i].used && r->rooms[i].m[1].used) room = &r->rooms[i];
+    MockRoom *room = mock_room_of(r, 1);
     if (!room) return;
     PlatAddr to = room->m[1].addr;
-    uint8_t d[1400], payload[COOP_MAX_PAYLOAD];   // d holds the random lengths below too
+    uint8_t d[1400], payload[COOP_MAX_PAYLOAD];
     for (int it = 0; it < 6000 && !r->stop; it++) {
         size_t n;
         int mode = it % 3;
         if (mode == 0) {
             n = rnd32() % 1300;
             for (size_t i = 0; i < n; i++) d[i] = (uint8_t)(rnd32() % 4 ? rnd32() : 0);
-            if (n > 12 && rnd32() % 2) d[0] = 0x4E, d[1] = 0x43, d[2] = 1;
+            if (n > 12 && rnd32() % 2) d[0] = 0x4E, d[1] = 0x43, d[2] = COOP_PROTO;
         } else {
             size_t pn = rnd32() % 200;
             for (size_t i = 0; i < pn; i++) payload[i] = (uint8_t)rnd32();
             static const uint8_t types[] = {COOP_T_CHALLENGE, COOP_T_JOINED, COOP_T_ERROR, COOP_T_ROSTER, COOP_T_PONG, COOP_T_DATA, COOP_T_PING, 0x77};
             uint8_t type = types[rnd32() % sizeof types];
-            if (type == COOP_T_DATA && pn) payload[0] = (uint8_t)(0x10 + rnd32() % 0xD0);   // a kind nothing listens to
+            if (type == COOP_T_DATA && pn > 13) payload[0] = COOP_ENV_V1, memcpy(payload + 1, &room->m[2].session, 8);
             CoopHdr h = {.ver = COOP_PROTO, .type = type, .room = mode == 1 ? room->id : rnd32(), .src = (uint8_t)(rnd32() % 10),
                          .dst = (uint8_t)(rnd32() % 3 == 0 ? COOP_DST_ALL : 1), .seq = type == COOP_T_ROSTER ? 0 : rnd32()};
-            n = coop_dgram_pack(d, sizeof d, &h, payload, pn, room->key);
+            n = coop_dgram_pack(d, sizeof d, &h, payload, pn, room->locator);
             if (mode == 2 && n) d[rnd32() % n] ^= (uint8_t)(1u << (rnd32() % 8));
         }
         plat_udp_send(r->sock, &to, d, n);
@@ -621,10 +763,9 @@ static void mock_main(void *arg) {
             while (plat_now_ms() < until) plat_udp_recv(r->sock, buf, sizeof buf, &from, 20);
             r->restart = 0;
         }
-        if (r->fuzz) {
-            mock_fuzz(r);
-            r->fuzz = 0;
-        }
+        if (r->fuzz) mock_fuzz(r), r->fuzz = 0;
+        if (r->forge) mock_forge(r), r->forge = 0;
+        if (r->replay) mock_replay(r), r->replay = 0;
         int n = plat_udp_recv(r->sock, buf, sizeof buf, &from, 10);
         if (n > 0) mock_handle(r, buf, (size_t)n, &from);
         if (plat_now_ms() >= r->next_roster) {   // the roster again every second: a lost update repairs itself
@@ -771,14 +912,14 @@ static void exchange(Player *a, Player *b, unsigned drop, const char *what, uint
 
 // The process's session, driven by the settings as the game does it: COOP, COOP_SERVER, COOP_NAME, COOP_AUTO and COOP_ROOM in the
 // environment (cfg_setenv bumps cfg_version, which the coop thread polls), then coop_init, the commands, a rename, switching
-// COOP off and on again, and coop_shutdown. alice is in the room of code H7K3WM with Bob.
+// COOP off and on again, and coop_shutdown. alice is in the room of ROOM_SECRET with Bob.
 static void probe_process(const char *server, unsigned drop, Player *alice, uint32_t *first) {
     char drop_text[16];
     snprintf(drop_text, sizeof drop_text, "%u", drop);
     cfg_setenv("NX2NAVI_COOP_NAME", NULL);
     cfg_setenv("NX2NAVI_COOP_SERVER", server);
     cfg_setenv("NX2NAVI_COOP_AUTO", "join");
-    cfg_setenv("NX2NAVI_COOP_ROOM", "h7k-3wm");   // a code as a player types it
+    cfg_setenv("NX2NAVI_COOP_ROOM", "h7k3wm-bcdfgh 234567");   // a secret as a player types it
     cfg_setenv("NX2NAVI_COOP_DROP", drop_text);
     cfg_setenv("NX2NAVI_COOP", "0");
     CoopView v;
@@ -789,11 +930,14 @@ static void probe_process(const char *server, unsigned drop, Player *alice, uint
     memset(&proc, 0, sizeof proc);
     proc.name = "process";
     CHECK(coop_on_message(COOP_K_TEST, on_test_message, &proc) && coop_on_view(on_view_change, &proc), "handlers register");
+    uint64_t id1 = coop_client_id();
+    CHECK(id1 && id1 == coop_client_id(), "the client id stays the same within a start of the game");
     coop_init();
     coop_init();   // twice is the same as once
     cfg_setenv("NX2NAVI_COOP", "1");
     CHECK(WAIT_FOR((coop_view_get(&v), v.state == COOP_JOINED), 30000), "COOP_AUTO=join joins the room of COOP_ROOM (state %d, %s)", v.state, v.status);
-    CHECK(v.self == 3 && v.n == 3 && !strcmp(v.code, "H7K-3WM"), "as member 3 of H7K-3WM (self %d, %d members, %s)", v.self, v.n, v.code);
+    CHECK(v.self == 3 && v.n == 3 && !strcmp(v.code, "H7K3WM-BCDFGH-234567") && v.maker == 1 && !v.made,
+          "as member 3 of H7K3WM-BCDFGH-234567, made by member 1 (self %d, %d members, %s, maker %d)", v.self, v.n, v.code, v.maker);
     CHECK(!strncmp(v.member[2].name, "Player-", 7) && strlen(v.member[2].name) == 11, "under the default name Player-xxxx (%s)", v.member[2].name);
     CHECK(WAIT_FOR(in_room(alice, 3), ROSTER_WAIT_MS), "Alice sees three members");
     CHECK(proc.views > 0, "the view hook ran");
@@ -818,8 +962,10 @@ static void probe_process(const char *server, unsigned drop, Player *alice, uint
     CHECK(alice->got >= min, "Alice got messages from the process: %u", alice->got);
     *first += 200;
     alice->got = 0;
-    CHECK(coop_send_to(1, COOP_K_TEST, "abc", 3) && !coop_send_to(0, COOP_K_TEST, "abc", 3) && !coop_send(COOP_K_TEST, "x", COOP_MAX_PAYLOAD),
+    static uint8_t too_long[COOP_MAX_MESSAGE + 1];
+    CHECK(coop_send_to(1, COOP_K_TEST, "abc", 3) && !coop_send_to(0, COOP_K_TEST, "abc", 3) && !coop_send(COOP_K_TEST, too_long, sizeof too_long),
           "coop_send_to takes a member, a message that is too long is refused");
+    CHECK(!coop_remove_member(1) || WAIT_FOR(in_room(alice, 3), 3000), "a member that did not make the room removes nobody");
 
     // a new name joins the room again under it
     cfg_setenv("NX2NAVI_COOP_NAME", "Process");
@@ -829,10 +975,11 @@ static void probe_process(const char *server, unsigned drop, Player *alice, uint
     CHECK(v.state == COOP_JOINED || WAIT_FOR((coop_view_get(&v), v.state == COOP_JOINED), 15000), "and the process is back in the room");
 
     // commands
-    CHECK(!coop_command(COOP_CMD_JOIN, "not a code") && !coop_command(COOP_CMD_JOIN, NULL) && !coop_command(COOP_CMD_CREATE, "BCDF"), "a bad room code is refused");
+    CHECK(!coop_command(COOP_CMD_JOIN, "not a secret") && !coop_command(COOP_CMD_JOIN, NULL) && !coop_command(COOP_CMD_CREATE, "H7K3WM"),
+          "a bad room secret is refused");
     CHECK(coop_command(COOP_CMD_LEAVE, NULL), "leave is taken");
     CHECK(WAIT_FOR((coop_view_get(&v), v.state == COOP_LEFT) && in_room(alice, 2), ROSTER_WAIT_MS), "the process left (state %d)", v.state);
-    CHECK(coop_command(COOP_CMD_JOIN, "H7K 3WM"), "join is taken");
+    CHECK(coop_command(COOP_CMD_JOIN, "H7K3WM BCDFGH 234567"), "join is taken");
     CHECK(WAIT_FOR((coop_view_get(&v), v.state == COOP_JOINED) && in_room(alice, 3), ROSTER_WAIT_MS), "and the process joined again (state %d, %s)", v.state, v.status);
 
     // COOP off and on again
@@ -851,6 +998,67 @@ static void probe_process(const char *server, unsigned drop, Player *alice, uint
     cfg_setenv("NX2NAVI_COOP", "0");
     cfg_setenv("NX2NAVI_COOP_AUTO", NULL);
     cfg_setenv("NX2NAVI_COOP_ROOM", NULL);
+}
+
+// The hostile relay of this file (the mock): what it forwards changed, a message it seals itself, a recorded message of
+// Bob's sent again after Bob joined again, and lies to a player who connects. Alice and Bob are in a room.
+static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uint16_t alice_port, unsigned drop, uint32_t *first) {
+    uint8_t m[9] = {'p', 'r', 'o', 'b', 'e', 0};
+    unsigned got_before = alice->got;
+    mock->corrupt_next = 1;
+    coop_u32_pack(m + 5, 4, 500);
+    coop_sess_send(bob->sess, 0, COOP_K_TEST, m, sizeof m);
+    plat_sleep_ms(300);
+    CHECK(alice->got == got_before && !(alice->seen[500 / 32] & (1u << (500 % 32))), "a message changed in transit is not delivered");
+
+    mock->forge = 1;
+    CHECK(WAIT_FOR(!mock->forge, 5000), "the relay forged a message");
+    plat_sleep_ms(300);
+    CHECK(!(alice->seen[600 / 32] & (1u << (600 % 32))), "a message the relay sealed itself, in Bob's name and session, is not delivered");
+
+    // a message of Bob's recorded, then Bob joins again (a new session), then the recorded one comes again
+    mock->record_from = view_of(bob).self;
+    coop_u32_pack(m + 5, 4, 700);
+    for (int i = 0; i < 20 && mock->record_from; i++) coop_sess_send(bob->sess, 0, COOP_K_TEST, m, sizeof m), plat_sleep_ms(50);
+    CHECK(WAIT_FOR(!mock->record_from && mock->recorded_n, 3000), "the relay recorded a message of Bob's");
+    CHECK(WAIT_FOR(alice->seen[700 / 32] & (1u << (700 % 32)), 3000), "and Alice got it once");
+    unsigned dups = alice->dups;
+    mock->replay = 1;   // the same session still: a replay within the window
+    CHECK(WAIT_FOR(!mock->replay, 3000), "replayed");
+    plat_sleep_ms(300);
+    CHECK(alice->dups == dups, "a message sent again in the same session is not delivered twice");
+    coop_sess_command(bob->sess, COOP_CMD_JOIN, ROOM_SECRET);   // Bob joins again: a new session
+    CHECK(WAIT_FOR(in_room(bob, 2) && in_room(alice, 2), ROSTER_WAIT_MS), "Bob is back");
+    plat_sleep_ms(1500);   // the roster with Bob's new session has reached Alice
+    uint32_t lost = view_of(alice).lost;
+    mock->replay = 1;
+    CHECK(WAIT_FOR(!mock->replay, 3000), "replayed after the rejoin");
+    plat_sleep_ms(300);
+    CHECK(alice->dups == dups && view_of(alice).lost > lost, "a message recorded before Bob joined again is refused after it (%u thrown away)",
+          view_of(alice).lost - lost);
+
+    // garbage and datagrams with the room's tag from the relay's address
+    lost = view_of(alice).lost;
+    mock->fuzz = 1;
+    CHECK(WAIT_FOR(!mock->fuzz, 60000), "the garbage was sent");
+    plat_sleep_ms(300);
+    CHECK(view_of(alice).lost > lost, "the garbage was counted as thrown away (%u)", view_of(alice).lost - lost);
+    CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2), ROSTER_WAIT_MS), "after the garbage both are still in the room");
+    exchange(alice, bob, drop, "after the hostile relay", first);
+
+    // an outsider's datagrams to Alice's port are not the relay's: thrown away
+    PlatUdp *evil = plat_udp_open(0, 0);
+    PlatAddr to;
+    plat_net_resolve("127.0.0.1", alice_port, &to);
+    uint8_t junk[200];
+    lost = view_of(alice).lost;
+    for (int i = 0; evil && i < 50; i++) {
+        for (size_t k = 0; k < sizeof junk; k++) junk[k] = (uint8_t)rnd32();
+        plat_udp_send(evil, &to, junk, 10 + (size_t)(rnd32() % 190));
+    }
+    plat_udp_close(evil);
+    CHECK(WAIT_FOR(view_of(alice).lost >= lost + 20, 5000), "datagrams from another address are thrown away");
+    CHECK(in_room(alice, 2), "and change nothing");
 }
 
 static void probe_sessions(void) {
@@ -880,56 +1088,29 @@ static void probe_sessions(void) {
     CHECK(v.state == COOP_LEFT, "a session that is on starts in no room (state %d)", v.state);
 
     // --- a room is made and joined
-    coop_sess_command(alice.sess, COOP_CMD_CREATE, "H7K3WM");   // a relay started with --allow-chosen-codes keeps the code
+    coop_sess_command(alice.sess, COOP_CMD_CREATE, ROOM_SECRET);
     CHECK(WAIT_FOR(view_of(&alice).state == COOP_JOINED, 30000), "Alice joined her room (state %d, %s)", view_of(&alice).state, view_of(&alice).status);
     v = view_of(&alice);
-    CHECK(!strcmp(v.code, "H7K-3WM") && v.self == 1 && v.n == 1 && !strcmp(v.member[0].name, "Alice"),
-          "Alice is member 1 of room %s (self %d, %d members)", v.code, v.self, v.n);
-    coop_sess_command(bob.sess, COOP_CMD_JOIN, "H7K3WM");
+    CHECK(!strcmp(v.code, "H7K3WM-BCDFGH-234567") && v.self == 1 && v.n == 1 && v.made && v.maker == 1 && !strcmp(v.member[0].name, "Alice"),
+          "Alice is member 1 and the maker of room %s (self %d, %d members, made %d)", v.code, v.self, v.n, v.made);
+    coop_sess_command(bob.sess, COOP_CMD_JOIN, "h7k3wm-bcdfgh-234567");
     CHECK(WAIT_FOR(in_room(&bob, 2) && in_room(&alice, 2), ROSTER_WAIT_MS), "both see two members (Alice %d, Bob %d)", view_of(&alice).n, view_of(&bob).n);
     v = view_of(&bob);
-    CHECK(v.self == 2 && !strcmp(v.code, "H7K-3WM") && v.n == 2 && !strcmp(v.member[0].name, "Alice") && !strcmp(v.member[1].name, "Bob"),
-          "Bob is member 2 and sees Alice (self %d, %d members)", v.self, v.n);
+    CHECK(v.self == 2 && v.maker == 1 && !v.made && v.n == 2 && !strcmp(v.member[0].name, "Alice") && !strcmp(v.member[1].name, "Bob"),
+          "Bob is member 2 and sees Alice as the maker (self %d, maker %d, %d members)", v.self, v.maker, v.n);
     CHECK(WAIT_FOR(view_of(&bob).ping_ms > 0, 5000), "the round trip to the relay is measured");
-    CHECK(alice.views > 0 && bob.views > 0, "the view hooks ran");
-    printf("coop-probe: room %s, Bob's round trip to the relay %u ms\n", v.code, view_of(&bob).ping_ms);
+    Player other;
+    player_start(&other, "Other", 0x07E, server, 0, 0, 0);
+    coop_sess_command(other.sess, COOP_CMD_CREATE, ROOM_SECRET);
+    CHECK(WAIT_FOR(view_of(&other).state == COOP_LEFT && strstr(view_of(&other).status, "already open"), 30000),
+          "a create of a room that is open is refused, not joined: %s", view_of(&other).status);
+    player_end(&other);
 
     uint32_t first = 0;
     exchange(&alice, &bob, drop, "in the room", &first);
+    CHECK(WAIT_FOR(view_of(&alice).member[1].heard_ms != UINT32_MAX, 3000), "a member whose messages opened counts as heard");
 
-    // --- hostile datagrams (the mock relay only: it knows the room key)
-    if (mock) {
-        unsigned got_before = alice.got;
-        mock->corrupt_next = 1;
-        uint8_t m[9];
-        memcpy(m, "probe", 5);
-        m[4] = 0;
-        coop_u32_pack(m + 5, 4, 500);
-        coop_sess_send(bob.sess, 0, COOP_K_TEST, m, sizeof m);
-        plat_sleep_ms(300);
-        CHECK(alice.got == got_before && !(alice.seen[500 / 32] & (1u << (500 % 32))), "a datagram whose tag was changed in transit is not delivered");
-        uint32_t lost_before = view_of(&alice).lost;
-        mock->fuzz = 1;
-        CHECK(WAIT_FOR(!mock->fuzz, 60000), "the garbage was sent");
-        plat_sleep_ms(300);
-        CHECK(view_of(&alice).lost > lost_before, "the garbage was counted as thrown away (%u)", view_of(&alice).lost - lost_before);
-        CHECK(WAIT_FOR(in_room(&alice, 2) && in_room(&bob, 2), ROSTER_WAIT_MS), "after the garbage both are still in the room (Alice %d, Bob %d)",
-              view_of(&alice).state, view_of(&bob).state);
-        exchange(&alice, &bob, drop, "after the garbage", &first);
-        // an outsider's datagrams to Alice's port are not the relay's: thrown away
-        PlatUdp *evil = plat_udp_open(0, 0);
-        PlatAddr to;
-        plat_net_resolve("127.0.0.1", alice_port, &to);
-        uint8_t junk[200];
-        lost_before = view_of(&alice).lost;
-        for (int i = 0; evil && i < 50; i++) {
-            for (size_t k = 0; k < sizeof junk; k++) junk[k] = (uint8_t)rnd32();
-            plat_udp_send(evil, &to, junk, 10 + (size_t)(rnd32() % 190));
-        }
-        plat_udp_close(evil);
-        CHECK(WAIT_FOR(view_of(&alice).lost >= lost_before + 20, 5000), "datagrams from another address are thrown away");
-        CHECK(in_room(&alice, 2), "and change nothing");
-    }
+    if (mock) probe_hostile_relay(mock, &alice, &bob, alice_port, drop, &first);
 
     // --- the relay is lost for good and comes back
     int restarted = 1;
@@ -938,6 +1119,7 @@ static void probe_sessions(void) {
         printf("coop-probe: the mock relay restarts\n");
     } else if (restart_mode && !strcmp(restart_mode, "stdin")) {
         printf("coop-probe: restart the relay now\n");
+        fflush(stdout);
         char line[64] = "";
         if (!fgets(line, sizeof line, stdin) || strncmp(line, "restarted", 9)) CHECK(0, "the relay was not restarted (got \"%s\")", line);
     } else {
@@ -951,7 +1133,8 @@ static void probe_sessions(void) {
               "after a relay restart both are in a room again (Alice state %d %s, Bob state %d %s)", view_of(&alice).state,
               view_of(&alice).status, view_of(&bob).state, view_of(&bob).status);
         v = view_of(&bob);
-        CHECK(!strcmp(v.code, "H7K-3WM"), "the room is made again under the same code (%s)", v.code);
+        CHECK(!strcmp(v.code, "H7K3WM-BCDFGH-234567") && v.maker == view_of(&alice).self, "the maker made the room again under its secret (%s, maker %d)",
+              v.code, v.maker);
         exchange(&alice, &bob, drop, "after the restart", &first);
     }
 
@@ -960,16 +1143,37 @@ static void probe_sessions(void) {
     CHECK(WAIT_FOR(view_of(&bob).state == COOP_LEFT, 5000), "Bob left (state %d)", view_of(&bob).state);
     CHECK(WAIT_FOR(in_room(&alice, 1), ROSTER_WAIT_MS), "Alice sees the room with only her in it (%d members)", view_of(&alice).n);
     if (!drop) CHECK(alice.byes > 0, "Alice got Bob's BYE");
-    coop_sess_command(bob.sess, COOP_CMD_JOIN, "h7k-3wm");   // a code as typed
+    coop_sess_command(bob.sess, COOP_CMD_JOIN, ROOM_SECRET);
     CHECK(WAIT_FOR(in_room(&bob, 2) && in_room(&alice, 2), ROSTER_WAIT_MS), "Bob joined again");
 
     // --- the process's own session, with the settings the game reads
     probe_process(server, drop, &alice, &first);
 
+    // --- a player who connects while the relay lies to it (the mock), and is then removed by the maker
+    Player carol;
+    player_start(&carol, "Carol", 0xCA201, server, 0, 0, 0);
+    if (mock) mock->lie = 1;
+    coop_sess_command(carol.sess, COOP_CMD_JOIN, ROOM_SECRET);
+    CHECK(WAIT_FOR(in_room(&carol, 3), ROSTER_WAIT_MS), "Carol joins%s (state %d, %s)", mock ? " though the relay first answered with lies" : "",
+          view_of(&carol).state, view_of(&carol).status);
+    CHECK(WAIT_FOR(in_room(&alice, 3), ROSTER_WAIT_MS), "Alice sees Carol");
+    int carol_id = view_of(&carol).self;
+    CHECK(!coop_sess_remove(bob.sess, carol_id) || WAIT_FOR(in_room(&carol, 3), 2000), "Bob, who did not make the room, cannot remove Carol");
+    plat_sleep_ms(500);
+    CHECK(in_room(&carol, 3), "Carol is still in the room");
+    CHECK(coop_sess_remove(alice.sess, carol_id), "the maker's removal is taken");
+    CHECK(WAIT_FOR(view_of(&carol).state == COOP_LEFT && strstr(view_of(&carol).status, "removed"), ROSTER_WAIT_MS),
+          "Carol is removed by the maker: %s", view_of(&carol).status);
+    CHECK(WAIT_FOR(in_room(&alice, 2), ROSTER_WAIT_MS), "and gone from Alice's roster");
+    coop_sess_command(carol.sess, COOP_CMD_JOIN, ROOM_SECRET);
+    CHECK(WAIT_FOR(view_of(&carol).state == COOP_LEFT && strstr(view_of(&carol).status, "removed"), 30000) && in_room(&alice, 2),
+          "and cannot come back as the same player: %s", view_of(&carol).status);
+    player_end(&carol);
+
     // --- a room that is not there, a server that is not there
-    Player carol, dave;
-    player_start(&carol, "Carol", 0xCA201, server, drop, 0, 0);
-    coop_sess_command(carol.sess, COOP_CMD_JOIN, "BCDFGH");
+    Player dave;
+    player_start(&carol, "Carol", 0xCA202, server, drop, 0, 0);
+    coop_sess_command(carol.sess, COOP_CMD_JOIN, "BCDFGHBCDFGHBCDFGH");
     CHECK(WAIT_FOR(strstr(view_of(&carol).status, "no such room") != NULL, 30000), "Carol, joining a room that does not exist, is told so: %s",
           view_of(&carol).status);
     CHECK(view_of(&carol).state == COOP_LEFT, "and ends in no room (state %d)", view_of(&carol).state);
@@ -978,10 +1182,12 @@ static void probe_sessions(void) {
     char dead[40];
     snprintf(dead, sizeof dead, "127.0.0.1:%u", dead_port);
     player_start(&dave, "Dave", 0xDA7E, dead, 0, 0, 0);
-    coop_sess_command(dave.sess, COOP_CMD_CREATE, "");
+    CHECK(coop_sess_command(dave.sess, COOP_CMD_CREATE, ""), "a create without a secret makes a new one");
     plat_sleep_ms(2500);
     v = view_of(&dave);
-    CHECK(v.state == COOP_CONNECTING && strstr(v.status, "no answer"), "Dave, with nobody at the server, keeps trying: state %d, %s", v.state, v.status);
+    char secret[COOP_SECRET_LEN + 1];
+    CHECK(v.state == COOP_CONNECTING && strstr(v.status, "no answer") && coop_secret_normalize(v.code, secret) && strcmp(secret, ROOM_SECRET),
+          "Dave, with nobody at the server, keeps trying with a new secret: state %d, %s", v.state, v.status);
     coop_sess_command(dave.sess, COOP_CMD_LEAVE, "");
     CHECK(WAIT_FOR(view_of(&dave).state == COOP_LEFT, 5000), "and leaves when told to");
     coop_sess_configure(dave.sess, &(CoopParams){.server = "", .name = "Dave", .on = 1});
@@ -998,7 +1204,7 @@ static void probe_sessions(void) {
 
 int probe_coop(void) {
     probe_sockets();
-    probe_hmac();
+    probe_crypto();
     probe_server_parse();
     probe_vectors();
     probe_fuzz();

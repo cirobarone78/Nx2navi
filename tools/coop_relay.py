@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 """NX2navi co-op relay: forwards datagrams between the players of a room (up to 8), nothing else. Standard library only.
 
-Usage: python tools/coop_relay.py [--host 0.0.0.0] [--port 24680] [--allow-chosen-codes] [--log-addrs]
+Usage: python tools/coop_relay.py [--host 0.0.0.0] [--port 24680] [--log-addrs] [--max-rooms 1000]
 
 The game's co-op layer (runtime/coop.c) talks to it over UDP; any player can run one on a machine the others can reach
 (forward the UDP port on a router) and put its address into the game's coop_server setting. docs/coop.md describes the
-setup. The relay keeps only who is in which room: it never reads what the players send each other, stores nothing on
-disk, and a restart loses the rooms (the players create one again).
+setup. The relay keeps only who is in which room: it stores nothing on disk, and a restart loses the rooms (the players'
+games make them again).
+
+A room is named by a secret the players share among themselves; the relay never sees it. It knows the room by a locator
+derived from the secret (16 bytes, BLAKE2b), which also keys the tag of every datagram between a client and the relay.
+What the players send each other (DATA) is sealed with another key derived from the secret: the relay forwards it and
+can neither read nor change nor make it.
 
 The wire format is runtime/coop_proto.h's; tests/coop_vectors.txt holds byte vectors both sides are checked against.
 A datagram is a 24-byte header, little-endian, then a payload:
 
-    0  u16 magic 0x434E        2  u8 version (1; the relay accepts that one)   3  u8 type
+    0  u16 magic 0x434E        2  u8 version (2; the relay accepts that one)   3  u8 type
     4  u32 room (0 until joined)   8  u8 src member 1..8 (0 = relay)   9  u8 dst member (0xFF: every other member)
     10 u16 payload length      12 u32 seq (the sender's datagram counter)
-    16 u8[8] tag = HMAC-SHA256(key, header[0:16] + payload)[:8], key = SHA256("nx2navi-coop/1" + code)[:16]
+    16 u8[8] tag = HMAC-SHA256(locator, header[0:16] + payload)[:8]
 
-Joining is a cookie exchange, so a spoofed source address cannot make the relay send anything larger than it
-received: the first CONNECT (padded to 64 bytes) is answered with a CHALLENGE holding a cookie of the sender's address
-and the minute; the CONNECT that carries the cookie joins. The room code is the shared secret: the relay and the members
-know it, a datagram with a wrong tag is dropped, and nothing is encrypted.
+Joining is a cookie exchange, so a spoofed source address cannot make the relay send anything larger than it received:
+a CONNECT is answered with a CHALLENGE holding a cookie of the sender's address and the minute; the CONNECT that carries
+the cookie joins. Every answer echoes the CONNECT's nonce. JOINED hands the member a rejoin token: a later CONNECT of the
+same client that carries it gets the same member id back (and needs no cookie), one without it is a new member.
+
+Limits: per member (datagrams and bytes, a forwarded datagram counted once for each receiver), per network (/24 for
+IPv4, /64 for IPv6: challenges, joins, rooms made), and for the whole relay (challenges, bytes sent).
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import secrets
 import select
 import socket
@@ -37,33 +46,36 @@ import time
 # ---- the wire format
 
 MAGIC = 0x434E
-PROTO = 1
+PROTO = 2
 HDR_LEN = 24
 MAX_DGRAM = 1200
 DST_ALL = 0xFF
 ALPHABET = '23456789BCDFGHJKMNPRSTVWXYZ'   # no vowels, no 0/1/O/I/L, no Q or E: 27 symbols
-CODE_LEN = 6
+SECRET_LEN = 18                            # 85.6 bits
+LOCATOR_LEN = 16
 MAX_MEMBERS = 8
 NAME_MAX = 24
 COOKIE_LEN = 16
 CONNECT_MIN = 64   # a datagram's smallest size for a CONNECT: the CHALLENGE answering it is smaller
+CONNECT_FIXED = 43
+ENV_V1, ENV_HDR, ENV_MAC = 1, 13, 16
 
-T_CONNECT, T_CHALLENGE, T_JOINED, T_ERROR, T_ROSTER, T_PING, T_PONG, T_LEAVE, T_DATA = 1, 2, 3, 5, 6, 7, 8, 9, 0x10
+T_CONNECT, T_CHALLENGE, T_JOINED, T_ERROR, T_ROSTER, T_PING, T_PONG, T_LEAVE, T_KICK, T_DATA = 1, 2, 3, 5, 6, 7, 8, 9, 11, 0x10
 INTENT_CREATE, INTENT_JOIN = 1, 2
-E_NO_ROOM, E_ROOM_FULL, E_PROTO, E_RATE, E_BAD_TAG, E_SERVER_FULL = 1, 2, 3, 4, 5, 6
-FLAG_AWAY = 1
+E_NO_ROOM, E_ROOM_FULL, E_PROTO, E_RATE, E_BAD_TAG, E_SERVER_FULL, E_ROOM_EXISTS, E_REMOVED = 1, 2, 3, 4, 5, 6, 7, 8
+FLAG_AWAY, FLAG_MAKER = 1, 2
 
 # ---- timing (seconds)
 SILENT_AWAY = 8       # a member that sent nothing for this long shows as away in the roster
 SILENT_DROP = 15      # and is dropped after this; its member id stays reserved for a rejoin
 REJOIN_KEEP = 60      # a dropped member's id is kept this long after its last datagram
-ROOM_EMPTY_TTL = 600  # a room with nobody in it is deleted after this
+ROOM_EMPTY_TTL = 600  # a room with nobody in it is deleted after this; one nobody but its maker ever joined, at REJOIN_KEEP
 ROSTER_EVERY = 5      # the roster is sent again this often: a lost update repairs itself
 ROSTER_AGAIN = (0.25, 0.75)   # and after a change, again this long after it: three chances against loss, as in coop.c's CONNECT bursts
 
 
-def normalize_code(text):
-    """The canonical 6-character room code of text (any case, '-' and spaces ignored), or None when it is not one."""
+def normalize_secret(text):
+    """The canonical 18-character room secret of text (any case, '-' and spaces ignored), or None when it is not one."""
     out = []
     for ch in text:
         if ch in '- ':
@@ -72,20 +84,26 @@ def normalize_code(text):
         if 97 <= o <= 122:
             ch = chr(o - 32)
         out.append(ch)
-    code = ''.join(out)
-    return code if len(code) == CODE_LEN and all(c in ALPHABET for c in code) else None
+    s = ''.join(out)
+    return s if len(s) == SECRET_LEN and all(c in ALPHABET for c in s) else None
 
 
-def format_code(code):
-    return code[:3] + '-' + code[3:]
+def format_secret(s):
+    return '-'.join(s[i:i + 6] for i in range(0, SECRET_LEN, 6))
 
 
-def random_code():
-    return ''.join(secrets.choice(ALPHABET) for _ in range(CODE_LEN))
+def random_secret():
+    return ''.join(secrets.choice(ALPHABET) for _ in range(SECRET_LEN))
 
 
-def room_key(code):
-    return hashlib.sha256(b'nx2navi-coop/1' + code.encode('ascii')).digest()[:16]
+def room_locator(secret):
+    """The relay's name of the room, and the key of the tags: BLAKE2b-128 keyed with the secret."""
+    return hashlib.blake2b(b'nx2navi-coop/2 room', key=secret.encode('ascii'), digest_size=LOCATOR_LEN).digest()
+
+
+def message_key(secret):
+    """The key that seals the players' messages (the relay never computes it; the tests and vectors do)."""
+    return hashlib.blake2b(b'nx2navi-coop/2 messages', key=secret.encode('ascii'), digest_size=32).digest()
 
 
 def make_tag(key, hdr16, payload):
@@ -105,7 +123,7 @@ class Dgram:
 
 
 def pack(type_, room, src, dst, seq, payload=b'', key=None, ver=PROTO):
-    """One datagram. key None: the tag is zero (a CONNECT that has no code yet, answers to one)."""
+    """One datagram. key None: the tag is zero (the answer to a client of another protocol version)."""
     hdr = struct.pack('<HBBIBBHI', MAGIC, ver, type_, room, src, dst, len(payload), seq & 0xFFFFFFFF)
     return hdr + (make_tag(key, hdr, payload) if key else bytes(8)) + payload
 
@@ -120,11 +138,17 @@ def parse(data):
     return Dgram(ver, type_, room, src, dst, seq, data[16:24], data[HDR_LEN:], data[:16])
 
 
+def control_char(c):
+    """A character a log or a console may act on: C0, DEL, C1 and the bidi controls (as coop_proto.c's)."""
+    o = ord(c)
+    return o < 32 or 127 <= o < 160 or o in (0x061C, 0x200E, 0x200F) or 0x202A <= o <= 0x202E or 0x2066 <= o <= 0x2069
+
+
 def clean_name(raw):
     """A display name from the bytes a client sent: at most NAME_MAX bytes of valid UTF-8 without control characters
     (each of those, and each invalid byte, becomes '?')."""
     text = raw.decode('utf-8', errors='replace')
-    text = ''.join('?' if c == '\ufffd' or ord(c) < 32 or ord(c) == 127 else c for c in text)
+    text = ''.join('?' if c == '\ufffd' or control_char(c) else c for c in text)
     out = b''
     for c in text:
         enc = c.encode('utf-8')
@@ -135,64 +159,104 @@ def clean_name(raw):
 
 
 def pack_roster(members):
-    """members: (id, flags, name bytes) in id order."""
+    """members: (id, flags, session, name bytes) in id order."""
     out = bytes([len(members)])
-    for mid, flags, name in members:
-        out += bytes([mid, flags, len(name)]) + name
+    for mid, flags, session, name in members:
+        out += struct.pack('<BBQB', mid, flags, session, len(name)) + name
     return out
 
 
 def parse_roster(payload, offset=0):
-    """((id, flags, name bytes), ...) from payload[offset:], or None when it is cut short or malformed."""
+    """((id, flags, session, name bytes), ...) from payload[offset:], or None when it is cut short or malformed."""
     if len(payload) <= offset:
         return None
     n, at, out = payload[offset], offset + 1, []
     if n > MAX_MEMBERS:
         return None
     for _ in range(n):
-        if at + 3 > len(payload):
+        if at + 11 > len(payload):
             return None
-        mid, flags, nlen = payload[at], payload[at + 1], payload[at + 2]
-        at += 3
+        mid, flags, session, nlen = struct.unpack_from('<BBQB', payload, at)
+        at += 11
         if nlen > NAME_MAX or at + nlen > len(payload):
             return None
-        out.append((mid, flags, payload[at:at + nlen]))
+        out.append((mid, flags, session, payload[at:at + nlen]))
         at += nlen
     return tuple(out)
 
 
-def pack_connect(intent, flags, code, client_id, name, cookie):
-    """The CONNECT payload. code: the 6 characters, or '' (create: the relay picks one). Zero-padded so that the
-    datagram is CONNECT_MIN bytes at least."""
-    body = struct.pack('<BB6sQB', intent, flags, code.encode('ascii') if code else bytes(6), client_id, len(name))
-    body += name + cookie
+def pack_connect(intent, flags, locator, client_id, session, nonce, name, cookie=bytes(COOKIE_LEN), token=bytes(COOKIE_LEN)):
+    """The CONNECT payload, zero-padded so that the datagram is CONNECT_MIN bytes at least."""
+    body = struct.pack('<BB16sQQQB', intent, flags, locator, client_id, session, nonce, len(name)) + name + cookie + token
     return body + bytes(max(0, CONNECT_MIN - HDR_LEN - len(body)))
 
 
 def parse_connect(payload):
-    """(intent, flags, code, client_id, name bytes, cookie) or None. code: '' when the field is zero, else the canonical
-    room code (the wire carries canonical codes only: a client normalises what the player typed)."""
-    if len(payload) < 17:
+    """(intent, flags, locator, client_id, session, nonce, name bytes, cookie, token) or None."""
+    if len(payload) < CONNECT_FIXED:
         return None
-    intent, flags, raw, cid, nlen = struct.unpack_from('<BB6sQB', payload)
-    if nlen > NAME_MAX or 17 + nlen + COOKIE_LEN > len(payload):
+    intent, flags, locator, cid, session, nonce, nlen = struct.unpack_from('<BB16sQQQB', payload)
+    if nlen > NAME_MAX or CONNECT_FIXED + nlen + 2 * COOKIE_LEN > len(payload):
         return None
-    code = '' if raw == bytes(6) else raw.decode('latin-1')
-    if code and normalize_code(code) != code:
-        return None
-    return intent, flags, code, cid, payload[17:17 + nlen], payload[17 + nlen:17 + nlen + COOKIE_LEN]
+    at = CONNECT_FIXED + nlen
+    return (intent, flags, locator, cid, session, nonce, payload[CONNECT_FIXED:at], payload[at:at + COOKIE_LEN],
+            payload[at + COOKIE_LEN:at + 2 * COOKIE_LEN])
 
 
-def pack_error(reason, text):
+def pack_challenge(nonce, cookie):
+    return struct.pack('<Q', nonce) + cookie
+
+
+def parse_challenge(payload):
+    if len(payload) != 8 + COOKIE_LEN:
+        return None
+    return struct.unpack_from('<Q', payload)[0], payload[8:]
+
+
+def pack_joined(member, nonce, token, roster):
+    return struct.pack('<BQ', member, nonce) + token + roster
+
+
+def parse_joined(payload):
+    """(member, nonce, token, roster) or None."""
+    if len(payload) < 9 + COOKIE_LEN:
+        return None
+    member, nonce = struct.unpack_from('<BQ', payload)
+    roster = parse_roster(payload, 9 + COOKIE_LEN)
+    return None if roster is None else (member, nonce, payload[9:9 + COOKIE_LEN], roster)
+
+
+def pack_error(reason, nonce, text):
     t = text.encode('utf-8')[:60]
-    return bytes([reason, len(t)]) + t
+    return struct.pack('<BQB', reason, nonce, len(t)) + t
 
 
 def parse_error(payload):
-    """(reason, text) or None."""
-    if len(payload) < 2 or 2 + payload[1] > len(payload):
+    """(reason, nonce, text) or None."""
+    if len(payload) < 10 or 10 + payload[9] > len(payload):
         return None
-    return payload[0], payload[2:2 + payload[1]].decode('utf-8', errors='replace')
+    reason, nonce, tlen = struct.unpack_from('<BQB', payload)
+    return reason, nonce, payload[10:10 + tlen].decode('utf-8', errors='replace')
+
+
+def pack_kick(member, session):
+    return struct.pack('<BQ', member, session)
+
+
+def parse_kick(payload):
+    return struct.unpack('<BQ', payload) if len(payload) == 9 else None
+
+
+def prefix_of(addr):
+    """The network an address belongs to for the limits: its /24 for IPv4 (and IPv4 in IPv6), its /64 for IPv6."""
+    try:
+        ip = ipaddress.ip_address(addr[0].split('%')[0])
+    except ValueError:
+        return addr[0]
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    bits = 24 if ip.version == 4 else 64
+    return str(ipaddress.ip_network(f'{ip}/{bits}', strict=False))
 
 
 # ---- the relay
@@ -205,8 +269,8 @@ class Bucket:
         self.rate, self.burst, self.tokens, self.stamp = rate, burst, burst, now
 
     def take(self, n, now):
-        self.tokens = min(self.burst, self.tokens + (now - self.stamp) * self.rate)
-        self.stamp = now
+        self.tokens = min(self.burst, self.tokens + max(0.0, now - self.stamp) * self.rate)
+        self.stamp = max(self.stamp, now)
         if self.tokens < n:
             return False
         self.tokens -= n
@@ -214,23 +278,36 @@ class Bucket:
 
 
 class Member:
-    __slots__ = ('id', 'cid', 'name', 'addr', 'last_seen', 'away', 'live', 'connect_seq', 'pkts', 'bytes')
+    __slots__ = ('id', 'cid', 'session', 'name', 'addr', 'last_seen', 'away', 'live', 'connect_seq', 'pkts', 'bytes',
+                 'token', 'maker')
 
-    def __init__(self, mid, cid, name, addr, now, connect_seq, pkts, bytes_):
-        self.id, self.cid, self.name, self.addr = mid, cid, name, addr
+    def __init__(self, mid, cid, session, name, addr, now, connect_seq, pkts, bytes_, maker):
+        self.id, self.cid, self.session, self.name, self.addr = mid, cid, session, name, addr
         self.last_seen, self.away, self.live, self.connect_seq = now, False, True, connect_seq
         self.pkts, self.bytes = pkts, bytes_
+        self.token = secrets.token_bytes(COOKIE_LEN)
+        self.maker = maker
 
 
 class Room:
-    __slots__ = ('id', 'code', 'key', 'members', 'empty_since', 'next_roster', 'again')
+    __slots__ = ('id', 'locator', 'members', 'empty_since', 'next_roster', 'again', 'banned', 'prefix', 'shared')
 
-    def __init__(self, rid, code, now):
-        self.id, self.code, self.key = rid, code, room_key(code)
+    def __init__(self, rid, locator, prefix, now):
+        self.id, self.locator, self.prefix = rid, locator, prefix
         self.members = {}   # member id -> Member, a dropped one (live False) keeps its id for a rejoin
         self.empty_since = now
         self.next_roster = now + ROSTER_EVERY
         self.again = []     # when the roster goes out once more after a change
+        self.banned = set()  # client ids and addresses the maker removed
+        self.shared = False  # someone besides its maker joined it once
+
+    @property
+    def key(self):
+        return self.locator
+
+    @property
+    def label(self):
+        return f'{self.id:08x}'
 
     def live(self):
         return [m for m in self.members.values() if m.live]
@@ -241,10 +318,10 @@ class Relay:
     datagrams to send as (address, bytes). now is a monotonic clock in seconds that the caller supplies, so a test
     can run the timeouts without waiting. An address is the tuple socket.recvfrom gives."""
 
-    def __init__(self, allow_chosen_codes=False, max_rooms=1000, log=None, log_addrs=False, secret=None,
+    def __init__(self, max_rooms=1000, log=None, log_addrs=False, secret=None,
                  pkt_rate=200, pkt_burst=400, byte_rate=65536, byte_burst=131072, join_rate=1 / 3, join_burst=20,
-                 challenge_rate=500):
-        self.allow_chosen_codes = allow_chosen_codes
+                 challenge_rate=5000, prefix_challenge_rate=20, prefix_challenge_burst=40, rooms_per_prefix=8,
+                 egress_rate=8 << 20):
         self.max_rooms = max_rooms
         self.log_fn = log
         self.log_addrs = log_addrs
@@ -252,14 +329,21 @@ class Relay:
         self.limits = (pkt_rate, pkt_burst, byte_rate, byte_burst)
         self.join_limit = (join_rate, join_burst)
         self.challenge_rate = challenge_rate
+        self.prefix_challenge = (prefix_challenge_rate, prefix_challenge_burst)
+        self.rooms_per_prefix = rooms_per_prefix
+        self.egress_rate = egress_rate
         self.rooms = {}        # room id -> Room
-        self.codes = {}        # code -> Room
+        self.locators = {}     # locator -> Room
         self.by_addr = {}      # address -> (Room, Member)
-        self.join_buckets = {}  # ip -> Bucket
+        self.join_buckets = {}       # network prefix -> Bucket
+        self.challenge_buckets = {}  # network prefix -> Bucket
+        self.prefix_rooms = {}       # network prefix -> rooms it made that are open
         self.challenges = None
+        self.egress = None
         self.seq = 0
         self.stats = {k: 0 for k in ('rx', 'malformed', 'bad_tag', 'no_member', 'wrong_addr', 'rate_limited',
-                                     'challenges', 'joins', 'rejoins', 'leaves', 'drops', 'forwarded', 'rooms_made')}
+                                     'challenges', 'joins', 'rejoins', 'leaves', 'drops', 'forwarded', 'rooms_made',
+                                     'kicks', 'egress_limited')}
 
     # -- helpers
 
@@ -284,11 +368,12 @@ class Relay:
     def to_member(self, room, member, type_, payload=b''):
         return member.addr, pack(type_, room.id, 0, member.id, self.next_seq(), payload, room.key)
 
-    def error(self, addr, reason, text, key=None):
-        return [(addr, pack(T_ERROR, 0, 0, 0, self.next_seq(), pack_error(reason, text), key))]
+    def error(self, addr, reason, nonce, text, key):
+        return [(addr, pack(T_ERROR, 0, 0, 0, self.next_seq(), pack_error(reason, nonce, text), key))]
 
     def roster_payload(self, room):
-        return pack_roster([(m.id, FLAG_AWAY if m.away else 0, m.name) for m in sorted(room.live(), key=lambda m: m.id)])
+        return pack_roster([(m.id, (FLAG_AWAY if m.away else 0) | (FLAG_MAKER if m.maker else 0), m.session, m.name)
+                            for m in sorted(room.live(), key=lambda m: m.id)])
 
     def roster_to_all(self, room, skip=None, changed_at=None):
         """The roster to every live member but skip. changed_at (the time): the roster changed, so it goes out again soon
@@ -298,8 +383,8 @@ class Relay:
         payload = self.roster_payload(room)
         return [self.to_member(room, m, T_ROSTER, payload) for m in room.live() if m is not skip]
 
-    def joined(self, room, member):
-        payload = bytes([member.id]) + room.code.encode('ascii') + self.roster_payload(room)
+    def joined(self, room, member, nonce):
+        payload = pack_joined(member.id, nonce, member.token, self.roster_payload(room))
         return [self.to_member(room, member, T_JOINED, payload)]
 
     def new_member_limits(self, now):
@@ -311,6 +396,36 @@ class Relay:
         if self.by_addr.get(member.addr[:2], (None, None))[1] is member:
             del self.by_addr[member.addr[:2]]
 
+    def bucket(self, table, key, rate, burst, now):
+        b = table.get(key)
+        if b is None:
+            b = table[key] = Bucket(rate, burst, now)
+        return b
+
+    def take_challenge(self, addr, now):
+        """A challenge (or an answer to another protocol version) for addr: its network's budget, then the relay's."""
+        if self.challenges is None:
+            self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
+        mine = self.bucket(self.challenge_buckets, prefix_of(addr), *self.prefix_challenge, now)
+        return mine.take(1, now) and self.challenges.take(1, now)
+
+    def take_egress(self, n, now):
+        if self.egress is None:
+            self.egress = Bucket(self.egress_rate, self.egress_rate, now)
+        return self.egress.take(n, now)
+
+    def delete_room(self, room, why):
+        self.rooms.pop(room.id, None)
+        self.locators.pop(room.locator, None)
+        left = self.prefix_rooms.get(room.prefix, 1) - 1
+        if left > 0:
+            self.prefix_rooms[room.prefix] = left
+        else:
+            self.prefix_rooms.pop(room.prefix, None)
+        for m in list(room.members.values()):
+            self.forget(room, m)
+        self.log(f'room {room.label} closed, {why} ({len(self.rooms)} rooms)')
+
     # -- datagrams
 
     def handle(self, data, addr, now):
@@ -321,9 +436,9 @@ class Relay:
             return []
         if dg.ver != PROTO:
             # a client of another protocol major: tell it so, if the answer is no larger than what it sent (a spoofed
-            # source gains nothing) and the relay is not already busy with challenges
-            out = self.error(addr, E_PROTO, f'relay speaks protocol {PROTO}')
-            return out if len(out[0][1]) <= len(data) and self.take_challenge(now) else []
+            # source gains nothing) and the network's challenge budget allows
+            out = self.error(addr, E_PROTO, 0, f'relay speaks protocol {PROTO}', None)
+            return out if len(out[0][1]) <= len(data) and self.take_challenge(addr, now) else []
         if dg.type == T_CONNECT:
             return self.connect(dg, data, addr, now)
         room = self.rooms.get(dg.room)
@@ -352,90 +467,117 @@ class Relay:
             out.append(self.to_member(room, member, T_PONG, dg.payload[:4]))
         elif dg.type == T_LEAVE:
             out += self.leave(room, member, now, 'left')
+        elif dg.type == T_KICK:
+            out += self.kick(room, member, dg, now)
         elif dg.type == T_DATA:
-            out += self.forward(room, member, dg, data)
+            out += self.forward(room, member, dg, data, now)
         return out
 
-    def take_challenge(self, now):
-        if self.challenges is None:
-            self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
-        return self.challenges.take(1, now)
-
-    def forward(self, room, member, dg, data):
+    def forward(self, room, member, dg, data, now):
         if dg.dst == DST_ALL:
             targets = [m for m in room.live() if m is not member]
         else:
             target = room.members.get(dg.dst)
             targets = [target] if target and target.live and target is not member else []
+        # each copy counts against the sender (its byte budget already paid one) and against the relay's
+        extra = len(data) * max(0, len(targets) - 1)
+        if extra and not member.bytes.take(extra, now):
+            self.stats['rate_limited'] += 1
+            return []
+        if not self.take_egress(len(data) * len(targets), now):
+            self.stats['egress_limited'] += 1
+            return []
         self.stats['forwarded'] += len(targets)
         return [(m.addr, data) for m in targets]
+
+    def kick(self, room, member, dg, now):
+        k = parse_kick(dg.payload)
+        if k is None or not member.maker:
+            return []
+        target = room.members.get(k[0])
+        if target is None or target is member or target.session != k[1]:
+            return []   # an earlier session of that id, or nobody: a KICK sent again later removes no one else
+        room.banned.update((target.cid, target.addr))
+        self.stats['kicks'] += 1
+        out = []
+        if target.live:
+            out.append((target.addr, pack(T_ERROR, room.id, 0, target.id, self.next_seq(),
+                                          pack_error(E_REMOVED, 0, 'removed by the room\'s maker'), room.key)))
+        return out + self.leave(room, target, now, 'was removed by the maker')
 
     def connect(self, dg, data, addr, now):
         c = parse_connect(dg.payload)
         if c is None:
             self.stats['malformed'] += 1
             return []
-        intent, _flags, code, cid, raw_name, cookie = c
+        intent, _flags, locator, cid, session, nonce, raw_name, cookie, token = c
         if intent not in (INTENT_CREATE, INTENT_JOIN):
             self.stats['malformed'] += 1
             return []
-        code_norm = code or None
-        key = room_key(code_norm) if code_norm else None   # the code is in the CONNECT: the tag proves integrity only
-        if not self.cookie_ok(addr, cookie, now):
+        key = locator   # the tag proves the sender knows the locator, which an observer of a CONNECT does too
+        room = self.locators.get(locator)
+        rejoin = None
+        if room is not None and any(token):   # a member of the room again: its token is its proof, no cookie needed
+            rejoin = next((m for m in room.members.values() if m.cid == cid and hmac.compare_digest(m.token, token)), None)
+        if rejoin is None and not self.cookie_ok(addr, cookie, now):
             # not yet proven to receive at its address: only a challenge, and only if that is no larger than the request
-            if len(data) < CONNECT_MIN or not self.take_challenge(now):
+            if len(data) < CONNECT_MIN or not self.take_challenge(addr, now):
                 return []
             self.stats['challenges'] += 1
-            return [(addr, pack(T_CHALLENGE, 0, 0, 0, self.next_seq(), self.cookie(addr, int(now // 60)), key))]
-        if key is not None and not dg.verify(key):
+            return [(addr, pack(T_CHALLENGE, 0, 0, 0, self.next_seq(), pack_challenge(nonce, self.cookie(addr, int(now // 60))), key))]
+        if not dg.verify(key):
             self.stats['bad_tag'] += 1
-            return self.error(addr, E_BAD_TAG, 'bad tag', key)
+            return self.error(addr, E_BAD_TAG, nonce, 'bad tag', key)
         known = self.by_addr.get(addr[:2])
-        if known and known[1].cid == cid and known[1].connect_seq == dg.seq and known[1].live:
+        if known and known[1].cid == cid and known[1].connect_seq == dg.seq and known[1].live and known[0] is room:
             known[1].last_seen = now   # a CONNECT sent again because its answer was lost: the answer again
-            return self.joined(known[0], known[1])
-        bucket = self.join_buckets.get(addr[0])
-        if bucket is None:
-            bucket = self.join_buckets[addr[0]] = Bucket(self.join_limit[0], self.join_limit[1], now)
+            return self.joined(known[0], known[1], nonce)
+        net = prefix_of(addr)
+        bucket = self.bucket(self.join_buckets, net, *self.join_limit, now)
         if not bucket.take(1, now):
             self.stats['rate_limited'] += 1
-            return self.error(addr, E_RATE, 'too many joins, try again later', key)
+            return self.error(addr, E_RATE, nonce, 'too many joins, try again later', key)
         name = clean_name(raw_name) or b'Player'
         out = []
         if intent == INTENT_JOIN:
-            room = self.codes.get(code_norm) if code_norm else None
             if room is None:
-                return self.error(addr, E_NO_ROOM, 'no such room', key)
-        else:
-            room = self.codes.get(code_norm) if code_norm and self.allow_chosen_codes else None
-            if room is None:
-                if len(self.rooms) >= self.max_rooms:
-                    return self.error(addr, E_SERVER_FULL, 'server full', key)
-                room = self.make_room(code_norm if code_norm and self.allow_chosen_codes else None, now)
+                bucket.take(2, now)   # a join of a room that is not there costs three
+                return self.error(addr, E_NO_ROOM, nonce, 'no such room', key)
+        elif room is not None and rejoin is None:
+            return self.error(addr, E_ROOM_EXISTS, nonce, 'a room with this secret is open', key)
+        elif room is None:
+            if len(self.rooms) >= self.max_rooms:
+                return self.error(addr, E_SERVER_FULL, nonce, 'server full', key)
+            if self.prefix_rooms.get(net, 0) >= self.rooms_per_prefix:
+                return self.error(addr, E_RATE, nonce, 'too many rooms from this network', key)
+            room = self.make_room(locator, net, now)
+        if cid in room.banned or addr in room.banned:
+            return self.error(addr, E_REMOVED, nonce, 'removed by the room\'s maker', key)
         if known and known[0] is not room:
             out += self.leave(known[0], known[1], now, 'moved to another room')   # same address, new room: it left the old
-        member = next((m for m in room.members.values() if m.cid == cid), None)
+        member = rejoin
         if member is None:
             mid = next((i for i in range(1, MAX_MEMBERS + 1) if i not in room.members), None)
             if mid is None:   # every id is taken: a dropped member's id goes to the newcomer, the longest gone first
                 gone = sorted((m for m in room.members.values() if not m.live), key=lambda m: m.last_seen)
                 if not gone:
-                    return out + self.error(addr, E_ROOM_FULL, 'room full', key)
+                    return out + self.error(addr, E_ROOM_FULL, nonce, 'room full', key)
                 mid = gone[0].id
                 del room.members[mid]
             pkts, byts = self.new_member_limits(now)
-            member = Member(mid, cid, name, addr, now, dg.seq, pkts, byts)
+            member = Member(mid, cid, session, name, addr, now, dg.seq, pkts, byts, maker=not room.members and intent == INTENT_CREATE)
             room.members[mid] = member
+            if not member.maker:
+                room.shared = True
             self.stats['joins'] += 1
-            self.log(f'room {format_code(room.code)}: {name.decode()} joined as member {mid} '
-                     f'({len(room.live())}/{MAX_MEMBERS}){self.where(addr)}')
-        else:   # the same client again (a rejoin after the relay was silent, a new address, a new name)
+            self.log(f'room {room.label}: {name.decode()} joined as member {mid} ({len(room.live())}/{MAX_MEMBERS}){self.where(addr)}')
+        else:   # the same member again (after the relay was silent, from a new address, under a new name or session)
             if member.addr != addr:
                 self.forget(room, member)
             if not member.live:
-                self.log(f'room {format_code(room.code)}: {name.decode()} rejoined as member {member.id}{self.where(addr)}')
+                self.log(f'room {room.label}: {name.decode()} rejoined as member {member.id}{self.where(addr)}')
                 self.stats['rejoins'] += 1
-            member.addr, member.name, member.connect_seq = addr, name, dg.seq
+            member.addr, member.name, member.connect_seq, member.session = addr, name, dg.seq, session
             member.last_seen, member.away, member.live = now, False, True
         old = self.by_addr.get(addr[:2])
         if old and old[1] is not member:   # another member of this room on the same address: that one is gone
@@ -443,29 +585,30 @@ class Relay:
             old[0].members.pop(old[1].id, None)
         self.by_addr[addr[:2]] = (room, member)
         room.empty_since = None
-        return out + self.joined(room, member) + self.roster_to_all(room, skip=member, changed_at=now)
+        return out + self.joined(room, member, nonce) + self.roster_to_all(room, skip=member, changed_at=now)
 
-    def make_room(self, code, now):
-        while code is None or code in self.codes:
-            code = random_code()
+    def make_room(self, locator, prefix, now):
         rid = 0
         while not rid or rid in self.rooms:
             rid = secrets.randbits(32)
-        room = Room(rid, code, now)
+        room = Room(rid, locator, prefix, now)
         self.rooms[rid] = room
-        self.codes[code] = room
+        self.locators[locator] = room
+        self.prefix_rooms[prefix] = self.prefix_rooms.get(prefix, 0) + 1
         self.stats['rooms_made'] += 1
-        self.log(f'room {format_code(code)} created ({len(self.rooms)} rooms)')
+        self.log(f'room {room.label} created ({len(self.rooms)} rooms)')
         return room
 
     def leave(self, room, member, now, why):
         self.forget(room, member)
         room.members.pop(member.id, None)
         self.stats['leaves'] += 1
-        self.log(f'room {format_code(room.code)}: {member.name.decode()} (member {member.id}) {why} '
-                 f'({len(room.live())}/{MAX_MEMBERS})')
+        self.log(f'room {room.label}: {member.name.decode()} (member {member.id}) {why} ({len(room.live())}/{MAX_MEMBERS})')
         if not room.live():
             room.empty_since = now
+            if not room.shared:   # nobody but its maker was ever in it: nothing to keep it for
+                self.delete_room(room, 'its maker left before anyone joined')
+                return []
         return self.roster_to_all(room, changed_at=now)
 
     # -- time
@@ -480,8 +623,8 @@ class Relay:
                     m.live = False
                     self.forget(room, m)
                     self.stats['drops'] += 1
-                    self.log(f'room {format_code(room.code)}: {m.name.decode()} (member {m.id}) dropped, silent '
-                             f'{SILENT_DROP} s ({len(room.live())}/{MAX_MEMBERS})')
+                    self.log(f'room {room.label}: {m.name.decode()} (member {m.id}) dropped, silent {SILENT_DROP} s '
+                             f'({len(room.live())}/{MAX_MEMBERS})')
                     changed = True
                 elif m.live and not m.away and silent >= SILENT_AWAY:
                     m.away = True
@@ -490,11 +633,9 @@ class Relay:
                     del room.members[m.id]
             if not room.live() and room.empty_since is None:
                 room.empty_since = now
-            if room.empty_since is not None and now - room.empty_since >= ROOM_EMPTY_TTL:
-                del self.rooms[room.id]
-                del self.codes[room.code]
-                self.log(f'room {format_code(room.code)} closed, empty for {ROOM_EMPTY_TTL // 60} minutes '
-                         f'({len(self.rooms)} rooms)')
+            ttl = ROOM_EMPTY_TTL if room.shared else REJOIN_KEEP
+            if room.empty_since is not None and now - room.empty_since >= ttl:
+                self.delete_room(room, f'empty for {ttl} s')
                 continue
             again = any(t <= now for t in room.again)
             if again:
@@ -502,9 +643,10 @@ class Relay:
             if changed or again or now >= room.next_roster:
                 out += self.roster_to_all(room, changed_at=now if changed else None)
                 room.next_roster = now + ROSTER_EVERY
-        for ip, b in list(self.join_buckets.items()):
-            if now - b.stamp > 120:
-                del self.join_buckets[ip]
+        for table in (self.join_buckets, self.challenge_buckets):
+            for k, b in list(table.items()):
+                if now - b.stamp > 120:
+                    del table[k]
         return out
 
 
@@ -558,20 +700,17 @@ def main():
     ap = argparse.ArgumentParser(description='NX2navi co-op relay (see docs/coop.md)')
     ap.add_argument('--host', default='0.0.0.0', help='address to listen on (default 0.0.0.0; :: for IPv6 and IPv4)')
     ap.add_argument('--port', type=int, default=24680, help='UDP port (default 24680; 0 picks a free one)')
-    ap.add_argument('--allow-chosen-codes', action='store_true',
-                    help='a create that names a room code makes that room, or joins it when it exists (tests, LAN '
-                         'parties); otherwise the relay picks every code')
     ap.add_argument('--log-addrs', action='store_true', help="write the players' addresses to the log (off by default)")
     ap.add_argument('--max-rooms', type=int, default=1000, help='rooms at most (default 1000)')
+    ap.add_argument('--rooms-per-network', type=int, default=8, help='open rooms one /24 or /64 may make (default 8)')
     a = ap.parse_args()
 
     def log(text):
         print(time.strftime('%H:%M:%S ') + text, flush=True)
 
-    relay = Relay(allow_chosen_codes=a.allow_chosen_codes, max_rooms=a.max_rooms, log=log, log_addrs=a.log_addrs)
+    relay = Relay(max_rooms=a.max_rooms, log=log, log_addrs=a.log_addrs, rooms_per_prefix=a.rooms_per_network)
     sock = open_socket(a.host, a.port)
-    log(f'coop_relay: listening on {a.host}:{sock.getsockname()[1]}'
-        f'{" (chosen room codes allowed)" if a.allow_chosen_codes else ""}')
+    log(f'coop_relay: listening on {a.host}:{sock.getsockname()[1]}')
     try:
         serve(relay, sock)
     except KeyboardInterrupt:

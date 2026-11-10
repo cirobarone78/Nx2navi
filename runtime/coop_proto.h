@@ -1,39 +1,57 @@
-// The co-op wire format, as pure functions on bytes: no sockets, no threads, no game state. A datagram is a 24-byte
-// header (little-endian) and a payload; the header carries an 8-byte tag, the start of an HMAC-SHA256 over the first 16
-// header bytes and the payload, keyed from the room code. The first part of the protocol is between a client and the
-// relay (tools/coop_relay.py, the same format in Python), the second is between the clients, carried as the payload of
-// a DATA datagram that the relay forwards unread: one kind byte and bytes whose meaning the layers above coop.c define.
-// tests/coop_vectors.txt holds byte vectors that this file and the relay's Python are checked against (--probe-coop,
-// tests/coop_relay_test.py). Every parser checks every length against the bytes it was given and fails closed.
+// The co-op wire format, as pure functions on bytes: no sockets, no threads, no game state. docs/coop.md ("The room's
+// secret and the wire") is the description a reviewer checks this file against.
+//
+// A room is named by a secret the players share out of band: 18 characters of a 27-symbol alphabet (85 bits), shown
+// XXXXXX-XXXXXX-XXXXXX. The relay never sees it. Two values are derived from it with keyed BLAKE2b (the key is the
+// secret's 18 canonical characters): the room's locator (16 bytes), which the relay knows the room by and which keys
+// the tag of every datagram between a client and the relay, and the message key (32 bytes), which seals every message
+// between the players (XChaCha20-Poly1305), so that the relay and anyone on the path can neither read nor change nor
+// make one.
+//
+// A datagram is a 24-byte header (little-endian) and a payload; the header carries an 8-byte tag, the start of an
+// HMAC-SHA256 over the first 16 header bytes and the payload, keyed with the locator. The client and relay messages
+// are CONNECT .. LEAVE and KICK (tools/coop_relay.py, the same format in Python); DATA carries a sealed player message:
+// the envelope (sender's session, counter) and, sealed, one kind byte and the message bytes the layers above coop.c
+// define. tests/coop_vectors.txt holds byte vectors that this file and the relay's Python are checked against
+// (--probe-coop, tests/coop_relay_test.py). Every parser checks every length against the bytes it was given and fails
+// closed.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
 enum {
     COOP_MAGIC = 0x434E,         // bytes 4E 43
-    COOP_PROTO = 1,              // protocol major: a relay and a client talk only when it is equal
+    COOP_PROTO = 2,              // protocol major: a relay and a client talk only when it is equal
     COOP_HDR_LEN = 24,
     COOP_MAX_DGRAM = 1200,       // a datagram's size at most: it crosses any path without fragmenting
     COOP_MAX_PAYLOAD = COOP_MAX_DGRAM - COOP_HDR_LEN,
     COOP_TAG_LEN = 8,
-    COOP_KEY_LEN = 16,
+    COOP_KEY_LEN = 16,           // the locator, which keys the tags
+    COOP_MSG_KEY_LEN = 32,
     COOP_DST_ALL = 0xFF,         // dst: every other member of the room
-    COOP_CODE_LEN = 6,
+    COOP_SECRET_LEN = 18,        // characters of a room secret
+    COOP_SECRET_TEXT = COOP_SECRET_LEN + 2,   // shown with two '-'
     COOP_MAX_MEMBERS = 8,
     COOP_NAME_MAX = 24,          // a player's name in bytes of UTF-8
     COOP_COOKIE_LEN = 16,
     COOP_CONNECT_MIN = 64,       // a CONNECT datagram's smallest size, so that no answer to it is larger
+    COOP_ENV_V1 = 1,             // the envelope of a player message
+    COOP_ENV_HDR = 13,           // u8 envelope version, u64 session, u32 counter
+    COOP_ENV_MAC = 16,
+    COOP_ENV_OVERHEAD = COOP_ENV_HDR + COOP_ENV_MAC,
+    COOP_MAX_MESSAGE = COOP_MAX_PAYLOAD - COOP_ENV_OVERHEAD - 1,   // a player message's bytes after its kind, at most
 };
 
-// Datagram types. CONNECT .. LEAVE are between a client and the relay, DATA carries the peers' messages.
+// Datagram types. CONNECT .. LEAVE and KICK are between a client and the relay, DATA carries the players' messages.
 enum { COOP_T_CONNECT = 1, COOP_T_CHALLENGE = 2, COOP_T_JOINED = 3, COOP_T_ERROR = 5, COOP_T_ROSTER = 6, COOP_T_PING = 7,
-       COOP_T_PONG = 8, COOP_T_LEAVE = 9, COOP_T_DATA = 0x10 };
-enum { COOP_INTENT_CREATE = 1, COOP_INTENT_JOIN = 2 };   // CONNECT: make a room (the relay picks the code) or join one
-enum { COOP_E_NO_ROOM = 1, COOP_E_ROOM_FULL = 2, COOP_E_PROTO = 3, COOP_E_RATE = 4, COOP_E_BAD_TAG = 5, COOP_E_SERVER_FULL = 6 };
-enum { COOP_FLAG_AWAY = 1 };   // roster flag: the relay has not heard from the member for a while
+       COOP_T_PONG = 8, COOP_T_LEAVE = 9, COOP_T_KICK = 11, COOP_T_DATA = 0x10 };
+enum { COOP_INTENT_CREATE = 1, COOP_INTENT_JOIN = 2 };   // CONNECT: make the room of a locator or join it
+enum { COOP_E_NO_ROOM = 1, COOP_E_ROOM_FULL = 2, COOP_E_PROTO = 3, COOP_E_RATE = 4, COOP_E_BAD_TAG = 5, COOP_E_SERVER_FULL = 6,
+       COOP_E_ROOM_EXISTS = 7, COOP_E_REMOVED = 8 };
+enum { COOP_FLAG_AWAY = 1, COOP_FLAG_MAKER = 2 };   // roster flags: not heard from for a while; made the room
 
-// The kinds of peer messages (the first byte of a DATA payload). coop.c only carries them; HELLO, POS, DIGEST, SECTION,
-// SYNC_NEED and NOTICE belong to the layers that send them. A kind of 0xF0 and above is free for tests.
+// The kinds of player messages (the first byte of a sealed message). coop.c only carries them; HELLO, POS, DIGEST,
+// SECTION, SYNC_NEED and NOTICE belong to the layers that send them. A kind of 0xF0 and above is free for tests.
 enum { COOP_K_HELLO = 1, COOP_K_POS = 2, COOP_K_DIGEST = 3, COOP_K_SECTION = 4, COOP_K_SYNC_NEED = 5, COOP_K_NOTICE = 6,
        COOP_K_BYE = 7, COOP_K_TEST = 0xF0 };
 
@@ -44,20 +62,25 @@ typedef struct {
     uint32_t room, seq;     // room 0 until joined; seq counts the sender's datagrams
 } CoopHdr;
 
-// ---- room codes: 6 characters of "23456789BCDFGHJKMNPRSTVWXYZ" (27 symbols, about 28.5 bits; no vowels, 0/1/O/I/L, Q
-// or E, so a code spoken or typed does not read as a word), shown as XXX-XXX.
-// Any ASCII case, '-' and spaces ignored. 1 and the canonical 6 characters plus a NUL in out when text is a code.
-int coop_code_normalize(const char *text, char out[COOP_CODE_LEN + 1]);
-void coop_code_format(const char code[COOP_CODE_LEN], char out[COOP_CODE_LEN + 2]);   // "XXX-XXX" and a NUL
+// ---- room secrets: 18 characters of "23456789BCDFGHJKMNPRSTVWXYZ" (27 symbols, 85.6 bits; no vowels, 0/1/O/I/L, Q or
+// E, so a secret spoken or typed does not read as a word), shown as XXXXXX-XXXXXX-XXXXXX. Any ASCII case, '-' and spaces
+// ignored. 1 and the canonical 18 characters plus a NUL in out when text is a secret.
+int coop_secret_normalize(const char *text, char out[COOP_SECRET_LEN + 1]);
+void coop_secret_format(const char secret[COOP_SECRET_LEN], char out[COOP_SECRET_TEXT + 1]);
+// A new secret from 32 random bytes (each symbol from one byte below 243, the rest skipped); 0 when they ran out.
+int coop_secret_from_random(const uint8_t random[32], char out[COOP_SECRET_LEN + 1]);
+// The secret's first characters and an ellipsis, for logs: "XXX…".
+void coop_secret_short(const char secret[COOP_SECRET_LEN], char out[8]);
 
-// ---- tags. HMAC-SHA256 with a key of any length; the room key is SHA256("nx2navi-coop/1" + code)[0:16] of the
-// canonical code. The tag of a datagram: HMAC(room key, header[0:16] + payload)[0:8].
+// ---- keys. BLAKE2b keyed with the secret's canonical characters: locator = BLAKE2b-128("nx2navi-coop/2 room"),
+// message key = BLAKE2b-256("nx2navi-coop/2 messages"). The tag of a datagram: HMAC-SHA256(locator, header[0:16] +
+// payload)[0:8].
 void coop_hmac_sha256(const void *key, size_t klen, const void *a, size_t an, const void *b, size_t bn, uint8_t out[32]);
-void coop_room_key(const char code[COOP_CODE_LEN], uint8_t key[COOP_KEY_LEN]);
+void coop_room_keys(const char secret[COOP_SECRET_LEN], uint8_t locator[COOP_KEY_LEN], uint8_t msg_key[COOP_MSG_KEY_LEN]);
 
 // ---- datagrams
-// The datagram of hdr (its len is ignored: n is the payload length) and payload into out. key NULL: a zero tag (a CONNECT
-// without a code yet, and what the relay answers to it). Bytes written, 0 when it does not fit cap or n is too long.
+// The datagram of hdr (its len is ignored: n is the payload length) and payload into out. key NULL: a zero tag (what a
+// relay of another protocol version answers). Bytes written, 0 when it does not fit cap or n is too long.
 size_t coop_dgram_pack(uint8_t *out, size_t cap, const CoopHdr *hdr, const void *payload, size_t n,
                        const uint8_t key[COOP_KEY_LEN]);
 // 1 when d is exactly one datagram of this format (magic, a length that matches); *payload points into d. The version
@@ -67,38 +90,65 @@ int coop_dgram_parse(const uint8_t *d, size_t n, CoopHdr *hdr, const uint8_t **p
 int coop_dgram_verify(const uint8_t *d, size_t n, const uint8_t key[COOP_KEY_LEN]);
 int coop_dgram_tag_zero(const uint8_t *d);
 
-// ---- names: a player's name from untrusted bytes. At most COOP_NAME_MAX bytes of valid UTF-8; a control character and
-// each byte that is not valid UTF-8 become '?'. out is NUL-terminated (cap at least COOP_NAME_MAX + 1); the length.
+// ---- names: a player's name from untrusted bytes. At most COOP_NAME_MAX bytes of valid UTF-8; a control character
+// (C0, DEL, C1) and each byte that is not valid UTF-8 become '?', and so do the characters that reorder text (bidi
+// controls). out is NUL-terminated (cap at least COOP_NAME_MAX + 1); the length.
 size_t coop_name_clean(char *out, size_t cap, const uint8_t *raw, size_t n);
 
 // ---- client and relay messages
+// CONNECT: u8 intent, u8 flags, u8[16] locator, u64 client id, u64 session, u64 nonce, u8 name length, name,
+// u8[16] cookie (zero, or the CHALLENGE's), u8[16] rejoin token (zero, or the JOINED's of this room).
 typedef struct {
     uint8_t intent, flags;
-    char code[COOP_CODE_LEN + 1];   // the room, canonical; "" for none (a create: the relay picks it)
-    uint64_t client_id;
+    uint8_t locator[COOP_KEY_LEN];
+    uint64_t client_id;     // random for each start of the game; the relay knows a rejoin of the same member by it
+    uint64_t session;       // random for each join: the others take messages only of the session the roster names
+    uint64_t nonce;         // random for each attempt: every answer carries it
     char name[COOP_NAME_MAX + 1];
-    uint8_t cookie[COOP_COOKIE_LEN];   // zero in the first CONNECT; the relay's CHALLENGE hands out the cookie
+    uint8_t cookie[COOP_COOKIE_LEN], token[COOP_COOKIE_LEN];
 } CoopConnect;
 size_t coop_connect_pack(uint8_t *out, size_t cap, const CoopConnect *c);   // zero-padded to COOP_CONNECT_MIN as a datagram
 int coop_connect_parse(const uint8_t *p, size_t n, CoopConnect *c);
 
-typedef struct { uint8_t id, flags; char name[COOP_NAME_MAX + 1]; } CoopMemberInfo;
+// CHALLENGE: u64 nonce, u8[16] cookie.
+size_t coop_challenge_pack(uint8_t *out, size_t cap, uint64_t nonce, const uint8_t cookie[COOP_COOKIE_LEN]);
+int coop_challenge_parse(const uint8_t *p, size_t n, uint64_t *nonce, uint8_t cookie[COOP_COOKIE_LEN]);
+
+// ROSTER: u8 n, n x (u8 id, u8 flags, u64 session, u8 name length, name).
+typedef struct { uint8_t id, flags; uint64_t session; char name[COOP_NAME_MAX + 1]; } CoopMemberInfo;
 typedef struct { uint8_t n; CoopMemberInfo m[COOP_MAX_MEMBERS]; } CoopRoster;
 size_t coop_roster_pack(uint8_t *out, size_t cap, const CoopRoster *r);
-// used (may be NULL): the bytes the roster took, JOINED carries one after its first fields.
+// used (may be NULL): the bytes the roster took.
 int coop_roster_parse(const uint8_t *p, size_t n, CoopRoster *r, size_t *used);
 
-typedef struct { uint8_t member; char code[COOP_CODE_LEN + 1]; CoopRoster roster; } CoopJoined;
+// JOINED: u8 member, u64 nonce, u8[16] rejoin token, roster.
+typedef struct { uint8_t member; uint64_t nonce; uint8_t token[COOP_COOKIE_LEN]; CoopRoster roster; } CoopJoined;
 size_t coop_joined_pack(uint8_t *out, size_t cap, const CoopJoined *j);
 int coop_joined_parse(const uint8_t *p, size_t n, CoopJoined *j);
 
-typedef struct { uint8_t reason; char text[61]; } CoopError;   // reason: COOP_E_*; text for the log, at most 60 bytes
+// ERROR: u8 reason, u64 nonce (of the CONNECT it answers, 0 else), u8 text length, text.
+typedef struct { uint8_t reason; uint64_t nonce; char text[61]; } CoopError;   // text for the log, at most 60 bytes
 size_t coop_error_pack(uint8_t *out, size_t cap, const CoopError *e);
 int coop_error_parse(const uint8_t *p, size_t n, CoopError *e);
+
+// KICK (the room's maker to the relay): u8 member, u64 its session.
+size_t coop_kick_pack(uint8_t *out, size_t cap, uint8_t member, uint64_t session);
+int coop_kick_parse(const uint8_t *p, size_t n, uint8_t *member, uint64_t *session);
 
 size_t coop_u32_pack(uint8_t *out, size_t cap, uint32_t v);   // PING and PONG: the token
 int coop_u32_parse(const uint8_t *p, size_t n, uint32_t *v);
 
-// ---- peer messages: the payload of a DATA datagram is one kind byte and the message
-size_t coop_peer_pack(uint8_t *out, size_t cap, uint8_t kind, const void *bytes, size_t n);
-int coop_peer_parse(const uint8_t *p, size_t n, uint8_t *kind, const uint8_t **bytes, size_t *nbytes);
+// ---- player messages: the payload of a DATA datagram, sealed with the message key.
+//   u8 envelope version (COOP_ENV_V1), u64 sender's session, u32 counter, ciphertext of (u8 kind, bytes), u8[16] tag
+// XChaCha20-Poly1305: nonce = session (8 bytes LE), counter (4 LE), src (1), 11 zero bytes; associated data = dst and
+// the envelope version. A session and counter are used once (a new session for every join, the counter from 1), so a
+// nonce never repeats under the room's key. A later envelope version can carry other fields; the kind byte and the
+// message inside stay as they are, so a new kind (a pose, say) only needs a number.
+// Seal: the payload into out (cap); its length, 0 when n is above COOP_MAX_MESSAGE or it does not fit.
+size_t coop_seal(uint8_t *out, size_t cap, const uint8_t key[COOP_MSG_KEY_LEN], uint8_t src, uint8_t dst, uint64_t session,
+                 uint32_t counter, uint8_t kind, const void *bytes, size_t n);
+// The envelope's clear fields; 0 when p is not an envelope of a version this build reads.
+int coop_envelope_peek(const uint8_t *p, size_t n, uint64_t *session, uint32_t *counter);
+// Open: 1 and the kind and bytes (into out, cap at least n) when the tag is right for this key, src and dst.
+int coop_open(const uint8_t *p, size_t n, const uint8_t key[COOP_MSG_KEY_LEN], uint8_t src, uint8_t dst, uint8_t *kind,
+              uint8_t *out, size_t cap, size_t *nout);

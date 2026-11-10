@@ -5,7 +5,7 @@
 // kept up to date at every change and recomputed when the rules change which categories count.
 //
 // Wire format (little-endian), after the peer message's kind byte (coop_proto.h):
-//   DIGEST   u8 version, u32 schema, u32 epoch, u64 owner, u8 ncat, ncat x u8 mode, u8 nsec, nsec x u32 sum
+//   DIGEST   u8 version, u32 schema, u32 epoch, u8 ncat, ncat x u8 mode, u8 nsec, nsec x u32 sum
 //   SECTION  u8 version, u32 schema, u8 n, n x entry
 //   entry    u8 kind, u8 category, u32 hash, [u64 contributor: gain and spend only], u32 value
 // A pool's base is a signed value stored with its top bit flipped, so the highest unsigned value is the highest signed one.
@@ -28,10 +28,9 @@ enum {
     PUSH_SLOTS = 4096,           // local changes waiting for their three sends
     DIGEST_MS = 2000,            // every digest_ms plus up to 400 ms
     ANSWER_MS = 500,             // a section goes to the same peer at most this often
-    FALLBACK_MS = 5000,          // no rules this long after joining: the lowest member id makes them
     RATE_BYTES = 32768,          // section and push bytes per second, under the relay's 64 KB/s per member
     BURST_BYTES = 8192,
-    MSG_CAP = COOP_MAX_PAYLOAD - 1,
+    MSG_CAP = COOP_MAX_MESSAGE,
     SYNC_HDR = 6,
 };
 
@@ -82,14 +81,14 @@ struct CoopSync {
     int npools;
     uint64_t bindings;
 
-    char code[COOP_CODE_LEN + 2];
+    char code[COOP_SECRET_TEXT + 1];
     int in_room, self, caught_up;
     uint64_t joined_at;
     Peer peer[COOP_MAX_MEMBERS + 1];
     CoopRules room, mine;
     int have_room, have_mine, made;
-    uint64_t originated_at;         // two games that both think they made the room take turns at most once a second
-    uint32_t seen_epoch;
+    int maker;                      // the member id the relay names as the room's maker, 0 none in the room
+    uint64_t originated_at;         // the maker makes its rules at most once a second
     unsigned rules_ver;
 
     Push push[PUSH_SLOTS];
@@ -212,13 +211,6 @@ void coop_rules_text(const CoopRules *r, char *out, size_t cap) {
         if (k < 0) break;
         at += (size_t)k;
     }
-}
-
-// The record that wins: higher epoch, then owner, then modes.
-static int rules_cmp(const CoopRules *a, const CoopRules *b) {
-    if (a->epoch != b->epoch) return a->epoch < b->epoch ? -1 : 1;
-    if (a->owner != b->owner) return a->owner < b->owner ? -1 : 1;
-    return memcmp(a->mode, b->mode, COOP_CAT_N);
 }
 
 // ---- registers
@@ -450,7 +442,6 @@ static void adopt_rules(CoopSync *s, const CoopRules *r) {
     CoopRules old = s->room;
     s->room = n;
     s->have_room = 1;
-    if (n.epoch > s->seen_epoch) s->seen_epoch = n.epoch;
     s->rules_ver++;
     recompute_sums(s);
     for (int i = 0; i < s->npools; i++) {   // a pool switched to per player stops; its counter stays as it is
@@ -468,10 +459,12 @@ static void adopt_rules(CoopSync *s, const CoopRules *r) {
     update_caught_up(s);
 }
 
+// The maker's own settings become the room's rules, one epoch later. The epoch saturates: only the maker raises it,
+// one for each change, so it never gets there, and no digest of anyone else can push it there and wrap it to 0.
 static void originate(CoopSync *s) {
     CoopRules r = s->mine;
-    r.epoch = (s->seen_epoch > s->room.epoch ? s->seen_epoch : s->room.epoch) + 1;
-    r.owner = s->self_id;
+    r.epoch = s->room.epoch == UINT32_MAX ? UINT32_MAX : s->room.epoch + 1;
+    r.maker = (uint8_t)s->self;
     adopt_rules(s, &r);
 }
 
@@ -494,12 +487,12 @@ void coop_sync_settings(CoopSync *s, const CoopRules *mine, int made_room) {
 
 // ---- the room
 
-void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int n, uint64_t now) {
+void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int n, int maker, uint64_t now) {
     if (!code) code = "";
     if (strcmp(code, s->code)) {
         snprintf(s->code, sizeof s->code, "%s", code);
         s->in_room = code[0] != 0;
-        s->have_room = 0, s->seen_epoch = 0, s->caught_up = 0;
+        s->have_room = 0, s->caught_up = 0;
         memset(&s->room, 0, sizeof s->room);
         memset(s->peer, 0, sizeof s->peer);
         s->joined_at = now, s->originated_at = 0;
@@ -509,6 +502,7 @@ void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int
         s->next_digest = now;
     }
     s->self = self;
+    s->maker = maker >= 1 && maker <= COOP_MAX_MEMBERS ? maker : 0;
     int seen[COOP_MAX_MEMBERS + 1] = {0};
     for (int i = 0; i < n; i++)
         if (ids[i] >= 1 && ids[i] <= COOP_MAX_MEMBERS && ids[i] != self) seen[ids[i]] = 1;
@@ -581,7 +575,6 @@ static void send_digest(CoopSync *s, int to, CoopSyncSendFn send, void *user) {
     put8(&p, COOP_K_DIGEST_VER);
     put32(&p, s->schema);
     put32(&p, s->have_room ? s->room.epoch : 0);
-    put64(&p, s->have_room ? s->room.owner : 0);
     put8(&p, COOP_CAT_N);
     for (int c = 0; c < COOP_CAT_N; c++) put8(&p, s->have_room ? s->room.mode[c] : 0);
     put8(&p, COOP_SYNC_SECTIONS);
@@ -590,23 +583,27 @@ static void send_digest(CoopSync *s, int to, CoopSyncSendFn send, void *user) {
 }
 
 static void on_digest(CoopSync *s, int from, const uint8_t *b, size_t n, uint64_t now) {
-    if (n < 1 + 4 + 4 + 8 + 1 || b[0] != COOP_K_DIGEST_VER || get32(b + 1) != s->schema) return;
-    size_t ncat = b[17];
-    if (n < 18 + ncat + 1) return;
-    size_t nsec = b[18 + ncat];
-    if (nsec != COOP_SYNC_SECTIONS || n < 19 + ncat + 4 * nsec) return;
-    CoopRules r = {.epoch = get32(b + 5), .owner = get64(b + 9)};
-    for (size_t c = 0; c < ncat && c < COOP_CAT_N; c++) r.mode[c] = b[18 + c];
+    if (n < 1 + 4 + 4 + 1 || b[0] != COOP_K_DIGEST_VER || get32(b + 1) != s->schema) return;
+    size_t ncat = b[9];
+    if (n < 10 + ncat + 1) return;
+    size_t nsec = b[10 + ncat];
+    if (nsec != COOP_SYNC_SECTIONS || n < 11 + ncat + 4 * nsec) return;
+    CoopRules r = {.epoch = get32(b + 5), .maker = (uint8_t)from};
+    for (size_t c = 0; c < ncat && c < COOP_CAT_N; c++) r.mode[c] = b[10 + c];
+    // only the maker the relay names changes the rules, and only to a later epoch; a game that holds none while no
+    // maker is in the room takes any member's (the player sees them before accepting the room)
     if (r.epoch) {
-        if (r.epoch > s->seen_epoch) s->seen_epoch = r.epoch;
-        if (!s->have_room || rules_cmp(&r, &s->room) > 0) adopt_rules(s, &r);
+        int by_maker = s->maker && from == s->maker;
+        int newer = !s->have_room || s->room.maker != from || r.epoch > s->room.epoch ||
+                    (r.epoch == UINT32_MAX && s->room.epoch == UINT32_MAX && memcmp(r.mode, s->room.mode, COOP_CAT_N));
+        if (by_maker ? newer : !s->have_room && !s->maker) adopt_rules(s, &r);
     }
     Peer *p = &s->peer[from];
     if (!p->present) return;
     p->have_digest = 1;
     int differs = 0;
     for (int i = 0; i < COOP_SYNC_SECTIONS; i++) {
-        p->sums[i] = get32(b + 19 + ncat + 4 * (size_t)i);
+        p->sums[i] = get32(b + 11 + ncat + 4 * (size_t)i);
         if (p->sums[i] != s->sums[i]) {
             differs = 1;
             if (now - p->answered_at[i] >= ANSWER_MS || !p->answered_at[i]) p->want |= 1ull << i;
@@ -718,14 +715,10 @@ void coop_sync_tick(CoopSync *s, uint64_t now, CoopSyncSendFn send, void *user) 
     s->tok_at = now;
     if (!s->in_room) return;
 
-    // rules: the maker's settings are the room's; a room nobody holds rules for gets the lowest member's
-    if (s->have_mine) {
-        int lowest = s->self;
-        for (int id = 1; id <= COOP_MAX_MEMBERS; id++)
-            if (s->peer[id].present && id < lowest) lowest = id;
-        int stale = !s->have_room || memcmp(s->room.mode, s->mine.mode, COOP_CAT_N);
-        int fallback = !s->have_room && now - s->joined_at >= FALLBACK_MS && s->self == lowest;
-        if (((s->made && stale) || fallback) && (!s->originated_at || now - s->originated_at >= 1000)) {
+    // rules: the maker's settings are the room's (the relay names the maker); nobody else makes any
+    if (s->have_mine && s->made) {
+        int stale = !s->have_room || s->room.maker != s->self || memcmp(s->room.mode, s->mine.mode, COOP_CAT_N);
+        if (stale && (!s->originated_at || now - s->originated_at >= 1000)) {
             s->originated_at = now ? now : 1;
             originate(s);
         }

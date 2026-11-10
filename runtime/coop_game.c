@@ -158,7 +158,7 @@ static struct {
 
     // the gate (G.lock; open is read by the game thread without it): nothing from a room is applied before the player
     // accepted what the room is (its members and rules) and a copy of the save exists to go back to
-    char room[COOP_CODE_LEN + 2];   // the room of the acceptance and the copy, "" none
+    char room[COOP_SECRET_TEXT + 1];   // the room of the acceptance and the copy, "" none
     CoopOffer offer;                // the room as it is now
     int accepted;                   // an offer of this room was accepted: acc_* hold it
     char acc_names[COOP_MAX_MEMBERS * 2][COOP_NAME_MAX + 1];
@@ -400,10 +400,15 @@ static void read_rules(CoopRules *r) {
     }
 }
 
-// "hash=value@frame" items separated by ',' or ';' (hash in hex): set that flag at that frame of play, for tests.
+// "hash=value@frame" items separated by ',' or ';' (hash in hex): set that flag at that frame of play, for tests. Read
+// from the environment only, never from nx2navi.ini: an ini a player was handed cannot set flags in their save.
 static void read_test_aid(void) {
     G.ntest = 0;
     const char *t = cfg_get("NX2NAVI_COOP_TEST_SET");
+    if (t && *t && !cfg_from_env("NX2NAVI_COOP_TEST_SET")) {
+        rt_log("coop: test: COOP_TEST_SET is taken from the environment only; the nx2navi.ini line is ignored");
+        return;
+    }
     while (t && *t && G.ntest < (int)(sizeof G.test / sizeof G.test[0])) {
         char *end;
         unsigned long h = strtoul(t, &end, 16);
@@ -467,7 +472,7 @@ static void on_view(const CoopView *v, void *user) {
     for (int i = 0; in_room && i < v->n; i++) ids[n++] = v->member[i].id;
     plat_mutex_lock(&G.lock);
     if (G.eng) {
-        coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, n, plat_now_ms());
+        coop_sync_room(G.eng, in_room ? v->code : "", v->self, ids, n, in_room ? v->maker : 0, plat_now_ms());
         CoopRules mine;
         read_rules(&mine);
         coop_sync_settings(G.eng, &mine, in_room && v->made);
@@ -526,6 +531,7 @@ static void offer_update(const CoopView *v) {
             if (v->member[i].id == v->self) continue;
             o.member[o.n].id = v->member[i].id;
             o.member[o.n].heard = v->member[i].heard_ms != UINT32_MAX;
+            o.member[o.n].maker = v->member[i].maker;
             snprintf(o.member[o.n].name, sizeof o.member[o.n].name, "%s", v->member[i].name);
             names += fnv(0xcbf29ce484222325ull, v->member[i].name, strlen(v->member[i].name));   // in any order
             o.n++;
@@ -546,8 +552,8 @@ static void offer_update(const CoopView *v) {
         char who[COOP_MAX_MEMBERS * 48] = "", rules[200];
         size_t at = 0;
         for (int i = 0; i < o.n && at < sizeof who; i++)
-            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d%s)", i ? ", " : "", o.member[i].name, o.member[i].id,
-                                   o.member[i].heard ? "" : ", not heard from yet");
+            at += (size_t)snprintf(who + at, sizeof who - at, "%s%s (member %d%s%s)", i ? ", " : "", o.member[i].name, o.member[i].id,
+                                   o.member[i].maker ? ", made the room" : "", o.member[i].heard ? "" : ", not heard from yet");
         coop_rules_text(&o.rules, rules, sizeof rules);
         rt_log("coop: sync: %s; in the room: %s; rules: %s", G.accepted ? "the room changed (a new member or other rules)" : "a room to accept",
                o.n ? who : "nobody else", rules);
@@ -614,7 +620,7 @@ static void on_tick(uint64_t now, void *user) {
         if (r.epoch) {
             char text[200];
             coop_rules_text(&r, text, sizeof text);
-            rt_log("coop: sync: the room's rules: %s%s", text, r.owner == G.self_id ? " (this player's settings)" : "");
+            rt_log("coop: sync: the room's rules: %s (from member %d)", text, r.maker);
         }
     }
     CoopView view;

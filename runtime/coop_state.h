@@ -14,12 +14,12 @@
 // SYNC messages, so two players converge within a few digests and a late joiner catches up with everything. A local
 // change goes out at once and again 80 and 250 ms later. Sending is paced (32 KB/s) under the relay's per-member limit.
 //
-// Rules belong to the room: every game merges the same way. The player who made the room originates them from their own
-// settings (coop_sync_settings); they ride in every DIGEST, ordered by (epoch, owner, modes), and the highest wins, so a
-// joiner and a game that rejoined after a relay restart adopt them. The maker raises the epoch when it changes a setting.
-// If no member has heard rules 5 s after joining (the maker left a room that lives on), the member with the lowest id
-// originates them. A category switched to shared starts merging (its digest sums differ, the sections are exchanged); one
-// switched to per player stops; what was merged stays.
+// Rules belong to the room: every game merges the same way. They are the settings of the member the relay names as the
+// room's maker (coop_sync_room's maker), who originates them (coop_sync_settings); they ride in every DIGEST with an
+// epoch the maker raises by one at each change (saturating). A game takes rules only from the maker's digests, and only
+// a later epoch, so no other member can change them; a game that holds none while no maker is in the room takes any
+// member's, which coop_game.c shows the player before anything is applied. A category switched to shared starts merging
+// (its digest sums differ, the sections are exchanged); one switched to per player stops; what was merged stays.
 //
 // Threads: none of its own and no lock. coop_game.c holds one lock around every call.
 #pragma once
@@ -41,7 +41,7 @@ enum { COOP_MODE_OWN = 0, COOP_MODE_SHARED = 1, COOP_MODE_POOL = 2 };
 
 typedef struct {
     uint32_t epoch;      // 0: no rules
-    uint64_t owner;      // the client id that made them
+    uint8_t maker;       // the member whose rules they are (this game's view: who sent them)
     uint8_t mode[COOP_CAT_N];
 } CoopRules;
 
@@ -60,11 +60,11 @@ void coop_rules_text(const CoopRules *r, char *out, size_t cap);
 
 // Register kinds on the wire.
 enum { COOP_R_FLAG = 1, COOP_R_POOL_BASE = 2, COOP_R_POOL_GAIN = 3, COOP_R_POOL_SPEND = 4 };
-enum { COOP_SYNC_SECTIONS = 64, COOP_K_DIGEST_VER = 1 };
+enum { COOP_SYNC_SECTIONS = 64, COOP_K_DIGEST_VER = 2 };   // 2: the digest carries no owner; rules come from the maker
 
 typedef struct CoopSync CoopSync;
-// self_id: this player's client id (the owner of rules it makes). schema: games merge only with the same (game version
-// and classification); 0 is a valid schema.
+// self_id: random for this start of the game (contributor ids derive from it). schema: games merge only with the same
+// (this layer's version, the game's, and the classified table); 0 until the table is known.
 CoopSync *coop_sync_new(uint64_t self_id, uint32_t schema);
 void coop_sync_free(CoopSync *s);
 // Trace lines (sent, received, by hash and value) go to fn when set.
@@ -87,8 +87,9 @@ unsigned coop_sync_ignored(const CoopSync *s);
 // ---- the room (the coop thread)
 // The room and who is in it: code "" when in none. A new code (or none) forgets the rules, the peers and everything
 // merged: nothing of one room reaches the next.
-// self: this player's member id; ids: every member's (self included).
-void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int n, uint64_t now_ms);
+// self: this player's member id; ids: every member's (self included); maker: the member the relay names as the room's
+// maker, 0 when none is in the room.
+void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, int n, int maker, uint64_t now_ms);
 // This player's own rule settings, and whether it made the room (its settings are the room's).
 void coop_sync_settings(CoopSync *s, const CoopRules *mine, int made_room);
 // A peer message (kind COOP_K_DIGEST or COOP_K_SECTION, the bytes after the kind) from member from.

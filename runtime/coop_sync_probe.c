@@ -49,6 +49,7 @@ typedef struct {
 
 typedef struct {
     int id;                         // member id
+    int made;                       // it made the room: the relay names it the maker
     CoopSync *eng;
     Flag f[MAX_FLAGS];
     int n;
@@ -187,12 +188,16 @@ static void net_flush(Net *net, uint64_t now) {
     }
 }
 
+// Every present game hears the roster: who is there, and the maker the relay names (a present game that made the room).
 static void net_roster(Net *net, const char *code, uint64_t now) {
-    int ids[MAX_PLAYERS], n = 0;
+    int ids[MAX_PLAYERS], n = 0, maker = 0;
     for (int i = 0; i < MAX_PLAYERS; i++)
-        if (net->games[i] && net->present[i]) ids[n++] = net->games[i]->id;
+        if (net->games[i] && net->present[i]) {
+            ids[n++] = net->games[i]->id;
+            if (net->games[i]->made) maker = net->games[i]->id;
+        }
     for (int i = 0; i < MAX_PLAYERS; i++)
-        if (net->games[i] && net->present[i]) coop_sync_room(net->games[i]->eng, code, net->games[i]->id, ids, n, now);
+        if (net->games[i] && net->present[i]) coop_sync_room(net->games[i]->eng, code, net->games[i]->id, ids, n, maker, now);
 }
 
 // Run every present game for ms of simulated time in 8 ms steps (the coop thread's step in a room, a frame on the game side).
@@ -243,12 +248,14 @@ static void settings(Game *g, int made, int items, int keys, int rupees, int amm
     r.mode[COOP_CAT_RUPEES] = (uint8_t)rupees;
     r.mode[COOP_CAT_AMMO] = (uint8_t)ammo;
     coop_sync_settings(g->eng, &r, made);
+    g->made = made;
 }
 
 static void defaults(Game *g, int made) {
     CoopRules r;
     coop_rules_default(&r);
     coop_sync_settings(g->eng, &r, made);
+    g->made = made;
 }
 
 // ---- 1. merge algebra
@@ -265,8 +272,8 @@ static int capture(int i, Packet **out) {
     for (int k = 0; k < 6; k++) solo.f[300 + (k * 11 + i * 7) % 64].value = 1 + (k + i) % 4;
     int ids[2] = {1, 2}, n = 0;
     uint64_t t = 1000;
-    coop_sync_room(solo.eng, "ALG001", 1, ids, 2, t);
-    coop_sync_room(peer.eng, "ALG001", 2, ids, 2, t);
+    coop_sync_room(solo.eng, "ALG001", 1, ids, 2, 1, t);
+    coop_sync_room(peer.eng, "ALG001", 2, ids, 2, 1, t);
     Net q = {0};
     for (int step = 0; step < 400; step++) {
         t += 8;
@@ -308,7 +315,7 @@ static void probe_algebra(void) {
         game_init(&g, 7, 999);
         defaults(&g, 1);
         int ids[2] = {7, 8};
-        coop_sync_room(g.eng, "ALG002", 7, ids, 2, 1000);
+        coop_sync_room(g.eng, "ALG002", 7, ids, 2, 7, 1000);
         Net none = {0};
         none.sending = 7;
         coop_sync_tick(g.eng, 1000, net_send, &none);   // it made the room: its rules (the defaults) are in force
@@ -415,7 +422,7 @@ static void probe_rules(void) {
     CoopRules ra, rb;
     coop_sync_rules(a.eng, &ra);
     coop_sync_rules(b.eng, &rb);
-    CHECK(ra.epoch && !memcmp(ra.mode, rb.mode, COOP_CAT_N) && rb.owner == 0xA1, "the joiner uses the maker's rules");
+    CHECK(ra.epoch && !memcmp(ra.mode, rb.mode, COOP_CAT_N) && rb.maker == 1, "the joiner uses the maker's rules");
     CHECK(rb.mode[COOP_CAT_KEYS] == COOP_MODE_OWN, "with progress per player keys are per player (normalized), not %d", rb.mode[COOP_CAT_KEYS]);
     CHECK(value_of(&b, 1) == 0 && value_of(&b, 0x1000) == 0, "progress and items per player stay with A");
     CHECK(value_of(&b, KEYS_FOREST) == 0, "keys per player stay with A");
@@ -501,26 +508,23 @@ static void probe_rules(void) {
     now = run(&net, now, 3000);
     CoopRules rd;
     coop_sync_rules(d.eng, &rd);
-    CHECK(rd.owner == 0xA1 && rd.mode[COOP_CAT_ITEMS] == COOP_MODE_OWN, "the maker left: a joiner adopts the rules the others hold");
+    CHECK(rd.epoch && rd.mode[COOP_CAT_ITEMS] == COOP_MODE_OWN, "the maker left: a joiner adopts the rules the others hold");
     game_free(&a), game_free(&b), game_free(&c), game_free(&d);
     free(net.q);
 
-    // a room nobody made (its maker gone before anyone heard the rules): the lowest member makes them after 5 s
+    // a room whose maker is gone before anyone heard the rules: nobody else makes any, nothing merges
     Net n2 = {0};
     Game x, y;
     game_init(&x, 5, 0x55);
     game_init(&y, 3, 0x33);
     settings(&x, 0, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_SHARED);
     settings(&y, 0, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_POOL, COOP_MODE_SHARED);
+    x.f[0].value = 1;
     n2.games[0] = &x, n2.games[1] = &y, n2.present[0] = n2.present[1] = 1;
-    now = run(&n2, (net_roster(&n2, "RULE02", 1000), 1000), 3000);
+    now = run(&n2, (net_roster(&n2, "RULE02", 1000), 1000), 8000);
     CoopRules rx;
     coop_sync_rules(x.eng, &rx);
-    CHECK(!rx.epoch, "no rules for the first seconds of a room without its maker");
-    now = run(&n2, now, 4000);
-    coop_sync_rules(x.eng, &rx);
-    CHECK(rx.epoch && rx.owner == 0x33 && rx.mode[COOP_CAT_AMMO] == COOP_MODE_POOL, "then the lowest member's settings (owner %llx)",
-          (unsigned long long)rx.owner);
+    CHECK(!rx.epoch && value_of(&y, 1) == 0, "a room without its maker: no member makes rules, nothing merges (epoch %u)", rx.epoch);
     game_free(&x), game_free(&y);
     free(n2.q);
 
@@ -582,7 +586,7 @@ static void probe_carry_over(void) {
     CHECK(value_of(&x, 11) == 1 && value_of(&p, 1) == 1, "carry-over: room A merged X and P");
     // X leaves room A, loads save Y (only flag 31), and joins room B, which Q made (Q has flag 41)
     net.present[1] = 0;
-    coop_sync_room(x.eng, "", 0, NULL, 0, now);
+    coop_sync_room(x.eng, "", 0, NULL, 0, 0, now);
     reload_save(&x);
     x.f[30].value = 1;
     q.f[40].value = 1;
@@ -732,6 +736,57 @@ static void probe_hostile(void) {
            "member is ignored, a flood is limited, the index stays short (%u)\n", st.probe_max);
 }
 
+// A member who is not the maker sends digests with the epoch at 2^32-1 and every category shared or pooled, in the
+// digest format of this engine and of the one before (which had an owner field): the rules stay the maker's, and the
+// maker's next change still reaches everyone.
+static size_t forge_digest(uint8_t *b, int version) {
+    size_t at = 0;
+    b[at++] = (uint8_t)version;
+    b[at++] = 0xEE, b[at++] = 0xFF, b[at++] = 0xC0, b[at++] = 0;
+    for (int i = 0; i < 4; i++) b[at++] = 0xFF;   // epoch 2^32-1
+    if (version == 1)
+        for (int i = 0; i < 8; i++) b[at++] = 0xFF;   // the owner field the version-1 digest had
+    b[at++] = COOP_CAT_N;
+    for (int c = 0; c < COOP_CAT_N; c++) b[at++] = coop_cat_is_pool(c) ? COOP_MODE_POOL : COOP_MODE_SHARED;
+    b[at++] = COOP_SYNC_SECTIONS;
+    memset(b + at, 0, 4 * COOP_SYNC_SECTIONS);
+    return at + 4 * COOP_SYNC_SECTIONS;
+}
+
+static void probe_takeover(void) {
+    Net net = {0};
+    Game a, b, h;
+    game_init(&a, 1, 0x81);
+    game_init(&b, 2, 0x82);
+    game_init(&h, 3, 0x83);
+    settings(&a, 1, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_OWN, COOP_MODE_SHARED);   // rupees own
+    defaults(&b, 0), defaults(&h, 0);
+    net.games[0] = &a, net.games[1] = &b, net.games[2] = &h, net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "TAKE01", 1000), 1000), 3000);
+    uint8_t d[400];
+    for (int version = 1; version <= 2; version++) {
+        size_t n = forge_digest(d, version);
+        coop_sync_receive(b.eng, 3, COOP_K_DIGEST, d, n, now += 10);
+        coop_sync_receive(a.eng, 3, COOP_K_DIGEST, d, n, now += 10);
+    }
+    CoopRules ra, rb;
+    coop_sync_rules(a.eng, &ra);
+    coop_sync_rules(b.eng, &rb);
+    CHECK(rb.mode[COOP_CAT_RUPEES] == COOP_MODE_OWN && ra.mode[COOP_CAT_RUPEES] == COOP_MODE_OWN && rb.epoch != UINT32_MAX,
+          "takeover: a member who is not the maker cannot change the rules (rupees %s, epoch %u)", coop_mode_name(rb.mode[COOP_CAT_RUPEES]),
+          rb.epoch);
+    now = run(&net, now, 3000);
+    settings(&a, 1, COOP_MODE_SHARED, COOP_MODE_POOL, COOP_MODE_POOL, COOP_MODE_OWN, COOP_MODE_SHARED);   // the maker pools rupees
+    now = run(&net, now, 3000);
+    coop_sync_rules(b.eng, &rb);
+    CHECK(rb.mode[COOP_CAT_RUPEES] == COOP_MODE_POOL && rb.mode[COOP_CAT_AMMO] == COOP_MODE_OWN,
+          "takeover: the maker's next change still reaches everyone (rupees %s, ammo %s)", coop_mode_name(rb.mode[COOP_CAT_RUPEES]),
+          coop_mode_name(rb.mode[COOP_CAT_AMMO]));
+    game_free(&a), game_free(&b), game_free(&h);
+    free(net.q);
+    printf("coop-probe: sync rules takeover: a member's digest at epoch 2^32-1 changes nothing; the maker's changes still hold\n");
+}
+
 // ---- 7. hostile bytes
 
 static uint32_t fuzz_limit(int cat, uint32_t hash, void *user) {
@@ -746,7 +801,7 @@ static void probe_sync_fuzz(void) {
     coop_rules_default(&r);
     coop_sync_settings(s, &r, 1);
     int ids[2] = {1, 2};
-    coop_sync_room(s, "FUZZ01", 1, ids, 2, 1000);
+    coop_sync_room(s, "FUZZ01", 1, ids, 2, 1, 1000);
     Net none = {0};
     coop_sync_tick(s, 1000, net_send, &none);
     uint8_t b[COOP_MAX_PAYLOAD];
@@ -780,6 +835,7 @@ int probe_coop_sync(void) {
     probe_keys();
     probe_carry_over();
     probe_hostile();
+    probe_takeover();
     probe_sync_fuzz();
     return fails;
 }

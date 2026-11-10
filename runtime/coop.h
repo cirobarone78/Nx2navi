@@ -19,7 +19,7 @@ typedef enum {
     COOP_LEFT,          // on, in no room (the status says why after a failure)
     COOP_CONNECTING,    // reaching the relay to create or join a room
     COOP_JOINED,        // in a room
-    COOP_RECONNECTING,  // the relay went silent; joining the same room again with the same client id
+    COOP_RECONNECTING,  // the relay went silent; joining the same room again as the same member
 } CoopState;
 
 typedef enum { COOP_CMD_CREATE = 1, COOP_CMD_JOIN, COOP_CMD_LEAVE } CoopCmd;
@@ -27,21 +27,25 @@ typedef enum { COOP_CMD_CREATE = 1, COOP_CMD_JOIN, COOP_CMD_LEAVE } CoopCmd;
 typedef struct {
     uint8_t id;                 // member id 1..8
     uint8_t away;               // the relay has not heard from the member for a while
+    uint8_t maker;              // made the room (the relay says so): its rules are the room's, and it may remove members
     char name[COOP_NAME_MAX + 1];
-    uint32_t heard_ms;          // milliseconds since the last message from this member through the relay; UINT32_MAX never
+    uint32_t heard_ms;          // milliseconds since the last message of this member that opened with the room's key;
+                                // UINT32_MAX never (a member the relay lists but that has not shown it knows the secret)
 } CoopPeer;
 
 typedef struct {
     CoopState state;
     unsigned version;           // changes with the state, the room, the roster and the status text
-    char code[COOP_CODE_LEN + 2];   // "XXX-XXX" in a room, or while joining one; else ""
+    char code[COOP_SECRET_TEXT + 1];   // the room's secret, XXXXXX-XXXXXX-XXXXXX, in a room or while joining one; else ""
+    char label[8];              // its first characters, for logs ("XXX…")
     int self;                   // this player's member id; 0 outside a room
+    int maker;                  // the member id of the room's maker, 0 when the maker is not in the room
     int made;                   // this player made the room (its settings are the room's rules, coop_state.h)
     int n;                      // members of the room, this player included, by id
     CoopPeer member[COOP_MAX_MEMBERS];
     uint32_t ping_ms;           // round trip to the relay; 0 until measured
     char status[96];            // what is going on or what went wrong, in words
-    uint32_t tx, rx, lost;      // datagrams sent, accepted, and received but not accepted (bad tag, wrong sender, duplicate)
+    uint32_t tx, rx, lost;      // datagrams sent, accepted, and received but not accepted (bad tag, wrong sender, replay)
 } CoopView;
 
 // ---- the process's session (the one the settings drive)
@@ -51,21 +55,24 @@ void coop_init(void);
 // Leaves the room and says BYE to the others, best effort, for the three ways the process ends (boot.c, svc.c,
 // gfx_present.c, before fs_save_flush): waits at most about 0.4 s for the coop thread, then returns whatever happened.
 void coop_shutdown(void);
-// Create, join or leave a room. code (a code as typed: any case, '-' and spaces allowed) is required by JOIN and optional for
-// CREATE (a relay that allows chosen codes then makes that room). 1 when queued, 0 when the code is not a room code or
-// co-op is off. The outcome shows in coop_view_get.
-int coop_command(CoopCmd cmd, const char *code);
+// Create, join or leave a room. secret (as typed: any case, '-' and spaces allowed) is required by JOIN; CREATE makes a
+// room of that secret, or of a new random one when it is NULL or empty (the view shows it: the player passes it on to
+// the others out of band). 1 when queued, 0 when the secret is not one or co-op is off. The outcome shows in coop_view_get.
+int coop_command(CoopCmd cmd, const char *secret);
+// The room's maker removes a member (its id): the relay drops it and refuses it again under that identity. 1 when sent.
+int coop_remove_member(int member);
 void coop_view_get(CoopView *out);
-// This player's id on the wire (8 bytes of SHA-256 over the account and the profile folder); reads the account once.
+// This player's id towards the relay: random for each start of the game, never sent to the other players.
 uint64_t coop_client_id(void);
 
 // Peer messages. kind is COOP_K_*; bytes follow it in the datagram. coop_send goes to every other member, coop_send_to to
-// one (a member id). 1 when queued, 0 when not in a room, the message is too long (COOP_MAX_PAYLOAD - 1 bytes) or the
-// outbox is full: a message is a datagram and may be lost anyway.
+// one (a member id). 1 when queued, 0 when not in a room, the message is too long (COOP_MAX_MESSAGE bytes) or the
+// outbox is full: a message is a datagram and may be lost anyway. Every message is sealed with the room's message key.
 int coop_send(uint8_t kind, const void *bytes, size_t n);
 int coop_send_to(int member, uint8_t kind, const void *bytes, size_t n);
-// fn(from member id, the message bytes after the kind, their count, user) for every message of that kind that passes its
-// tag check and the duplicate filter. One handler per kind; register before the message can arrive (at start-up).
+// fn(from member id, the message bytes after the kind, their count, user) for every message of that kind that opened
+// with the room's key, came from the session the roster names for its sender and is not a replay. One handler per kind;
+// register before the message can arrive (at start-up).
 typedef void (*CoopMsgFn)(int from, const uint8_t *bytes, size_t n, void *user);
 int coop_on_message(uint8_t kind, CoopMsgFn fn, void *user);
 // fn(view, user) after the state, the room, the roster or the status changed; up to 8 hooks. A layer that sends a HELLO to
@@ -87,7 +94,7 @@ typedef struct {
     const char *tag;            // names the session in log lines ("coop[A]: ..."); NULL for none
     const char *server;         // "host[:port]"
     const char *name;           // the player's name
-    uint64_t client_id;         // the same one on every reconnect keeps the member id for a minute
+    uint64_t client_id;         // the same one on every reconnect keeps the member id for a minute (with the rejoin token)
     int on;                     // 0: off (COOP_OFF), the COOP setting; 1: on, in no room until a command says
     uint16_t local_port;        // 0: any
     unsigned drop_pct;          // percent of received datagrams thrown away, for tests
@@ -100,7 +107,8 @@ void coop_sess_free(CoopSess *s);               // the stepping thread must be g
 // The stepping thread calls this in a loop: handles commands, the outbox, one batch of datagrams and the timers, waiting at
 // most 8 ms (in a room), 50 ms (reaching the relay) or 250 ms (idle) for the next datagram.
 void coop_sess_step(CoopSess *s);
-int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *code);   // as coop_command, for this session
+int coop_sess_command(CoopSess *s, CoopCmd cmd, const char *secret);   // as coop_command, for this session
+int coop_sess_remove(CoopSess *s, int member);                        // as coop_remove_member
 int coop_sess_send(CoopSess *s, int member, uint8_t kind, const void *bytes, size_t n);   // member 0 or COOP_DST_ALL: all
 int coop_sess_on_message(CoopSess *s, uint8_t kind, CoopMsgFn fn, void *user);
 int coop_sess_on_view(CoopSess *s, CoopViewFn fn, void *user);
