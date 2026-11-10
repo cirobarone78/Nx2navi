@@ -4,7 +4,7 @@
 // and sampler descriptor slots, and VkSamplers.
 //
 // A texture that mirrors its pool memory (tex_mirrored) stops re-uploading once the GPU rendered into it (the
-// "GPU-owned" rule); a slot of a finalized texture follows the live texture at its storage address.
+// "GPU-owned" rule); a finalized slot follows live GPU content but never revives freed CPU-backed storage.
 // Contains code Copyright (c) 2026 jhaizhou, Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 //
 // Every image lives in VK_IMAGE_LAYOUT_GENERAL. Uploads are recorded into the upload batch of vk_memory.c; the replay
@@ -51,7 +51,6 @@ typedef struct Tex {
     uint32_t use_round;           // look_round when a lookup last reached it (touch)
     uint64_t use_frame;           // gfx_counters.frames then
     int uploaded, released;
-    uint32_t rel_serial;          // reg_serial when it was released: slots registered before then are stale (slot_resolve)
     uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
     uint32_t back_gap;            // most presents between a release and its taking back so far (stale_after)
     uint32_t n_up;                // uploads of this entry (vk_texture_debug)
@@ -95,7 +94,7 @@ typedef struct {
     uint32_t cgen;                // agen of the slot's address when ce was resolved
     uint32_t cepoch;
     view_t cview;
-    uint8_t chas_view, used, has_view;
+    uint8_t chas_view, used, has_view, finalized;   // finalized survives eviction of the released Tex entry
     uint64_t khash;               // hash of the descriptor key and view, 0 for CPU-written textures (vk_texture_slot_khash_locked)
     view_t v;
     tex_t t;
@@ -132,7 +131,7 @@ static int nowned, cowned;
 static uint64_t max_owned;   // largest storage size in owned[]
 static uint64_t gpu_writes;  // GPU writes into mirrored textures so far: Tex.gpu_seq
 // Bumped whenever the entry a slot resolves to can change: an entry created or destroyed, released or taken back into
-// use (the slot lookup and the follow of a finalized slot read only by_key, by_addr and the released flags).
+// use, or a registered slot finalized (the follow reads by_key, by_addr and the entry and slot lifetime flags).
 static uint32_t tex_gen = 1;
 // Bumped with tex_gen and whenever a slot is registered: what vk_texture_by_id returns for any slot may have changed.
 static uint32_t slots_gen = 1;
@@ -1927,7 +1926,6 @@ static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < 
 static void mark_released(Tex *e) {   // tex_lock held; e is not released
     e->released = 1;
     e->rel_epoch = submit_epoch;
-    e->rel_serial = reg_serial;
     e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     nreleased++;
     rel_append(e);
@@ -1997,10 +1995,24 @@ void vk_texture_release(const tex_t *t) {
     make_key(t, &k);
     lock();
     Tex *e = nvn_hm_get(&by_key, &k);
+    // Staleness belongs to the registered descriptor, not the cached image: a released Tex can be destroyed before the
+    // slot looks again (eviction, the released cap, start_at for a mirrored one). A registered texture may also be
+    // finalized before its image is created.
+    int changed = 0;
+    if (sinfo)
+        for (int id = bucket_head[agen_idx(k.addr)]; id >= 0; id = slot_next[id]) {
+            TexSlot *s = &tslots[id];
+            if (s->finalized || (uintptr_t)s->t.mem != k.addr) continue;
+            TexKey sk;
+            make_key(&s->t, &sk);
+            if (!memcmp(&sk, &k, sizeof k)) s->finalized = 1, s->ce = NULL, changed = 1;
+        }
     if (e && !e->released) {
         mark_released(e);
+        changed = 0;   // the image's release already invalidated the address bucket
         sweep_released();
     }
+    if (changed) tex_gen_bump(k.addr);
     unlock();
 }
 
@@ -2043,7 +2055,8 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     // keeps its serial and resolved entry, so the texture pool refresh (vk_exec_draw.c pool_sync_entries) does not
     // resolve it again. Only while that entry is live: after a release, a registration is what makes a slot current
     // again (slot_resolve's stale rule), so it goes the full way.
-    if (s->used && s->ce && !s->ce->released && !memcmp(&s->t, t, sizeof *t) && s->has_view == (v != NULL) &&
+    if (s->used && !s->finalized && s->ce && s->t.mem == t->mem && s->cgen == agen[agen_idx((uintptr_t)t->mem)] &&
+        !s->ce->released && !memcmp(&s->t, t, sizeof *t) && s->has_view == (v != NULL) &&
         (!v || !memcmp(&s->v, v, sizeof *v))) {
         n_same_regs++;
         unlock();
@@ -2052,6 +2065,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     s->t = *t;
     if (!s->used && id < VK_POOL_TEX) pool_slots++;
     s->used = 1;
+    s->finalized = 0;
     s->ce = NULL;
     slots_gen++;
     if (!++reg_serial) reg_serial = 1;
@@ -2098,7 +2112,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     make_key(&s->t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
     int stale = 0;
-    if (!e || e->released) {   // a finalized slot follows the live texture at its storage
+    if (!e || e->released || s->finalized) {   // a finalized slot follows live GPU content, not newly reused CPU bytes
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
         // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
@@ -2118,17 +2132,14 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             // that 2D image, no 3D view can be made of it (vk_exec_draw.c get_view) and they read and wrote stand-ins.
             // With the target kept they get the volume itself.
             if (p->key.d.target != k.d.target) continue;
-            if (same_but_swizzle(&p->key, &k)) { e = p; break; }
+            if (same_but_swizzle(&p->key, &k) && (!cpu_slot || !s->finalized || alias_has_gpu_content(p))) { e = p; break; }
             if (!any && (!cpu_slot || alias_has_gpu_content(p))) any = p;
         }
-        // own is missing or released here; for a CPU slot entry_of below finds or revives it by key. A CPU slot whose
-        // own entry was released after the slot was registered is stale: the game finalized that texture and is
-        // freeing its storage, and reviving it uploaded from that storage while another thread unmapped it (an
-        // access violation in tex_bl_copy from the pool refresh, Kokiri Forest). It resolves to nothing; a slot
-        // registered again after the release is live and revives the entry.
+        // A finalized CPU descriptor must not recreate its image from freed storage. The slot keeps this state even
+        // after its released image was evicted; registering the descriptor again makes it current.
         if (!e && any) e = any;
         else if (!e && !cpu_slot) e = own && own->superseded ? NULL : own;   // a superseded one: entry_of takes it back
-        else if (!e && own && (uint32_t)(sinfo[s - tslots] >> 16) <= own->rel_serial) stale = 1;
+        else if (!e && cpu_slot && s->finalized) stale = 1;
     }
     if (!e && s->t.mem && !stale) {
         if (create_budget < 0) e = entry_of(&s->t);

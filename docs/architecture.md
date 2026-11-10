@@ -82,6 +82,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`GfxShaderRes.ptr`, `vk_exec_draw.c ptr_addr`).
 - Bindless textures: the texture and sampler pools are descriptor arrays kept in step with the game's pool writes
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
+  Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
+  cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
+  finalized descriptors may still follow live GPU-owned content.
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in

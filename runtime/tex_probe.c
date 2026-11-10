@@ -463,7 +463,7 @@ static tex_t make_tex(pool_t *pool, uint64_t off, int format, uint32_t w, uint32
     t.magic = MAGIC('T', 'E', 'X', 0);
     t.d.target = 1, t.d.format = format, t.d.width = w, t.d.height = h, t.d.depth = 1, t.d.levels = levels;
     nvn_tex_layout(&t.d, &t.L);
-    t.pool = pool, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
+    t.pool = pool, t.pool_flags = (uint16_t)pool->flags, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
     return t;
 }
 
@@ -536,11 +536,23 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_write_texels(&g, NULL, &all, gl[0], 256, 256 * 64);
     if (read_back(&g, 0, gl, 0, "physical-pool RGBA8 WriteTexels")) return 1;
 
-    // a slot of a finalized texture follows the live texture at the same storage
+    // A finalized CPU-backed slot must not revive its stale bytes or follow a new, unrendered CPU texture.
     vk_texture_register(5, &b, NULL);
     vk_texture_release(&b);
     tex_t b2 = make_tex(tpool, 0x40000, 0x25, 16, 12, 1, 4);
     const VkTexImage *live = vk_texture_get(&b2);
+    GCHECK(live && !vk_texture_by_id(5, NULL, NULL), "stale CPU slot 5 revived or followed unrendered storage");
+    // Registration is the lifetime boundary that makes the descriptor current again, even after its image was evicted.
+    vk_texture_register(5, &b, NULL);
+    const VkTexImage *renewed = vk_texture_by_id(5, NULL, NULL);
+    GCHECK(renewed && renewed->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && renewed->width == 64 && renewed->height == 48,
+           "re-registered CPU slot 5 did not resolve its own descriptor");
+    vk_texture_release(&b);
+    // GPU-owned slots do follow the live image at their storage, even when its descriptor has changed.
+    vk_texture_register(5, &g, NULL);
+    vk_texture_release(&g);
+    tex_t g2 = make_tex(phys, 0, NVN_FORMAT_R32UI, 32, 32, 1, 5);
+    live = vk_texture_get(&g2);
     VkImage live_img = live ? live->image : VK_NULL_HANDLE;
     const VkTexImage *slot = vk_texture_by_id(5, NULL, NULL);
     GCHECK(live && slot && slot->image == live_img, "slot 5 does not follow the live texture at its storage");
@@ -551,14 +563,14 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_sampler_register(0, &sp);
     VkSampler s0 = vk_sampler_by_id(0), s1 = vk_sampler_for(&sp);
     GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(1), "sampler slots");
-    g_gpu_checks += 7;
-    vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g);
+    g_gpu_checks += 9;
+    vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g2);
     for (int i = 0; i < 4; i++) free(lin[i]), free(bl[i]);
     free(gl[0]);
     uint64_t images, ups, reups;
     vk_texture_stats(&images, &ups, &reups);
     printf("probe-vkmem: textures: RGBA8 3 levels and BC1 equal to the CPU reference after upload, re-upload after CPU "
-           "writes, physical-pool alias WriteTexels/ReadTexels, slot redirect, samplers (%llu images, %llu uploads, "
+           "writes, physical-pool alias WriteTexels/ReadTexels, stale CPU slot, GPU slot redirect, samplers (%llu images, %llu uploads, "
            "%llu re-uploads)\n", (unsigned long long)images, (unsigned long long)ups, (unsigned long long)reups);
     return 0;
 }
