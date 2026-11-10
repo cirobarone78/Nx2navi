@@ -1578,6 +1578,7 @@ typedef struct {
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
     uint64_t flush_skipped;   // flush ranges not copied: the write watch covers them
+    uint64_t cap_bytes, cap_copies, cap_t, cap_fallback;   // NX2NAVI_MIRROR_CAPTURE: copied at the prologue by the CPU
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -2237,7 +2238,8 @@ static int chunk_new(uint64_t size, int host) {
     plat_mutex_unlock(&snap_pool_lock);
     if (best < 0) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want,
-                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,   // a capture chunk is a copy source
                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VmaAllocationCreateInfo ai = {.usage = host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                       .flags = host == CHUNK_MARKS ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
@@ -2775,11 +2777,85 @@ void vk_mem_mirror_begin(void) {
 
 int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl; }
 
+// ---- submit-time capture (NX2NAVI_MIRROR_CAPTURE, default 0)
+// The mirror uploads (copy_ranges, buf -> mbuf) are GPU copies out of the imported buffer, so they read guest memory
+// when the GPU reaches the prologue, which can be most of a frame after the game submitted. Ocarina rewrites data its
+// frame's passes read once it has submitted later work, with no fence between (nvn_api_core.c nvnQueueSubmitCommands,
+// NX2NAVI_SUBMIT_FINISH), and an upload that runs late takes the next frame's bytes. With 1 the CPU copies the same
+// ranges out of guest memory while the prologue is recorded, into host chunks of the submission (chunk_new, freed with
+// it at its fence by snap_free), and the GPU copies those into the mirrors: the mirrors get the bytes as they were at
+// the submit (on the submitting thread without NX2NAVI_REPLAY_ASYNC, when the replay reaches the part with it). The
+// copied bytes are what the plain uploads would copy, about 1.2 MiB a frame in Kakariko (mirror log, upload). It does
+// not cover pools the GPU reads without a mirror (imported pools read in place, the device address table's readers),
+// so it is a step towards dropping the frame wait, not a replacement for it on its own. A chunk that cannot be made
+// falls back to the GPU copies.
+static int mirror_capture(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("MIRROR_CAPTURE", "0") == 1;
+        if (on) rt_log("mem: mirror uploads are copied out of guest memory by the CPU when their prologue is recorded "
+                       "(NX2NAVI_MIRROR_CAPTURE)");
+    }
+    return on;
+}
+
+// The ranges as copy_ranges merges them, read by the CPU now into one host chunk and recorded as copies from it.
+// 0: no chunk (the caller records the GPU copies).
+static int capture_ranges(VkCommandBuffer cb, MRange *a, int n) {
+    if (!n) return 1;
+    uint64_t t0 = qpc();
+    qsort(a, (size_t)n, sizeof *a, range_cmp);
+    uint64_t total = 0;   // an upper bound: overlaps count twice
+    for (int i = 0; i < n; i++) total += a[i].size;
+    int k = chunk_new(total, CHUNK_LIST);
+    if (k < 0) {
+        mrep.cap_fallback++;
+        return 0;
+    }
+    chunks[k].used = UINT64_MAX;   // not a snapshot chunk
+    VkCtx *c = vk_ctx();
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(c->vma, chunks[k].alloc, &info);
+    uint8_t *map = info.pMappedData;
+    uint64_t at = 0;
+    for (int i = 0; i < n;) {
+        PoolRec *r = a[i].r;
+        uint64_t lim = r->import_hi - r->import_lo;
+        int m = 0;
+        for (; i < n && a[i].r == r; i++) {
+            uint64_t lo = a[i].off, hi = a[i].off + a[i].size;
+            if (hi > lim) hi = lim;
+            if (lo >= hi) continue;
+            if (m && lo <= mregions[m - 1].dstOffset + mregions[m - 1].size) {   // overlapping or adjacent: extend
+                uint64_t end = mregions[m - 1].dstOffset + mregions[m - 1].size;
+                if (hi > end) {
+                    memcpy(map + at, (const void *)(uintptr_t)(r->import_lo + end), hi - end);
+                    at += hi - end;
+                    mregions[m - 1].size += hi - end;
+                }
+                continue;
+            }
+            if (m == cregions) grow((void **)&mregions, &cregions, sizeof *mregions);
+            memcpy(map + at, (const void *)(uintptr_t)(r->import_lo + lo), hi - lo);
+            mregions[m++] = (VkBufferCopy){at, lo, hi - lo};
+            at += hi - lo;
+        }
+        if (!m) continue;
+        vkCmdCopyBuffer(cb, chunks[k].buf, r->mbuf, (uint32_t)m, mregions);
+        mrep.cap_copies += (uint64_t)m;
+    }
+    vmaFlushAllocation(c->vma, chunks[k].alloc, 0, at);
+    mrep.cap_bytes += at, mrep.upload_bytes += at;
+    mrep.cap_t += qpc() - t0;
+    return 1;
+}
+
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     if (!npend && snl_copied == nsnl) return;
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
+    if (!mirror_capture() || !capture_ranges(cb, pend, npend))
+        copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
     if (snl_copied < nsnl) {   // the snapshots read what the uploads above wrote
         if (npend) mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                             VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -3047,6 +3123,10 @@ static void mirror_log(uint64_t frame) {
            "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; flushed and not copied (write-watched) %.3f MiB",
            (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f,
            a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M, a.flush_skipped / f / M);
+    if (a.cap_bytes || a.cap_fallback)
+        rt_log("mem: mirror frame %llu: captured at the prologue per frame %.3f MiB in %.1f copies, %.3f ms of the "
+               "recording thread; fell back to GPU copies %.2f (NX2NAVI_MIRROR_CAPTURE)", (unsigned long long)frame,
+               a.cap_bytes / f / M, a.cap_copies / f, qpc_ms(a.cap_t) / f, a.cap_fallback / f);
 }
 
 // After vram_log: every heap's usage as the driver reports it (VK_EXT_memory_budget) beside VMA's share of it, VMA by

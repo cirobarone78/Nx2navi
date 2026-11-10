@@ -679,6 +679,10 @@
 # frames of the scene can flicker; tell us what you see if you try it. In the settings menu: Experimental FPS boost
 # (Screen tab). With shadow storage (Linux, Wine) it stays off.
 # wb_lazy = 0
+# 1: the uploads into the video-memory copies of the game's buffers are read from game memory by the CPU when the
+# GPU work is handed over, instead of by the GPU when it runs that work, so data the game rewrites after handing
+# its frame over does not reach that frame. Off by default until measured; it does not yet replace the frame wait.
+# mirror_capture = 0
 # Linux, shadow storage: 1 clears the write watch's protection of a range in one call before the GPU's bytes are copied
 # back into the game's memory, instead of taking a fault at the first store into each page.
 # shadow_bulk_write = 0
