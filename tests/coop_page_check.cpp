@@ -698,8 +698,7 @@ static void check_states(void) {
     out_of_room(COOP_CONNECTING, "too many joins from this network; trying again in a minute");
     frames(3);
     CHECK(shows(UI_MENU_COOP_JOIN_LIMIT), "the relay's join limit is not said");
-    in_room_as(false, 0x4444444u, true);
-    g_fake.state = COOP_RECONNECTING, g_fake.room_lost = 1, g_fake.version++;
+    out_of_room(COOP_CONNECTING, "the room was lost; waiting for it");
     frames(3);
     CHECK(shows(UI_MENU_COOP_LOST), "a room the relay lost is not said");
     printf("  the join limit and a lost room are said\n");

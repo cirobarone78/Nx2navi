@@ -673,10 +673,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_SPENT_NONE] = "Nobody took more from the pools than they brought.",
     [UI_MENU_COOP_SPENT_DESC] = "This key took more from the pools than it brought. A player who used keys others found is "
                                 "listed too; one nobody expected drained the pools. Removing the key gives back what it "
-                                "took, in every game, also after the player left.",
+                                "took, in every game, also after the player left. Remove it before a pool reset: a reset "
+                                "keeps what a player still in the room took.",
     [UI_MENU_COOP_RESET] = "Reset the pools",
     [UI_MENU_COOP_RESET_DESC] = "Every game joins the pools again with what it held for the players in the room. This "
-                                "recovers a pool that a player who left had emptied; flags stay as they are.",
+                                "recovers a pool that a player who left had emptied; flags stay as they are. A player who "
+                                "drained a pool and is still in the room keeps what they took: remove them first, then reset.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Reset the pools for everyone in the room?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remove %s, key %s, from the room?",
     [UI_MENU_COOP_NOT_ACCEPTED] = "Not accepted: the room changed or a player in it has not said who they are. Look at the "
@@ -1384,10 +1386,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_SPENT_NONE] = "Никто не взял из запасов больше, чем принёс.",
     [UI_MENU_COOP_SPENT_DESC] = "Этот ключ взял из запасов больше, чем принёс. Здесь и игрок, который пользовался ключами, "
                                 "найденными другими; тот, кого никто не ждал, опустошил запасы. Удаление ключа возвращает "
-                                "взятое во всех играх, и после ухода игрока тоже.",
+                                "взятое во всех играх, и после ухода игрока тоже. Удалите ключ до сброса запасов: сброс "
+                                "оставляет взятое игроку, который ещё в комнате.",
     [UI_MENU_COOP_RESET] = "Сбросить запасы",
     [UI_MENU_COOP_RESET_DESC] = "Каждая игра заново входит в запасы с тем, что у неё было для игроков в комнате. Так "
-                                "восстанавливается запас, который опустошил ушедший игрок; флаги остаются как есть.",
+                                "восстанавливается запас, который опустошил ушедший игрок; флаги остаются как есть. Игрок, "
+                                "опустошивший запас и оставшийся в комнате, сохраняет взятое: сначала удалите его, потом сбросьте.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Сбросить запасы для всех в комнате?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Удалить %s (ключ %s) из комнаты?",
     [UI_MENU_COOP_NOT_ACCEPTED] = "Не принято: комната изменилась или кто-то в ней не назвался. Посмотрите предложение ещё раз.",
@@ -2080,10 +2084,12 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_SPENT_NONE] = "Ninguém pegou dos estoques mais do que trouxe.",
     [UI_MENU_COOP_SPENT_DESC] = "Esta chave pegou dos estoques mais do que trouxe. Um jogador que usou chaves que outros "
                                 "acharam também aparece; alguém que ninguém esperava esvaziou os estoques. Remover a chave "
-                                "devolve o que ela pegou, em todos os jogos, também depois que o jogador saiu.",
+                                "devolve o que ela pegou, em todos os jogos, também depois que o jogador saiu. Remova-a antes "
+                                "de redefinir os estoques: a redefinição mantém o que pegou um jogador que ainda está na sala.",
     [UI_MENU_COOP_RESET] = "Redefinir os estoques",
     [UI_MENU_COOP_RESET_DESC] = "Cada jogo entra de novo nos estoques com o que tinha para os jogadores na sala. Isso "
-                                "recupera um estoque que um jogador que saiu esvaziou; as flags ficam como estão.",
+                                "recupera um estoque que um jogador que saiu esvaziou; as flags ficam como estão. Um jogador "
+                                "que esvaziou um estoque e ainda está na sala fica com o que pegou: remova-o primeiro, depois redefina.",
     [UI_MENU_COOP_RESET_CONFIRM] = "Redefinir os estoques para todos na sala?",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remover %s, chave %s, da sala?",
     [UI_MENU_COOP_NOT_ACCEPTED] = "Não aceito: a sala mudou ou alguém nela não disse quem é. Veja a oferta de novo.",
@@ -2838,10 +2844,11 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COOP_NOT_IN_ROOM] = "不在房间中",
     [UI_MENU_COOP_SPENT_NONE] = "没有人从共用中取走的比带来的多。",
     [UI_MENU_COOP_SPENT_DESC] = "这个身份从共用中取走的比带来的多。用了别人找到的钥匙的玩家也会列在这里；没人预料到的那个人"
-                                "掏空了共用。移除这个身份会在所有游戏中归还它取走的东西，玩家离开后也是如此。",
+                                "掏空了共用。移除这个身份会在所有游戏中归还它取走的东西，玩家离开后也是如此。请在重置共用之前"
+                                "移除它：重置时仍在房间中的玩家会保留已取走的东西。",
     [UI_MENU_COOP_RESET] = "重置共用",
     [UI_MENU_COOP_RESET_DESC] = "每个游戏都会带着它为房间中玩家保存的数量重新加入共用。这能恢复被已离开的玩家掏空的共用；"
-                                "标记保持不变。",
+                                "标记保持不变。掏空了共用且仍在房间中的玩家会保留已取走的东西：先移除，再重置。",
     [UI_MENU_COOP_RESET_CONFIRM] = "为房间中的所有人重置共用？",
     [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "将 %s（身份指纹 %s）移出房间？",
     [UI_MENU_COOP_NOT_ACCEPTED] = "未接受：房间已变化，或其中有玩家未表明身份。请重新查看提议。",

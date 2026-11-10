@@ -55,8 +55,9 @@ Read this before you join a room.
   had never been in it, so keys you brought while their gains were in the pool stay yours, and a claim made while
   their spends were in it does not leave the pool fuller than what the others brought. A pool reset while that player
   is still in the room carries what they took into the new pools, and removing them afterwards does not give it back:
-  remove first, then reset (the reset's log line and the maker's hint say so). Keys a removed player's gains handed out
-  stay only as doors already opened. With rupees or ammunition in a pool (off by default) the same holds for them.
+  remove first, then reset (the reset's log line, the maker's hint and the Co-op tab's Reset the pools say so). Keys a
+  removed player's gains handed out stay only as doors already opened. With rupees or ammunition in a pool (off by
+  default) the same holds for them.
   Flags stay set when a player is removed. None of this can be undone inside the game otherwise: go back to the copy
   of your save. Invite only people you trust with your save, as you would hand them your controller.
 - **Who can get in.** Only someone who knows the room's secret: 18 characters (85 bits) that the game makes when a room
@@ -121,7 +122,9 @@ The menu (F1, or the pad's combo) has a Co-op tab, usable with the keyboard, the
   each was last heard and each one's key; the maker sees its own key to read out, and Remove on each other player's
   row, which removes by the key (a player who never said who they are has no key and is removed by member number,
   only while the same session still holds it). The maker also has a Pools group: every key that took more from the
-  pools than it brought, in the room or not, with what it took and a Remove of that key, and Reset the pools. Then the
+  pools than it brought, in the room or not, with what it took and a Remove of that key, and Reset the pools, which
+  says to remove such a player first. What it took can change, up or down, when the maker removes a player or a
+  player accepts more keys, also while that player's game is at its title screen. Then the
   room's secret, hidden until you press its row, and a row that copies it to the clipboard; the rules (the room's
   creator changes them, everyone else reads them; a change is a new offer for everyone); Leave the room. The status
   line says when the relay lost the room and the game is getting back into it, and when the relay takes no more joins

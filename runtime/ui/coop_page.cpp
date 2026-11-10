@@ -280,7 +280,8 @@ static void status_line(void) {
     }
     // the relay's limit on joins from one network: the session waits a minute and tries again by itself
     if (g_view.state != COOP_LEFT && strstr(g_view.status, "trying again in a minute")) opt_text(UI_MENU_COOP_JOIN_LIMIT, true);
-    if (in_room(g_view) && g_view.room_lost) opt_text(UI_MENU_COOP_LOST, true);
+    // a room the relay lost (its restart): the session makes it again or waits for it, and says so in its status
+    if (g_view.state != COOP_LEFT && strstr(g_view.status, "the room was lost")) opt_text(UI_MENU_COOP_LOST, true);
 }
 
 static void rows_out(void) {
