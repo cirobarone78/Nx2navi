@@ -3115,6 +3115,8 @@ static int dlss_biased(const samp_par *k) {
 void vk_sampler_dlss_bias(float b) {
     lock();
     if (b != dlss_bias) {
+        rt_log("vk: texture LOD bias %.2f on the scene's tiled textures (the upscaler's render scale; was %.2f)", b,
+               dlss_bias);
         dlss_bias = b;
         for (int i = 0; i < nsslots; i++) sslots[i].s = sslots[i].sp = sslots[i].sc = VK_NULL_HANDLE;   // looked up again (the key moves)
         samp_gen++;
