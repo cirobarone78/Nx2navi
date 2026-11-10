@@ -502,7 +502,9 @@ extern "C" void menu_vk_release(void) {
 // working directory) as menu-test-<frame>-<page>.png; after the last tab the menu closes.
 // NX2NAVI_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (NX2NAVI_ prefix
 // optional) at that presented frame; changes live settings with no input, menu open or not. nx2navi.ini is written only by
-// the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note).
+// the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
+// NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
+// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };   // Ocarina of Time: the options this port has
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
@@ -555,8 +557,15 @@ static void test_apply_sets(uint64_t frame) {
     for (; g_test.next_set < g_test.n_sets && g_test.sets[g_test.next_set].frame <= frame; g_test.next_set++) {
         const TestSet &t = g_test.sets[g_test.next_set];
         rt_log("menu: test hook: frame %llu: %s=%s", (unsigned long long)frame, t.key, t.value);
-        if (!strcmp(t.key, "NX2NAVI_SAVE")) rt_log("menu: test hook: cfg_save %s", cfg_save() ? "wrote" : "failed");
-        else cfg_set(t.key, t.value);
+        if (!strcmp(t.key, "NX2NAVI_SAVE")) {
+            rt_log("menu: test hook: cfg_save %s", cfg_save() ? "wrote" : "failed");
+        } else if (!strcmp(t.key, "NX2NAVI_FOCUS")) {
+            char row[80];
+            snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
+            opt_focus_key(row);
+        } else {
+            cfg_set(t.key, t.value);
+        }
     }
 }
 
