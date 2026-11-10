@@ -545,11 +545,12 @@ the room, `CoopView.name` the player's own name. The wire format is `runtime/coo
   another member's name made with the secret alone (and a flood of them), a member's session after a forged roster
   with a replayed message, a roster without it, a relay that says the room is gone, and a replayed identity of a
   session the game never saw end, claims made again after a removal (keys brought while a removed player's gains
-  counted, a claim made while its spends counted, honest games that agree), another save that joins only once
-  accepted; and a randomised run (a few seeds by default; `NX2NAVI_COOP_ADVERSARY=first:count` runs those seeds
-  alone) of hostile members who hold the secret, admitted or not, and of an attacker with the secret and no accepted
-  key who forges senders and rosters and replays messages and identities, against invariants of flags, acceptance,
-  identification and a ledger of the honest players' joins, pickups and uses. The session part adds rosters forged
+  counted, a claim made while its spends counted, honest games that agree, a game at its title screen), another save
+  that joins only once accepted; and a randomised run (a few seeds by default; `NX2NAVI_COOP_ADVERSARY=first:count`
+  runs those seeds alone) of hostile members who hold the secret, admitted or not, and of an attacker with the secret
+  and no accepted key who forges senders and rosters and replays messages and identities, against invariants of flags,
+  acceptance, identification and a ledger of the honest players' joins, pickups and uses. The session part adds
+  rosters forged
   far and a little ahead, rosters that list another session again and again, a refusal for the network's joins, and a
   room that is not there. `ocarina --probe-fs` checks that the first copy
   of a save outlasts the rotation.

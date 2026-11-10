@@ -1694,6 +1694,8 @@ static int send_section(CoopSync *s, int sec, int to, CoopSyncSendFn send, void 
     return msg_send(s, &m, to, send, user);
 }
 
+static void pool_recheck(CoopSync *s, Pool *p, uint64_t now);
+
 void coop_sync_tick(CoopSync *s, uint64_t now, CoopSyncSendFn send, void *user) {
     if (now > s->now) s->now = now;
     if (!s->tok_at) s->tok_at = now, s->tokens = BURST_BYTES;
@@ -1721,6 +1723,12 @@ void coop_sync_tick(CoopSync *s, uint64_t now, CoopSyncSendFn send, void *user) 
             if (s->digest_to >> id & 1 && s->peer[id].present) send_digest(s, id, send, user);
     s->digest_to = 0;
     if (!s->have_room) return;
+
+    // a claim waiting to be made again (a removal, or the player accepting more keys) is made now, also while the game
+    // reports no pool counter (its title screen, a load): until then the others count this player's keys as the old
+    // claim had them, and a pool reset in that time would carry them for nobody but this game
+    for (int k = 0; k < s->npools; k++)
+        if (s->pools[k].recheck) pool_recheck(s, &s->pools[k], now), pool_check(s, &s->pools[k]);
 
     // local changes: three sends, 0, 80 and 250 ms after the change
     Msg m;

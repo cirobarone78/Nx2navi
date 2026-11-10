@@ -2918,6 +2918,45 @@ static void probe_h5_rebind(void) {
     printf("coop-probe: sync rebind: another save joins the pools once its player accepted the room again\n");
 }
 
+// A claim waiting to be made again (after a removal, or more keys accepted) is made also while the game reports no
+// pool counter (its title screen): the others count this player's keys at once, and a pool reset made meanwhile
+// carries them for the others too, so no key another player picks up after the reset is absorbed when this player
+// comes back (seed 46304 of the randomised run).
+static void probe_h5_claim_at_title(void) {
+    Net net = {0};
+    Game a, b, m;
+    game_init(&a, 1, 0x5601), game_init(&b, 2, 0x5602), game_init(&m, 3, 0x5603);
+    defaults(&a, 1), defaults(&b, 0), defaults(&m, 0);
+    a.hold_pools = 1;   // A at the title screen
+    net.games[0] = &a, net.games[1] = &m, net.games[2] = &b, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H5T", 1000), 1000), 5000);
+    flag_of(&m, KEYS_FOREST)->value = 10;   // M joined the pool, and picks up 10
+    now = run(&net, now, 3000);
+    flag_of(&a, KEYS_FOREST)->value = 2, a.hold_pools = 0;   // A loads a save with 2 keys: its claim counts M's 10
+    now = run(&net, now, 3000);
+    a.hold_pools = 1;   // A back at its title screen, where the maker removes M
+    int acted = coop_sync_remove(a.eng, 3);
+    net.present[1] = 0, net.present[2] = 1;   // M leaves; B, who never saw M, comes with no key
+    now = run(&net, (net_roster(&net, "H5T", now), now), 5000);
+    int64_t after_removal;
+    coop_sync_pool(b.eng, KEYS_FOREST, &after_removal);
+    int reset = coop_sync_reset_pools(a.eng);   // still at the title screen, the maker resets the pools
+    now = run(&net, now, 5000);
+    flag_of(&b, KEYS_FOREST)->value += 1;   // B picks up one more
+    now = run(&net, now, 3000);
+    a.hold_pools = 0;   // A plays again
+    now = run(&net, now, 5000);
+    int64_t va, vb;
+    coop_sync_pool(a.eng, KEYS_FOREST, &va), coop_sync_pool(b.eng, KEYS_FOREST, &vb);
+    CHECK(acted && reset && after_removal == 2 && va == 3 && vb == 3 && value_of(&a, KEYS_FOREST) == 3 && value_of(&b, KEYS_FOREST) == 3,
+          "closing 5: a claim is made again after a removal while its game is at the title screen: B counts A's 2 keys (%lld), and after a "
+          "reset meanwhile and B's pickup the pools hold A's 2 and B's 1 (pools %lld %lld, shown %d %d)",
+          (long long)after_removal, (long long)va, (long long)vb, value_of(&a, KEYS_FOREST), value_of(&b, KEYS_FOREST));
+    game_free(&a), game_free(&b), game_free(&m);
+    free(net.q);
+    printf("coop-probe: sync claim at the title screen: a removal makes the claim again also while the game plays no save\n");
+}
+
 int probe_coop_sync(void) {
     fails = 0;
     if (getenv("NX2NAVI_COOP_ADVERSARY")) {
@@ -2958,6 +2997,7 @@ int probe_coop_sync(void) {
     probe_h5_session_end();
     probe_h5_join();
     probe_h5_rebind();
+    probe_h5_claim_at_title();
     probe_adversary();
     return fails;
 }
