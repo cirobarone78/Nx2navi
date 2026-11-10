@@ -1103,7 +1103,7 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
-enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
+enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW, PS_SHARED };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
 static uint8_t *pstate;
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
 static int ww_shmem;                 // the write watch covers shared memory: watched reservations are memfds
@@ -1262,8 +1262,9 @@ int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
     return ioctl(ww_fd, UFFDIO_WRITEPROTECT, &wp) == 0;
 }
 
-uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
-    if (!max || !n) return 0;
+// The userfaultfd write watch over [addr, addr + n). The kernel skips the shared pages' driver mappings (PAGEMAP_SCAN
+// passes over VM_PFNMAP areas unless PM_SCAN_CHECK_WPASYNC asks it to refuse them).
+static uint64_t ww_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (ww_fd < 0) return UINT64_MAX;
     struct page_region r[256];
     uint64_t got = 0;
@@ -1272,7 +1273,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         // zero page. A page never touched since its commit has no protection marker either and counts as written to
         // the kernel; a read maps the zero page there. Neither is a write, as on Windows.
         struct pm_scan_arg arg = {.size = sizeof arg,
-                                  .flags = reset ? PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC : 0,
+                                  .flags = reset ? PM_SCAN_WP_MATCHING : 0,
                                   .start = at, .end = end, .vec = (uint64_t)(uintptr_t)r, .vec_len = 256,
                                   .max_pages = max - got,
                                   .category_inverted = PAGE_IS_PFNZERO,
@@ -1289,10 +1290,251 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     return got;
 }
 
-// One handler for the synchronous faults. A SIGSEGV whose page-fault error code has the write bit set goes to the
-// write-fault hook first (memory.c thaws a frozen region); any other fault, in this executable or in a library (Mesa,
-// SDL), then goes to the crash hook (main.c), which reports it and ends the process. Without a crash hook the fault
-// gets the default action. Runs on the thread's signal stack.
+// ---- shared pages (plat_mem_share). A driver's mapping takes no userfaultfd write watch, so writes to shared pages are
+// tracked by protection, and only where a consumer watches them (plat_mem_watch: a texture's storage, a mirrored pool):
+// most pool memory nothing checks, and protecting it would cost a fault for every page the game writes. A watched page
+// is read-only until written; the write faults, shared_fault marks the page written and makes it read-write, and
+// shared_written reports it and makes it read-only again (reset). Unwatched pages are read-write and never reported.
+// SH_LOCK orders a fault against a reset or a watch of the same page: they make the page read-only before they mark it
+// unwritten, under the lock, so a write either lands before the protection (and the bytes read after it hold it) or
+// faults after it and marks the page again. When the kernel refuses to split the mapping any further
+// (vm.max_map_count), the whole mapping turns read-write and untracked, which plat_mem_written reports, so its
+// consumers take every page.
+enum { SH_ON = 1, SH_FIRST = 2, SH_WATCHED = 4, SH_WRITTEN = 8, SH_LOCK = 16, SH_UNTRACKED = 32 };   // SH_FIRST: a mapping starts here
+static uint8_t *sstate;   // per page below PS_LIMIT, mapped lazily like pstate; vm_lock for SH_ON and SH_FIRST
+static uint8_t *swatch;   // per page: how many consumers watch it (255 stays watched for good); under the page's SH_LOCK
+static int64_t sh_faults, sh_rearmed;
+
+static uint8_t sh_get(uint64_t page) {
+    return sstate && page < PS_LIMIT ? __atomic_load_n(&sstate[page / PG], __ATOMIC_ACQUIRE) : 0;
+}
+
+static void sh_lock(uint64_t page) {
+    while (__atomic_fetch_or(&sstate[page / PG], SH_LOCK, __ATOMIC_ACQUIRE) & SH_LOCK) __builtin_ia32_pause();
+}
+
+static void sh_unlock(uint64_t page) { __atomic_fetch_and(&sstate[page / PG], (uint8_t)~SH_LOCK, __ATOMIC_RELEASE); }
+
+static void sh_set(uint64_t page, uint8_t bits) { __atomic_fetch_or(&sstate[page / PG], bits, __ATOMIC_RELEASE); }
+
+// The mapping holding page turns read-write and untracked for good: the kernel refused a protection change inside it.
+static int sh_untrack(uint64_t page) {
+    uint64_t lo = page, hi = page + PG;
+    while (!(sh_get(lo) & SH_FIRST) && (sh_get(lo - PG) & SH_ON)) lo -= PG;
+    while ((sh_get(hi) & (SH_ON | SH_FIRST)) == SH_ON) hi += PG;
+    if (mprotect((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE)) return 0;
+    for (uint64_t p = lo; p < hi; p += PG) sh_set(p, SH_UNTRACKED | SH_WRITTEN);
+    return 1;
+}
+
+static _Noreturn void sh_fatal(const char *what, uint64_t a, uint64_t n) {
+    fprintf(stderr, "FATAL: platform: shared pages %#llx+%#llx cannot be %s (%s)\n", (unsigned long long)a,
+            (unsigned long long)n, what, strerror(errno));
+    _exit(70);
+}
+
+// A write fault on a shared page (from fault_handler). Watched: marked written and read-write. Unwatched: an unwatch
+// made it read-write while the write waited for the lock (made so here too, should it still be read-only), or the
+// range got its own memory back meanwhile; either way the write runs again. 1 retries the write.
+static int shared_fault(uint64_t addr) {
+    uint64_t page = addr & ~(PG - 1);
+    if (!(sh_get(page) & SH_ON)) return 0;
+    sh_lock(page);   // a watch, an unwatch or an unshare in progress settles the page before it lets go
+    int ok = 1;
+    if (sh_get(page) & SH_WATCHED) {
+        sh_set(page, SH_WRITTEN);
+        ok = !mprotect((void *)(uintptr_t)page, PG, PROT_READ | PROT_WRITE) || sh_untrack(page);
+        __atomic_add_fetch(&sh_faults, 1, __ATOMIC_RELAXED);
+    } else if (pstate[page / PG] == PS_SHARED) {
+        ok = !mprotect((void *)(uintptr_t)page, PG, PROT_READ | PROT_WRITE);
+    } else {
+        ok = pstate[page / PG] == PS_RW;   // own memory again; a guest protection change is not ours to undo
+    }
+    sh_unlock(page);
+    return ok;
+}
+
+// The shared pages of [lo, hi): plat_mem_written for them.
+static uint64_t shared_written(uint64_t lo, uint64_t hi, uint64_t *pages, uint64_t max, int reset) {
+    uint64_t got = 0;
+    for (uint64_t p = lo; p < hi && got < max;) {
+        uint8_t v = sh_get(p);
+        if (v & SH_UNTRACKED) return UINT64_MAX;
+        if (!(v & SH_WRITTEN)) { p += PG; continue; }
+        if (!reset) { pages[got++] = p, p += PG; continue; }
+        uint64_t q = p;   // the run of written pages from p, locked
+        for (; q < hi && got + (q - p) / PG < max; q += PG) {
+            sh_lock(q);
+            if ((sh_get(q) & (SH_WRITTEN | SH_UNTRACKED)) != SH_WRITTEN) { sh_unlock(q); break; }
+        }
+        if (q == p) { p += PG; continue; }
+        int ok = !mprotect((void *)(uintptr_t)p, q - p, PROT_READ) || sh_untrack(p);
+        int untracked = sh_get(p) & SH_UNTRACKED;
+        for (uint64_t x = p; x < q; x += PG) {
+            if (!untracked) __atomic_fetch_and(&sstate[x / PG], (uint8_t)~SH_WRITTEN, __ATOMIC_RELEASE);
+            pages[got++] = x;
+            sh_unlock(x);
+        }
+        if (!ok) sh_fatal("protected", p, q - p);
+        if (untracked) return UINT64_MAX;
+        __atomic_add_fetch(&sh_rearmed, (int64_t)((q - p) / PG), __ATOMIC_RELAXED);
+        p = q;
+    }
+    return got;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
+    if (!max || !n) return 0;
+    uint64_t got = ww_written(addr, n, pages, max, reset);
+    if (!sstate || got == UINT64_MAX || got == max) return got;   // a full answer: the caller asks again
+    uint64_t k = shared_written(addr & ~(PG - 1), addr + n, pages + got, max - got, reset);
+    if (k == UINT64_MAX) return UINT64_MAX;
+    if (k && got) qsort(pages, (size_t)(got + k), sizeof *pages, cmp_u64);   // in address order
+    return got + k;
+}
+
+// vm_lock held: [addr, addr + n) gets the reservation's own memory again, read-write and watched. The shared pages are
+// locked across the change, so a reset or a watch running on another thread does not protect the new memory.
+static int own_memory(uint64_t addr, uint64_t n) {
+    for (uint64_t p = addr; sstate && p < addr + n; p += PG)
+        if (sh_get(p) & SH_ON) sh_lock(p);
+    SharedRegion *s = shared_region(addr);
+    void *p = s ? mmap((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, s->fd, (off_t)(addr - s->lo))
+                : mmap((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                       -1, 0);
+    if (p != (void *)(uintptr_t)addr) {
+        for (uint64_t x = addr; sstate && x < addr + n; x += PG)
+            if (sh_get(x) & SH_LOCK) sh_unlock(x);
+        return 0;
+    }
+    madvise(p, n, MADV_NOHUGEPAGE);
+    struct uffdio_register reg = {.range = {addr, n}, .mode = UFFDIO_REGISTER_MODE_WP};
+    if (ww_fd >= 0 && ioctl(ww_fd, UFFDIO_REGISTER, &reg))
+        fprintf(stderr, "platform: write watch over %#llx+%#llx failed (%s)\n", (unsigned long long)addr,
+                (unsigned long long)n, strerror(errno));
+    ps_set(addr, n, PS_RW);
+    if (sstate) memset(sstate + addr / PG, 0, (size_t)(n / PG)), memset(swatch + addr / PG, 0, (size_t)(n / PG));   // unlocks
+    return 1;
+}
+
+int plat_mem_share(uint64_t addr, uint64_t n, int fd, uint64_t off) {
+    int ok = 0;
+    plat_mutex_lock(&vm_lock);
+    if (!sstate) {   // both or neither
+        void *p = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void *w = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED && w != MAP_FAILED) sstate = p, swatch = w;
+        else if (p != MAP_FAILED) munmap(p, PS_LIMIT / PG);
+    }
+    if (sstate && pstate && n && !((addr | n | off) & (PG - 1)) && addr + n <= PS_LIMIT) {
+        // Read-write and unwatched: plat_mem_watch protects what a consumer checks.
+        void *p = mmap((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+        ok = p == (void *)(uintptr_t)addr;
+        if (ok) {
+            SharedRegion *s = shared_region(addr);   // the reservation's own pages are not needed while it is shared
+            if (s) fallocate(s->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(addr - s->lo), (off_t)n);
+            ps_set(addr, n, PS_SHARED);
+            memset(sstate + addr / PG, SH_ON, (size_t)(n / PG));
+            sstate[addr / PG] |= SH_FIRST;
+        } else if (!own_memory(addr, n)) {   // a failed MAP_FIXED may have unmapped the range already
+            sh_fatal("given their own memory back", addr, n);
+        }
+    }
+    close(fd);
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
+int plat_mem_unshare(uint64_t addr, uint64_t n) {
+    plat_mutex_lock(&vm_lock);
+    int ok = own_memory(addr, n);
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
+// The locked run [p, q) of shared pages: protected and watched (watch), or read-write and unwatched; unlocked after. An
+// untracked mapping stays read-write: protecting it again would split it where the kernel refused to.
+static void sh_arm_run(uint64_t p, uint64_t q, int watch) {
+    if (q <= p) return;
+    int untracked = sh_get(p) & SH_UNTRACKED;
+    if (!untracked && !mprotect((void *)(uintptr_t)p, q - p, watch ? PROT_READ : PROT_READ | PROT_WRITE)) {
+        for (uint64_t x = p; x < q; x += PG) {
+            __atomic_fetch_and(&sstate[x / PG], (uint8_t)~(SH_WRITTEN | SH_WATCHED), __ATOMIC_RELEASE);
+            if (watch) sh_set(x, SH_WATCHED);
+        }
+    } else if (!untracked && !sh_untrack(p)) {
+        sh_fatal(watch ? "watched" : "unwatched", p, q - p);
+    }
+    for (uint64_t x = p; x < q; x += PG) sh_unlock(x);
+}
+
+void plat_mem_watch(uint64_t addr, uint64_t n) {
+    if (!sstate || !swatch || !n) return;
+    for (uint64_t p = addr & ~(PG - 1), end = addr + n; p < end;) {
+        if (!(sh_get(p) & SH_ON)) { p += PG; continue; }
+        uint64_t q = p;   // the run of shared pages nothing watched yet, locked
+        int more = 0;     // q is watched already: counted, and the next run starts after it
+        for (; q < end && (sh_get(q) & SH_ON); q += PG) {
+            sh_lock(q);
+            uint8_t *w = &swatch[q / PG];
+            if (*w) { *w += *w < 255; sh_unlock(q); more = 1; break; }
+            *w = 1;
+        }
+        sh_arm_run(p, q, 1);
+        p = q + (more ? PG : 0);
+    }
+}
+
+void plat_mem_unwatch(uint64_t addr, uint64_t n) {
+    if (!sstate || !swatch || !n) return;
+    for (uint64_t p = addr & ~(PG - 1), end = addr + n; p < end;) {
+        if (!(sh_get(p) & SH_ON)) { p += PG; continue; }
+        uint64_t q = p;   // the run of shared pages nothing watches any more, locked
+        int more = 0;     // q keeps other watchers: counted down, and the next run starts after it
+        for (; q < end && (sh_get(q) & SH_ON); q += PG) {
+            sh_lock(q);
+            uint8_t *w = &swatch[q / PG];
+            if (*w > 1) { *w -= *w < 255; sh_unlock(q); more = 1; break; }
+            *w = 0;
+        }
+        sh_arm_run(p, q, 0);
+        p = q + (more ? PG : 0);
+    }
+}
+
+void plat_mem_shared_write(uint64_t addr, uint64_t n) {
+    if (!sstate || !n) return;
+    for (uint64_t p = addr & ~(PG - 1), end = addr + n; p < end;) {
+        if ((sh_get(p) & (SH_WATCHED | SH_WRITTEN)) != SH_WATCHED) { p += PG; continue; }
+        uint64_t q = p;   // the run of read-only watched pages from p, locked and marked
+        for (; q < end; q += PG) {
+            if ((sh_get(q) & (SH_WATCHED | SH_WRITTEN)) != SH_WATCHED) break;
+            sh_lock(q);
+            if (sh_get(q) & SH_WRITTEN) { sh_unlock(q); break; }
+            sh_set(q, SH_WRITTEN);
+        }
+        if (q == p) { p += PG; continue; }
+        if (mprotect((void *)(uintptr_t)p, q - p, PROT_READ | PROT_WRITE) && !sh_untrack(p)) sh_fatal("made writable", p, q - p);
+        for (uint64_t x = p; x < q; x += PG) sh_unlock(x);
+        p = q;
+    }
+}
+
+void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed) {
+    *faults = (uint64_t)__atomic_exchange_n(&sh_faults, 0, __ATOMIC_RELAXED);
+    *rearmed = (uint64_t)__atomic_exchange_n(&sh_rearmed, 0, __ATOMIC_RELAXED);
+}
+
+// One handler for the synchronous faults. A SIGSEGV goes to the access hook first when there is one; then a write to a
+// shared page is the tracking's (shared_fault); another write goes to the write-fault hook (memory.c thaws a frozen
+// region); any other fault, in this executable or in a library (Mesa, SDL), then goes to the crash hook (main.c), which
+// reports it and ends the process. Without a crash hook the fault gets the default action. Runs on the thread's signal
+// stack.
 static int (*fault_hook)(uint64_t addr);
 static int (*access_hook)(uint64_t addr, int write, uint64_t ip);   // every read or write fault, before fault_hook
 static void (*crash_fn)(const PlatCrash *c);
@@ -1303,6 +1545,10 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     if (sig == SIGSEGV && access_hook && !(err & 16) &&
         access_hook((uint64_t)(uintptr_t)si->si_addr, (err & 2) != 0, (uint64_t)u->uc_mcontext.gregs[REG_RIP]))
         return;
+    if (sig == SIGSEGV && (err & 2) && shared_fault((uint64_t)(uintptr_t)si->si_addr)) {
+        if (fault_hook) fault_hook((uint64_t)(uintptr_t)si->si_addr);   // its region thaws too, so queries see the page
+        return;
+    }
     if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
     uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
     Dl_info at, self;
@@ -1442,9 +1688,19 @@ void plat_reexec(void) {
     _exit(70);
 }
 
+// process_vm_readv cannot reach a driver's mapping: shared pages are copied directly (they are always readable).
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
-    struct iovec local = {out, n}, remote = {(void *)(uintptr_t)addr, n};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+    for (uint64_t a = addr, end = addr + n; a < end;) {
+        uint64_t b = (a | (PG - 1)) + 1 < end ? (a | (PG - 1)) + 1 : end;
+        if (sh_get(a & ~(PG - 1)) & SH_ON) {
+            memcpy((uint8_t *)out + (a - addr), (const void *)(uintptr_t)a, b - a);
+        } else {
+            struct iovec local = {(uint8_t *)out + (a - addr), b - a}, remote = {(void *)(uintptr_t)a, b - a};
+            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)(b - a)) return 0;
+        }
+        a = b;
+    }
+    return 1;
 }
 
 int plat_mem_readable(uint64_t addr, uint64_t n) {
@@ -1480,6 +1736,7 @@ void plat_file_close(PlatFile *f) {
 }
 
 int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    plat_mem_shared_write((uint64_t)(uintptr_t)buf, n);   // the kernel's write fails on a read-only page, not faults
     ssize_t k;
     do k = pread(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);

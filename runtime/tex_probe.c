@@ -335,6 +335,7 @@ static int test_import(pool_t *pool) {
     uint8_t *m = pool->mem;
     uint64_t a = (uintptr_t)m, pages[64], n;
     GCHECK(vk_pool_init(pool), "vk_pool_init of a CPU-visible pool at %#llx", (unsigned long long)a);
+    plat_mem_watch(a, pool->size);   // pool memory shared with the GPU reports writes where a consumer watches it
     VkMemSpan sp;
     GCHECK(vk_mem_resolve(a + 0x1000, 0x20000, &sp) && sp.buffer && sp.offset == 0x1000 && sp.avail == pool->size - 0x1000,
            "resolve inside the imported pool (offset %#llx, avail %#llx)", (unsigned long long)sp.offset,
@@ -352,6 +353,7 @@ static int test_import(pool_t *pool) {
     vk_mem_gpu_pending(a + 0x1000, 0x20000);
     vk_mem_shadow_sync();   // as a submit does: the part's CPU inputs go in before its GPU work
     copy_wait(sb, 0, sp.buffer, sp.offset, 0x20000);
+
     vk_gpu_written(a + 0x1000, 0x20000);
     GCHECK(!memcmp(m + 0x1000, s, 0x20000), "GPU copy into the imported heap range differs from the source");
     n = mem_written_pages(a, pool->size, pages, 64);

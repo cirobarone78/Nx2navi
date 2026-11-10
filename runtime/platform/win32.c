@@ -872,6 +872,25 @@ void *plat_mem_host_view(uint64_t addr, uint64_t n) {
     return NULL;
 }
 
+// Windows maps no driver memory at a chosen address: pools keep imports or shadow copies.
+int plat_mem_share(uint64_t addr, uint64_t n, int fd, uint64_t off) {
+    (void)addr, (void)n, (void)fd, (void)off;
+    return 0;
+}
+
+int plat_mem_unshare(uint64_t addr, uint64_t n) {
+    (void)addr, (void)n;
+    return 0;
+}
+
+void plat_mem_watch(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+
+void plat_mem_unwatch(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+
+void plat_mem_shared_write(uint64_t addr, uint64_t n) { (void)addr, (void)n; }
+
+void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed) { *faults = *rearmed = 0; }
+
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
     AddVectoredExceptionHandler(1, fault_veh);

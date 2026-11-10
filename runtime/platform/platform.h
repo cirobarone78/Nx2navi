@@ -234,7 +234,9 @@ static inline void *plat_casp(void *volatile *p, void *xchg, void *cmp) {
 
 // ---- virtual memory: ranges reserved at fixed addresses below 2^39, their pages committed, decommitted and protected
 // at 4 KiB granularity.
-enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW };
+// PLAT_MEM_SHARED: committed pages shared with the GPU (plat_mem_share), readable and writable for the guest; the
+// platform keeps their protection for its write tracking.
+enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW, PLAT_MEM_SHARED };
 enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1 };   // plat_mem_state besides PLAT_PROT_* for committed pages
 // Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. flags: PLAT_WATCH, writes to its
 // pages are tracked for plat_mem_written; PLAT_HOST_VIEW with it, the pages also get an unwatched view
@@ -271,6 +273,24 @@ void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
 // there is none (Windows; Linux without shared-memory write protection). A host write there changes the guest's pages
 // and is not reported by plat_mem_written.
 void *plat_mem_host_view(uint64_t addr, uint64_t n);
+// Shared pages: committed pages [addr, addr + n) of a watched reservation take their bytes from a GPU allocation the
+// driver exported (fd, a dma-buf, which the call closes; off: where the range starts in it), so the CPU and the GPU
+// read and write the same bytes. The caller copies the pages' bytes into the allocation first. Their writes are
+// tracked for plat_mem_written only where plat_mem_watch asked for it. 0 where the platform cannot (Windows) or the
+// mapping failed: the range then has memory of its own again, whose bytes the caller copies back.
+int plat_mem_share(uint64_t addr, uint64_t n, int fd, uint64_t off);
+// The shared range gets memory of its own again, read-write and watched; the caller copies the bytes back. 1 on success.
+int plat_mem_unshare(uint64_t addr, uint64_t n);
+// Writes to the shared pages of [addr, addr + n) are tracked for plat_mem_written from now on; unwatched shared pages
+// are never reported. A consumer watches a range before it reads the bytes it checks. Other pages: nothing to do.
+// plat_mem_unwatch takes one watch back: a page nothing watches any more is read-write and untracked again.
+void plat_mem_watch(uint64_t addr, uint64_t n);
+void plat_mem_unwatch(uint64_t addr, uint64_t n);
+// The watched shared pages of [addr, addr + n) become writable and count as written: before a write that does not
+// fault (the kernel's, a file read into guest memory).
+void plat_mem_shared_write(uint64_t addr, uint64_t n);
+// Shared-page write faults and the pages made read-only again by plat_mem_written since the last call.
+void plat_mem_shared_stats(uint64_t *faults, uint64_t *rearmed);
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);

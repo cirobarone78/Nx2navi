@@ -76,6 +76,8 @@ typedef struct Tex {
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     uint64_t chash;               // content_hash of the storage at its last upload (small textures, CHASH_MAX)
     uint8_t chash_ok;             // chash holds it
+    uint8_t watched;              // its storage is watched (plat_mem_watch): pool memory shared with the GPU reports
+                                  // CPU writes to it for as long as the entry lives
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
     ImgKey ik;                    // the image's creation parameters
     uint8_t reusable;             // its image may go to a new texture once it is released (own memory, GPU-only content)
@@ -515,6 +517,11 @@ static int tex_reuse_on(void) {
 }
 
 static void destroy_tex(Tex *e);
+
+// Pool memory shared with the GPU reports CPU writes to the entry's storage from here on (vk_memory.c share_pool).
+static void watch_storage(Tex *e) {
+    if (!e->watched) e->watched = 1, plat_mem_watch(e->pub.addr, e->t.L.size);
+}
 
 // Whether an image with these requirements can lie in the pool memory at e's address (*sp: that memory).
 static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, uint64_t guest_size, VkMemSpan *sp) {
@@ -1023,6 +1030,7 @@ static void retire_remove(Tex *e);
 
 static void destroy_tex(Tex *e) {
     if (e->retiring) retire_remove(e);
+    if (e->watched) plat_mem_unwatch(e->pub.addr, e->t.L.size);
     own_remove(e);
     gwin_remove(e);
     n_site[0]++;
@@ -1790,6 +1798,8 @@ static void upload(Tex *e) {
         e->uploaded = 1;
         return;
     }
+    // The watch comes before the bytes read below, so a write during the copy shows at the next check.
+    watch_storage(e);
     e->chash_ok = e->t.L.size <= CHASH_MAX;   // the hash of what this upload copies (make_fresh_snap compares it)
     if (e->chash_ok) e->chash = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
     static __thread char ctx[160];   // what this thread copies, for a crash report
@@ -2373,6 +2383,7 @@ void vk_texture_gpu_written(const tex_t *t) {
         if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
             e->gpu_dirty = 1;
+            watch_storage(e);   // CPU writes after this render decide its write-back
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
             if (wb_exact < 0) wb_exact = cfg_bool("NX2NAVI_WB_EXACT");
             if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))

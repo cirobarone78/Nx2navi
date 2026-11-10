@@ -251,6 +251,15 @@ reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue
 Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Where the device exports dma-bufs (`VK_EXT_external_memory_dma_buf`, RADV), the shadow allocation is the guest memory
+instead of a copy (shared pools, `runtime/vk_memory.c` `share_pool`): it comes from exportable host-cached memory and
+is mapped at the pool's guest address (`runtime/platform/linux.c` `plat_mem_share`), so the CPU and the GPU read and
+write the same bytes, nothing is copied before a submit or after a fence, and the pools' memory is not doubled. The
+userfaultfd write watch cannot cover such a mapping: writes to it are tracked by page protection, only where a texture
+or a VRAM mirror watches (`plat_mem_watch`), and a pool earns its mirror after a trial in which the CPU wrote at most
+16 of its pages (`mirror_trial`), since every CPU write to a watched page costs a fault. Kokiri Forest on an
+RX 9070 XT: 68 fps with copies, 92 shared. `NX2NAVI_SHARE=0` keeps the copies, which the rest of this paragraph
+describes.
 On Linux the watched guest memory is a memfd mapped at the guest address, with a second mapping of it that the write
 watch does not cover (`runtime/platform/linux.c` `plat_mem_host_view`). The fence write-back goes through that second
 mapping, so the GPU's bytes neither take a protection fault per page nor come back from the write watch as CPU writes;

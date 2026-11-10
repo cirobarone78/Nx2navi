@@ -412,17 +412,22 @@ void mem_thaw(uint64_t a, uint64_t n) {
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
+    plat_mem_shared_write(a, n);   // pages shared with the GPU are read-only until written, as a frozen region
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
-// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again. Pages shared
+// with the GPU (PLAT_MEM_SHARED) are left as they are: the platform tracks their writes, and a write to a watched one
+// thaws the region as any write does (linux.c fault_handler), so queries see it.
 static int freeze_locked(uint64_t r) {
-    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
-    int n = 0;
+    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[64][2];
+    int n = 0, shared = 0;
     for (uint64_t x = a, y; x < end; x = y) {
         int st = plat_mem_state(x, end, &y);
-        if (st >= PLAT_PROT_NONE) {
-            if (st != PLAT_PROT_RW || n == 16) return 0;
+        if (st == PLAT_MEM_SHARED) {
+            shared = 1;
+        } else if (st >= PLAT_PROT_NONE) {
+            if (st != PLAT_PROT_RW || n == 64) return 0;
             run[n][0] = x, run[n][1] = y, n++;
         } else if (st != PLAT_MEM_RESERVED) return 0;
     }
@@ -431,7 +436,7 @@ static int freeze_locked(uint64_t r) {
             while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
             return 0;
         }
-    return n > 0;
+    return n > 0 || shared;
 }
 
 int mem_freeze(uint64_t a) {
