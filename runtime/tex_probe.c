@@ -11,6 +11,7 @@
 #include "nvn_api.h"
 #include "tex.h"
 #include "vk.h"
+#include "vk_gpa.h"
 #include "platform/platform.h"
 
 static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
@@ -382,6 +383,178 @@ static int test_import(pool_t *pool) {
     return 0;
 }
 
+// One invocation follows vk_gpa.c's real L1 -> L2 -> record layout, then loads a uint through the primary BDA.
+// Push constant: guest address. Storage bindings: 0 = actual GPA table, 1 = independent host-visible result.
+// The source pool is deliberately never a descriptor, transfer source or resolved span. Unmapped pages return 0.
+// SPIR-V 1.3, PhysicalStorageBuffer64 / GLSL450; the instruction comments keep this small probe self-contained.
+static const uint32_t gpa_read_spv[] = {
+    0x07230203, 0x00010300, 0, 65, 0,
+    0x00020011, 1,                         // OpCapability Shader
+    0x00020011, 11,                        // OpCapability Int64
+    0x00020011, 5347,                      // OpCapability PhysicalStorageBufferAddresses
+    0x0009000a, 0x5f565053, 0x5f52484b, 0x73796870, 0x6c616369,
+                0x6f74735f, 0x65676172, 0x6675625f, 0x00726566, // SPV_KHR_physical_storage_buffer
+    0x0003000e, 5348, 1,                   // OpMemoryModel PhysicalStorageBuffer64 GLSL450
+    0x0005000f, 5, 26, 0x6e69616d, 0,     // OpEntryPoint GLCompute %26 "main"
+    0x00060010, 26, 17, 1, 1, 1,          // OpExecutionMode LocalSize 1 1 1
+    0x00040047, 6, 6, 4,                  // runtime uint array: ArrayStride 4
+    0x00030047, 7, 2,                     // storage struct: Block
+    0x00050048, 7, 0, 35, 0,              // member 0: Offset 0
+    0x00040047, 10, 34, 0, 0x00040047, 10, 33, 0, // table: DescriptorSet 0, Binding 0
+    0x00040047, 11, 34, 0, 0x00040047, 11, 33, 1, // result: DescriptorSet 0, Binding 1
+    0x00030047, 12, 2, 0x00050048, 12, 0, 35, 0, // push struct: Block, Offset 0
+    0x00020013, 1,                         // void
+    0x00040015, 2, 32, 0, 0x00040015, 3, 64, 0, // uint, uint64
+    0x00020014, 4, 0x00030021, 5, 1,      // bool, void function
+    0x0003001d, 6, 2, 0x0003001e, 7, 6,  // runtime uint array, storage struct
+    0x00040020, 8, 12, 7, 0x00040020, 9, 12, 2, // StorageBuffer pointers
+    0x0004003b, 8, 10, 12, 0x0004003b, 8, 11, 12, // table, result
+    0x0003001e, 12, 3, 0x00040020, 13, 9, 12, // push struct, pointer
+    0x0004003b, 13, 14, 9, 0x00040020, 15, 9, 3, // push variable, uint64 pointer
+    0x00040020, 16, 5349, 2,              // PhysicalStorageBuffer uint pointer
+    0x0004002b, 2, 17, 0, 0x0004002b, 2, 18, 1, 0x0004002b, 2, 19, 2,
+    0x0004002b, 2, 20, 4, 0x0004002b, 2, 21, 12, 0x0004002b, 2, 22, 16,
+    0x0004002b, 2, 23, 24, 0x0004002b, 2, 24, 32, 0x0004002b, 2, 25, 4095,
+    0x0004002b, 2, 61, 65552,             // L2 array word base
+    0x00050036, 1, 26, 0, 5, 0x000200f8, 27, // function, label
+    0x00050041, 15, 28, 14, 17, 0x0004003d, 3, 29, 28, // guest = push.address
+    0x000500c2, 3, 30, 29, 23, 0x00040071, 2, 31, 30, // uint(guest >> 24)
+    0x00050080, 2, 59, 31, 22,           // L1 index = 16 + uint(guest >> 24)
+    0x00060041, 9, 32, 10, 17, 59, 0x0004003d, 2, 33, 32, // L1 block word
+    0x000500c2, 3, 34, 29, 21, 0x00040071, 2, 35, 34, // uint(guest >> 12)
+    0x000500c7, 2, 36, 35, 25,           // page = uint(guest >> 12) & 4095
+    0x000500c4, 2, 62, 33, 21, 0x00050080, 2, 63, 61, 62, // L2 base = 65552 + block * 4096
+    0x00050080, 2, 42, 63, 36,           // L2 index = base + page
+    0x00060041, 9, 37, 10, 17, 42, 0x0004003d, 2, 38, 37, // record = table[L2 index]
+    0x00060041, 9, 58, 11, 17, 17,      // result pointer
+    0x000500ab, 4, 39, 38, 17,          // mapped = record != 0
+    0x000300f7, 60, 0, 0x000400fa, 39, 40, 41, // merge; branch mapped
+    0x000200f8, 40,
+    0x00060041, 9, 43, 10, 17, 19, 0x0004003d, 2, 44, 43, // records base = table[2]
+    0x000500c4, 2, 45, 38, 19, 0x00050080, 2, 46, 44, 45, // index = base + record * 4
+    0x00060041, 9, 47, 10, 17, 46, 0x0004003d, 2, 48, 47, // delta low
+    0x00050080, 2, 49, 46, 18,
+    0x00060041, 9, 50, 10, 17, 49, 0x0004003d, 2, 51, 50, // delta high
+    0x00040071, 3, 52, 48, 0x00040071, 3, 53, 51, // widen delta halves
+    0x000500c4, 3, 54, 53, 24, 0x000500c5, 3, 55, 52, 54, // delta = low | high << 32
+    0x00050080, 3, 56, 29, 55, 0x00040078, 16, 57, 56, // BDA = guest + delta; pointer
+    0x0006003d, 2, 64, 57, 2, 4,        // uint value = *BDA, Aligned 4
+    0x0003003e, 58, 64, 0x000200f9, 60, // result = value; branch merge
+    0x000200f8, 41, 0x0003003e, 58, 17, 0x000200f9, 60, // unmapped: result = 0
+    0x000200f8, 60, 0x000100fd, 0x00010038 // merge, return, function end
+};
+
+typedef struct {
+    VkPipeline pipe;
+    VkPipelineLayout layout;
+    VkDescriptorSet set;
+    uint64_t source;
+    int setup_mirror, mirrored;
+} GpaRead;
+
+static void gpa_read_record(VkCommandBuffer cb, void *arg) {
+    GpaRead *r = arg;
+    // Match vk_backend.c submit_now and vk_exec.c vk_exec_record, including epochs on descriptor reuse.
+    vk_texture_new_submit();
+    vk_mem_mirror_begin();
+    // The sole explicit source use is optional mirror creation, before the first read. That submission consumes its
+    // shadow touch and first-upload list. Neither read after CPU mutation may resolve/use/flush this pool.
+    if (r->setup_mirror) r->mirrored = vk_mem_mirror_probe(r->source), r->setup_mirror = 0;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->layout, 0, 1, &r->set, 0, NULL);
+    vkCmdPushConstants(cb, r->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof r->source, &r->source);
+    vk_mem_gpa_use(); // actual table use, including this second dispatch's reused descriptor set
+    vkCmdDispatch(cb, 1, 1, 1);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_mem_mirror_end(cb, vk_sync_issued() + 1); // callback runs under the submission lock, before issued advances
+}
+
+static int test_gpa_read(uint8_t *guest) {
+    VkCtx *c = vk_ctx();
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = guest + 0xA00000, .size = 0x10000,
+                   .game_mem = guest + 0xA00000};
+    volatile uint32_t *source = (volatile uint32_t *)pool.mem;
+    *source = 0x13579BDFu; // before pool_init: shadow-only starts with the same bytes as direct import
+    GCHECK(vk_gpa_on() && vk_pool_init(&pool), "GPA CPU-read pool initialization (requires buffer device addresses)");
+    VkBuffer out = VK_NULL_HANDLE;
+    VmaAllocation alloc = NULL;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkDescriptorPool dp = VK_NULL_HANDLE;
+    GpaRead r = {.source = (uintptr_t)pool.mem, .setup_mirror = vk_mirror_on};
+    int bad = 1;
+#define GPA_CHECK(cond, what) do { if (!(cond)) { printf("probe-vkmem: FAIL GPA " what "\n"); goto done; } } while (0)
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT};
+    VmaAllocationInfo info;
+    GPA_CHECK(vmaCreateBuffer(c->vma, &bi, &ai, &out, &alloc, &info) == VK_SUCCESS && info.pMappedData, "result buffer");
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo dl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2,
+                                         .pBindings = bindings};
+    GPA_CHECK(vkCreateDescriptorSetLayout(c->device, &dl, NULL, &dsl) == VK_SUCCESS, "descriptor layout");
+    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof r.source};
+    VkPipelineLayoutCreateInfo pl = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    GPA_CHECK(vkCreatePipelineLayout(c->device, &pl, NULL, &r.layout) == VK_SUCCESS, "pipeline layout");
+    VkShaderModuleCreateInfo sm = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof gpa_read_spv,
+                                   .pCode = gpa_read_spv};
+    GPA_CHECK(vkCreateShaderModule(c->device, &sm, NULL, &module) == VK_SUCCESS, "shader module");
+    VkComputePipelineCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = r.layout,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = module, .pName = "main"}};
+    GPA_CHECK(vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &cp, NULL, &r.pipe) == VK_SUCCESS, "compute pipeline");
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+                                     .poolSizeCount = 1, .pPoolSizes = &ps};
+    GPA_CHECK(vkCreateDescriptorPool(c->device, &pi, NULL, &dp) == VK_SUCCESS, "descriptor pool");
+    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dp,
+                                     .descriptorSetCount = 1, .pSetLayouts = &dsl};
+    GPA_CHECK(vkAllocateDescriptorSets(c->device, &da, &r.set) == VK_SUCCESS, "descriptor set");
+    VkDescriptorBufferInfo buffers[2] = {vk_gpa_info(), {out, 0, 4}};
+    VkWriteDescriptorSet writes[2];
+    for (unsigned i = 0; i < 2; i++)
+        writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = r.set, .dstBinding = i,
+                                          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                          .pBufferInfo = &buffers[i]};
+    vkUpdateDescriptorSets(c->device, 2, writes, 0, NULL);
+    static const uint32_t want[2] = {0x13579BDFu, 0x2468ACE0u};
+    for (unsigned pass = 0; pass < 2; pass++) {
+        if (pass) *source = want[pass]; // ordinary CPU write only: no resolve/use/flush/shadow_sync of the source
+        uint64_t fence = vk_sync_probe_submit(gpa_read_record, &r);
+        GPA_CHECK(vk_sync_fence_wait(fence, 5000000000ull), "shader fence timed out");
+        GPA_CHECK(!vk_mirror_on || r.mirrored, "source mirror setup");
+        vmaInvalidateAllocation(c->vma, alloc, 0, VK_WHOLE_SIZE);
+        uint32_t got = *(volatile uint32_t *)info.pMappedData;
+        if (got != want[pass]) {
+            printf("probe-vkmem: FAIL GPA/BDA %s read: got %#010x, expected %#010x (mirror %d)\n",
+                   pass ? "after CPU mutation" : "initial", got, want[pass], r.mirrored);
+            goto done;
+        }
+    }
+    g_gpu_checks += 2;
+    printf("probe-vkmem: GPA/BDA CPU write -> shader read: initial %#010x and mutation %#010x exact (mirror %d)\n",
+           want[0], want[1], r.mirrored);
+    bad = 0;
+done:
+    vk_sync_finish(); // including timeout failures: no probe object may outlive its shader
+    if (dp) vkDestroyDescriptorPool(c->device, dp, NULL);
+    if (r.pipe) vkDestroyPipeline(c->device, r.pipe, NULL);
+    if (module) vkDestroyShaderModule(c->device, module, NULL);
+    if (r.layout) vkDestroyPipelineLayout(c->device, r.layout, NULL);
+    if (dsl) vkDestroyDescriptorSetLayout(c->device, dsl, NULL);
+    if (out) vmaDestroyBuffer(c->vma, out, alloc);
+    vk_pool_fini(&pool);
+#undef GPA_CHECK
+    return bad;
+}
+
 // ReadFile into a watched page, buffered and unbuffered: timed, and whether write watch saw the kernel's write.
 static int test_readfile(uint8_t *dst) {
     char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64];
@@ -507,14 +680,10 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     GCHECK(img && img->mirrored && img->levels == 3 && img->format == VK_FORMAT_R8G8B8A8_UNORM, "RGBA8 texture image");
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8")) return 1;
-    // CPU writes to the storage: write watch -> re-upload on the next use
-    uint64_t up0, re0, re1;
-    vk_texture_stats(NULL, &up0, &re0);
+    // CPU writes to storage must reach every GPU-visible mip, independent of the backing's conservative dirty policy.
     if (fill_storage(&t, lin)) return 1;
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8 rewritten")) return 1;
-    vk_texture_stats(NULL, NULL, &re1);
-    GCHECK(re1 == re0 + 1, "storage rewritten: %llu re-uploads (want 1)", (unsigned long long)(re1 - re0));
     if (read_back(&t, 1, lin, 0, "RGBA8 ReadTexels from storage")) return 1;
 
     // BC1, 64x48: blocks uploaded as they are, read back from the image
@@ -585,7 +754,7 @@ static int test_gpu(void) {
     vk_mem_stats(&st);
     GCHECK(!st.imported_pools && !st.physical_pools && !st.virtual_pools, "pools left after fini");
     g_gpu_checks += 2;
-    return 0;
+    return test_gpa_read(h);
 }
 
 int probe_vkmem(void) {

@@ -216,6 +216,32 @@ host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wro
 writes come back at its fence. In play that costs about 0.2 ms a frame and doubles the memory of those pools (about
 1.1 GB). `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Direct-import pinning can conservatively mark pages dirty again without a CPU write. Texture coherence probes compare
+the GPU-visible bytes of every rewritten mip; an exact re-upload count is not a backing-independent contract.
+Both direct imports and shadow buffers register their guest address ranges in the GPU device address table, so shaders
+can follow pointers into either backing. Registration depends on the buffer, not a directly owned `VkDeviceMemory`:
+shadow storage uses a VMA allocation. A later VRAM mirror remaps the record with the original buffer as its write twin;
+finalization unmaps the record first.
+
+A shader reading through the GPA table need not bind or resolve its pointed-to pool. Actual draw/dispatch resource use
+therefore marks each recorded part, even when descriptors are reused. Its submission prologue queries the mapped copied
+pools' shared write-watch snapshots, skips frozen regions and clean generations, and uploads only CPU-dirty pages into
+shadow storage and already-created VRAM mirrors. Shadow copies retain the pending GPU-written byte exclusions;
+mirror uploads stay ordered after previous GPU write-backs. This does not add written-range tracking or fence copyback
+for GPU stores made only through BDA pointers.
+
+`--probe-vkmem` exercises that contract through the real GPA table and submission prologue: a shader must read
+`0x13579BDF`, then `0x2468ACE0` after an ordinary CPU write, without resolving, binding or flushing the source after that
+write. Mirror setup occurs only before the first read. On Linux, run all four backing combinations against the rebuilt
+native executable (Fish):
+
+```fish
+for shadow in 0 1
+    for memory in import mirror
+        env NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
+    end
+end
+```
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.

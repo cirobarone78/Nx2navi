@@ -27,7 +27,8 @@
 //
 // NX2NAVI_GPA=0 turns the table off: the translator is told the host has no device addresses (those accesses read 0).
 // NX2NAVI_GPA_EMPTY=1 keeps it empty, so every access through it reads the zero buffer (diagnosis).
-// Mirrored pools are not synced for the table's readers (vk_exec_draw.c ssbo_info says why).
+// Actual shader use marks the submission part (vk_exec_draw.c bind_resources); its prologue syncs CPU-dirty pages of
+// GPA-mapped copied pools. GPU stores that bypass replay's written-range tracking remain a separate coherence boundary.
 #include <stdlib.h>
 #include <string.h>
 

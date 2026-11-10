@@ -312,8 +312,9 @@ int vk_pool_init(pool_t *p) {
         phys_list[nphys++] = r;
     }
     plat_mutex_unlock(&pool_lock);
-    // The imported pages go into the device address table: shaders that read a pointer from memory reach them there.
-    if (r->kind == POOL_IMPORT && r->mem && r->buf && r->import_hi > r->import_lo)
+    // Both direct imports and VMA-backed shadows expose buf; only direct imports own r->mem.
+    // Register either backing so shaders can follow pointers through the device address table.
+    if (r->kind == POOL_IMPORT && r->buf && r->import_hi > r->import_lo)
         r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
     return 1;
 }
@@ -959,8 +960,8 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // Where importing guest memory costs too much (Linux: re-protecting pages that amdgpu imported as a userptr
 // invalidates the buffer, about 1.3 ms per 16 MiB at the next submit, and the import's write pinning clears the
 // write watch), a CPU-visible pool gets a host-visible buffer of its own instead, at the offsets the import would have:
-// - CPU -> shadow: right before each submit (vk_mem_shadow_sync), the pools the replay resolved since the last one are
-//   queried for written pages; pages stamped after a pool's sgen are copied in by the CPU.
+// - CPU -> shadow: right before each submit, vk_mem_shadow_sync queries explicitly resolved pools; vk_mem_gpa_sync also
+//   covers mapped copied pools when a recorded shader uses the table. Only pages newer than a pool's sgen are copied.
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
 //   reports it at the fence (vk_gpu_written), which copies those bytes back into guest memory. Until then the CPU
 //   copies skip them: a page the CPU and the GPU both write keeps the GPU's bytes.
@@ -1037,11 +1038,14 @@ static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b, int i) {
 }
 
 // shadow_lock and gen_lock held: stamps the pool's written pages and copies those newer than its shadow.
-static void shadow_sync_pool(PoolRec *r) {
+static void shadow_sync_pool(PoolRec *r, int snapped) {
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint32_t g = ++gen_now;
     int tracked = 1;
-    for (uint64_t a = lo; a < hi;) {   // one query per run of regions that are not frozen
+    if (snapped) {
+        for (uint64_t k = lo >> SNAP_SHIFT; k <= (hi - 1) >> SNAP_SHIFT; k++)
+            if (snap_untracked[k]) tracked = 0;
+    } else for (uint64_t a = lo; a < hi;) {   // one query per run of regions that are not frozen
         uint64_t b = (a | ((1ull << REG_SHIFT) - 1)) + 1;
         if (b > hi) b = hi;
         if (mem_frozen(a)) { a = b; continue; }
@@ -1082,7 +1086,7 @@ void vk_mem_shadow_sync(void) {
     plat_mutex_lock(&shadow_lock);
     if (nstouch) {
         plat_mutex_lock(&gen_lock);
-        for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i]), stouch[i]->stouched = 0;
+        for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i], 0), stouch[i]->stouched = 0;
         plat_mutex_unlock(&gen_lock);
         s_syncs += (uint64_t)nstouch;
         nstouch = 0;
@@ -1759,6 +1763,54 @@ static void mirror_sync(PoolRec *r) {
     }
     mrep.syncs++, r->st_syncs++;
     mrep.sync_t += qpc() - t0;
+}
+
+// Replay / submit lock: mark actual shader use, not descriptor construction (which may be memoized).
+static int gpa_part_used;
+void vk_mem_gpa_use(void) { gpa_part_used = 1; }
+
+static int gpa_copied_pool(const PoolRec *r) {
+    return r->kind == POOL_IMPORT && r->gpa_rec && (r->smap || r->mstate == MS_ON);
+}
+
+// The table's pointers can reach any mapped pool, without vk_mem_resolve ever seeing that pool. Query their shared
+// write-watch snapshots once per region/epoch, then copy only newer pages. Never allocate a mirror for a GPA reader.
+void vk_mem_gpa_sync(void) {
+    if (!gpa_part_used) return;
+    gpa_part_used = 0;
+    if (!shadow_on && !vk_mirror_on) return;
+    uint64_t t0 = qpc(), run0 = 0, run1 = 0;
+    uint32_t epoch = vk_texture_epoch();
+    int have = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    plat_mutex_lock(&shadow_lock);
+    plat_mutex_lock(&gen_lock);
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *r = pool_index.e[i].buf;
+        if (!gpa_copied_pool(r)) continue;
+        uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
+        if (have && a <= run1 + 1) {
+            if (b > run1) run1 = b;
+        } else {
+            if (have) s_queries += snap_regions(run0, run1, epoch);
+            run0 = a, run1 = b, have = 1;
+        }
+    }
+    if (have) s_queries += snap_regions(run0, run1, epoch);
+    for (int i = 0; i < pool_index.n; i++) {
+        PoolRec *r = pool_index.e[i].buf;
+        if (gpa_copied_pool(r) && r->smap) shadow_sync_pool(r, 1), s_syncs++;
+    }
+    plat_mutex_unlock(&gen_lock);
+    // shadow_copy retains pending GPU-written byte exclusions. Mirror uploads read that shadow (or direct import),
+    // and stay ordered after previous GPU write-backs by the existing prologue; none of the write-back paths change.
+    for (int i = 0; i < pool_index.n; i++) {
+        PoolRec *r = pool_index.e[i].buf;
+        if (gpa_copied_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
+    }
+    s_ticks += qpc() - t0;
+    plat_mutex_unlock(&shadow_lock);
+    plat_mutex_unlock_shared(&pool_lock);
 }
 
 void vk_mem_use(VkMemSpan *sp) {
