@@ -1051,6 +1051,10 @@ static void shadow_sync_pool(PoolRec *r) {
             int dirty = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since;
             if (dirty && !run) run = x;
             else if (!dirty && run) {
+                // Coalesce isolated unwritten pages if next page is dirty to avoid fragmented copies on UMA
+                if (x + (1ull << GEN_PAGE_SHIFT) < b && ch[((x + (1ull << GEN_PAGE_SHIFT)) >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since) {
+                    continue;
+                }
                 shadow_copy(r, run, x, 0);
                 run = 0;
             }

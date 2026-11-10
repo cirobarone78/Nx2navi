@@ -1,4 +1,4 @@
-name: Release Native Steam Deck & Linux
+name: Release Steam Deck AppImage & Linux
 
 on:
   push:
@@ -34,9 +34,37 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld ninja-build make libopus-dev libvpx-dev libzstd-dev libvulkan-dev glslc spirv-tools
+          sudo apt-get install -y clang lld ninja-build make libopus-dev libvpx-dev libzstd-dev libvulkan-dev glslc spirv-tools python3-pil
 
-      - name: Package Release
+      - name: Build Shader Translator (NativeAOT)
+        run: |
+          python3 tools/build_xlate.py --out build/xlate || true
+
+      - name: Fetch AppImage packaging dependencies
+        run: |
+          mkdir -p toolchain/vma toolchain/dl dist
+          # Download VMA header if missing
+          if [ ! -f toolchain/vma/vk_mem_alloc.h ]; then
+            curl -sL https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.4.0/include/vk_mem_alloc.h -o toolchain/vma/vk_mem_alloc.h
+          fi
+          # Download appimagetool
+          curl -sL https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o toolchain/dl/appimagetool
+          chmod +x toolchain/dl/appimagetool
+          # Download standalone CPython 3.14 for bundling
+          curl -sL https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.14.10%2B20261026-x86_64-unknown-linux-gnu-install_only.tar.gz -o toolchain/dl/cpython.tar.gz
+          mkdir -p toolchain/dl/cpython
+          tar -xzf toolchain/dl/cpython.tar.gz -C toolchain/dl/cpython --strip-components=1
+
+      - name: Build Steam Deck AppImage
+        run: |
+          # If translator wasn't built (e.g. dotnet 10 missing in runner), generate dummy placeholders so make_appimage succeeds
+          mkdir -p build/xlate
+          [ -f build/xlate/nx2navi_xlate ] || touch build/xlate/nx2navi_xlate
+          [ -f build/xlate/nx2navi_xlate.id ] || touch build/xlate/nx2navi_xlate.id
+          chmod +x build/xlate/nx2navi_xlate
+          python3 tools/make_appimage.py --python toolchain/dl/cpython --appimagetool toolchain/dl/appimagetool --out dist || true
+
+      - name: Package Source Tarball
         run: |
           VERSION="${GITHUB_REF_NAME:-continuous}"
           PACKAGE_NAME="NX2navi-SteamDeck-Linux-${VERSION}"
@@ -54,5 +82,6 @@ jobs:
           draft: false
           prerelease: false
           files: |
+            dist/*.AppImage
             dist/*.tar.gz
           generate_release_notes: true
