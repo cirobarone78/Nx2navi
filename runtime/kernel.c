@@ -267,7 +267,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
         t->wkind = W_NONE;
         return R_TIMEOUT;
     }
-    uint64_t now = kern_now_ns();
+    uint64_t now = ns < 0 ? 0 : kern_now_ns();   // a wait without a timeout reads no clock (G is held here)
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
     while (!t->woke) {
@@ -376,7 +376,18 @@ static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
-void kern_ap_stub(void);
+void kern_ap_stub_ymm(void), kern_ap_stub_xmm(void);
+static void (*ap_stub)(void) = kern_ap_stub_xmm;   // the stub for this processor (ap_init)
+
+// The processor has AVX and the system saves YMM state across thread switches (OSXSAVE, XCR0 bits 1 and 2).
+static int cpu_keeps_ymm(void) {
+    unsigned a = 1, b, c = 0, d;
+    __asm__("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    if ((c & 0x18000000u) != 0x18000000u) return 0;
+    unsigned lo, hi;
+    __asm__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;
+}
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
@@ -393,8 +404,9 @@ static void ap_init(void) {
                 if (f < lo) lo = f;
                 if (f > hi) hi = f;
             }
-        const uintptr_t host[] = {(uintptr_t)kern_ap_stub, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
-                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
+        ap_stub = cpu_keeps_ymm() ? kern_ap_stub_ymm : kern_ap_stub_xmm;
+        const uintptr_t host[] = {(uintptr_t)kern_ap_stub_ymm, (uintptr_t)kern_ap_stub_xmm, (uintptr_t)kern_checkpoint,
+                                  (uintptr_t)rt_svc, (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
         int bad = !n || lo >= hi;
         for (unsigned i = 0; i < sizeof host / sizeof *host; i++) bad |= host[i] >= lo && host[i] <= hi;
         if (bad) {
@@ -408,9 +420,10 @@ static void ap_init(void) {
         }
     }
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
-           "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (NX2NAVI_ASYNC_PREEMPT=0 turns all off)" : "off",
+           "code exe+%#llx-exe+%#llx; an interrupted core's %s registers are kept", g_ap_int ? "on" : "off",
+           g_ap ? "on (NX2NAVI_ASYNC_PREEMPT=0 turns all off)" : "off",
            (unsigned long long)(g_gen_lo ? g_gen_lo - plat_exe_base() : 0),
-           (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0));
+           (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0), ap_stub == kern_ap_stub_ymm ? "YMM" : "XMM");
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -437,187 +450,25 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // in kern_ap_yield and jumps back to kern_ap_rip(), whose value it first stores in the return slot it reserved at
 // entry, so a stack walk sees the interrupted function as its caller. No ret: the jump keeps call/return pairs
 // balanced. The waiter never writes the owner's stack.
-// An x86-64-v2 build (no __AVX__) saves XMM0-15 with SSE moves into the same 32-byte slots instead: its game code
-// keeps nothing in the upper YMM halves, and the CPUs it is for have no VEX encoding, so a vmovdqa there faults with
-// an illegal instruction the first time a core is interrupted.
-#ifdef __AVX__
+// Two bodies of the stub (kernel_ap_stub.h): kern_ap_stub_ymm saves YMM0-15 and is the one used wherever the processor
+// and the system keep YMM state (ap_stub, chosen by ap_init). The lifted code of such a PC is compiled with AVX2 and
+// keeps data in the upper halves, which every function the stub calls is free to clear, whatever the runtime itself was
+// compiled for. kern_ap_stub_xmm saves XMM0-15 with SSE moves: code on a processor without AVX has nothing in the upper
+// halves, and a VEX move there is an illegal instruction.
+#define AP_NAME "kern_ap_stub_ymm"
 #define AP_VMOV "vmovdqa"
 #define AP_V "%ymm"
 #define AP_VZEROUPPER "    vzeroupper\n"
-#else
+#include "kernel_ap_stub.h"
+#undef AP_NAME
+#undef AP_VMOV
+#undef AP_V
+#undef AP_VZEROUPPER
+#define AP_NAME "kern_ap_stub_xmm"
 #define AP_VMOV "movdqa"
 #define AP_V "%xmm"
 #define AP_VZEROUPPER ""
-#endif
-#ifdef _WIN32
-__asm__(".text\n"
-        ".globl kern_ap_stub\n"
-        ".def kern_ap_stub; .scl 2; .type 32; .endef\n"
-        ".p2align 4\n"
-        "kern_ap_stub:\n"
-        ".seh_proc kern_ap_stub\n"
-        "    leaq -8(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
-        ".seh_stackalloc 8\n"
-        "    pushfq\n"
-        ".seh_stackalloc 8\n"
-        "    pushq %rax\n"
-        ".seh_pushreg %rax\n"
-        "    pushq %rcx\n"
-        ".seh_pushreg %rcx\n"
-        "    pushq %rdx\n"
-        ".seh_pushreg %rdx\n"
-        "    pushq %r8\n"
-        ".seh_pushreg %r8\n"
-        "    pushq %r9\n"
-        ".seh_pushreg %r9\n"
-        "    pushq %r10\n"
-        ".seh_pushreg %r10\n"
-        "    pushq %r11\n"
-        ".seh_pushreg %r11\n"
-        "    pushq %rbp\n"
-        ".seh_pushreg %rbp\n"
-        "    movq %rsp, %rbp\n"
-        ".seh_setframe %rbp, 0\n"
-        ".seh_endprologue\n"
-        "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 0: shadow space, 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
-        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
-        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
-        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
-        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
-        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
-        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
-        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
-        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
-        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
-        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
-        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
-        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
-        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
-        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
-        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
-        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
-        "    stmxcsr 32(%rsp)\n"
-        "    movl $0x1f80, 36(%rsp)\n"
-        "    ldmxcsr 36(%rsp)\n"
-        "    cld\n"
-        AP_VZEROUPPER
-        "    call kern_ap_rip\n"
-        "    movq %rax, 72(%rbp)\n"   // the return slot: rbp + 8 pushes + pushfq
-        "    call kern_ap_yield\n"
-        "    ldmxcsr 32(%rsp)\n"
-        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
-        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
-        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
-        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
-        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
-        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
-        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
-        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
-        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
-        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
-        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
-        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
-        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
-        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
-        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
-        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
-        "    movq %rbp, %rsp\n"
-        "    popq %rbp\n"
-        "    popq %r11\n"
-        "    popq %r10\n"
-        "    popq %r9\n"
-        "    popq %r8\n"
-        "    popq %rdx\n"
-        "    popq %rcx\n"
-        "    popq %rax\n"
-        "    popfq\n"
-        "    leaq 8(%rsp), %rsp\n"
-        "    jmpq *-8(%rsp)\n"
-        ".seh_endproc\n");
-#else
-// The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
-// below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
-// way the slot is at entry - 136; the exit restores rsp to the entry value and jumps through the slot.
-__asm__(".text\n"
-        ".globl kern_ap_stub\n"
-        ".type kern_ap_stub, @function\n"
-        ".p2align 4\n"
-        "kern_ap_stub:\n"
-        "    .cfi_startproc\n"
-        "    leaq -136(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
-        "    pushfq\n"
-        "    pushq %rax\n"
-        "    pushq %rcx\n"
-        "    pushq %rdx\n"
-        "    pushq %rsi\n"
-        "    pushq %rdi\n"
-        "    pushq %r8\n"
-        "    pushq %r9\n"
-        "    pushq %r10\n"
-        "    pushq %r11\n"
-        "    pushq %rbp\n"
-        "    movq %rsp, %rbp\n"
-        "    andq $-32, %rsp\n"
-        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
-        "    " AP_VMOV " " AP_V "0, 64(%rsp)\n"
-        "    " AP_VMOV " " AP_V "1, 96(%rsp)\n"
-        "    " AP_VMOV " " AP_V "2, 128(%rsp)\n"
-        "    " AP_VMOV " " AP_V "3, 160(%rsp)\n"
-        "    " AP_VMOV " " AP_V "4, 192(%rsp)\n"
-        "    " AP_VMOV " " AP_V "5, 224(%rsp)\n"
-        "    " AP_VMOV " " AP_V "6, 256(%rsp)\n"
-        "    " AP_VMOV " " AP_V "7, 288(%rsp)\n"
-        "    " AP_VMOV " " AP_V "8, 320(%rsp)\n"
-        "    " AP_VMOV " " AP_V "9, 352(%rsp)\n"
-        "    " AP_VMOV " " AP_V "10, 384(%rsp)\n"
-        "    " AP_VMOV " " AP_V "11, 416(%rsp)\n"
-        "    " AP_VMOV " " AP_V "12, 448(%rsp)\n"
-        "    " AP_VMOV " " AP_V "13, 480(%rsp)\n"
-        "    " AP_VMOV " " AP_V "14, 512(%rsp)\n"
-        "    " AP_VMOV " " AP_V "15, 544(%rsp)\n"
-        "    stmxcsr 32(%rsp)\n"
-        "    movl $0x1f80, 36(%rsp)\n"
-        "    ldmxcsr 36(%rsp)\n"
-        "    cld\n"
-        AP_VZEROUPPER
-        "    call kern_ap_rip\n"
-        "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
-        "    call kern_ap_yield\n"
-        "    ldmxcsr 32(%rsp)\n"
-        "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
-        "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
-        "    " AP_VMOV " 128(%rsp), " AP_V "2\n"
-        "    " AP_VMOV " 160(%rsp), " AP_V "3\n"
-        "    " AP_VMOV " 192(%rsp), " AP_V "4\n"
-        "    " AP_VMOV " 224(%rsp), " AP_V "5\n"
-        "    " AP_VMOV " 256(%rsp), " AP_V "6\n"
-        "    " AP_VMOV " 288(%rsp), " AP_V "7\n"
-        "    " AP_VMOV " 320(%rsp), " AP_V "8\n"
-        "    " AP_VMOV " 352(%rsp), " AP_V "9\n"
-        "    " AP_VMOV " 384(%rsp), " AP_V "10\n"
-        "    " AP_VMOV " 416(%rsp), " AP_V "11\n"
-        "    " AP_VMOV " 448(%rsp), " AP_V "12\n"
-        "    " AP_VMOV " 480(%rsp), " AP_V "13\n"
-        "    " AP_VMOV " 512(%rsp), " AP_V "14\n"
-        "    " AP_VMOV " 544(%rsp), " AP_V "15\n"
-        "    movq %rbp, %rsp\n"
-        "    popq %rbp\n"
-        "    popq %r11\n"
-        "    popq %r10\n"
-        "    popq %r9\n"
-        "    popq %r8\n"
-        "    popq %rdi\n"
-        "    popq %rsi\n"
-        "    popq %rdx\n"
-        "    popq %rcx\n"
-        "    popq %rax\n"
-        "    popfq\n"
-        "    leaq 136(%rsp), %rsp\n"
-        "    jmpq *-136(%rsp)\n"
-        "    .cfi_endproc\n"
-        ".size kern_ap_stub, .-kern_ap_stub\n");
-#endif
+#include "kernel_ap_stub.h"
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
 
@@ -657,7 +508,7 @@ static int ap_try(RtThread *w) {
     } else {
         o->ap_rip = rip;
         o->ap_pending = 1;
-        to = (uint64_t)(uintptr_t)kern_ap_stub;
+        to = (uint64_t)(uintptr_t)ap_stub;
     }
     if (!plat_intr_resume(o->hthr, to)) {
         o->ap_pending = 0;
@@ -1187,6 +1038,8 @@ void kern_core_stats(int *held_now, int *held_max) {
     unlock();
 }
 
+int kern_cores(void) { return g_active_cores; }
+
 void kern_core_stats_reset(void) {
     lock();
     g_held_max = 0;
@@ -1438,8 +1291,8 @@ static RtThread *thr_new(int prio, int core, uint64_t mask) {
     // TLR (0x200) and the "current thread object" the SDK reads through TLR+0x1F8, in one guest-visible block.
     t->tlr = mem_kernel_alloc(TLR_SIZE + THREAD_OBJ_SIZE, TLR_SIZE);
     *(uint64_t *)(t->tlr + 0x1F8) = (uint64_t)(uintptr_t)(t->tlr + TLR_SIZE);
-    *(uint64_t *)(t->tlr + 0x1F0) = (uint64_t)(uintptr_t)t->tls;   // the SDK reads the TLS pointer here and makes it TPIDR_EL0
     t->tls = mem_kernel_alloc(TLS_SIZE, 16);
+    *(uint64_t *)(t->tlr + 0x1F0) = (uint64_t)(uintptr_t)t->tls;   // the SDK reads the TLS pointer here and makes it TPIDR_EL0
     c->tpidrro = (uint64_t)(uintptr_t)t->tlr;
     c->tpidr = (uint64_t)(uintptr_t)t->tls;
     c->excl_addr = ~0ull;
@@ -1747,12 +1600,21 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
             unlock();
             return 1;
         }
-        // Yield: hand the core to a waiting thread of equal or better priority.
+        // Yield: hand the core to a waiting thread of equal or better priority. Most yields find nobody waiting for a
+        // core: those take neither G nor the priority scan over every blocked thread (prio_of), which the game's yield
+        // loops paid thousands of times a second. The look is as racy as rt_spin_gate's: a thread that queues for a
+        // core right after it is found by the next yield, and kicks the owner itself in core_take meanwhile.
+        if (!__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) {
+            plat_yield();
+            return 1;
+        }
         lock();
-        int give = 0;
-        int tp = prio_of(t);
+        int give = 0, tp = -1;
         for (RtThread *w = g_core_wait; w && !give; w = w->cnext)
-            give = t->cur_core >= 0 && core_allowed(w, t->cur_core) && prio_of(w) <= tp;
+            if (t->cur_core >= 0 && core_allowed(w, t->cur_core)) {
+                if (tp < 0) tp = prio_of(t);   // only once a waiter may run on this core
+                give = prio_of(w) <= tp;
+            }
         if (give) {
             core_put(t);
             core_take(t);

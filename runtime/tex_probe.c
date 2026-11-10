@@ -463,6 +463,7 @@ static tex_t make_tex(pool_t *pool, uint64_t off, int format, uint32_t w, uint32
     t.magic = MAGIC('T', 'E', 'X', 0);
     t.d.target = 1, t.d.format = format, t.d.width = w, t.d.height = h, t.d.depth = 1, t.d.levels = levels;
     nvn_tex_layout(&t.d, &t.L);
+    // pool_flags as nvnTextureInitialize records them: tex_mirrored (vk_texture.c) reads them, not the pool object
     t.pool = pool, t.pool_flags = (uint16_t)pool->flags, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
     return t;
 }
@@ -496,6 +497,35 @@ static int read_back(const tex_t *t, unsigned lv, uint8_t *const *lin, int gpu, 
            t->d.format, ok ? "differs from" : "failed against");
     g_gpu_checks++;
     return 0;
+}
+
+// Level 0 of image (w x h RGBA8) read through a staging buffer after everything recorded so far has run: whether every
+// texel is `want`, the way a draw sampling the image would see it.
+static int image_is_color(VkImage image, uint32_t w, uint32_t h, const uint8_t want[4]) {
+    VkCtx *c = vk_ctx();
+    VkBuffer rb;
+    VmaAllocation ra;
+    size_t n = (size_t)w * h * 4;
+    uint8_t *r = vk_staging(n, &rb, &ra);
+    VkCommandBuffer cb = vk_upload_begin();
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkBufferImageCopy rg = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, rb, 1, &rg);
+    mb = (VkMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_upload_end();
+    vk_upload_flush(1);
+    vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
+    int same = 1;
+    for (size_t i = 0; i < n; i += 4) same &= !memcmp(r + i, want, 4);
+    vmaDestroyBuffer(c->vma, rb, ra);
+    return same;
 }
 
 static int test_textures(pool_t *tpool, pool_t *phys) {
@@ -548,6 +578,22 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     GCHECK(renewed && renewed->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && renewed->width == 64 && renewed->height == 48,
            "re-registered CPU slot 5 did not resolve its own descriptor");
     vk_texture_release(&b);
+    // Once the live texture at its storage holds GPU content the storage bytes lack, the finalized CPU slot follows it.
+    // The live texture is cleared on the GPU and noted as rendered into, as a draw into it would be; the slot's image
+    // must then show the clear, which neither the storage bytes nor a recreated image of the slot's own descriptor hold.
+    GCHECK(live && live->image && live->width == 16 && live->height == 12, "RGBA8 image of the texture at the slot's storage");
+    vk_texture_gpu_written(&b2);   // the clear below is its content, not the storage
+    const float clear[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+    const uint8_t cleared[4] = {0x00, 0xFF, 0xFF, 0xFF};
+    VkClearColorValue cv;
+    memcpy(cv.float32, clear, sizeof cv.float32);
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkCommandBuffer ccb = vk_upload_begin();
+    vkCmdClearColorImage(ccb, live->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
+    vk_upload_end();
+    const VkTexImage *followed = vk_texture_by_id(5, NULL, NULL);
+    GCHECK(followed && followed->image == live->image, "finalized CPU slot 5 does not follow the rendered texture at its storage");
+    GCHECK(image_is_color(followed->image, 16, 12, cleared), "the image of slot 5 does not hold the clear written into the live texture");
     // GPU-owned slots do follow the live image at their storage, even when its descriptor has changed.
     vk_texture_register(5, &g, NULL);
     vk_texture_release(&g);
@@ -563,14 +609,15 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_sampler_register(0, &sp);
     VkSampler s0 = vk_sampler_by_id(0), s1 = vk_sampler_for(&sp);
     GCHECK(s0 && s0 == s1 && !vk_sampler_by_id(1), "sampler slots");
-    g_gpu_checks += 9;
+    g_gpu_checks += 12;
     vk_texture_release(&t), vk_texture_release(&b2), vk_texture_release(&g2);
     for (int i = 0; i < 4; i++) free(lin[i]), free(bl[i]);
     free(gl[0]);
     uint64_t images, ups, reups;
     vk_texture_stats(&images, &ups, &reups);
     printf("probe-vkmem: textures: RGBA8 3 levels and BC1 equal to the CPU reference after upload, re-upload after CPU "
-           "writes, physical-pool alias WriteTexels/ReadTexels, stale CPU slot, GPU slot redirect, samplers (%llu images, %llu uploads, "
+           "writes, physical-pool alias WriteTexels/ReadTexels, stale CPU slot, CPU slot following rendered content, GPU slot "
+           "redirect, samplers (%llu images, %llu uploads, "
            "%llu re-uploads)\n", (unsigned long long)images, (unsigned long long)ups, (unsigned long long)reups);
     return 0;
 }

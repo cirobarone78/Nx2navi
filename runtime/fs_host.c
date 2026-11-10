@@ -8,6 +8,8 @@
 //   <profile>/save-tx/                 the save mount's working copy and Commit's staging (section "save
 //                                      transactions")
 //   <profile>/save-backup/<time>/      the three committed saves before the current one
+//   <profile>/save-import/             a save the menu imported, made the save at the next start (section "a shared
+//                                      save")
 //   <profile>/temp/                    emptied at start
 //   <profile>/cache/<index>/           cache storage
 //
@@ -23,6 +25,7 @@
 #include "host.h"
 #include "platform/platform.h"
 #include "romfs_path.h"
+#include "save_share.h"
 
 #define NX2NAVI_APPLICATION_ID 0x0400486024dec000ull   // the game's title id, as svc.c PROGRAM_ID tells it
 #define FILE_BASE 0x200000000ull
@@ -618,6 +621,170 @@ static uint32_t save_commit(void) {
     return commit_run();
 }
 
+// ---- a shared save (save_share.c): the export reads the newest save, the menu's import waits for the next start
+//
+//   <profile>/save-import/        a save the menu took from a zip: it becomes the save at the next start
+//   <profile>/save-import.part/   that save while the menu writes it; renamed to save-import when complete
+//
+// The import cannot replace the save while the game runs: the game holds its progress in memory and writes it back
+// at its next save, over the imported files, and the save mount's working copy is made once per mount. So the start
+// takes it (import_pending), in storage_init after save_recover and before the game mounts its save: the save the
+// game would load is copied to <game folder>/saves/backup <local time> (save_share_backup_dir, where the launcher keeps
+// the backups of its imports), then the import becomes a finished commit (ready-<n>) and swaps in as one (swap_in),
+// which also moves the replaced save to save-backup. When the copy fails the import waits for the next start.
+static char import_done[1100];   // the backup folder of the import this start made the save; "-" with none to back up
+static void ready(void);
+
+static void import_pending(void) {
+    char imp[1100], part[1100];
+    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    snprintf(part, sizeof part, "%s/save-import.part", profile);
+    if (exists(part) && remove_tree(part)) rt_log("host save import: cannot delete the unfinished %s", part);
+    if (plat_fs_kind(imp) != PLAT_FS_DIR) return;
+    const char *cur = newest_save();
+    char backup[1100] = "";
+    if (exists(cur)) {
+        int nfiles = 0, linked = 0;
+        uint64_t bytes = 0;
+        if (!save_share_backup_dir(backup, sizeof backup) || copy_tree(cur, backup, NULL, 1, &nfiles, &linked, &bytes)) {
+            rt_log("host save import: cannot copy the current save to %s; the import waits in %s for the next start",
+                   *backup ? backup : "the saves folder", imp);
+            if (*backup) remove_tree(backup);
+            return;
+        }
+        if (!nfiles) {   // an empty account folder: nothing to keep
+            remove_tree(backup);
+            *backup = 0;
+        }
+    }
+    char commit[1100];
+    snprintf(commit, sizeof commit, "%s/ready-%010u", tx_root, ready_seq + 1);
+    if (move_dir(imp, commit, MOVE_TRIES)) {
+        rt_log("host save import: cannot move %s into save-tx; it waits for the next start", imp);
+        return;
+    }
+    ready_seq++;
+    if (*ready_root) remove_tree(ready_root);   // the save the backup holds
+    snprintf(ready_root, sizeof ready_root, "%s", commit);
+    int waits = swap_in();
+    snprintf(import_done, sizeof import_done, "%s", *backup ? backup : "-");
+    rt_log("host save import: the save imported in the menu is the save now%s; the save it replaced is in %s",
+           waits ? " (it waits in save-tx)" : "", *backup ? backup : "(none: there was no save)");
+}
+
+const char *fs_save_import_done(void) {
+    return plat_cas32(&storage_ready, 0, 0) ? import_done : "";
+}
+
+// Visits every file under dir (rel: its path below the save, "" at the top), in name order; links are left out.
+// -1 when a file cannot be read.
+static int export_tree(const char *dir, const char *rel, FsSaveVisit visit, void *ctx) {
+    Listing l;
+    if (list_dir(dir, &l)) return -1;
+    qsort(l.e, (size_t)l.n, sizeof *l.e, listed_cmp);
+    int n = 0;
+    for (int i = 0; i < l.n && n >= 0; i++) {
+        if (l.e[i].kind == PLAT_FS_LINK) continue;
+        char *path = join(dir, l.e[i].name);
+        char *sub = *rel ? join(rel, l.e[i].name) : strdup(l.e[i].name);
+        need(sub != NULL, "save export path");
+        if (l.e[i].kind == PLAT_FS_DIR) {
+            int k = export_tree(path, sub, visit, ctx);
+            n = k < 0 ? -1 : n + k;
+        } else {
+            uint64_t size = 0;
+            uint8_t *data = plat_file_read(path, &size);   // NULL for an empty file as well
+            if (!data && plat_file_size(path) != 0) n = -1;
+            else if (!visit(ctx, sub, data ? data : (const uint8_t *)"", (size_t)size)) n = -1;
+            else n++;
+            free(data);
+        }
+        free(path);
+        free(sub);
+    }
+    listing_free(l.e, l.n);
+    return n;
+}
+
+int fs_save_export(FsSaveVisit visit, void *ctx) {
+    ready();
+    // the commit thread holds tx_lock while it swaps a commit in, and the committed save is never written in place
+    plat_mutex_lock(&tx_lock);
+    const char *src = newest_save();
+    int n = exists(src) ? export_tree(src, "", visit, ctx) : 0;
+    plat_mutex_unlock(&tx_lock);
+    return n;
+}
+
+// Writes one file and flushes it; 0 on success.
+static int stage_file(const char *path, const uint8_t *data, size_t n) {
+    char dir[PATH_CAP];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *cut = strrchr(dir, '/');
+    if (cut) {
+        *cut = 0;
+        plat_file_mkdir_p(dir);
+    }
+    PlatFile *f = plat_fs_create(path, NULL);
+    if (!f) return -1;
+    int ok = 1;
+    for (size_t at = 0; ok && at < n;) {
+        uint32_t k = n - at > COPY_CHUNK ? COPY_CHUNK : (uint32_t)(n - at);
+        ok = plat_file_pwrite(f, data + at, k, at) == k;
+        at += k;
+    }
+    ok = ok && plat_file_fsync(f);
+    plat_file_close(f);
+    return ok ? 0 : -1;
+}
+
+int fs_save_import_stage(int count, const char *const *rel, const uint8_t *const *data, const size_t *size) {
+    ready();   // the start's own import_pending has run: this one waits for the next start
+    char imp[1100], part[1100];
+    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    snprintf(part, sizeof part, "%s/save-import.part", profile);
+    if (remove_tree_retry(part) || plat_fs_mkdir(part)) {
+        rt_log("host save import: cannot make %s", part);
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        char *path = join(part, rel[i]);
+        int bad = strlen(path) >= PATH_CAP || stage_file(path, data[i], size[i]);
+        free(path);
+        if (bad) {
+            rt_log("host save import: cannot write %s into %s", rel[i], part);
+            remove_tree(part);
+            return -1;
+        }
+    }
+    plat_fs_sync_dir(part);
+    if (remove_tree_retry(imp) || move_dir(part, imp, MOVE_TRIES)) {
+        rt_log("host save import: cannot put the import in place as %s", imp);
+        remove_tree(part);
+        return -1;
+    }
+    rt_log("host save import: %d files wait in %s for the next start", count, imp);
+    return 0;
+}
+
+int fs_save_import_waiting(void) {
+    // the menu asks every frame: before the game's first storage use the start's own import_pending has not run, and
+    // this is no reason to run it on the present thread
+    if (!plat_cas32(&storage_ready, 0, 0)) return 0;
+    char imp[1100];
+    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    return plat_fs_kind(imp) == PLAT_FS_DIR;
+}
+
+int fs_save_import_cancel(void) {
+    ready();
+    char imp[1100];
+    snprintf(imp, sizeof imp, "%s/save-import", profile);
+    if (remove_tree_retry(imp)) return -1;
+    rt_log("host save import: the import waiting for the next start was dropped");
+    return 0;
+}
+
 // ---- storage roots
 // One game per profile: a second one's start would take the first one's commit in progress for an interrupted one
 // and delete it, and both would write into one working copy (save-tx/work), losing or mixing their saves. rt_boot
@@ -653,6 +820,7 @@ static void storage_init(void *param) {
     snprintf(new_root, sizeof new_root, "%s/new", tx_root);
     snprintf(old_root, sizeof old_root, "%s/old", tx_root);
     save_recover();   // before save_root is created: an absent save_root means a commit to complete
+    import_pending();
     make_dirs(save_root);
     snprintf(p, sizeof p, "%s/temp", profile);
     remove_tree(p);
@@ -984,6 +1152,8 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
+        // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting
+        if (mem_probing()) mem_thaw((uintptr_t)buffer + done, chunk);
         int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (put <= 0) rt_fatal("fs: host save write failure");
         done += (uint64_t)put;

@@ -72,9 +72,37 @@ static void mesa_cache_beside_exe(void) {
     plat_setenv("MESA_SHADER_CACHE_DIR", dir);
 }
 
+#ifdef __linux__
+// NVIDIA's Linux driver keeps the pipelines it compiles in a disk cache of its own, by default in ~/.cache/nvidia,
+// shared with every program. One process adds at most __GL_SHADER_DISK_CACHE_SIZE to it (1 GiB unless set), and a start
+// that finds more than that in several files deletes the later ones. nx2navi.exe --prepare-shaders builds the 42,142
+// variants of game 1.1.1 into it in one process: with the default limit it stored about 30,700 of them and the rest
+// were compiled again by the first start after it. So unless the environment sets them, the cache goes to nvidia-cache
+// beside the exe, which nothing else writes, with a limit of NV_CACHE_BYTES. The driver makes GLCache inside that
+// folder but not the folder, so it is made here.
+#define NV_CACHE_BYTES "8589934592"   // 8 GiB
+static void nvidia_cache_beside_exe(void) {
+    char dir[PLAT_PATH_MAX * 2], size[32];
+    if (!plat_getenv("__GL_SHADER_DISK_CACHE_PATH", dir, sizeof dir)) {
+        int len = plat_exe_path(dir, sizeof dir - 16);
+        char *cut = len ? plat_last_sep(dir) : NULL;
+        if (cut) {
+            strcpy(cut + 1, "nvidia-cache");
+            plat_fs_mkdir(dir);   // already there is fine
+            plat_setenv("__GL_SHADER_DISK_CACHE_PATH", dir);
+        }
+    }
+    if (!plat_getenv("__GL_SHADER_DISK_CACHE_SIZE", size, sizeof size))
+        plat_setenv("__GL_SHADER_DISK_CACHE_SIZE", NV_CACHE_BYTES);
+}
+#endif
+
 static int create_instance(void) {
     vk_dlssg_early();   // DLSS Frame Generation: Streamline before any Vulkan call of the process (its slInit asks so)
     mesa_cache_beside_exe();
+#ifdef __linux__
+    nvidia_cache_beside_exe();
+#endif
     const char *ext[12];
     uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -86,7 +114,8 @@ static int create_instance(void) {
     // DLSS Frame Generation: Streamline's plugins call its naming functions even when they say it is off
     if (validate || (vk_dlssg_wanted() && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)))
         ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
+    // armed, not wanted: the menu switches HDR on during the run (vk_hdr.c), and the extensions are fixed here
+    if (vk_hdr_armed() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
     vk_dlaa_instance_exts(ext, &n_ext, 12);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "NX2navi",
@@ -324,7 +353,7 @@ static int create_device(void) {
     // GPU timestamps on the CPU clock (vk_sync.c): the perf line splits GPU idle time into waiting for a submission or not.
     if (has_ext(ep, ne, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) { g_vk.has_calibrated = 2; ext[n_ext++] = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME; }
     else if (has_ext(ep, ne, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) { g_vk.has_calibrated = 1; ext[n_ext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME; }
-    if (vk_hdr_wanted() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
+    if (vk_hdr_armed() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
         g_vk.has_hdr_metadata = 1;
         ext[n_ext++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
     }
@@ -446,6 +475,7 @@ static int create_device(void) {
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
+                                 .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
 
@@ -465,6 +495,7 @@ static long g_errors_total;     // outlives the device so the probe can print it
 static void destroy_all(void) {
     gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
+    if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);

@@ -82,9 +82,11 @@ void fail(const char *what, unsigned r) {
 // It needs DLSS's or FSR 3.1's motion vectors, so it also needs one of them on. Not on a device made through
 // Streamline's proxies (NVIDIA's frame generation set at the start, vk_dlssg_dpa): AMD's swapchain there crashed in
 // NVIDIA's driver when the menu switched from NVIDIA's frame generation to AMD's. That switch waits for a restart,
-// as the menu says (menu.cpp row_framegen).
+// as the menu says (menu.cpp row_framegen). Not after a failure (fail): the present code then takes AMD's swapchain
+// down as it does for a switch in the menu, and a plain one follows.
 extern "C" int vk_fg_wanted(void) {
-    return !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") && cfg_bool("NX2NAVI_DLAA") && vk_dlaa_wanted() && !vk_dlssg_dpa();
+    return !F.failed && !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") && cfg_bool("NX2NAVI_DLAA") && vk_dlaa_wanted() &&
+           !vk_dlssg_dpa();
 }
 
 // Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.
@@ -92,9 +94,12 @@ extern "C" uint32_t vk_fg_queue_count(void) { return 3; }
 
 extern "C" void vk_fg_queues(VkQueue present, VkQueue acquire) { F.present = present, F.acquire = acquire; }
 
-extern "C" int vk_fg_active(void) { return F.sc != nullptr && !F.failed; }
+// AMD's swapchain is in place: the window's swapchain handle is AMD's object, and every swapchain call has to go
+// through AMD's functions. That holds after a failure too, until the present code has replaced the swapchain
+// (vk_fg_wanted): the plain Vulkan calls must never get that handle.
+extern "C" int vk_fg_active(void) { return F.sc != nullptr; }
 
-extern "C" int vk_fg_generating(void) { return vk_fg_active() && __atomic_load_n(&F.on, __ATOMIC_RELAXED); }
+extern "C" int vk_fg_generating(void) { return vk_fg_active() && !F.failed && __atomic_load_n(&F.on, __ATOMIC_RELAXED); }
 
 extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
     if (F.sc) return F.fn.pOutCreateSwapchainFFXAPI(vk_ctx()->device, ci, nullptr, sc, F.sc);
@@ -120,6 +125,7 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
     }
     F.fn.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
     if (vk_ffx_query(&F.sc, &F.fn.header) != FFX_API_RETURN_OK || !F.fn.pOutQueuePresentKHR) {
+        vk_ffx_destroy(&F.sc), F.sc = nullptr;   // with it goes the swapchain it made: nothing was handed out yet
         fail("the swapchain functions", 0);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -162,7 +168,7 @@ static bool hdr_format(VkFormat f) {
 extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt, VkExtent2D ext, VkImage hudless,
                             VkImageView hudless_view, const int pic[4]) {
     (void)hudless_view;
-    if (!vk_fg_active()) return;
+    if (!vk_fg_active() || F.failed) return;
     vk_dlaa_hudless_wanted = 1;   // the upscaling pass keeps a copy of the picture before the HUD (vk_dlaa.c hudless)
     const VkCtx *c = vk_ctx();
     VkFfxImage depth, mv;

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audren.h"
 #include "cfg.h"
 #include "flight.h"
 #include "fs.h"
@@ -238,7 +239,8 @@ int gfx_window_focused(void) { return g_focused; }
 unsigned gfx_window_focus_messages(void) { return (unsigned)g_focus_msgs; }
 
 // Present path (g_pl held): a settings change (cfg_version) reaches the window thread, which applies a changed size or
-// fullscreen; a changed NX2NAVI_VK_PRESENT rebuilds the swapchain at this present.
+// fullscreen; a changed NX2NAVI_VK_PRESENT or NX2NAVI_HDR rebuilds the swapchain at this present.
+static int g_sc_hdr_wanted;   // vk_hdr_wanted when the swapchain was made (create_swapchain)
 static void window_settings_live(void) {
     static unsigned seen;
     static int started;
@@ -253,7 +255,11 @@ static void window_settings_live(void) {
         if (started) plat_xchg32(&g_dirty, 1);
     }
     if (started && vk_fg_wanted() != vk_fg_active()) plat_xchg32(&g_dirty, 1);   // frame generation switched: its own swapchain
+    // HDR switched in the menu: a swapchain of the other format. Compared with what the swapchain was made for, not
+    // with what it got: on a display without HDR10 the setting stays on and the swapchain SDR, and that is settled.
+    if (started && vk_hdr_wanted() != g_sc_hdr_wanted) plat_xchg32(&g_dirty, 1);
     ov_operation_mode_live();
+    audio_channels_live();
     if (started) gfx_window_apply_settings();
     started = 1;
 }
@@ -362,7 +368,8 @@ static int create_swapchain(void) {
     if (!nf) return plat_xchg32(&g_dirty, 1), 0;
     // UNORM: the blit writes the bytes the game wrote (no sRGB encode). NX2NAVI_HDR: HDR10 when the surface offers it.
     VkSurfaceFormatKHR sf = fmts[0];
-    int hdr = vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
+    g_sc_hdr_wanted = vk_hdr_wanted();
+    int hdr = g_sc_hdr_wanted && vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
@@ -428,6 +435,10 @@ static int create_swapchain(void) {
     drop_swapchain_locked(c);
     g_sc = made;
     g_sc_fmt = sf.format;
+    static int hdr_was = -1;   // the log says when a later swapchain is of the other kind (the menu's HDR row)
+    if (hdr_was >= 0 && hdr_was != hdr)
+        rt_log("gfx: the swapchain is now %s (format %d)", hdr ? "HDR10" : "SDR", (int)sf.format);
+    hdr_was = hdr;
     g_sc_hdr = hdr;
     vk_hdr_set_active(hdr);
     if (hdr) vk_hdr_metadata(g_sc, 1);
@@ -962,6 +973,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (cw <= 0 || ch <= 0) cx = cy = 0, cw = w, ch = h;   // a crop outside the image (the game's nvnWindowSetCrop):
                                                              // the whole image, not an inverted blit rectangle
     window_settings_live();
+    cam_speed_tick();
     // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
     const char *menu_shot = NULL;
     MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue,

@@ -43,12 +43,14 @@ extern "C" {
 #include "amiibo.h"
 #include "cheats.h"
 #include "cfg.h"
+#include "folder_pick.h"
 #include "fs.h"
 #include "input.h"
 #include "input_map.h"
 #include "mods.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "save_share.h"
 #include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
@@ -63,6 +65,7 @@ int wide_available(void);
 const char *const *vk_color_preset(const char *name);
 int vk_hdr_wanted(void);
 int vk_hdr_active(void);
+int vk_hdr_needs_restart(void);
 int vk_dlaa_needs_restart(void);
 double frame_step_limit_hz(void);
 int frame_limit_follows_display(void);
@@ -498,9 +501,12 @@ extern "C" void menu_vk_release(void) {
 // NX2NAVI_MENU_TEST=<frame>[:<frames per page>]: at that presented frame the menu opens on its first tab; each tab stays
 // <frames per page> frames (default 30) and its last frame's swapchain image goes to NX2NAVI_MENU_TEST_DIR (default: the
 // working directory) as menu-test-<frame>-<page>.png; after the last tab the menu closes.
+// NX2NAVI_MENU_TEST_CLICK=<key>:<part>[,...]: mouse clicks on the rows of the page shown (ui/option_rows.cpp click_test).
 // NX2NAVI_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (NX2NAVI_ prefix
 // optional) at that presented frame; changes live settings with no input, menu open or not. nx2navi.ini is written only by
-// the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note).
+// the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
+// NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
+// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
 enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };   // Ocarina of Time: the options this port has
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
@@ -553,8 +559,15 @@ static void test_apply_sets(uint64_t frame) {
     for (; g_test.next_set < g_test.n_sets && g_test.sets[g_test.next_set].frame <= frame; g_test.next_set++) {
         const TestSet &t = g_test.sets[g_test.next_set];
         rt_log("menu: test hook: frame %llu: %s=%s", (unsigned long long)frame, t.key, t.value);
-        if (!strcmp(t.key, "NX2NAVI_SAVE")) rt_log("menu: test hook: cfg_save %s", cfg_save() ? "wrote" : "failed");
-        else cfg_set(t.key, t.value);
+        if (!strcmp(t.key, "NX2NAVI_SAVE")) {
+            rt_log("menu: test hook: cfg_save %s", cfg_save() ? "wrote" : "failed");
+        } else if (!strcmp(t.key, "NX2NAVI_FOCUS")) {
+            char row[80];
+            snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
+            opt_focus_key(row);
+        } else {
+            cfg_set(t.key, t.value);
+        }
     }
 }
 
@@ -857,18 +870,20 @@ static void row_upscaling(void) {
     if (e.kind >= DLSS) opt_apply("NX2NAVI_TAA", e.kind == FSR3 ? "fsr3" : "dlss");
 }
 
-// "in use: off" under the HDR value when the game started with HDR on but the swapchain is not HDR10 (the display or
-// Windows' HDR switch is off, vk_hdr_surface_format). The row's "after restart" comes from the setting itself (cfg.c).
+// Under the HDR value: "after restart" when what is set waits for one (the game's own HDR, to or from it:
+// vk_hdr_needs_restart), "in use: off" when HDR is on but the swapchain is not HDR10 (the display or Windows' HDR
+// switch is off, vk_hdr_surface_format).
 static const char *hdr_note(void) {
+    if (vk_hdr_needs_restart()) return menu_text(UI_MENU_AFTER_RESTART);
     if (!vk_hdr_wanted() || vk_hdr_active() || !*gfx_window_present_mode() || !cfg_bool("NX2NAVI_HDR")) return nullptr;
     static char note[96];
     snprintf(note, sizeof note, menu_text(UI_MENU_PRESENT_IN_USE), menu_text(UI_MENU_FRAMEGEN_OFF));
     return note;
 }
 
-// HDR (vk_hdr.c), after a restart: off, the HDR tone mapper over the game's picture or the game's native HDR. The
-// brightness rows follow while it is on; the tone mapper's own rows only with the first (native HDR is the game's
-// picture as it is), its grading rows only with its own curve chosen.
+// HDR (vk_hdr.c): off or the HDR tone mapper over the game's picture, switched at once, or the game's native HDR,
+// which the game takes up at its start. The brightness rows follow while it is on; the tone mapper's own rows only
+// with the first (native HDR is the game's picture as it is), its grading rows only with its own curve chosen.
 static void row_hdr(void) {
     static const char *const values[] = {"0", "1", "native"};
     const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), menu_text(UI_MENU_HDR_TONEMAPPED), menu_text(UI_MENU_HDR_NATIVE)};
@@ -977,7 +992,110 @@ static void tab_screen(float scale) {
     int dl = cfg_bool("NX2NAVI_DLAA"), fsr3 = dl && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
     if (!fsr3 && (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || dl)) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
     opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    // Anisotropic filtering of the surface textures that tile (vk_texture.c aniso_raised), at once (vk_sampler_aniso_live)
+    static const char *const aniso[] = {"game", "2", "4", "8", "16"};
+    const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
+    opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
     opt_end();
+}
+
+// ---- the Game tab's Saves group (save_share.c). Export writes the save the game would load next into a zip in the
+// player's Downloads folder, for another player or, with this run's log and nx2navi.ini, a bug report. Import takes a
+// zip the player picks in the host's file dialog and leaves its save for the next start (fs_host.c import_pending): the
+// game holds its progress in memory and would write it back over a save replaced under it. The work runs off the
+// present thread (a thread of its own, or the dialog's); the rows wait greyed meanwhile, and the line under them says
+// what the last one did, else what an import did at this start.
+static PlatMutex g_share_lock = PLAT_MUTEX_INIT;
+static std::atomic<int> g_share_busy{0};
+static int g_share_text = -1;   // the last result's UiTextId, -1 none; a format that takes g_share_arg
+static char g_share_arg[PLAT_PATH_MAX + 64];
+static bool g_share_warn;
+
+static void share_done(UiTextId text, const char *arg, bool warn) {
+    plat_mutex_lock(&g_share_lock);
+    g_share_text = text;
+    snprintf(g_share_arg, sizeof g_share_arg, "%s", arg ? arg : "");
+    g_share_warn = warn;
+    plat_mutex_unlock(&g_share_lock);
+    g_share_busy.store(0);
+}
+
+static void share_export_main(void *arg) {
+    const int bug_report = (int)(intptr_t)arg;
+    char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64];
+    SaveShareResult r = save_share_default_dir(dir, sizeof dir) ? save_share_export(dir, bug_report, path, sizeof path)
+                                                                : SAVE_SHARE_WRITE_FAILED;
+    if (r == SAVE_SHARE_OK) share_done(UI_MENU_SAVE_EXPORTED, path, false);
+    else share_done(r == SAVE_SHARE_NO_SAVE ? UI_MENU_SAVE_E_NO_SAVE : r == SAVE_SHARE_READ_FAILED ? UI_MENU_SAVE_E_READ_SAVE
+                                                                                                   : UI_MENU_SAVE_E_WRITE,
+                    dir, true);
+}
+
+// The file dialog's answer, on its thread: the import's checks and the copy into the profile run here.
+static void share_zip_picked(const char *path, void *ctx) {
+    (void)ctx;
+    if (!path) {   // cancelled: the last line stays
+        g_share_busy.store(0);
+        return;
+    }
+    char detail[160];
+    SaveShareResult r = save_share_import(path, detail, sizeof detail);
+    UiTextId text;
+    switch (r) {
+    case SAVE_SHARE_OK: text = UI_MENU_SAVE_IMPORT_READY; break;
+    case SAVE_SHARE_READ_FAILED: text = UI_MENU_SAVE_E_READ; break;
+    case SAVE_SHARE_WRITE_FAILED: text = UI_MENU_SAVE_E_STAGE; break;
+    case SAVE_SHARE_OTHER_GAME: text = UI_MENU_SAVE_E_OTHER_GAME; break;
+    case SAVE_SHARE_NEWER: text = UI_MENU_SAVE_E_NEWER; break;
+    case SAVE_SHARE_DAMAGED: text = UI_MENU_SAVE_E_DAMAGED; break;
+    case SAVE_SHARE_UNSAFE: text = UI_MENU_SAVE_E_UNSAFE; break;
+    default: text = UI_MENU_SAVE_E_NOT_SAVE; break;
+    }
+    share_done(text, r == SAVE_SHARE_OK ? detail : path, r != SAVE_SHARE_OK);
+}
+
+static void rows_saves(void) {
+    opt_group(UI_MENU_SAVES);
+    const bool busy = g_share_busy.load() != 0;
+    int start = 0;   // 1 export, 2 export for a bug report, 3 import
+    if (busy) opt_disable_next(UI_MENU_SAVE_BUSY);
+    if (opt_button("##save_export", UI_MENU_SAVE_EXPORT, UI_MENU_SAVE_EXPORT_DESC)) start = 1;
+    if (busy) opt_disable_next(UI_MENU_SAVE_BUSY);
+    if (opt_button("##save_export_bug", UI_MENU_SAVE_EXPORT_BUG, UI_MENU_SAVE_EXPORT_BUG_DESC)) start = 2;
+    // a stat per frame while the Game tab shows; the launcher's own import drops a waiting one
+    const bool waiting = save_share_pending() != 0;
+    if (busy) opt_disable_next(UI_MENU_SAVE_BUSY);
+    if (opt_button("##save_import", UI_MENU_SAVE_IMPORT, UI_MENU_SAVE_IMPORT_DESC,
+                   waiting ? menu_text(UI_MENU_SAVE_IMPORT_WAITING) : ""))
+        start = 3;
+    if (waiting) {
+        if (busy) opt_disable_next(UI_MENU_SAVE_BUSY);
+        if (opt_button("##save_import_cancel", UI_MENU_SAVE_IMPORT_CANCEL, UI_MENU_SAVE_IMPORT_CANCEL_DESC)) {
+            if (save_share_cancel()) share_done(UI_MENU_SAVE_E_STAGE, "", true);
+            else share_done(UI_MENU_SAVE_IMPORT_CANCELLED, "", false);
+        }
+    }
+    if (start && !busy) {
+        g_share_busy.store(1);
+        if (start == 3) {
+            char dir[PLAT_PATH_MAX];
+            file_pick(save_share_default_dir(dir, sizeof dir) ? dir : "", "zip", share_zip_picked, NULL);
+        } else if (!plat_thread_spawn(share_export_main, (void *)(intptr_t)(start == 2), "save export", 0)) {
+            share_done(UI_MENU_SAVE_E_READ_SAVE, "", true);
+        }
+    }
+    char line[PLAT_PATH_MAX * 2] = "";
+    plat_mutex_lock(&g_share_lock);
+    bool warn = g_share_warn;
+    if (g_share_text >= 0) snprintf(line, sizeof line, menu_text((UiTextId)g_share_text), g_share_arg);
+    plat_mutex_unlock(&g_share_lock);
+    const char *done = fs_save_import_done();
+    if (!line[0] && *done) {
+        if (!strcmp(done, "-")) snprintf(line, sizeof line, "%s", menu_text(UI_MENU_SAVE_IMPORTED_NEW));
+        else snprintf(line, sizeof line, menu_text(UI_MENU_SAVE_IMPORTED), done);
+        warn = false;
+    }
+    if (line[0]) opt_text_str(line, warn);
 }
 
 static void tab_game(float scale) {
@@ -989,6 +1107,7 @@ static void tab_game(float scale) {
     opt_toggle("NX2NAVI_ASSUME_FOCUS", UI_MENU_ASSUME_FOCUS, UI_MENU_ASSUME_FOCUS_DESC);
     // discord_rpc.c reads the setting on its own thread and connects or clears the status within half a second
     opt_toggle("NX2NAVI_DISCORD_RPC", UI_MENU_DISCORD_RPC, UI_MENU_DISCORD_RPC_DESC);
+    rows_saves();
     opt_end();
 }
 

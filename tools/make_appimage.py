@@ -145,6 +145,9 @@ def main():
     shutil.rmtree(app, ignore_errors=True)
     kit = app / 'usr' / 'kit'
     kit.mkdir(parents=True)
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import build_shaders
+    build_shaders.build(ROOT / 'runtime')   # the image carries the runtime's shaders compiled (runtime/*_spv.h)
     for d in KIT_DIRS:
         copy_tree(ROOT / d, kit / d)
     copy_tree(ROOT / 'tools', kit / 'tools', TOOLS_SKIP)

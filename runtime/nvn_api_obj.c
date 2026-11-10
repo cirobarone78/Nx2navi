@@ -770,7 +770,10 @@ static void sleep_until(uint64_t deadline) {
         uint64_t now = kern_now_ns();
         if (now >= deadline) return;
         uint64_t d = deadline - now;
-        if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
+        // The high-resolution wait never returns early and at most PLAT_WAIT_LATE_NS late, so it takes the wait up to
+        // that margin before the deadline and only the rest is spent yielding. The coarse sleep that stood here left
+        // 1 to 2 ms of every paced frame to the yield loop.
+        if (d > PLAT_WAIT_LATE_NS + 100000) plat_wait_ns(d - PLAT_WAIT_LATE_NS - 100000);
         else plat_yield();
     }
 }
