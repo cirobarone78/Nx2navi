@@ -88,17 +88,19 @@ void input_map_configure(void);
 // button is labelled A (a Switch Pro Controller, a GuliKit) and Xbox otherwise.
 int input_pad_layout_pick(const char *setting, int east_labelled_a);
 
-// Button prompts (NX2NAVI_PROMPTS): the controller whose buttons the game's prompts show. Nintendo: the game's own. Xbox
-// and PlayStation: that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create), and the face buttons
-// named by the label of the button the pad layout presses (runtime/romfs.c overlay_init, tools/pad_prompts.py). PC:
-// the key or mouse button the keyboard defaults press each button with, the mouse for the right stick.
-enum { PROMPTS_NINTENDO, PROMPTS_XBOX, PROMPTS_PC, PROMPTS_PLAYSTATION };
-// The prompts for a NX2NAVI_PROMPTS value ("nintendo", "xbox", "playstation" or "pc", any case). Unset or empty: Xbox
-// while the pad layout setting is "xbox_prompts", else Nintendo.
+// Button prompts (NX2NAVI_PROMPTS): the controller whose buttons the game's prompts show. Nintendo: the game's own. Xbox,
+// PlayStation and Steam Deck: that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create; the
+// Deck's A B X Y with L1 R1 L2 R2, Menu and View), and the face buttons named by the label of the button the pad layout
+// presses (runtime/romfs.c overlay_init, tools/pad_prompts.py). PC: the key or mouse button the keyboard defaults press
+// each button with, the mouse for the right stick.
+enum { PROMPTS_NINTENDO, PROMPTS_XBOX, PROMPTS_PC, PROMPTS_PLAYSTATION, PROMPTS_STEAMDECK };
+// The prompts for a NX2NAVI_PROMPTS value ("nintendo", "xbox", "playstation", "steamdeck" or "pc", any case). Unset or
+// empty: Xbox while the pad layout setting is "xbox_prompts", else Nintendo.
 int input_prompts_pick(const char *prompts, const char *pad_layout);
 // The folder next to romfs-index.bin that holds those prompts for a NX2NAVI_PAD_LAYOUT value, NULL for the game's own. The
 // Nintendo layout plays a pad by position, so its folder names the face buttons the other way round
-// (romfs-patches-xbox: the right button does A and is labelled B; romfs-patches-playstation: it is circle); xbox and
+// (romfs-patches-xbox and romfs-patches-steamdeck: the right button does A and is labelled B;
+// romfs-patches-playstation: it is circle); xbox and
 // auto put every Switch button on the button labelled with its letter, or on cross, circle, square and triangle in
 // that order (auto picks the layout per pad by its labels), so they share romfs-patches-<style>-label. The PC prompts
 // follow no pad: romfs-patches-pc whatever the layout (romfs.c overlay_init serves romfs-patches-pc-<w>x<h> under that

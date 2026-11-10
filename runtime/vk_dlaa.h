@@ -8,7 +8,18 @@
 #define DLAA_SCENE_MIN_W 320u
 
 int vk_dlaa_wanted(void);   // the setting is on (the device may still lack DLSS)
-int vk_dlaa_fsr3(void);
+// DLSS Frame Generation through NGX itself (vk_dlaa.c vk_ngxfg_*, gfx_present.c's presenter): NX2NAVI_FRAMEGEN = dlss
+// where Streamline does not run (every build but the Windows one, where these all answer 0).
+typedef struct { VkImage img; VkImageView view; VkFormat fmt; uint32_t w, h; } VkNgxImage;   // in GENERAL
+int vk_ngxfg_wanted(void);   // this run can generate frames through NGX (DLSS upscaling on at the start)
+int vk_ngxfg_max(void);      // generated frames per rendered one the GPU allows (1 = 2x, 5 = 6x), 0 when unavailable
+int vk_ngxfg_on(void);       // ... and NX2NAVI_FRAMEGEN = dlss now (the menu switches it live)
+void vk_ngxfg_reset(void);   // the next generation starts without history (a resize, the menu)
+// Records count generated frames into out[] and a copy of bb into real; returns how many were made (0: none, and real
+// is not written).
+int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
+                      const VkNgxImage *real);
+int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, which loads
 int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
 // Frame generation (vk_fg.cpp): the depth and motion vectors of the frame DLSS or FSR 3.1 last ran on, with its jitter
 // and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the
@@ -33,14 +44,23 @@ int vk_dlaa_fg_camera(VkDlaaCamera *c);     // ... and its temporal upscaler is 
 void vk_dlaa_instance_exts(const char **ext, uint32_t *n, uint32_t max);
 void vk_dlaa_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t max);
 void vk_dlaa_init(void);
+// vk_device.c destroy_all, once the device is idle and before the allocator and the device go (Linux): releases the NGX
+// features and parameters, frees every image, buffer, pipeline and query pool DLAA made, resets its state for a later
+// device and shuts NGX down for this one. Safe when NGX never came up, when nothing was made, and more than once.
+// Windows: does nothing.
+void vk_dlaa_release(void);
 // 1 when dlaa is on and NGX came up with DLSS (after vk_dlaa_init): a DLSS mode's smaller scene is scaled up by DLSS.
 int vk_dlaa_available(void);
+// The video memory DLSS reports for its features (NGX's statistics), for the log; -1 while unknown.
+int64_t vk_dlaa_vram(void);
 // vk_exec.c vk_exec_pass_begin, once the pass's targets are resolved and before its barrier: arms the frame on the
 // scene's light target or, at the first quarter-width pass after it, runs DLAA on that target. Each present ends the
 // frame (vk_dlaa_frame).
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
+// 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
+int vk_dlaa_resized_take(void);
 // vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
 // the viewport of the scene's draws by the frame's jitter (vk_dlaa_viewport, when the viewport is recorded).
 void vk_dlaa_draw(VkExec *ex);

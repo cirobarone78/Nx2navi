@@ -47,7 +47,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - In-game settings menu (F1, or Minus and Plus together on a gamepad) and performance overlay (F10)
 - Keyboard, mouse and gamepads with remapping, Nintendo, Xbox or PlayStation button layout, rumble and gyro; the game
   follows whichever connected gamepad you press, and DualShock 3 controllers are read directly when enabled
-- Xbox, PlayStation and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is
+- Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is
   built; the keyboard prompts follow your key bindings
 - Stereo or 5.1 surround sound output, on the output device of your choice; the default microphone for the game's
   microphone input
@@ -95,4 +95,5 @@ of Zelda*, *Ocarina of Time* and *Nintendo Switch* are trademarks of Nintendo.
 [docs/building.md](docs/building.md) lists the toolchain and the steps. `tools/make_game.py` also builds the game
 natively on Linux ([docs/README-BuildKit.md](docs/README-BuildKit.md), "Linux"); the launcher and the setup are
 Windows only. Everything the build writes stays under
-`build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit.
+`build\` and `generated\`, which git ignores, as it does the runtime's shaders the build compiles
+(`runtime\*_spv.h`; the repository holds their source only); run `tools/check_content.py` before a commit.

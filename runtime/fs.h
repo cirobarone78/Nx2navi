@@ -63,3 +63,16 @@ int fs_save_busy(void);                                    // a save is being wr
                                                            // or save data changed in the last 3 s and not committed
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends
+// A shared save (save_share.c). fs_save_export: visit(ctx, path below the save with '/', bytes, size) for every file of
+// the save the game would load next, under the commit lock; visit returns 0 to fail. The number of files (0: no save
+// yet), -1 when one could not be read or visit failed.
+typedef int (*FsSaveVisit)(void *ctx, const char *rel, const uint8_t *data, size_t n);
+int fs_save_export(FsSaveVisit visit, void *ctx);
+// The menu's import: count files (relative '/' paths, bytes) become <profile>/save-import, which the next start makes
+// the save, backing up the save it replaces; one waiting already is replaced. 0 on success.
+int fs_save_import_stage(int count, const char *const *rel, const uint8_t *const *data, const size_t *size);
+int fs_save_import_waiting(void);                          // 1 while an import waits for the next start (0 before
+                                                           // the first storage use)
+int fs_save_import_cancel(void);                           // drops it; 0 on success
+const char *fs_save_import_done(void);                     // the backup of the save an import replaced at this start,
+                                                           // "-" when there was none, "" when no import ran

@@ -1,4 +1,5 @@
-// --probe-cfg: nx2navi.ini parsing, the environment override and a missing file (cfg.c). Needs no game files.
+// --probe-cfg: nx2navi.ini parsing, the environment override, a missing file and the settings waiting for a restart
+// (cfg.c). Needs no game files.
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +18,26 @@ static int fails;
 #define EQ(a, b) ((a) && !strcmp((a), (b)))
 
 int probe_cfg(void) {
+    // cfg_pending, before this probe's files replace the settings cfg_init read: a restart-only setting counts while its
+    // value differs from the one at start, a live one never
+    if (!cfg_from_env("NX2NAVI_MICROPHONE") && !cfg_from_env("NX2NAVI_VOLUME")) {
+        const char *mic = cfg_value("NX2NAVI_MICROPHONE");
+        int base = cfg_pending_count();
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE"), "pending: unchanged since the start");
+        cfg_set("NX2NAVI_MICROPHONE", strcmp(mic, "0") ? "0" : "1");
+        CHECK(cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base + 1, "pending: a restart-only setting changed");
+        cfg_set("NX2NAVI_MICROPHONE", mic);
+        CHECK(!cfg_pending("NX2NAVI_MICROPHONE") && cfg_pending_count() == base, "pending: set back to its start value");
+        cfg_set("NX2NAVI_VOLUME", "7");
+        CHECK(!cfg_pending("NX2NAVI_VOLUME") && cfg_pending_count() == base, "pending: a live setting never counts");
+        // a value the environment sets after the start (the command line's --monitor arrives that way) never waits:
+        // no row can change it and a restart keeps it
+        if (!cfg_from_env("NX2NAVI_MONITOR")) {
+            cfg_setenv("NX2NAVI_MONITOR", "2");
+            CHECK(!cfg_pending("NX2NAVI_MONITOR") && cfg_pending_count() == base, "pending: set by the environment after the start");
+            cfg_setenv("NX2NAVI_MONITOR", NULL);
+        }
+    }
     char path[1024];
     if (!plat_exe_path(path, sizeof path)) return 1;
     char *cut = plat_last_sep(path);
@@ -221,6 +242,20 @@ int probe_cfg(void) {
     cfg_set("NX2NAVI_VOLUME", "60");
     CHECK(cfg_save_to(path) == 1, "reset: volume 60 again for the environment case");
 
+    // a file saved as UTF-16 (little and big endian, with a line ending of two characters) reads as the same lines
+    static const char wtext[] = "[audio]\r\nvolume = 35\r\n[input]\r\nmotion = 0\r\n";
+    for (int be = 0; be < 2; be++) {
+        uint8_t wbuf[2 + 2 * sizeof wtext];
+        size_t wn = 0;
+        wbuf[wn++] = be ? 0xFE : 0xFF, wbuf[wn++] = be ? 0xFF : 0xFE;
+        for (size_t i = 0; i + 1 < sizeof wtext; i++)
+            wbuf[wn++] = be ? 0 : (uint8_t)wtext[i], wbuf[wn++] = be ? (uint8_t)wtext[i] : 0;
+        CHECK(plat_file_write("cfg-probe-utf16.ini", wbuf, wn) && cfg_load("cfg-probe-utf16.ini") == 1 &&
+              EQ(cfg_get("NX2NAVI_VOLUME"), "35") && EQ(cfg_get("NX2NAVI_MOTION"), "0"),
+              be ? "an ini saved as UTF-16, big endian, is not read" : "an ini saved as UTF-16, little endian, is not read");
+    }
+    plat_file_delete("cfg-probe-utf16.ini");
+
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_VOLUME"), "60"), "reset: reload");
     cfg_setenv("NX2NAVI_VOLUME", "70");
@@ -367,6 +402,13 @@ int probe_cfg(void) {
               input_prompts_pick("playstation", "xbox_prompts") == PROMPTS_PLAYSTATION &&
               input_prompts_pick("ps", "nintendo") == PROMPTS_NINTENDO,
           "prompts: playstation in any case; an unknown value is the game's own");
+    CHECK(input_prompts_pick("SteamDeck", "nintendo") == PROMPTS_STEAMDECK &&
+              input_prompts_pick("steamdeck", "xbox_prompts") == PROMPTS_STEAMDECK &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "nintendo"), "romfs-patches-steamdeck") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "xbox"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "auto"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, NULL), "romfs-patches-steamdeck-label"),
+          "prompts: steamdeck in any case, its face buttons by position for the Nintendo layout, by label otherwise");
     CHECK(EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox_prompts"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&

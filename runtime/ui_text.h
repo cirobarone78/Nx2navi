@@ -41,6 +41,9 @@ typedef enum {
     UI_MENU_FOV, UI_MENU_FOV_DESC,
     UI_MENU_SHADOW_RES, UI_MENU_SHADOW_RES_DESC, UI_MENU_SHADOW_RES_GAME,
     UI_MENU_ANISO, UI_MENU_ANISO_DESC, UI_MENU_ANISO_GAME,
+    UI_MENU_TEX_DETAIL, UI_MENU_TEX_DETAIL_DESC,
+    UI_MENU_TEX_DETAIL_AUTO,   // "Automatic: %s", %s the level it picks on this card
+    UI_MENU_TEX_DETAIL_FULL, UI_MENU_TEX_DETAIL_REDUCED, UI_MENU_TEX_DETAIL_LOW,
     UI_MENU_SHARPNESS, UI_MENU_SHARPNESS_DESC, UI_MENU_SHARPNESS_NEEDS_FSR,
     UI_MENU_COLOR,            // group heading over the colour rows
     UI_MENU_COLOR_PRESET, UI_MENU_COLOR_PRESET_DESC, UI_MENU_COLOR_DEFAULT, UI_MENU_COLOR_VIVID, UI_MENU_COLOR_CLARITY,
@@ -107,12 +110,13 @@ typedef enum {
     UI_MENU_PAD_LAYOUT, UI_MENU_PAD_LAYOUT_DESC, UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_NINTENDO,
     UI_MENU_PAD_LAYOUT_XBOX, UI_MENU_PAD_LAYOUT_PLAYSTATION, UI_MENU_PAD_LAYOUT_IN_USE,
     UI_MENU_PROMPTS, UI_MENU_PROMPTS_DESC, UI_MENU_PROMPTS_NINTENDO, UI_MENU_PROMPTS_XBOX, UI_MENU_PROMPTS_PLAYSTATION,
-    UI_MENU_PROMPTS_PC,
+    UI_MENU_PROMPTS_STEAMDECK, UI_MENU_PROMPTS_PC,
     // the notes under the prompts: their files are missing or damaged, they change after restart, or why they are off
     UI_MENU_PROMPTS_MISSING, UI_MENU_PROMPTS_FAILED, UI_MENU_PROMPTS_RESTART, UI_MENU_PROMPTS_OFF_SHAPE,
     UI_MENU_PROMPTS_OFF_MODS, UI_MENU_PROMPTS_OFF_PATCHES,
     // "Restart now" under the prompts while they change after restart, and its confirmation (Cancel: UI_MENU_RESET_NO)
     UI_MENU_RESTART, UI_MENU_RESTART_DESC, UI_MENU_RESTART_CONFIRM, UI_MENU_QUIT_CONFIRM, UI_MENU_RESTART_YES, UI_MENU_RESTART_SAVING, UI_MENU_QUIT_SAVING,
+    UI_MENU_RESTART_COUNT,   // the bar's Restart with the count of settings waiting for it (printf: %d)
     UI_MENU_GROUP_STICKS, UI_MENU_LSTICK_DEADZONE, UI_MENU_RSTICK_DEADZONE, UI_MENU_STICK_DEADZONE_DESC,
     UI_MENU_STICK_DEADZONE_NOW, UI_MENU_STICK_SENS, UI_MENU_STICK_SENS_DESC,
     UI_MENU_MOUSE_MODE, UI_MENU_MOUSE_MODE_DESC, UI_MENU_MOUSE_STICK, UI_MENU_MOUSE_DIRECT,
@@ -243,7 +247,27 @@ typedef enum {
     UI_MENU_CHEAT_CODE_DESC, UI_MENU_CHEAT_KEY_DESC /* "%s": the buttons */, UI_MENU_CHEAT_DATA_DESC,
     UI_MENU_CHEAT_MASTER, UI_MENU_CHEAT_MASTER_DESC, UI_MENU_CHEAT_RESTORE, UI_MENU_CHEAT_RESTORE_DESC,
     UI_MENU_CHEAT_REBUILD, UI_MENU_CHEAT_REBUILD_DESC, UI_MENU_CHEAT_UNSUPPORTED, UI_MENU_CHEAT_UNSUPPORTED_DESC,
-    UI_MENU_LAST_ID = UI_MENU_CHEAT_UNSUPPORTED_DESC,
+    // the Game tab's Saves group (ui/menu.cpp rows_saves, save_share.c): export the save into a zip, import a shared
+    // one at the next start. UI_MENU_SAVE_EXPORTED to UI_MENU_SAVE_E_UNSAFE are printf formats with at most one "%s"
+    // (a path, or the zip's NX2navi version and date)
+    UI_MENU_SAVES,
+    UI_MENU_SAVE_EXPORT, UI_MENU_SAVE_EXPORT_DESC, UI_MENU_SAVE_EXPORT_BUG, UI_MENU_SAVE_EXPORT_BUG_DESC,
+    UI_MENU_SAVE_IMPORT, UI_MENU_SAVE_IMPORT_DESC,
+    UI_MENU_SAVE_IMPORT_WAITING,     // the import row's value while an import waits for the next start
+    UI_MENU_SAVE_IMPORT_CANCEL, UI_MENU_SAVE_IMPORT_CANCEL_DESC,
+    UI_MENU_SAVE_BUSY,               // note on the rows while an export or import runs
+    UI_MENU_SAVE_EXPORTED,           // "%s": the zip's path
+    UI_MENU_SAVE_IMPORT_READY,       // "%s": "<NX2navi version>, <export date>" of the zip
+    UI_MENU_SAVE_IMPORT_CANCELLED,
+    UI_MENU_SAVE_IMPORTED,           // "%s": the folder the replaced save was copied to, at this start
+    UI_MENU_SAVE_IMPORTED_NEW,       // the same with no save to replace
+    UI_MENU_SAVE_E_NO_SAVE, UI_MENU_SAVE_E_READ_SAVE,
+    UI_MENU_SAVE_E_WRITE,            // "%s": the folder the zip could not be written into
+    UI_MENU_SAVE_E_READ,             // "%s" here and below: the zip
+    UI_MENU_SAVE_E_STAGE,
+    UI_MENU_SAVE_E_NOT_SAVE, UI_MENU_SAVE_E_OTHER_GAME, UI_MENU_SAVE_E_NEWER, UI_MENU_SAVE_E_DAMAGED,
+    UI_MENU_SAVE_E_UNSAFE,
+    UI_MENU_LAST_ID = UI_MENU_SAVE_E_UNSAFE,
     // the boot screen while the boot prewarm prepares shaders and pipelines (boot.c, ui/menu.cpp menu_boot_frame)
     UI_BOOT_TITLE, UI_BOOT_STARTING,
     UI_BOOT_SHADERS, UI_BOOT_PIPELINES,   // printf: "%lld" done, "%lld" total
@@ -255,9 +279,16 @@ typedef enum {
     // the same rows' texts on a GPU DLSS does not run on (not NVIDIA): the menu leaves DLSS out there
     UI_MENU_UPSCALING_DESC_FSR, UI_MENU_FRAMEGEN_DESC_FSR, UI_MENU_FRAMEGEN_NOTE_FSR,
     UI_MENU_FRAMEGEN_NEEDS_FSR,
+    // and on a build where FSR 3.1 does not load (vk_ffx_available): the menu leaves it out there, and these texts say so
+    UI_MENU_UPSCALING_DESC_NO_FSR,
+    UI_MENU_FSR3_OFF,   // FSR 3.1 is still set but not loadable: "in use: off" and why
+    UI_MENU_FRAMEGEN_DESC_DLSS, UI_MENU_FRAMEGEN_NOTE_DLSS, UI_MENU_FRAMEGEN_NEEDS_DLSS,   // DLSS only
+    UI_MENU_FRAMEGEN_DESC_NONE, UI_MENU_FRAMEGEN_NEEDS_NONE,                               // neither runs
     // DLSS frame generation (ui/menu.cpp row_framegen, row_framegen_mult): the multiplier row, its notes when this GPU
     // and driver allow less than 4x, and the frame generation row's notes when DLSS's does not run
     UI_MENU_FRAMEGEN_MULT, UI_MENU_FRAMEGEN_MULT_DESC,
+    // the multiplier row where DLSS's frame generation runs through NGX itself (ui/menu.cpp row_framegen_mult_ngx)
+    UI_MENU_FG_MULT_DESC, UI_MENU_FG_MULT_DYNAMIC,
     UI_MENU_FRAMEGEN_MULT_RTX50,     // this GPU and driver do 2x only
     UI_MENU_FRAMEGEN_MULT_UPTO,      // printf: "%d", the highest multiplier this GPU and driver allow
     UI_MENU_FRAMEGEN_MULT_OLD_DLL,   // nx2navi_dlssg.dll is older than multi frame generation
