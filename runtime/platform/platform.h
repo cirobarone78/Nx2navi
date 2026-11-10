@@ -41,6 +41,10 @@ uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id ti
 // The logical processors the process may use (bit n = processor n, the first 64), into *all, and the lowest of each
 // physical core among them into *first; returns the number of physical cores, 0 when unknown.
 int plat_cpu_cores(uint64_t *all, uint64_t *first);
+// The logical processors of the process's set (the first 64) that share the largest L3 cache, when the L3 caches
+// are not all the same size: the die with AMD's 3D V-Cache on a two-die X3D processor. 0 when they are (one die, or
+// equal dies) or the topology is unknown. *l3_kb: that cache's size.
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb);
 int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it

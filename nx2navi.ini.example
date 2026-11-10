@@ -66,6 +66,11 @@
 # dyn_res = 0
 # dyn_res_target = 16.7
 # dyn_res_step = 45
+# Processors. On a processor whose dies have L3 caches of different sizes (AMD's two-die X3D processors, with 3D
+# V-Cache on one die) the game runs on the die with the larger cache: 1 = on, 0 = Windows places the threads.
+# cache_die = 1
+# One logical processor of each physical core, so no two busy threads share a core: 1 = on, 0 = all of them.
+# one_per_core = 0
 
 # Shaders and pipelines.
 # Draws whose pipeline is still building: default waits on a reserved worker; draw is the previous scheduling.

@@ -95,6 +95,32 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
+    DWORD_PTR proc, sys;
+    *l3_kb = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = len ? malloc(len) : NULL;
+    uint64_t die = 0;
+    DWORD big = 0, small = ~0u;
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, buf, &len))
+        for (DWORD off = 0; off < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)((char *)buf + off);
+            const CACHE_RELATIONSHIP *c = &e->Cache;
+            if (c->Level == 3 && c->GroupMask.Group == 0) {   // every L3, also those outside the process's set
+                if (c->CacheSize > big) big = c->CacheSize, die = 0;
+                if (c->CacheSize == big) die |= c->GroupMask.Mask;
+                if (c->CacheSize < small) small = c->CacheSize;
+            }
+            off += e->Size;
+        }
+    free(buf);
+    if (!die || big == small) return 0;
+    *l3_kb = big >> 10;
+    return die & proc;
+}
+
 int plat_process_affinity(uint64_t mask) { return SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)mask) != 0; }
 
 uint64_t plat_thread_cpu_ns(uint32_t tid) {
