@@ -1,7 +1,8 @@
-"""Xbox, PlayStation and keyboard-and-mouse button prompts for Ocarina of Time (Switch 2), drawn from button art on the
-player's machine.
+"""Xbox, PlayStation, Steam Deck and keyboard-and-mouse button prompts for Ocarina of Time (Switch 2), drawn from button
+art on the player's machine.
 
-    python tools/pad_prompts.py --art FOLDER --game FOLDER [--style xbox|playstation|pc] [--layout position|label]
+    python tools/pad_prompts.py --art FOLDER --game FOLDER [--style xbox|playstation|steamdeck|pc]
+                                [--layout position|label]
                                 [--binds nx2navi.ini]
 
 --art is a folder of button art with the file names of STYLES (tools/prompt_art.py) and KEY_ART below: the Source
@@ -14,7 +15,9 @@ romfs.bin, as the setup writes them); --romfs names another, which may also be a
 style and layout becomes the overlay folder <game>/romfs-patches-<style> (layout position) or
 <game>/romfs-patches-<style>-label (layout label), and the keyboard and mouse <game>/romfs-patches-pc, each with a
 manifest.tsv: runtime/romfs.c overlay_init loads it in place of the game's files when nx2navi.ini has prompts = xbox,
-playstation or pc (runtime/input_map.c input_prompts_folder). Without --style or --layout, every style or layout.
+playstation, steamdeck or pc (runtime/input_map.c input_prompts_folder). Without --style or --layout, every style or
+layout. The Steam Deck style has no art of its own: its buttons are named as an Xbox pad's face buttons and a
+PlayStation pad's shoulders and stick clicks, so it is drawn from those two pads' pictures (prompt_art.py STYLES).
 --out writes a single style and layout elsewhere.
 
 The two pad layouts follow pad_layout (runtime/input_map.c). position, for pad_layout = nintendo: a pad is played by

@@ -4,7 +4,7 @@
 // and sampler descriptor slots, and VkSamplers.
 //
 // A texture that mirrors its pool memory (tex_mirrored) stops re-uploading once the GPU rendered into it (the
-// "GPU-owned" rule); a slot of a finalized texture follows the live texture at its storage address.
+// "GPU-owned" rule); a finalized slot follows live GPU content but never revives freed CPU-backed storage.
 // Contains code Copyright (c) 2026 jhaizhou, Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 //
 // Every image lives in VK_IMAGE_LAYOUT_GENERAL. Uploads are recorded into the upload batch of vk_memory.c; the replay
@@ -56,7 +56,6 @@ typedef struct Tex {
     uint64_t retire_takes;        // vk_pool_takes when it was retired
     uint64_t retire_due;          // vk_sync_issued once every pool set was taken since (0: not yet); destroyed after it
     int uploaded, released;
-    uint32_t rel_serial;          // reg_serial when it was released: slots registered before then are stale (slot_resolve)
     uint64_t uid;                 // names the entry in its bucket's released set (tex_gen_flip); 0 until its first release
     uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
     uint32_t back_gap;            // most presents between a release and its taking back so far (stale_after)
@@ -101,16 +100,18 @@ typedef struct {
     uint32_t cgen;                // agen of the slot's address when ce was resolved
     uint32_t cepoch;
     view_t cview;
-    uint8_t chas_view, used, has_view;
+    uint8_t chas_view, used, has_view, finalized;   // finalized survives eviction of the released Tex entry
     uint8_t cheld;                // ce is NULL as the texture was evicted by disuse, valid while cgen is (held_out)
     uint8_t cwant;                // a shader sampled its stand-in (vk_pool_marks_read): slot_resolve makes it at once
     uint64_t khash;               // hash of the descriptor key and view, 0 for CPU-written textures (vk_texture_slot_khash_locked)
     view_t v;
     tex_t t;
 } TexSlot;
-typedef struct { samp_par p; VkSampler s, sp, sc; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
+typedef struct { samp_par p; VkSampler s, sp, sc, sd[2]; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
                                                                                // its point-sampled form (vk_sampler_point_by_id_locked),
-                                                                               // sc its comparing form (vk_sampler_compare_by_id_locked)
+                                                                               // sc its comparing form (vk_sampler_compare_by_id_locked),
+                                                                               // sd[n - 1] its form for a texture made without n
+                                                                               // levels (vk_sampler_detail_by_id_locked)
 
 static PlatRMutex tex_lock;
 static PlatOnce tex_once = PLAT_ONCE_INIT;
@@ -164,7 +165,7 @@ static int nowned, cowned;
 static uint64_t max_owned;   // largest storage size in owned[]
 static uint64_t gpu_writes;  // GPU writes into mirrored textures so far: Tex.gpu_seq
 // Bumped whenever the entry a slot resolves to can change: an entry created or destroyed, released or taken back into
-// use (the slot lookup and the follow of a finalized slot read only by_key, by_addr and the released flags).
+// use, or a registered slot finalized (the follow reads by_key, by_addr and the entry and slot lifetime flags).
 static uint32_t tex_gen = 1;
 // Bumped with tex_gen and whenever a slot is registered: what vk_texture_by_id returns for any slot may have changed.
 static uint32_t slots_gen = 1;
@@ -257,10 +258,10 @@ static void tex_gen_bump(uint64_t addr) {
 // generation never stands for two states. The global generations still move, so their readers look, and find the
 // tokens equal. plain: the take-back of an entry that was superseded or overwritten while released changes more than
 // the flag, and is a change like any other.
-// One input of slot_resolve is not in the state: the stale rule compares a slot's registration with the entry's
-// release (rel_serial), which is later at every release. A slot is stale at every later release once it is at one, so
-// what it resolves to in a released state stays right; the one that is not stale takes the entry back, which is the
-// lookup-made change in_lookup deals with.
+// One input of slot_resolve is not in the state: the stale rule reads the slot's finalized flag, which a release sets
+// on the slots registered with its descriptor and a registration clears. A slot is stale at every later release once
+// it is at one, so what it resolves to in a released state stays right; the one that is not stale takes the entry
+// back, which is the lookup-made change in_lookup deals with.
 static void tex_gen_flip(Tex *e, int plain) {
     static int on = -1;
     static uint64_t uids;
@@ -520,7 +521,7 @@ static void destroy_tex(Tex *e);
 static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, uint64_t guest_size, VkMemSpan *sp) {
     if ((e->f.depth || e->f.stencil) && req->size > guest_size) return 0;
     if (!req->size) return 0;   // an image the device could not lay out (image_size)
-    if (!vk_mem_resolve(e->pub.addr, req->size, sp) || !sp->alloc || sp->alloc_offset % req->alignment) return 0;
+    if (!vk_mem_lookup(e->pub.addr, req->size, sp) || !sp->alloc || sp->alloc_offset % req->alignment) return 0;
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp->alloc, &info);
     return req->memoryTypeBits >> info.memoryType & 1;
@@ -692,6 +693,104 @@ static void astc_probe_alpha(const tex_t *t, const TexVkFormat *f) {
                (unsigned long long)n_probe_alpha, n_probe_bytes_alpha / 1048576.0);
 }
 
+// ---- texture detail (NX2NAVI_TEXTURE_DETAIL = auto | full | reduced | low, texture_detail in nx2navi.ini; read at
+// the first texture, so a change waits for a restart)
+// The material textures of a loaded area are what fills a small card, and three quarters of a mipmapped texture is its
+// largest level. Over the budget Windows moves device memory into system memory and the frame rate falls to a
+// fraction (a tester's RTX 3060 Laptop, 6 GiB with a budget of 4,730 MiB, ran the world at 5 to 15 fps).
+//
+// Measured on an RTX 5090 with the budget taken as those 4,730 MiB (NX2NAVI_VRAM_BUDGET_MB), a walk through Castle
+// Town at 1440p with DLSS Balanced, device memory in use at its peak and the textures in it:
+//   full     6,907 MiB, textures 4,302 MiB (2,852 MiB of them ASTC as BC3), 2,589 M ASTC texels decoded
+//   reduced  5,472 MiB, textures 2,357 MiB (908 MiB), 826 M texels
+//   low      4,987 MiB, textures 1,997 MiB (548 MiB), 503 M texels
+// About 1.1 GiB of each is outside the textures and buffers (DLSS alone reports 0.7 GiB). What a level does not touch
+// stays: about 0.8 GiB of BC4, BC5 and BC7 textures the game ships in those formats, 0.65 GiB of render targets and
+// 0.9 GiB of buffer mirrors.
+//
+// reduced makes such a texture without its largest level, low without its two largest when it is 1024x1024 or more
+// (detail_skip decides). The image then holds the game's levels from VkTexImage.skip on: image level i is the game's
+// level i + skip, at that level's own size, so a level and a texel rectangle inside it mean the same in both and only
+// the level index moves. Every path from a game level to the image subtracts skip: the upload and its ASTC regions
+// (upload, astc_bl_regions), WriteTexels and the write-back (image_texels, write_back_n), the views (vk_exec_draw.c
+// get_view) and the sampler's LOD clamp (vk_sampler_detail_by_id_locked). Shaders sample with normalised coordinates
+// and derivatives, which pick the same game level as before wherever it is kept.
+//
+// Only a texture for which that holds is reduced: an ASTC texture this runtime decodes (not one the device samples as
+// ASTC, whose copies run on the image, vk_exec_xfer.c sub_resolve), a 2D texture or 2D array, block-linear, one
+// sample, mipmapped, DETAIL_MIN texels or more each way, whose content the CPU provides (tex_mirrored). That leaves
+// out render targets and storage images (no ASTC format can be either), 3D and cube textures, the small and unmipped
+// ones (interface art, glyph atlases, lookup tables, ramps) and whatever the GPU copies, as texture copies of a
+// decoded ASTC texture are not replayed at all. Two more are left whole:
+//  - a texture made over a live one that holds GPU-written content, which start_at copies in texel for texel;
+//  - a texture a shader reads by texel position or whose size it asks for (exact, below): a fetch at a level the image
+//    lacks, or coordinates worked out from the size of another texture, would read the wrong texels. The translated
+//    shaders do that only through fixed bindings (gfx_shader.c reflect_exact; none of 44,081 prepared shaders of game
+//    1.1.1 does it through the texture pool), so the replay sees the texture at the binding and asks for it whole
+//    (vk_texture_exact_by_id_locked). The key then stays whole for the session.
+// The size of a 2D array is also asked for by the layer clamp the translator puts before array samples; that reads
+// the layer count alone, which no level changes, and does not count (reflect_exact).
+//
+// auto: full from DETAIL_FULL_MB of device-local budget on, low under DETAIL_LOW_MB, reduced between. Textures give
+// way from 80% of the budget on (sweep_pressure), so a level wants its use at or under that: full, 6.9 to 7.5 GiB in
+// the town and in Hyrule Field, on cards of 10 GiB and more (their budgets start near 9 GiB; an 8 GiB card's is about
+// 7.2 GiB); reduced, 5.5 GiB, on 8 GiB cards; and every 6 GiB card, whose budget stays under 5.5 GiB, gets low.
+#define DETAIL_MIN 256
+#define DETAIL_LOW_MIN 1024
+#define DETAIL_FULL_MB 8192
+#define DETAIL_LOW_MB 6144
+#define EXACT_MAX 65536
+static nvn_hmap exact = {.klen = sizeof(TexKey)};   // keys made whole whatever the setting; value 1
+static uint64_t n_exact;                             // textures made whole again so far
+
+static int alias_has_gpu_content(const struct Tex *src);
+
+static int64_t detail_budget_mb = -1;   // the device-local budget auto went by, in MiB; 0: the device reports none
+
+int vk_texture_detail_auto(void) {
+    int64_t mb = __atomic_load_n(&detail_budget_mb, __ATOMIC_RELAXED);
+    if (mb < 0 && !vk_ctx()) return 0;   // asked before there is a device: nothing is kept
+    if (mb < 0) {   // read once: the budget moves with what else uses the card, the choice must not
+        uint64_t used = 0, budget = 0;
+        int exact_budget = 0;
+        mb = vk_mem_vram(&used, &budget, &exact_budget) ? (int64_t)(budget >> 20) : 0;
+        __atomic_store_n(&detail_budget_mb, mb, __ATOMIC_RELAXED);
+    }
+    return !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
+}
+
+static int detail_most(void) {   // the most levels a texture is made without: 0 full, 1 reduced, 2 low
+    static const char *const names[3] = {"full", "reduced", "low"};
+    static int most = -1;
+    if (most >= 0) return most;
+    const char *v = cfg_value("NX2NAVI_TEXTURE_DETAIL");
+    most = !strcmp(v, "full") ? 0 : !strcmp(v, "reduced") ? 1 : !strcmp(v, "low") ? 2 : -1;
+    if (most >= 0) {
+        rt_log("vk: texture detail: %s (texture_detail)", v);
+    } else {
+        most = vk_texture_detail_auto();
+        if (!detail_budget_mb)
+            rt_log("vk: texture detail: full (texture_detail = %s; the device reports no video memory budget)", v);
+        else
+            rt_log("vk: texture detail: %s, chosen for a video memory budget of %lld MiB (texture_detail = %s; full from "
+                   "%d MiB, low under %d MiB)", names[most], (long long)detail_budget_mb, v, DETAIL_FULL_MB, DETAIL_LOW_MB);
+    }
+    return most;
+}
+
+// The top mip levels the image of t is made without (the rule above). w, h, levels: the image as it would be whole.
+static uint32_t detail_skip(const tex_t *t, const TexKey *k, const TexVkFormat *f, uint32_t w, uint32_t h, uint32_t levels,
+                            uint32_t samples) {
+    int most = detail_most();
+    const nvn_texdesc *d = &t->d;
+    if (!most || !f->astc_bw || samples > 1 || levels < 2 || w < DETAIL_MIN || h < DETAIL_MIN) return 0;
+    if ((d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY) || nvn_tex_is_linear(d)) return 0;
+    if (!tex_mirrored(t) || (exact.n && nvn_hm_get(&exact, k))) return 0;
+    for (const struct Tex *p = nvn_hm_get(&by_addr, &k->addr); p; p = p->next_at)
+        if (!p->released && alias_has_gpu_content(p)) return 0;
+    return most >= 2 && levels >= 4 && w >= DETAIL_LOW_MIN && h >= DETAIL_LOW_MIN ? 2 : 1;
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
@@ -730,6 +829,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     if (levels > most) levels = most;
     uint32_t samples = d->samples > 1 ? (uint32_t)d->samples : 1;
     if (samples > 1) levels = 1;
+    uint32_t skip = detail_skip(t, k, &f, w, h, levels, samples);   // texture detail: the image starts at this level
+    if (skip) w = mip(w, skip), h = mip(h, skip), levels -= skip;
     VkFormatFeatureFlags ff = features_of(f.vk);
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     int ds = f.depth || f.stencil;
@@ -935,6 +1036,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
     p->scale = (uint8_t)scale;
+    p->skip = (uint8_t)skip;
 
     if (!defer_init) init_new(e);
     return e;
@@ -1105,7 +1207,9 @@ static int idle(const Tex *e, uint64_t now);
 // commit then ran out at an area load (device lost); only entries released STALE_FRAMES presents ago go, so the
 // transient ones the game takes back within frames stay. NX2NAVI_TEX_COMMIT_FREE_MB (default the larger of 4 GiB and a tenth of the commit
 // limit; 0 = off) lowers that bound to COMMIT_LOW_KEEP while less of the system's commit is free: an allocation that
-// fails there ends the game. Both drop only stale entries (drop_stale), a few per check like the VRAM pressure.
+// fails there ends the game. On Linux nothing fails at the limit: the OOM killer ends the game when its cgroup or the
+// machine runs out of memory, and plat_commit_info reports the tighter of the two. Both drop only stale entries
+// (drop_stale), a few per check like the VRAM pressure.
 //
 // NX2NAVI_TEX_PROC_COMMIT_MB (default the installed memory, at least PROC_COMMIT_MIN_MB; 0 = off) counts the commit as
 // low too while this process's own commit is above it. The system's figure depends on the page file and on what else
@@ -1114,7 +1218,9 @@ static int idle(const Tex *e, uint64_t now);
 // more commit than the PC has memory: beyond that it lives on the page file, whatever its size. The bound holds until
 // the process is a thirty-second under it, so that it does not flip with every texture freed. The floor keeps it out
 // of the way on PCs with less memory, where a bound at the installed memory could hold all through play: the system's
-// figure decides there, as before.
+// figure decides there, as before. On Linux the process's figure is its resident anonymous memory, which cannot pass
+// the installed memory, so only a bound set below that holds there; a cgroup's limit and the machine's RAM act through
+// the system's figure.
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
@@ -1154,7 +1260,9 @@ static int commit_is_low(void) {
             plat_mem_info(&ram_used, &ram_total, &ram_proc);
             proc_commit_mb = ram_total > PROC_COMMIT_MIN_MB ? (long long)ram_total : PROC_COMMIT_MIN_MB;
         }
-        if (!plat_commit_enforced()) commit_free_mb = proc_commit_mb = 0;   // a limit no allocation fails at
+        if (!plat_commit_enforced()) commit_free_mb = proc_commit_mb = 0;   // no limit known
+        char note[2048];   // the platform layer's own lines go to stderr only, so the log file gets this through here
+        if (plat_commit_note(note, sizeof note)) rt_log("platform: %s", note);
         if (proc_commit_mb)
             rt_log("vk: textures give way as under low commit while this process's commit is above %lld MB "
                    "(NX2NAVI_TEX_PROC_COMMIT_MB; 0 = off)", proc_commit_mb);
@@ -1726,7 +1834,8 @@ static uint64_t content_hash(const void *p, uint64_t n) {
 // The CPU deswizzle moved every 16 bytes through the GOB arithmetic and was most of an ASTC upload's CPU time when an
 // area loads. Fills ar (n = levels * layers, level-major as upload's regions) and returns 1 when every level and layer
 // qualifies: block-linear, starting 16-byte aligned, its layout inside the storage. NX2NAVI_ASTC_GPU_DESWIZZLE=0 keeps
-// the CPU deswizzle.
+// the CPU deswizzle. levels counts the image's levels: level lv of the image is the game's level lv + skip (texture
+// detail), which is where its blocks lie and what its size is.
 static int astc_bl_regions(const Tex *e, uint32_t levels, uint32_t layers, int bw, int bh, VkAstcRegion *ar) {
     static int on = -1;
     if (on < 0) {
@@ -1735,16 +1844,16 @@ static int astc_bl_regions(const Tex *e, uint32_t levels, uint32_t layers, int b
     }
     const nvn_texdesc *d = &e->t.d;
     if (!on || nvn_tex_is_linear(d)) return 0;
-    uint32_t k = 0;
+    uint32_t k = 0, sk = e->pub.skip;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t row_bytes, rows, slices, bpb;
             uint64_t base;
             unsigned th, td;
-            if (nvn_deswizzle_geom(d, lv, ly, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) || (base & 15) || th > 5 ||
-                td > 5)
+            if (nvn_deswizzle_geom(d, lv + sk, ly, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) || (base & 15) ||
+                th > 5 || td > 5)
                 return 0;
-            ar[k] = (VkAstcRegion){.src = base, .w = mip(d->width, lv), .h = mip(d->height, lv), .slices = slices,
+            ar[k] = (VkAstcRegion){.src = base, .w = mip(d->width, lv + sk), .h = mip(d->height, lv + sk), .slices = slices,
                                    .level = lv, .layer = ly, .bl = 1, .th = (uint8_t)th, .td = (uint8_t)td};
             if (base + vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh) > e->t.L.size) return 0;
             k++;
@@ -1768,7 +1877,9 @@ static int astc_arena(void) {
     return on;
 }
 
-// Copies the whole storage into the image (every level and layer the image has).
+// Copies the whole storage into the image (every level and layer the image has). An image made without its top levels
+// (texture detail, VkTexImage.skip) has the game's level lv + skip at its level lv: the loops below run over the image's
+// levels and read the storage at the game's.
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
     const tex_t *t = &e->t;
@@ -1794,20 +1905,23 @@ static void upload(Tex *e) {
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
-    uint32_t n = levels * layers, k = 0;
+    uint32_t n = levels * layers, k = 0, sk = linear ? 0 : e->pub.skip;
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
     VkDeviceSize total = 0, decoded = 0;
+    uint64_t src_bytes = 0;   // the storage bytes the image's levels take (all of the storage unless levels are left out)
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
-            uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
+            uint32_t w = mip(d->width, lv + sk), h = one_d ? 1 : mip(d->height, lv + sk), sl = is3d ? mip(d->depth, lv + sk) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
             uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
             rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
                                           .imageExtent = {w, h, sl}};
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
+            src_bytes += raw;
         }
+    if (!sk) src_bytes = t->L.size;
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
     uint8_t *rmap = NULL, *raw_copy = NULL;
@@ -1822,6 +1936,14 @@ static void upload(Tex *e) {
         for (k1 = k0 + 1; k1 < n && (agpu || (k1 + 1 < n ? rg[k1 + 1].bufferOffset : total) - base <= UPLOAD_PART);) k1++;
         size = (k1 < n ? rg[k1].bufferOffset : total) - base;
         if (gdsw) size = t->L.size;   // the storage as it is (one part: the GPU decoder takes every region at once)
+        // Without its top levels, only the levels the image has: each region's blocks as they lie in the storage, one
+        // after the other (the top level is three quarters of the bytes, and an array keeps each layer's levels
+        // together, so the kept levels are no single range).
+        if (gdsw && sk) {
+            size = 0;
+            for (k = 0; k < n; k++) size += vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh);
+            src_bytes = size;
+        }
         if (k0) parts++;
         VkCommandBuffer cb = vk_upload_begin();
         // The part stages in a range of the staging arena (vk_staging_at, its offset added to the regions below), or in
@@ -1845,9 +1967,17 @@ static void upload(Tex *e) {
             log_limited(&n_gone, "texture %#llx (%llu bytes): storage released during the upload; uploaded as zeros",
                         (unsigned long long)e->pub.addr, (unsigned long long)e->t.L.size);
         }
-        if (gdsw) {
+        if (gdsw && !sk) {
             if (held) memcpy(stg, t->mem, size);
             else memset(stg, 0, size);
+        } else if (gdsw) {
+            VkDeviceSize at = 0;
+            for (k = 0; k < n; k++) {   // astc_bl_regions checked that each lies inside the storage
+                VkDeviceSize nb = vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh);
+                if (held) memcpy(stg + at, t->mem + ar[k].src, nb);
+                else memset(stg + at, 0, nb);
+                ar[k].src = at, at += nb;
+            }
         }
         for (k = k0; k < k1 && !gdsw; k++) {
             uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
@@ -1859,9 +1989,9 @@ static void upload(Tex *e) {
             tmps[k - k0] = tmp;
             if (!held) {
                 memset(tmp ? tmp : dst, 0, raw);
-            } else if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+            } else if (nvn_deswizzle(d, lv + sk, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
-                            (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
+                            (unsigned long long)e->pub.addr, d->format, d->target, lv + sk, ly);
                 memset(tmp ? tmp : dst, 0, raw);
             }
         }
@@ -1933,13 +2063,13 @@ static void upload(Tex *e) {
     uint64_t dt = kern_now_ns() - u0;
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
-        ru_n++, ru_bytes += t->L.size, ru_ns += dt;
+        ru_n++, ru_bytes += src_bytes, ru_ns += dt;
         if (e->wt_n) {
-            ru_wt_n++, ru_wt_bytes += t->L.size, ru_wt_ns += dt;
+            ru_wt_n++, ru_wt_bytes += src_bytes, ru_wt_ns += dt;
             if (rt_trace & RT_TRACE_PERF)
                 rt_log("perf: frame %llu: re-upload after %u WriteTexels: texture %#llx fmt %#x %ux%u, %.1f KiB, %.3f ms",
                        (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), e->wt_n,
-                       (unsigned long long)e->pub.addr, d->format, d->width, d->height, t->L.size / 1024.0, dt / 1e6);
+                       (unsigned long long)e->pub.addr, d->format, d->width, d->height, src_bytes / 1024.0, dt / 1e6);
         }
     } else {
         n_uploads++, perf_count(PERF_CNT_TEX_UP);
@@ -1949,7 +2079,7 @@ static void upload(Tex *e) {
     e->n_up++;
     perf_end(PERF_TEX, p0);
     vk_texstat_time(VK_TS_UPLOAD, u0);
-    vk_texstat_add(VK_TS_UPLOAD, 0, t->L.size);
+    vk_texstat_add(VK_TS_UPLOAD, 0, src_bytes);
 }
 
 // Whether e's storage fills no 4 KiB page of its own, so the write tracking can only see writes to pages it shares.
@@ -2044,6 +2174,7 @@ static int alias_compatible(const Tex *e, const Tex *src, const char **why) {
     if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1)
         return *why = "depth, stencil or multisample", 0;
     if (p->type != q->type) return *why = "another image type", 0;
+    if (p->skip || q->skip) return *why = "made without its top levels (texture detail)", 0;   // level i is not level i
     if (nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return *why = "linear and block-linear", 0;
     int ew, eh, sw, sh, eb = img_block(e, &ew, &eh), sb = img_block(src, &sw, &sh);
     if (!eb || eb != sb || ew != sw || eh != sh) return *why = "another block size", 0;
@@ -2323,7 +2454,6 @@ static int wb_wanted(const Tex *e) { return e->t.L.size <= wb_limit || e->run < 
 static void mark_released(Tex *e) {   // tex_lock held; e is not released
     e->released = 1;
     e->rel_epoch = submit_epoch;
-    e->rel_serial = reg_serial;
     e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     nreleased++;
     rel_append(e);
@@ -2363,6 +2493,12 @@ void vk_texture_gpu_written(const tex_t *t) {
         }
         e->pub.gpu_owned = 1;
         e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
+        if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
+            static volatile int32_t n_skip_written;
+            log_limited(&n_skip_written, "texture %#llx (fmt %#x %ux%u), made without its top %u levels, was written by "
+                        "the GPU: its levels are not the game's", (unsigned long long)e->pub.addr, e->t.d.format,
+                        e->t.d.width, e->t.d.height, e->pub.skip);
+        }
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
@@ -2393,10 +2529,24 @@ void vk_texture_release(const tex_t *t) {
     make_key(t, &k);
     lock();
     Tex *e = nvn_hm_get(&by_key, &k);
+    // Staleness belongs to the registered descriptor, not the cached image: a released Tex can be destroyed before the
+    // slot looks again (eviction, the released cap, start_at for a mirrored one). A registered texture may also be
+    // finalized before its image is created.
+    int changed = 0;
+    if (sinfo)
+        for (int id = bucket_head[agen_idx(k.addr)]; id >= 0; id = slot_next[id]) {
+            TexSlot *s = &tslots[id];
+            if (s->finalized || (uintptr_t)s->t.mem != k.addr) continue;
+            TexKey sk;
+            make_key(&s->t, &sk);
+            if (!memcmp(&sk, &k, sizeof k)) s->finalized = 1, s->ce = NULL, changed = 1;
+        }
     if (e && !e->released) {
         mark_released(e);
+        changed = 0;   // the image's release already invalidated the address bucket
         sweep_released();
     }
+    if (changed) tex_gen_bump(k.addr);
     unlock();
 }
 
@@ -2441,7 +2591,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     // again (slot_resolve's stale rule), so it goes the full way. A slot held out of the pool (cheld) keeps that too:
     // the same descriptor names the same held texture. Both only while the resolution is current (cgen): a destroyed
     // entry bumped the generation and its record may be freed, so ce is not read past that.
-    int current = s->used && s->cgen == agen[sinfo[id] & 0xffff];
+    int current = s->used && !s->finalized && s->cgen == agen[sinfo[id] & 0xffff];
     if (current && ((s->ce && !s->ce->released) || s->cheld) && !memcmp(&s->t, t, sizeof *t) &&
         s->has_view == (v != NULL) && (!v || !memcmp(&s->v, v, sizeof *v))) {
         n_same_regs++;
@@ -2451,6 +2601,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     s->t = *t;
     if (!s->used && id < VK_POOL_TEX) pool_slots++;
     s->used = 1;
+    s->finalized = 0;
     s->ce = NULL;
     s->cheld = 0;
     slots_gen++;
@@ -2509,7 +2660,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     make_key(&s->t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
     int stale = 0;
-    if (!e || e->released) {   // a finalized slot follows the live texture at its storage
+    if (!e || e->released || s->finalized) {   // a finalized slot follows live GPU content, not newly reused CPU bytes
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
         // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
@@ -2529,17 +2680,14 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             // that 2D image, no 3D view can be made of it (vk_exec_draw.c get_view) and they read and wrote stand-ins.
             // With the target kept they get the volume itself.
             if (p->key.d.target != k.d.target) continue;
-            if (same_but_swizzle(&p->key, &k)) { e = p; break; }
+            if (same_but_swizzle(&p->key, &k) && (!cpu_slot || !s->finalized || alias_has_gpu_content(p))) { e = p; break; }
             if (!any && (!cpu_slot || alias_has_gpu_content(p))) any = p;
         }
-        // own is missing or released here; for a CPU slot entry_of below finds or revives it by key. A CPU slot whose
-        // own entry was released after the slot was registered is stale: the game finalized that texture and is
-        // freeing its storage, and reviving it uploaded from that storage while another thread unmapped it (an
-        // access violation in tex_bl_copy from the pool refresh, Kokiri Forest). It resolves to nothing; a slot
-        // registered again after the release is live and revives the entry.
+        // A finalized CPU descriptor must not recreate its image from freed storage. The slot keeps this state even
+        // after its released image was evicted; registering the descriptor again makes it current.
         if (!e && any) e = any;
         else if (!e && !cpu_slot) e = own && own->superseded ? NULL : own;   // a superseded one: entry_of takes it back
-        else if (!e && own && (uint32_t)(sinfo[s - tslots] >> 16) <= own->rel_serial) stale = 1;
+        else if (!e && cpu_slot && s->finalized) stale = 1;
     }
     if (!e && s->t.mem && !stale) {
         // evicted by disuse: the pool refresh keeps the stand-in, without spending the creation budget on it
@@ -2665,6 +2813,27 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     if (view) *view = has_view ? s->cview : s->v;
     if (has_view) *has_view = view ? s->chas_view : s->has_view;
     return e ? &e->pub : NULL;
+}
+
+// Texture detail: the texture slot id resolves to was made without its top levels, and a shader binding reads its
+// texels by position or asks for its size (vk_exec_draw.c tex_info_full, GfxShaderRes.exact). Its key joins exact, the
+// entry goes and the lookup makes it again whole, uploaded from its storage as a texture seen for the first time. A
+// lookup that is out of its creation budget leaves the stand-in for now, as for any new texture. Texture lock held.
+const VkTexImage *vk_texture_exact_by_id_locked(int id, view_t *view, int *has_view) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
+    TexSlot *s = &tslots[id];
+    Tex *e = s->ce && s->cgen == agen[sinfo[id] & 0xffff] ? s->ce : NULL;   // what the caller's lookup just resolved
+    if (e && e->pub.skip) {
+        if (exact.n >= EXACT_MAX) nvn_hm_clear(&exact, NULL);   // never seen; they would be found again one by one
+        nvn_hm_put(&exact, &e->key, (void *)(uintptr_t)1);
+        n_exact++;
+        static volatile int32_t n_logged;
+        log_limited(&n_logged, "texture detail: texture %#llx (fmt %#x %ux%u, %u levels) is read by texel position or its "
+                    "size is asked for: made whole again (%llu so far)", (unsigned long long)e->pub.addr, e->t.d.format,
+                    e->t.d.width, e->t.d.height, e->pub.levels + e->pub.skip, (unsigned long long)n_exact);
+        destroy_tex(e);
+    }
+    return vk_texture_by_id_locked(id, view, has_view);
 }
 
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
@@ -2798,8 +2967,8 @@ static int texels_read_record(Tex *e, const Region *g, const NVNcopyRegion *r, T
         log_limited(&n_ds, "texels of packed depth-stencil format %#x are not copied", e->t.d.format);
         return 0;
     }
-    if (g->level >= e->pub.levels) return 0;
-    uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
+    if (g->level < e->pub.skip || g->level - e->pub.skip >= e->pub.levels) return 0;   // a level the image lacks
+    uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height, il = g->level - e->pub.skip;
     t->w = w;
     t->ib = e->f.expand_rgb ? (size_t)g->bpb / 3 * 4 : 0;
     t->slice = t->ib ? (size_t)w * h * t->ib : g->wb * g->hb;
@@ -2808,7 +2977,7 @@ static int texels_read_record(Tex *e, const Region *g, const NVNcopyRegion *r, T
     if (!rg) rt_fatal("vk: out of memory for a texture read");
     for (int z = 0; z < g->nz; z++)
         rg[z] = (VkBufferImageCopy){.bufferOffset = t->slice * (size_t)z,
-                                    .imageSubresource = {aspect, g->level, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
+                                    .imageSubresource = {aspect, il, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
                                     .imageOffset = {r->xoffset, r->yoffset, g->is3d ? r->zoffset + z : 0},
                                     .imageExtent = {w, h, 1}};
     VkCommandBuffer cb = vk_upload_begin();
@@ -2851,7 +3020,11 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         log_limited(&n_ds, "texels of packed depth-stencil format %#x are not copied", e->t.d.format);
         return 0;
     }
-    if (g->level >= e->pub.levels) return 0;
+    // Texture detail: a level the image was made without takes no texels (the storage holds them, vk_write_texels); the
+    // others are the image's level g->level - skip, the rectangle unchanged.
+    if (g->level < e->pub.skip) return 1;
+    uint32_t il = g->level - e->pub.skip;
+    if (il >= e->pub.levels) return 0;
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
     int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && vk_astc_gpu();
     size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
@@ -2878,7 +3051,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
             for (size_t y = 0; y < g->hb; y++) memcpy(s + y * g->wb, m + y * g->row, g->wb);
         }
         rg[z] = (VkBufferImageCopy){.bufferOffset = slice * (size_t)z,
-                                    .imageSubresource = {aspect, g->level, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
+                                    .imageSubresource = {aspect, il, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
                                     .imageOffset = {r->xoffset, r->yoffset, g->is3d ? r->zoffset + z : 0},
                                     .imageExtent = {w, h, 1}};
     }
@@ -3001,8 +3174,8 @@ static void write_back_n(Tex **v, int n) {
         Tex *e = v[i];
         const nvn_texdesc *d = &e->t.d;
         int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
-        uint32_t levels = linear ? 1 : e->pub.levels, layers = linear || is3d ? 1 : e->pub.layers;
-        for (uint32_t lv = 0; lv < levels; lv++)
+        uint32_t levels = linear ? 1 : e->pub.levels + e->pub.skip, layers = linear || is3d ? 1 : e->pub.layers;
+        for (uint32_t lv = linear ? 0 : e->pub.skip; lv < levels; lv++)   // the game's levels the image holds
             for (uint32_t ly = 0; ly < layers; ly++) {
                 if (np == cap) {
                     cap = cap ? cap * 2 : 16;
@@ -3332,7 +3505,7 @@ void vk_sampler_register(int id, const samp_par *s) {
         sslots = p, nsslots = n;
     }
     sslots[id].p = *s;
-    sslots[id].s = sslots[id].sp = sslots[id].sc = VK_NULL_HANDLE;
+    sslots[id].s = sslots[id].sp = sslots[id].sc = sslots[id].sd[0] = sslots[id].sd[1] = VK_NULL_HANDLE;
     sslots[id].used = 1;
     samp_gen++;
     unlock();
@@ -3354,7 +3527,8 @@ void vk_sampler_dlss_bias(float b) {
         rt_log("vk: texture LOD bias %.2f on the scene's tiled textures (the upscaler's render scale; was %.2f)", b,
                dlss_bias);
         dlss_bias = b;
-        for (int i = 0; i < nsslots; i++) sslots[i].s = sslots[i].sp = sslots[i].sc = VK_NULL_HANDLE;   // looked up again (the key moves)
+        for (int i = 0; i < nsslots; i++)   // looked up again (the key moves)
+            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
         samp_gen++;
     }
     unlock();
@@ -3375,7 +3549,8 @@ void vk_sampler_aniso_live(void) {
     if (sf.init && a != sf.aniso) {
         sf.aniso = a;
         aniso_log();
-        for (int i = 0; i < nsslots; i++) sslots[i].s = sslots[i].sp = sslots[i].sc = VK_NULL_HANDLE;   // looked up again (the key moves)
+        for (int i = 0; i < nsslots; i++)   // looked up again (the key moves)
+            sslots[i].s = sslots[i].sp = sslots[i].sc = sslots[i].sd[0] = sslots[i].sd[1] = VK_NULL_HANDLE;
         samp_gen++;
     }
     unlock();
@@ -3458,6 +3633,35 @@ VkSampler vk_sampler_compare_by_id_locked(int id) {
     return s->sc;
 }
 
+// Texture detail: a texture made without its top `skip` levels has the game's level i + skip at its level i, and the
+// LOD the device works out for it is the game's less skip, so the level a sample lands on is the game's wherever that
+// level is kept. A sampler's LOD clamp counts the game's levels and has to move down with them: a clamp to levels 0-2
+// left alone would let the image's level 2 through, the game's level 4. The bias is relative and stays. A clamp that is
+// open (from 0, up to more levels than a texture has) is the same sampler. Only draws that bind texture and sampler
+// as one resource come here (vk_exec_draw.c tex_info_full); the sampler pool's entries serve every texture and keep
+// the game's clamp.
+VkSampler vk_sampler_detail_by_id_locked(int id, uint32_t skip) {
+    VkCtx *c = vk_ctx();
+    if (!skip || skip > 2) return vk_sampler_by_id_locked(id);
+    if (!c || id < 0 || id >= nsslots || !sslots[id].used) return VK_NULL_HANDLE;
+    SampSlot *s = &sslots[id];
+    if (!s->sd[skip - 1]) {
+        samp_par k = s->p;
+        if (k.lod_min > 0) k.lod_min = fmaxf(k.lod_min - (float)skip, 0);
+        if (k.lod_max < 32) k.lod_max = fmaxf(k.lod_max - (float)skip, 0);   // 32 and more: above any texture's last level
+        if (k.lod_min == s->p.lod_min && k.lod_max == s->p.lod_max) {
+            s->sd[skip - 1] = vk_sampler_by_id_locked(id);
+        } else {
+            static int told;   // a clamp that leaves levels out; one up to a texture's last level changes nothing
+            if ((s->p.lod_min > 0 || s->p.lod_max < 8) && told++ < 8)
+                rt_log("vk: texture detail: sampler slot %d clamps the LOD to %g..%g; %g..%g for a texture made without %u "
+                       "levels", id, s->p.lod_min, s->p.lod_max, k.lod_min, k.lod_max, skip);
+            s->sd[skip - 1] = sampler_for(c, &k);
+        }
+    }
+    return s->sd[skip - 1];
+}
+
 VkSampler vk_sampler_by_id(int id) {
     lock();
     VkSampler v = vk_sampler_by_id_locked(id);
@@ -3511,6 +3715,7 @@ void vk_texture_census_log(uint64_t frame) {
     enum { K_BC3, K_RGBA8, K_CPU, K_GPU, K_N };
     static const char *const kn[K_N] = {"ASTC as BC3", "ASTC as RGBA8", "other CPU-written", "GPU-written"};
     uint64_t n[K_N] = {0}, b[K_N] = {0}, in[K_N] = {0}, ib[K_N] = {0}, bound = 0, dup_n = 0, dup_b = 0;
+    uint64_t sk_n[3] = {0}, sk_b[3] = {0};   // texture detail: entries made without 1 and 2 levels, and their memory
     struct { int fmt; uint64_t n, b; } fm[48];
     int nfm = 0;
     struct { uint64_t b; uint32_t w, h, d, levels; int fmt, gpu; } big[4] = {{0}};   // copied: read after unlock
@@ -3525,6 +3730,7 @@ void vk_texture_census_log(uint64_t frame) {
         if (!e->bytes) { bound += e->bound_to != NULL; continue; }
         int k = !comes_back_intact(e) ? K_GPU : e->f.astc_bw ? (e->f.astc_bc ? K_BC3 : K_RGBA8) : K_CPU;
         n[k]++, b[k] += e->bytes;
+        if (e->pub.skip < 3) sk_n[e->pub.skip]++, sk_b[e->pub.skip] += e->bytes;
         if (idle(e, now)) in[k]++, ib[k] += e->bytes;
         int j = 0;
         while (j < nfm && fm[j].fmt != (int)e->f.vk) j++;
@@ -3570,8 +3776,13 @@ void vk_texture_census_log(uint64_t frame) {
     for (int k = 0; k < K_N; k++)
         o += snprintf(line + o, sizeof line - (size_t)o, " %s %llu %.0f MiB (%llu %.0f MiB);", kn[k], (unsigned long long)n[k],
                       b[k] / M, (unsigned long long)in[k], ib[k] / M);
-    snprintf(line + o, sizeof line - (size_t)o, " bound into pool memory %llu; sharing an address with another %llu %.0f MiB",
-             (unsigned long long)bound, (unsigned long long)dup_n, dup_b / M);
+    o += snprintf(line + o, sizeof line - (size_t)o, " bound into pool memory %llu; sharing an address with another %llu %.0f MiB",
+                  (unsigned long long)bound, (unsigned long long)dup_n, dup_b / M);
+    if (detail_most())   // nothing more in the line at full detail
+        snprintf(line + o, sizeof line - (size_t)o, "; texture detail: made without their top level %llu %.0f MiB, without "
+                 "two %llu %.0f MiB, made whole again for a shader %llu (%u shaders loaded read a texture by texel "
+                 "position or size)", (unsigned long long)sk_n[1], sk_b[1] / M, (unsigned long long)sk_n[2], sk_b[2] / M,
+                 (unsigned long long)n_exact, gfx_shader_exact_seen());
     rt_log("%s", line);
     for (int x = 0; x < nfm; x++)   // by bytes, largest first
         for (int y = x + 1; y < nfm; y++)

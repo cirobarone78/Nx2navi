@@ -133,7 +133,7 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
    3 minutes without a count moving it says so, and that the step is still running.
 4. **Draw the Button Prompts**, only when the version holds button art (`app/<version>/prompt-art`, a release made
    with `--prompt-art`; `build.has_prompt_art`): make_game.py's last step runs `tools/pad_prompts.py` on that art
-   and writes the Xbox, PlayStation and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
+   and writes the Xbox, PlayStation, Steam Deck and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
    30 s), which the game's Controls > Button prompts loads. The keyboard and mouse prompts show the keys of
    `nx2navi.ini`'s `bind_` lines, so Rebuild the Game after rebinding keys draws them again; the step's key names
    all it reads (the RomFS, the art, the tools, those lines), so it runs again only when one changed or a folder is

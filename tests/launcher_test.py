@@ -1091,6 +1091,30 @@ class PromptArtTest(Tmp):
         for tools in (make_launcher.TOOLS, make_kit.TOOLS):
             self.assertLessEqual(local | {'pad_prompts.py'}, set(tools))
 
+    def test_launcher_release_carries_what_make_game_imports(self):
+        """Every tool make_game.py imports is in the launcher release, unless the import sits in a try that catches
+        ImportError (build_shaders: a source checkout's step the release's prebuilt headers do not need) or only runs
+        on Linux (build_game, whose kit carries it). An import that is neither stopped every player's update at its
+        compile step."""
+        import ast
+        import make_launcher
+        tree = ast.parse((ROOT / 'tools' / 'make_game.py').read_text(encoding='utf-8'))
+        guarded = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try) and any(
+                    isinstance(h.type, ast.Name) and h.type.id in ('ImportError', 'ModuleNotFoundError')
+                    for h in node.handlers):
+                for inner in node.body:
+                    guarded |= {id(n) for n in ast.walk(inner)}
+        needed = set()
+        for node in ast.walk(tree):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
+            for root in (n.split('.')[0] for n in names):
+                if (ROOT / 'tools' / f'{root}.py').is_file() and id(node) not in guarded and root != 'build_game':
+                    needed.add(f'{root}.py')
+        self.assertLessEqual(needed, set(make_launcher.TOOLS))
+
 
 # ---------------------------------------------------------------- make_game.py
 
@@ -1573,9 +1597,11 @@ class MakeGameTest(Tmp):
             self.assertEqual((others, runs), (['compile', 'lift', 'romfs', 'scan', 'shaders'], 1))
             self.assertEqual(states(ev), ['start', 'done'])
             fractions = [e['fraction'] for e in ev if e['ev'] == 'progress']
-            self.assertEqual(fractions, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            sets = len(self.mg.prompt_art.OVERLAYS)   # two folders per pad style and the keyboard and mouse one
+            self.assertEqual(sets, 7)
+            self.assertEqual(fractions, [round(i / sets, 4) for i in range(sets + 1)])
             details = [e['detail'] for e in ev if e['ev'] == 'progress']
-            self.assertEqual(details[-1], 'Drew 5 of 5 sets of button prompts')
+            self.assertEqual(details[-1], f'Drew {sets} of {sets} sets of button prompts')
             self.assertIn('prompts', json.loads((self.out / 'build-cache' / 'state.json').read_text())['steps'])
             self.assertEqual(build(), ([], [{'ev': 'step', 'step': 'prompts', 'state': 'skip'}], 1))
             # a setting that is no key binding changes nothing; a binding draws the prompts again, and only them
@@ -1711,6 +1737,119 @@ class MakeGameTest(Tmp):
         (self.tmp / 'n.txt').write_text(dlss_pin.notice_text(), encoding='utf-8')
         self.assertEqual(self.mg.notice_sha256(self.tmp / 'n.txt'), dlss_pin.SHA256)
         self.assertEqual((dlss_pin.NAME, dlss_pin.NOTICE), (self.mg.DLSS_DLL, self.mg.DLSS_NOTICE))
+
+    def test_dlss_library_beside_the_game_on_linux(self):
+        """The kit's libnvidia-ngx-dlss.so.<version> and its notice go beside the game. The name carries the DLSS
+        version, so a kit with another version replaces the file an earlier build placed under its old name, and a
+        library the player put there, of any version, is kept. Each platform places only its own library."""
+        from unittest import mock
+        kit, out = self.tmp / 'kit', self.tmp / 'game'
+        (kit / 'bin').mkdir(parents=True)
+        out.mkdir()
+        note = out / 'libnvidia-ngx-dlss-NOTICE.txt'
+
+        def kit_lib(version, data, when):
+            for old in (kit / 'bin').glob('libnvidia-ngx-dlss.so.*'):
+                old.unlink()
+            lib = kit / 'bin' / f'libnvidia-ngx-dlss.so.{version}'
+            lib.write_bytes(data)
+            os.utime(lib, (when, when))
+            (kit / 'bin' / 'libnvidia-ngx-dlss-NOTICE.txt').write_text(
+                f'NVIDIA DLSS {version}\n\nsha256 {hashlib.sha256(data).hexdigest()}\n')
+
+        def beside(folder=out):
+            return sorted(p.name for p in folder.iterdir())
+
+        with mock.patch.object(self.mg, 'KIT', kit):
+            self.assertIsNone(self.mg.place_dlss(out, linux=True))   # a kit without DLSS: nothing
+            self.assertEqual(beside(), [])
+            (kit / 'bin' / 'nvngx_dlss.dll').write_bytes(b'the Windows DLL')
+            self.assertIsNone(self.mg.place_dlss(out, linux=True))   # the Windows DLL is not a Linux build's
+            self.assertEqual(beside(), [])
+            kit_lib('310.9.1', b'dlss one', 1_700_000_000)
+            self.assertIsNone(self.mg.place_dlss(out, linux=True))
+            self.assertEqual(beside(), ['libnvidia-ngx-dlss-NOTICE.txt', 'libnvidia-ngx-dlss.so.310.9.1'])
+            self.assertEqual((out / 'libnvidia-ngx-dlss.so.310.9.1').read_bytes(), b'dlss one')
+            self.assertIn(hashlib.sha256(b'dlss one').hexdigest(), note.read_text())
+            self.assertIsNone(self.mg.place_dlss(out, linux=True))   # unchanged
+            self.assertEqual(len(beside()), 2)
+            kit_lib('310.10.0', b'dlss two', 1_700_100_000)          # another version: the earlier build's file goes
+            self.assertIsNone(self.mg.place_dlss(out, linux=True))
+            self.assertEqual(beside(), ['libnvidia-ngx-dlss-NOTICE.txt', 'libnvidia-ngx-dlss.so.310.10.0'])
+            self.assertEqual((out / 'libnvidia-ngx-dlss.so.310.10.0').read_bytes(), b'dlss two')
+            self.assertIn(hashlib.sha256(b'dlss two').hexdigest(), note.read_text())
+            # a library the player put there first, of another version: kept, and the kit's is not placed beside it
+            mine = self.tmp / 'mine'
+            mine.mkdir()
+            (mine / 'libnvidia-ngx-dlss.so.310.4.0').write_bytes(b"the player's own DLSS")
+            self.assertIn('libnvidia-ngx-dlss.so.310.4.0 kept', self.mg.place_dlss(mine, linux=True))
+            self.assertEqual(beside(mine), ['libnvidia-ngx-dlss.so.310.4.0'])
+            # the same version with other bytes (the player's own build) is kept too
+            (mine / 'libnvidia-ngx-dlss.so.310.4.0').unlink()
+            (mine / 'libnvidia-ngx-dlss.so.310.10.0').write_bytes(b"the player's own build")
+            self.assertIn('kept', self.mg.place_dlss(mine, linux=True))
+            self.assertEqual((mine / 'libnvidia-ngx-dlss.so.310.10.0').read_bytes(), b"the player's own build")
+            # a player's library put beside a library an earlier build placed: both stay
+            (out / 'libnvidia-ngx-dlss.so.310.4.0').write_bytes(b"the player's own DLSS")
+            self.assertIn('kept', self.mg.place_dlss(out, linux=True))
+            self.assertEqual(len(beside()), 3)
+            # and a Windows build takes the DLL, not the library
+            win = self.tmp / 'win'
+            win.mkdir()
+            self.assertIsNone(self.mg.place_dlss(win))
+            self.assertEqual(beside(win), ['nvngx_dlss.dll'])
+
+    def test_dlss_pin_for_linux(self):
+        """The Linux library is pinned beside the Windows DLL, at the same DLSS version with its own size and sha256.
+        A file on disk must be the pinned one, a missing one is downloaded into the cache under its own name, and the
+        notice names the library and carries the sha256 line make_game.py reads."""
+        import dlss_pin
+        from unittest import mock
+        p = dlss_pin.pin(linux=True)
+        self.assertEqual(p.name, f'libnvidia-ngx-dlss.so.{dlss_pin.VERSION}')
+        self.assertTrue(p.name.startswith(self.mg.DLSS_SO_PREFIX))
+        self.assertFalse(p.notice.startswith(self.mg.DLSS_SO_PREFIX))   # the runtime takes that prefix for the library
+        self.assertEqual(p.notice, self.mg.DLSS_SO_NOTICE)
+        self.assertEqual(dlss_pin.pin().name, dlss_pin.NAME)             # the default is still the Windows DLL
+        self.assertNotEqual((p.size, p.sha256), (dlss_pin.SIZE, dlss_pin.SHA256))
+        (self.tmp / 'n.txt').write_text(dlss_pin.notice_text(linux=True), encoding='utf-8')
+        self.assertEqual(self.mg.notice_sha256(self.tmp / 'n.txt'), p.sha256)
+        self.assertIn(p.name, dlss_pin.notice_text(linux=True))
+        self.assertNotIn('nvngx_dlss.dll', dlss_pin.notice_text(linux=True))
+        data = b'a DLSS library'
+        lib, cache = self.tmp / 'file.so', self.tmp / 'dl'
+        lib.write_bytes(data)
+        fetched = []
+
+        def download(url, dest, sha256=None, size=None):
+            fetched.append((url, Path(dest).name, sha256, size))
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(data)
+            return dest
+
+        pinned = dict(LINUX_SIZE=len(data), LINUX_SHA256=hashlib.sha256(data).hexdigest(),
+                      SIZE=len(data) + 1, SHA256=hashlib.sha256(data + b'!').hexdigest())
+        with mock.patch.multiple(dlss_pin, **pinned), mock.patch('launcher.net.download', download), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(dlss_pin.resolve(lib, cache, linux=True), lib)
+            with self.assertRaises(SystemExit):   # the Windows DLL's pin does not accept the Linux file
+                dlss_pin.resolve(lib, cache)
+            lib.write_bytes(b'another DLSS!')
+            with self.assertRaises(SystemExit):
+                dlss_pin.resolve(lib, cache, linux=True)
+            with self.assertRaises(SystemExit):
+                dlss_pin.resolve(self.tmp / 'missing.so', cache, linux=True)
+            self.assertEqual(fetched, [])
+            self.assertEqual(dlss_pin.resolve(None, cache, linux=True), cache / p.name)
+            self.assertEqual(fetched, [(p.url, p.name, hashlib.sha256(data).hexdigest(), len(data))])
+            self.assertEqual(dlss_pin.resolve(None, cache), cache / f'nvngx_dlss-{dlss_pin.VERSION}.dll')
+            self.assertEqual(fetched[1][:2], (dlss_pin.URL, f'nvngx_dlss-{dlss_pin.VERSION}.dll'))
+            bin_dir = self.tmp / 'bin'
+            bin_dir.mkdir()
+            dlss_pin.place(cache / p.name, bin_dir, linux=True)
+            self.assertEqual((bin_dir / p.notice).read_text(encoding='utf-8'), dlss_pin.notice_text(linux=True))
+        self.assertEqual(sorted(x.name for x in bin_dir.iterdir()), sorted([p.notice, p.name]))
+        self.assertEqual((bin_dir / p.name).read_bytes(), data)
 
     def test_compile_key_ignores_file_time_and_sysroot(self):
         """The compiler's id leaves its file time out (a tool update that puts the same compiler back keeps every

@@ -16,7 +16,7 @@ it is zipped.
 
 --prompt-art names folders that hold XGamepad, P5Gamepad and Keyboard_Mouse, or those three folders themselves: the
 pictures tools/pad_prompts.py reads go into the kit's prompt-art folder (tools/prompt_art.py art_files), and
-make_game.py draws the Xbox, PlayStation and keyboard and mouse prompts from them. Without it the kit builds the game
+make_game.py draws the Xbox, PlayStation, Steam Deck and keyboard and mouse prompts from them. Without it the kit builds the game
 with the game's own prompts only.
 """
 import argparse

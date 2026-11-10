@@ -347,13 +347,15 @@ static int row_text(const char *key, const char *label, const char *desc, const 
         dl->AddText(font, small, ImVec2(nx, ny), v.note ? IM_COL32(250, 206, 130, 255) : SKIN_TEXT_DIM, t, NULL, 0, &nclip);
         if (tw > 0) note_right = nx - fs * 0.6f;
     }
-    // the label and its note, clipped before the value
+    // the label and its note, clipped before the value. A restart-only setting says "after restart" while its value
+    // differs from the one the game started with (cfg_pending), so the note marks what a restart would change; the
+    // description says it whatever the value (desc_set)
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
     dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : SKIN_TEXT, label, NULL, 0, &clip);
-    const char *note = disabled        ? disabled
-                     : off             ? menu_text(UI_MENU_SET_BY_ENV)
-                     : m && !m->live ? menu_text(UI_MENU_AFTER_RESTART)
-                                     : NULL;
+    const char *note = disabled                          ? disabled
+                     : off                               ? menu_text(UI_MENU_SET_BY_ENV)
+                     : m && !m->live && cfg_pending(key) ? menu_text(UI_MENU_AFTER_RESTART)
+                                                         : NULL;
     ImVec4 note_clip(p.x, p.y, note_right, p.y + h);
     if (note)
         dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : SKIN_TEXT_DIM, note, NULL, 0,

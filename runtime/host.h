@@ -23,6 +23,7 @@ void rt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rt_vlogf(const char *fmt, va_list ap);
 void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
+void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
        RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
 extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
@@ -185,6 +186,16 @@ void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen r
                                                            // before a kernel write (file read) into guest memory
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
+// NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
+int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
+                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
+uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx);
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t out[][2], int max);
+int mem_lazy_armed(uint64_t a, uint64_t n);
+void mem_lazy_window(int open);
+void mem_lazy_release(uint64_t a, uint64_t n);
+void mem_lazy_report(uint64_t frame, uint64_t skipped);
+int mem_lazy_pick(uint64_t *addr, int max);                // test: addresses of armed pages
 int mem_probe(uint64_t a, uint64_t n);                     // the 2 MiB regions inside [a, a+n) fault on their next access
 int mem_probing(void);                                     // the probe is on
 void mem_probe_report(uint64_t frame);                     // logs the accesses since the last report
@@ -379,4 +390,7 @@ int probe_movie(void);                                     // movie_probe.c: hos
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
 int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
+// vk_device.c: the drivers' own shader caches beside the exe (MESA_SHADER_CACHE_DIR, on NVIDIA's Linux driver
+// __GL_SHADER_DISK_CACHE_PATH and _SIZE) in the environment, once; before any thread can load a Vulkan driver
+void vk_driver_cache_env(void);
 int vk_pipeline_spirv_selftest(void);                      // vk_pipeline.c: --selftest, the SPIR-V rewrites without a device

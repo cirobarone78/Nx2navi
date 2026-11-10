@@ -84,6 +84,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Texture filtering",
     [UI_MENU_ANISO_DESC] = "Anisotropic filtering of surface textures: ground, roads and walls seen at a shallow angle stay sharp into the distance instead of blurring. Game: the level the game asks for, as on the Switch.",
     [UI_MENU_ANISO_GAME] = "Game",
+    [UI_MENU_TEX_DETAIL] = "Texture detail",
+    [UI_MENU_TEX_DETAIL_DESC] = "Sharpness of large surface textures. Reduced and Low leave out their largest versions, so that an area fits the video memory of 6 and 8 GB cards; only surfaces seen up close look softer. Automatic picks by the card's video memory.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Automatic: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Full", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduced", [UI_MENU_TEX_DETAIL_LOW] = "Low",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "How sharp FSR makes the picture. 0 turns it off.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "only with AMD FSR 1 or FSR 3.1",
@@ -252,8 +256,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PAD_LAYOUT_IN_USE] = "in use: %s",
     [UI_MENU_PROMPTS] = "Button prompts",
     [UI_MENU_PROMPTS_DESC] = "Which buttons the game's prompts show, in text, in the action prompt and on the "
-                             "ocarina's notes. Nintendo: the game's own. Xbox and PlayStation: that pad's buttons (LB, "
-                             "RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create), and A, B, X and Y as the "
+                             "ocarina's notes. Nintendo: the game's own. Xbox, PlayStation and Steam Deck: that pad's "
+                             "buttons (LB, RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create; the Deck's A, B, X, "
+                             "Y with L1, R1, L2, R2, Menu, View), and A, B, X and Y as the "
                              "button the layout above presses (with Nintendo (A right) the right button does A, so the "
                              "prompts for A show B, or circle). Keyboard and mouse: the key each button has (E, Ctrl, "
                              "Space, left click...), WASD for moving and the mouse for the camera. The prompt files "
@@ -262,7 +267,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                              "are part of the game's files, so a button you remap in Controls keeps its old prompt on "
                              "screen until the files are made again.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
     [UI_MENU_PROMPTS_MISSING] = "prompt files missing: tools/pad_prompts.py makes them",
     [UI_MENU_PROMPTS_FAILED] = "prompt files damaged: make them again with tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "prompts change after restart",
@@ -275,6 +281,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Restart the game now? Progress since your last save is lost.",
     [UI_MENU_QUIT_CONFIRM] = "Quit the game? Progress since your last save is lost.",
     [UI_MENU_RESTART_YES] = "Restart",
+    [UI_MENU_RESTART_COUNT] = "Restart (%d)",
     [UI_MENU_RESTART_SAVING] = "The game is saving: Restart is possible in a moment.",
     [UI_MENU_QUIT_SAVING] = "The game is saving: Quit is possible in a moment.",
     [UI_MENU_GROUP_STICKS] = "Analog sticks",
@@ -396,7 +403,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Lets a game thread interrupt another one on the same virtual core.",
     [UI_MENU_PREEMPT_OFF] = "Off", [UI_MENU_PREEMPT_ON] = "On", [UI_MENU_PREEMPT_INHERIT] = "Inheritance only",
     [UI_MENU_REPLAY_ASYNC] = "GPU frame prep on its own thread",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepares frames for the GPU on a separate thread instead of the game thread. Adds up to one frame of latency.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepares frames for the GPU on a separate thread instead of the game thread. Faster in heavy scenes, but can show a dark or flickering frame now and then, and adds up to one frame of latency.",
     [UI_MENU_TIMER_1MS] = "1 ms Windows timer",
     [UI_MENU_TIMER_1MS_DESC] = "Raises the system timer resolution to 1 ms for steadier frame pacing.",
     [UI_MENU_PIPE_WAIT] = "Waiting draw handling",
@@ -552,7 +559,20 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
+                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
+    [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
+    [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
+    [UI_MENU_FRAMEGEN_NEEDS_DLSS] = "choose a DLSS mode under Upscaling first",
+    [UI_MENU_FRAMEGEN_DESC_NONE] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1, and neither runs "
+                                   "here.",
+    [UI_MENU_FRAMEGEN_NEEDS_NONE] = "needs DLSS or FSR 3.1, which do not run here",
     [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
+    [UI_MENU_FG_MULT_DESC] = "Frames on screen for each frame the game draws with DLSS Frame Generation: 2x adds one "
+                             "generated frame, up to 6x on an RTX 50 card. Dynamic adds only the frames needed to "
+                             "reach your display's refresh rate. Changes take effect at once.",
+    [UI_MENU_FG_MULT_DYNAMIC] = "Dynamic",
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
                                    "the frames on screen, so the game draws the limit divided by this: set the limit "
@@ -628,6 +648,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Фильтрация текстур",
     [UI_MENU_ANISO_DESC] = "Анизотропная фильтрация текстур поверхностей: земля, дороги и стены под острым углом остаются чёткими вдали, а не размываются. Игра: уровень, который запрашивает игра, как на Switch.",
     [UI_MENU_ANISO_GAME] = "Игра",
+    [UI_MENU_TEX_DETAIL] = "Детализация текстур",
+    [UI_MENU_TEX_DETAIL_DESC] = "Чёткость больших текстур поверхностей. «Сниженная» и «Низкая» не загружают их самые крупные версии, чтобы область помещалась в видеопамять карт на 6 и 8 ГБ; мягче выглядят только поверхности вблизи. «Авто» выбирает по объёму видеопамяти.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Авто: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Полная", [UI_MENU_TEX_DETAIL_REDUCED] = "Сниженная", [UI_MENU_TEX_DETAIL_LOW] = "Низкая",
     [UI_MENU_SHARPNESS] = "Резкость FSR",
     [UI_MENU_SHARPNESS_DESC] = "Насколько FSR повышает резкость. 0 отключает.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "только с AMD FSR 1",
@@ -803,7 +827,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                              "перезапуска. Подсказки записаны в файлах игры, поэтому у кнопки, переназначенной на "
                              "вкладке управления, на экране остаётся прежняя подсказка, пока файлы не созданы заново.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
     [UI_MENU_PROMPTS_MISSING] = "нет файлов подсказок: их создаёт tools/pad_prompts.py",
     [UI_MENU_PROMPTS_FAILED] = "файлы подсказок повреждены: создайте их снова tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "подсказки сменятся после перезапуска",
@@ -816,6 +841,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Перезапустить игру сейчас? Прогресс после последнего сохранения будет потерян.",
     [UI_MENU_QUIT_CONFIRM] = "Выйти из игры? Прогресс после последнего сохранения будет потерян.",
     [UI_MENU_RESTART_YES] = "Перезапустить",
+    [UI_MENU_RESTART_COUNT] = "Перезапустить (%d)",
     [UI_MENU_RESTART_SAVING] = "Игра сохраняется: перезапуск будет доступен через мгновение.",
     [UI_MENU_QUIT_SAVING] = "Игра сохраняется: выход будет доступен через мгновение.",
     [UI_MENU_GROUP_STICKS] = "Стики",
@@ -939,7 +965,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Позволяет потоку игры прервать другой поток на том же виртуальном ядре.",
     [UI_MENU_PREEMPT_OFF] = "Выкл.", [UI_MENU_PREEMPT_ON] = "Вкл.", [UI_MENU_PREEMPT_INHERIT] = "Только наследование",
     [UI_MENU_REPLAY_ASYNC] = "Подготовка кадра для GPU в отдельном потоке",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Кадр для GPU готовится в отдельном потоке, а не в потоке игры. Добавляет до одного кадра задержки.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Кадр для GPU готовится в отдельном потоке, а не в потоке игры. Быстрее в тяжёлых сценах, но иногда может показать тёмный или мерцающий кадр и добавляет до одного кадра задержки.",
     [UI_MENU_TIMER_1MS] = "Таймер Windows 1 мс",
     [UI_MENU_TIMER_1MS_DESC] = "Повышает точность системного таймера до 1 мс для ровного темпа кадров.",
     [UI_MENU_PIPE_WAIT] = "Обработка ожидающих отрисовок",
@@ -1328,7 +1354,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Deixa uma thread do jogo interromper outra no mesmo núcleo virtual.",
     [UI_MENU_PREEMPT_OFF] = "Desligado", [UI_MENU_PREEMPT_ON] = "Ligado", [UI_MENU_PREEMPT_INHERIT] = "Só herança",
     [UI_MENU_REPLAY_ASYNC] = "Preparo de quadro da GPU em thread própria",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepara os quadros para a GPU numa thread separada em vez da thread do jogo. Adiciona até um quadro de latência.",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Prepara os quadros para a GPU numa thread separada em vez da thread do jogo. Mais rápido em cenas pesadas, mas pode mostrar um quadro escuro ou piscando de vez em quando, e adiciona até um quadro de latência.",
     [UI_MENU_TIMER_1MS] = "Timer do Windows de 1 ms",
     [UI_MENU_TIMER_1MS_DESC] = "Aumenta a resolução do timer do sistema para 1 ms, para um ritmo de quadros mais estável.",
     [UI_MENU_PIPE_WAIT] = "Tratamento de desenhos em espera",
@@ -1432,6 +1458,13 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                            "ângulo raso continuam nítidos ao longe em vez de borrar. Jogo: o nível que o jogo pede, "
                            "como no Switch.",
     [UI_MENU_ANISO_GAME] = "Jogo",
+    [UI_MENU_TEX_DETAIL] = "Detalhe das texturas",
+    [UI_MENU_TEX_DETAIL_DESC] = "Nitidez das texturas grandes de superfície. Reduzido e Baixo deixam de fora as versões "
+                                "maiores delas, para que uma área caiba na memória de vídeo de placas de 6 e 8 GB; só as "
+                                "superfícies vistas de perto ficam mais suaves. Automático escolhe pela memória de vídeo "
+                                "da placa.",
+    [UI_MENU_TEX_DETAIL_AUTO] = "Automático: %s",
+    [UI_MENU_TEX_DETAIL_FULL] = "Completo", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduzido", [UI_MENU_TEX_DETAIL_LOW] = "Baixo",
     [UI_MENU_COLOR] = "Cor",
     [UI_MENU_COLOR_PRESET] = "Perfil de cor",
     [UI_MENU_COLOR_PRESET_DESC] = "Define os quatro valores abaixo. Vívido: mais contraste e saturação, sombras um "
@@ -1495,6 +1528,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "Reiniciar o jogo agora? O progresso desde o último salvamento é perdido.",
     [UI_MENU_QUIT_CONFIRM] = "Sair do jogo? O progresso desde o último salvamento é perdido.",
     [UI_MENU_RESTART_YES] = "Reiniciar",
+    [UI_MENU_RESTART_COUNT] = "Reiniciar (%d)",
     [UI_MENU_RESTART_SAVING] = "O jogo está salvando: dá para reiniciar em um instante.",
     [UI_MENU_QUIT_SAVING] = "O jogo está salvando: dá para sair em um instante.",
     [UI_MENU_STICK_SENS] = "Velocidade da câmera (analógico)",
@@ -1964,7 +1998,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PREEMPT_ON] = "开",
     [UI_MENU_PREEMPT_INHERIT] = "仅继承",
     [UI_MENU_REPLAY_ASYNC] = "GPU 帧准备独立线程",
-    [UI_MENU_REPLAY_ASYNC_DESC] = "在单独的线程而不是游戏线程上为 GPU 准备帧。"
+    [UI_MENU_REPLAY_ASYNC_DESC] = "在单独的线程而不是游戏线程上为 GPU 准备帧。在复杂场景中更快，但偶尔可能出现变暗或闪烁的画面。"
                                   "最多增加一帧延迟。",
     [UI_MENU_TIMER_1MS] = "1 ms Windows 计时器",
     [UI_MENU_TIMER_1MS_DESC] = "将系统计时器精度提高到 1 ms，使帧间隔更平稳。",
@@ -2111,6 +2145,10 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "纹理过滤",
     [UI_MENU_ANISO_DESC] = "表面纹理的各向异性过滤：以小角度看到的地面、道路和墙壁在远处依然清晰，而不会模糊。游戏：使用游戏请求的级别，与 Switch 上相同。",
     [UI_MENU_ANISO_GAME] = "游戏",
+    [UI_MENU_TEX_DETAIL] = "纹理细节",
+    [UI_MENU_TEX_DETAIL_DESC] = "大型表面纹理的清晰度。“降低”和“低”不加载它们最大的版本，使一个区域能放进 6 GB 和 8 GB 显卡的显存；只有近处的表面看起来略微柔和。“自动”根据显卡的显存选择。",
+    [UI_MENU_TEX_DETAIL_AUTO] = "自动：%s",
+    [UI_MENU_TEX_DETAIL_FULL] = "完整", [UI_MENU_TEX_DETAIL_REDUCED] = "降低", [UI_MENU_TEX_DETAIL_LOW] = "低",
     [UI_MENU_HDR_GROUP] = "HDR",
     [UI_MENU_HDR] = "HDR 输出",
     [UI_MENU_HDR_DESC] = "在 HDR 显示器上呈现更亮的高光。请先在 Windows 中开启 HDR。",
@@ -2149,6 +2187,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RESTART_CONFIRM] = "现在重启游戏？上次存档之后的进度将会丢失。",
     [UI_MENU_QUIT_CONFIRM] = "退出游戏？上次存档之后的进度将会丢失。",
     [UI_MENU_RESTART_YES] = "重启",
+    [UI_MENU_RESTART_COUNT] = "重启（%d）",
     [UI_MENU_RESTART_SAVING] = "游戏正在存档：稍后即可重启。",
     [UI_MENU_QUIT_SAVING] = "游戏正在存档：稍后即可退出。",
     [UI_MENU_STICK_SENS] = "摇杆镜头速度",

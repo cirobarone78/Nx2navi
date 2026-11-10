@@ -108,9 +108,288 @@ static void unprobe_locked(uint64_t r) {
     plat_dec32(&nprb);
 }
 
+// Lazy write-back (NX2NAVI_WB_LAZY, default 1 on Windows and 0 elsewhere, vk_memory.c "lazy write-back"). It was off
+// by default in 0.7.0: with it on, single frames came out with the whole scene's shadowing missing, 10 to 180 of 1,800
+// presents standing in Hyrule Field with other programs keeping the CPU busy and none found with it off. That was
+// not this code's doing: frames were drawn from copies taken before the game's signal that their data was written
+// (vk_exec_xfer.c "events the CPU signals"), and with the write-backs gone the frames came faster and the signal fell
+// into the replay more often. With that fixed, two such runs under eight busy threads showed none.
+// What a shader wrote into a mirrored pool is
+// copied back into guest memory at the end of every submission, in case the CPU reads it. Ocarina's CPU does not read
+// most of it: standing in Hyrule Field, 66 MiB a frame went back over PCIe, 7 to 9 ms of each frame's 13 to 15 ms of
+// GPU time, and the write-back probe found no access to it in 40 s. So a range that went back once is armed here: its
+// whole pages are made inaccessible (mem_lazy_arm), and while it stays armed the back end leaves its later writes in
+// the mirror (mem_lazy_skip marks it stale). The first read or write of an armed page faults: lazy_fault has the
+// back end copy the range's bytes down now (lz_fetch, a GPU copy after everything submitted so far), gives the pages
+// back and runs the access again, and the range stays out for a while (lz_hot: 1 s, doubling to 32 s while it keeps
+// being touched), written back every submission as before. Every thaw (before the kernel writes or reads guest
+// memory, and before mapping changes) releases the armed ranges of its regions the same way.
+// A region with armed pages is not frozen (freeze_locked wants every page read-write), and a frozen one is not armed.
+// A fetch brings what the GPU work handed over so far wrote. The part of a submission that is being recorded has left
+// its writes out as well, and makes up for it when it finds a range it skipped no longer armed (vk_memory.c
+// lazy_part_check). Between that check and the part's hand-over a release would be seen by neither side, so the
+// replay opens a window there (mem_lazy_window) and a fault on an armed page waits for it to close: the fetch then
+// has the part's writes. Only a fault of the replay thread itself, a wait of 20 ms, or a release by a thaw goes ahead
+// inside the window (lz_gaps counts the faults): that part's writes to the range then reach guest memory with the
+// range's next write-back.
+typedef struct { uint64_t lo, hi, h0, h1; int64_t delta; uint8_t stale; } LzSeg;   // pages [lo, hi); buffer offset = address + delta
+static LzSeg *lzs;                      // frz_lock
+static int lz_n, lz_cap;                // frz_lock
+static volatile uint8_t lzr[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // a segment reaches into the region
+static uint32_t lz_hot[RT_ADDRESS_LIMIT >> FRZ_SHIFT];        // frz_lock: plat_now_ms() | 1 until which nothing is armed here
+static uint8_t lz_back[RT_ADDRESS_LIMIT >> FRZ_SHIFT];        // frz_lock: seconds of the region's last hold
+static volatile int32_t lz_on;
+static int lz_want;                     // the setting, read in mem_init
+static void (*lz_fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size);
+// The back end's test that the mirror holds every CPU write to [lo, hi) (vk_memory.c lazy_clean): a fetch copies the
+// mirror's bytes over the whole range, so a CPU write the mirror does not have yet would be lost to it.
+static int (*lz_clean)(uint64_t lo, uint64_t hi, void *ctx);
+static uint64_t lz_unclean;             // frz_lock: arms refused since the last report because the mirror lacked a CPU write
+// frz_lock: since the last report: faults by a read, by a write, other releases, fetches, their bytes and time
+static uint64_t lz_faults[2], lz_other, lz_fetches, lz_fetch_bytes, lz_fetch_ns, lz_gaps;
+static volatile uint32_t lz_win_tid;    // the replay thread's id while its part is between check and hand-over; 0 else
+
+static void lazy_flags_locked(uint64_t lo, uint64_t hi) {
+    for (uint64_t r = lo >> FRZ_SHIFT; r <= (hi - 1) >> FRZ_SHIFT; r++) {
+        int any = 0;
+        for (int j = 0; j < lz_n && !any; j++)
+            any = lzs[j].lo < ((r + 1) << FRZ_SHIFT) && lzs[j].hi > (r << FRZ_SHIFT);
+        __atomic_store_n(&lzr[r], (uint8_t)any, __ATOMIC_RELEASE);
+    }
+}
+
+// frz_lock held exclusively. Segment i goes: its bytes come down first when the mirror's are newer, then its pages
+// are read-write again. why: 0 a read fault, 1 a write fault (both hold the regions back), else a thaw or the mirror
+// going away.
+static void lazy_drop_locked(int i, int why) {
+    LzSeg s = lzs[i];
+    if (s.stale && lz_fetch) {
+        uint64_t t0 = plat_now_ns();
+        lz_fetch(s.h0, s.h1, (uint64_t)((int64_t)s.lo + s.delta), s.hi - s.lo);
+        lz_fetches++, lz_fetch_bytes += s.hi - s.lo, lz_fetch_ns += plat_now_ns() - t0;
+    }
+    for (uint64_t a = s.lo, b; a < s.hi; a = b)
+        if (plat_mem_state(a, s.hi, &b) == PLAT_PROT_NONE && !plat_mem_protect(a, b - a, PLAT_PROT_RW))
+            rt_fatal("memory: giving back the lazily written pages %#llx+%#llx failed", (unsigned long long)a,
+                     (unsigned long long)(b - a));
+    lzs[i] = lzs[--lz_n];
+    lazy_flags_locked(s.lo, s.hi);
+    if (why > 1) { lz_other++; return; }
+    lz_faults[why]++;
+    uint32_t now = (uint32_t)plat_now_ms();
+    for (uint64_t r = s.lo >> FRZ_SHIFT; r <= (s.hi - 1) >> FRZ_SHIFT; r++) {
+        int again = lz_hot[r] && (int32_t)(now - lz_hot[r]) < 60000;   // touched again within a minute of its last hold
+        uint8_t b = again ? (uint8_t)(lz_back[r] < 32 ? lz_back[r] * 2 : 32) : 1;
+        lz_back[r] = b ? b : 1;
+        lz_hot[r] = (now + (uint32_t)lz_back[r] * 1000u) | 1;
+    }
+}
+
+// frz_lock held exclusively: every segment that reaches into region r goes.
+static void lazy_drop_region_locked(uint64_t r, int why) {
+    for (int i = lz_n; i-- > 0;)
+        if (lzs[i].lo < ((r + 1) << FRZ_SHIFT) && lzs[i].hi > (r << FRZ_SHIFT)) lazy_drop_locked(i, why);
+}
+
+static int lazy_covered_locked(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < lz_n; i++)
+        if (lzs[i].lo <= lo && lzs[i].hi >= hi) return 1;
+    return 0;
+}
+
+// frz_lock held exclusively: [x, e), inside one region, becomes inaccessible when every committed page of it is
+// read-write, or inaccessible as part of a segment already; anything else (a read-only page, a hole, a page the game
+// made inaccessible itself) leaves it as it is. Then the back end checks that the mirror ctx belongs to holds every CPU
+// write to [x, e) (lz_clean): after the protection no write can come in, so a write that came before it is in the
+// write-watch or the page generations. When the mirror lacks one, the pages are given back and nothing is armed: the
+// CPU wrote into the range after its write-back reached guest memory and before this arm, and the next sync of the
+// mirror carries that write up; a fetch before it would have copied the mirror's older bytes over it (single frames
+// with another frame's lighting constants, or a black scene).
+static int lazy_protect_locked(uint64_t x, uint64_t e, void *ctx) {
+    uint64_t run[16][2];
+    int k = 0;
+    for (uint64_t a = x, b; a < e; a = b) {
+        int st = plat_mem_state(a, e, &b);
+        if (st == PLAT_PROT_RW) {
+            if (k == 16) return 0;
+            run[k][0] = a, run[k][1] = b, k++;
+        } else if (st != PLAT_PROT_NONE || !lazy_covered_locked(a, b)) return 0;
+    }
+    for (int i = 0; i < k; i++)
+        if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_NONE)) {
+            while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
+            return 0;
+        }
+    if (lz_clean && !lz_clean(x, e, ctx)) {
+        for (int i = 0; i < k; i++) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
+        lz_unclean++;
+        return 0;
+    }
+    return 1;
+}
+
+// Arms the whole pages of [a, a + n), which the back end has just written back from the buffer h0 into h1 at offset
+// off: they fault on their next access. Returns the bytes armed now. Not in a frozen, probed, held or thaw-held region.
+uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || a >= RT_ADDRESS_LIMIT || !watched(a, n)) return 0;
+    uint64_t lo = (a + PAGE - 1) & ~(PAGE - 1), hi = (a + n) & ~(PAGE - 1), armed = 0;
+    if (hi <= lo) return 0;
+    int64_t delta = (int64_t)off - (int64_t)a;
+    plat_mutex_lock(&frz_lock);
+    if (lazy_covered_locked(lo, hi)) {
+        plat_mutex_unlock(&frz_lock);
+        return 0;
+    }
+    uint32_t now = (uint32_t)plat_now_ms();
+    for (uint64_t x = lo, e; x < hi; x = e) {
+        uint64_t r = x >> FRZ_SHIFT;
+        e = (r + 1) << FRZ_SHIFT;
+        if (e > hi) e = hi;
+        if (frz[r] || prb[r] || (lz_hot[r] && (int32_t)(lz_hot[r] - now) > 0) ||
+            (thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) || !lazy_protect_locked(x, e, ctx))
+            continue;
+        uint64_t slo = x, shi = e;
+        uint8_t stale = 0;
+        for (int j = 0; j < lz_n; j++)   // one segment for what touches in the same buffer
+            if (lzs[j].h0 == h0 && lzs[j].delta == delta && lzs[j].lo <= shi && lzs[j].hi >= slo) {
+                if (lzs[j].lo < slo) slo = lzs[j].lo;
+                if (lzs[j].hi > shi) shi = lzs[j].hi;
+                stale |= lzs[j].stale;
+                lzs[j] = lzs[--lz_n];
+                j = -1;
+            }
+        if (lz_n == lz_cap) {
+            lz_cap = lz_cap ? lz_cap * 2 : 256;
+            lzs = realloc(lzs, sizeof *lzs * (size_t)lz_cap);
+            if (!lzs) rt_fatal("memory: out of memory for the lazily written ranges");
+        }
+        lzs[lz_n++] = (LzSeg){slo, shi, h0, h1, delta, stale};
+        __atomic_store_n(&lzr[r], 1, __ATOMIC_RELEASE);
+        armed += e - x;
+    }
+    plat_mutex_unlock(&frz_lock);
+    return armed;
+}
+
+// The armed parts of [a, a + n), sorted, into out (at most max); they count as stale from here on: the caller leaves
+// the bytes it is about to write there in the mirror. Returns how many.
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t out[][2], int max) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || !n || a >= RT_ADDRESS_LIMIT || a + n > RT_ADDRESS_LIMIT) return 0;
+    int any = 0, k = 0;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT && !any; r++) any = lzr[r];
+    if (!any) return 0;
+    plat_mutex_lock(&frz_lock);
+    for (int i = 0; i < lz_n && k < max; i++) {
+        uint64_t lo = lzs[i].lo > a ? lzs[i].lo : a, hi = lzs[i].hi < a + n ? lzs[i].hi : a + n;
+        if (lo >= hi) continue;
+        lzs[i].stale = 1;
+        int at = k++;
+        for (; at > 0 && out[at - 1][0] > lo; at--) out[at][0] = out[at - 1][0], out[at][1] = out[at - 1][1];
+        out[at][0] = lo, out[at][1] = hi;
+    }
+    plat_mutex_unlock(&frz_lock);
+    return k;
+}
+
+// [a, a + n) is armed as a whole still.
+int mem_lazy_armed(uint64_t a, uint64_t n) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return 0;
+    plat_mutex_lock(&frz_lock);
+    int ok = lazy_covered_locked(a, a + n);
+    plat_mutex_unlock(&frz_lock);
+    return ok;
+}
+
+// Releases what is armed in [a, a + n): before the buffers a fetch would read go away.
+void mem_lazy_release(uint64_t a, uint64_t n) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || !n) return;
+    plat_mutex_lock(&frz_lock);
+    for (int i = lz_n; i-- > 0;)
+        if (lzs[i].lo < a + n && lzs[i].hi > a) lazy_drop_locked(i, 4);
+    plat_mutex_unlock(&frz_lock);
+}
+
+// The back end is ready to fetch: arming starts. 0 when the setting is off (or the probe is on, which watches the
+// same pages).
+int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
+                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx)) {
+    if (!lz_want) return 0;
+    lz_fetch = fetch, lz_clean = clean;
+    __atomic_store_n(&lz_on, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+// Opens (under frz_lock, so no release is half done) or closes the window of the replay's part.
+void mem_lazy_window(int open) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return;
+    if (!open) {
+        __atomic_store_n(&lz_win_tid, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    plat_mutex_lock(&frz_lock);
+    __atomic_store_n(&lz_win_tid, plat_thread_id(), __ATOMIC_RELEASE);
+    plat_mutex_unlock(&frz_lock);
+}
+
+static int lazy_fault(uint64_t a, int write) {
+    if (a >= RT_ADDRESS_LIMIT || !__atomic_load_n(&lzr[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE)) return 0;
+    uint32_t me = plat_thread_id();
+    for (int tries = 0;; tries++) {
+        plat_mutex_lock(&frz_lock);
+        int i = 0;
+        while (i < lz_n && !(a >= lzs[i].lo && a < lzs[i].hi)) i++;
+        if (i == lz_n) {
+            plat_mutex_unlock(&frz_lock);
+            return 0;
+        }
+        uint32_t w = __atomic_load_n(&lz_win_tid, __ATOMIC_ACQUIRE);
+        if (w && w != me && tries < 400) {   // up to 20 ms: after the hand-over the fetch has that part's writes
+            plat_mutex_unlock(&frz_lock);
+            plat_wait_ns(50000);
+            continue;
+        }
+        if (w) lz_gaps++;
+        lazy_drop_locked(i, write != 0);
+        plat_mutex_unlock(&frz_lock);
+        return 1;
+    }
+}
+
+// Test (NX2NAVI_WB_LAZY_TOUCH): the first addresses of up to max armed segments, another set each call, for a caller
+// that reads them to make the faults a game's access would.
+int mem_lazy_pick(uint64_t *addr, int max) {
+    static int next;
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return 0;
+    int k = 0;
+    plat_mutex_lock(&frz_lock);
+    for (; k < max && k < lz_n; k++) addr[k] = lzs[(next + k) % lz_n].lo;
+    next += k;
+    plat_mutex_unlock(&frz_lock);
+    return k;
+}
+
+// One log line since the last one; skipped: the bytes the back end left in the mirror since then.
+void mem_lazy_report(uint64_t frame, uint64_t skipped) {
+    if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return;
+    plat_mutex_lock(&frz_lock);
+    uint64_t bytes = 0, fr = lz_faults[0], fw = lz_faults[1], other = lz_other, nf = lz_fetches, fb = lz_fetch_bytes,
+             fns = lz_fetch_ns, gaps = lz_gaps, unclean = lz_unclean;
+    int n = lz_n;
+    for (int i = 0; i < lz_n; i++) bytes += lzs[i].hi - lzs[i].lo;
+    lz_faults[0] = lz_faults[1] = lz_other = lz_fetches = lz_fetch_bytes = lz_fetch_ns = lz_gaps = lz_unclean = 0;
+    plat_mutex_unlock(&frz_lock);
+    rt_log("mem: lazy write-back at frame %llu: %d ranges armed, %.1f MiB; since the last line %.1f MiB left in the "
+           "mirror, %llu read and %llu write faults (%llu inside a part's window), %llu other releases, %llu fetches of "
+           "%.1f MiB in %.2f ms, %llu arms refused (a CPU write not in the mirror yet)", (unsigned long long)frame, n,
+           bytes / 1048576.0, skipped / 1048576.0, (unsigned long long)fr, (unsigned long long)fw,
+           (unsigned long long)gaps, (unsigned long long)other, (unsigned long long)nf, fb / 1048576.0, fns / 1e6,
+           (unsigned long long)unclean);
+}
+
 // frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
 static void thaw_locked(uint64_t r, int why) {
     if (why == 2) thaw_ms[r] = (uint32_t)plat_now_ms() | 1;
+    if (lzr[r]) lazy_drop_region_locked(r, why + 1);   // not a fault on an armed page: no hold
     if (prb[r]) unprobe_locked(r);
     if (!frz[r]) return;
     // The read-only runs only: freeze_locked left reserved holes (heap pages given back) as they were. Every committed
@@ -212,7 +491,8 @@ int mem_probe(uint64_t a, uint64_t n) {
     return armed;
 }
 
-int mem_probing(void) { return __atomic_load_n(&prb_on, __ATOMIC_RELAXED); }
+// Pages of guest memory may be inaccessible (the probe, or the lazy write-back): a kernel read of them has to thaw first.
+int mem_probing(void) { return __atomic_load_n(&prb_on, __ATOMIC_RELAXED) || __atomic_load_n(&lz_on, __ATOMIC_RELAXED); }
 
 // The platform's access-fault hook while the probe is on: the first access of a probed region ends its probe and is
 // noted; 1 runs the access again. A read that faulted in a region another thread gave back meanwhile retries too; a
@@ -230,6 +510,16 @@ static int probe_fault(uint64_t a, int write, uint64_t ip) {
     plat_mutex_unlock(&frz_lock);
     if (was) return 1;
     if (write) return 0;
+    uint64_t end;
+    return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) >= PLAT_PROT_READ;
+}
+
+// The platform's access-fault hook: an armed page of the lazy write-back first, then the probe. A read that faulted on
+// a page another thread gave back meanwhile runs again; a write goes on to thaw_fault.
+static int access_fault(uint64_t a, int write, uint64_t ip) {
+    if (__atomic_load_n(&lz_on, __ATOMIC_RELAXED) && lazy_fault(a, write)) return 1;
+    if (__atomic_load_n(&prb_on, __ATOMIC_RELAXED)) return probe_fault(a, write, ip);
+    if (write || a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
     uint64_t end;
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) >= PLAT_PROT_READ;
 }
@@ -348,8 +638,11 @@ void mem_init(void) {
     // depends on NX2NAVI_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
     cfg_init();
     if (cfg_bool("NX2NAVI_WB_PROBE")) {   // a diagnosis: off, no access fault reaches probe_fault and nothing is probed
-        plat_mem_access_hook(probe_fault);
+        plat_mem_access_hook(access_fault);
         __atomic_store_n(&prb_on, 1, __ATOMIC_RELEASE);
+    } else if (cfg_bool("NX2NAVI_WB_LAZY")) {   // armed only once the back end can fetch (mem_lazy_enable)
+        plat_mem_access_hook(access_fault);
+        lz_want = 1;
     }
     const char *pool = cfg_get("NX2NAVI_APP_POOL");
     L = (RtGuestLayout){
