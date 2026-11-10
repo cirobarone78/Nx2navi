@@ -2050,6 +2050,9 @@ typedef struct {   // an honest game's joins, pickups and uses in one pools' epo
     int nj;
     int64_t floor;                 // the claims of joins no longer kept, at the most they came to
     uint32_t gain, spend;          // its player's pickups and uses since its first join in the epoch, counted here
+    int own;                       // its game's own record of the epoch as the game last signed it (ob, og, os): final
+    int32_t ob;                    // once the game moved on to a later epoch
+    uint32_t og, os;
 } AdvEpoch;
 
 typedef struct {
@@ -2155,8 +2158,9 @@ static int adv_claim(const Adv *a, int h, int p, const AdvEpoch *e, int64_t *cla
 }
 
 // What pool p holds in honest game g's view by the ledger: the claims, pickups and uses in g's epoch of the honest games
-// it counts. held: only those whose record g holds as its owner holds it now (a record still on its way is lag, not
-// damage; at the end every record has arrived). 0 when none counts.
+// it counts. held: only those whose record g holds as its owner last signed it in that epoch (a record still on its way
+// is lag, not damage; at the end every record has arrived). An owner that moved on to a later epoch signs nothing more
+// in this one, so its last record there is final and counts once it arrived. 0 when none counts.
 static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
     int64_t b[ADV_H], gg[ADV_H], s[ADV_H], c, debt;
     int n = 0;
@@ -2165,10 +2169,9 @@ static int adv_ledger(const Adv *a, int g, int p, int held, int64_t *out) {
         const AdvLed *L = &a->led[h][p];
         const AdvEpoch *e = L->cur.ep == ep ? &L->cur : L->prev.valid && L->prev.ep == ep ? &L->prev : NULL;
         if (!e || !adv_counts(a, g, h) || !adv_claim(a, h, p, e, &c, &debt)) continue;
-        int32_t rb, ob;
-        uint32_t rg, rs, og, os;
-        if (held && !(coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs) &&
-                      coop_sync_own_record(a->h[h].eng, adv_pool_hash[p], &ob, &og, &os) && rb == ob && rg == og && rs == os))
+        int32_t rb;
+        uint32_t rg, rs;
+        if (held && !(e->own && coop_sync_record(a->h[g].eng, adv_pool_hash[p], a->hkid[h], &rb, &rg, &rs) && rb == e->ob && rg == e->og && rs == e->os))
             continue;
         b[n] = c, gg[n] = (int64_t)e->gain + debt, s[n] = e->spend, n++;
     }
@@ -2223,6 +2226,7 @@ static void adv_led_report(Adv *a, Game *g, const Flag *f, int was, int after) {
         L->has_carry = 0;
     }
     L->last = f->value;
+    e->own = coop_sync_own_record(g->eng, f->hash, &e->ob, &e->og, &e->os);
 }
 
 static void adv_led_applied(Adv *a, Game *g, const Flag *f) {
