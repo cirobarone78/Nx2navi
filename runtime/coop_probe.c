@@ -33,6 +33,13 @@ static int fails;
 // A member learns of a join or a leave from a roster datagram that may be lost; a relay sends it again within a second and every 5 s,
 // so this wait holds eleven of them: at 30 % loss they are all lost once in half a million waits.
 #define ROSTER_WAIT_MS 40000
+// With no loss (NX2NAVI_COOP_DROP unset) a roster step has no lost datagram to wait for, so it is bounded as the code
+// promises: a spoofed or listed-elsewhere session settles within 4 s (a rejoin once per backoff, the rosters after it;
+// it took under 2.5 s, the probe's earlier fixed wait), and after a roster forged a little ahead the relay's are taken
+// again within the silence time (1.5 s here) and 4 s (docs/coop.md, "the client and relay datagrams"), plus up to 1 s
+// for the mock relay's next roster and 1 s for a loaded machine. Lost datagrams make the waits long at 30 % loss.
+#define SETTLE_NO_LOSS_MS 4000
+#define STALE_NO_LOSS_MS (1500 + 4000 + 1000 + 1000)
 #define FAIL_RET(...) do { CHECK(0, __VA_ARGS__); return; } while (0)
 #define WAIT_FOR(cond, ms) ({ uint64_t t_ = plat_now_ms() + (ms); int ok_; while (!(ok_ = (cond)) && plat_now_ms() < t_) plat_sleep_ms(10); ok_; })
 
@@ -1310,8 +1317,15 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     // lost: the wait holds as many rosters as ROSTER_WAIT_MS does.
     recon = alice->saw_reconnect;
     mock->spoof = view_of(alice).self;
+    uint64_t spoofed_at = plat_now_ms();
     CHECK(WAIT_FOR(alice->saw_reconnect > recon && settled(mock, alice, bob), ROSTER_WAIT_MS),
           "F9: Alice joined again, and the relay and both rosters list her new session");
+    double settle_s = (double)(plat_now_ms() - spoofed_at) / 1000;
+    // with no loss nothing waits for a lost datagram: Alice joins again at the roster (once per backoff) and the next
+    // rosters name her new session (the probe's old fixed wait was 2.5 s); a rejoin or roster that comes late fails here
+    CHECK(drop || settle_s * 1000 <= SETTLE_NO_LOSS_MS, "F9: with no loss Alice's new session settled %.1f s after the spoofed "
+          "rejoin, not within %.1f s", settle_s, SETTLE_NO_LOSS_MS / 1000.0);
+    printf("coop-probe: F9: Alice's new session settled %.1f s after the spoofed rejoin\n", settle_s);
     exchange(alice, bob, drop, "F9: after a spoofed rejoin of Alice", first);
 
     // an outsider's datagrams to Alice's port are not the relay's: thrown away
@@ -1339,8 +1353,13 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     }
     unsigned rejoins = alice->saw_reconnect - recon2;
     CHECK(rejoins <= 1, "H4 F4: three rosters that list another session for Alice make her join again once (%u times)", rejoins);
+    uint64_t spoofs_at = plat_now_ms();
     CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2) && settled(mock, alice, bob), ROSTER_WAIT_MS),
           "and both are in the room after it, the relay and both rosters listing each one's present session");
+    settle_s = (double)(plat_now_ms() - spoofs_at) / 1000;
+    CHECK(drop || settle_s * 1000 <= SETTLE_NO_LOSS_MS, "H4 F4: with no loss the rosters settled %.1f s after the three that "
+          "list another session for Alice, not within %.1f s", settle_s, SETTLE_NO_LOSS_MS / 1000.0);
+    printf("coop-probe: H4 F4: the rosters settled %.1f s after the three that list another session for Alice\n", settle_s);
     exchange(alice, bob, drop, "H4 F4: after the rosters listing another session for Alice", first);
     // someone on the path sends Alice a roster far ahead of the relay's counter that lists another session for Bob: it
     // is not taken, and Bob's messages keep reaching her
@@ -1357,8 +1376,13 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     int forged_taken = WAIT_FOR(!names_session(alice, bob), 1000);   // its three copies can all be lost at 30 % loss
     CHECK(drop || forged_taken, "H4 F4: a roster 1000 ahead is taken");
     CHECK(WAIT_FOR(names_session(alice, bob), 1500 + 4000 + 11000), "H4 F4: the relay's rosters are taken again after a forged one 1000 ahead");
+    const uint64_t retaken_ms = plat_now_ms() - forged_at;
+    // with no loss the guide's bound holds: the silence time and 4 s, then the mock's next roster
+    CHECK(drop || !forged_taken || retaken_ms <= STALE_NO_LOSS_MS, "H4 F4: with no loss the relay's rosters were taken again "
+          "%.1f s after a forged one 1000 ahead, not within %.1f s (the silence time and 4 s, the mock's next roster, 1 s)",
+          (double)retaken_ms / 1000, STALE_NO_LOSS_MS / 1000.0);
     char what[96];
-    snprintf(what, sizeof what, "H4 F4: %.1f s after a forged roster 1000 ahead%s", (double)(plat_now_ms() - forged_at) / 1000,
+    snprintf(what, sizeof what, "H4 F4: %.1f s after a forged roster 1000 ahead%s", (double)retaken_ms / 1000,
              forged_taken ? "" : ", all of whose copies were lost");
     exchange(alice, bob, drop, what, first);
     // the sixth review's finding 1: one message in Bob's name and session, sealed with the room's key (which everyone
