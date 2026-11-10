@@ -814,6 +814,45 @@ static void probe_honest_base(void) {
     printf("coop-probe: sync honest base: a pool base above the counter's limit after spends is taken, and its sender is not ignored\n");
 }
 
+// A member asks for every section every 100 ms (digests with random sums) of a game whose state is 60 KB: a member who
+// joins meanwhile still gets the whole state, because the game answers its peers in turn.
+static uint32_t big_limit(int cat, uint32_t hash, void *user) {
+    (void)user;
+    return cat == COOP_CAT_PROGRESS && hash >= 0x10000 && hash < 0x20000 ? 1 : 0;
+}
+
+static void probe_fair_answers(void) {
+    Net net = {0};
+    Game a, c;
+    game_init(&a, 2, 0xB2), game_init(&c, 3, 0xB3);
+    coop_sync_limits(a.eng, big_limit, NULL), coop_sync_limits(c.eng, big_limit, NULL);
+    defaults(&a, 1), defaults(&c, 0);
+    net.games[0] = &a, net.games[1] = &c, net.present[0] = 1;
+    uint64_t now = 1000;
+    int ids[2] = {1, 2};
+    coop_sync_room(a.eng, "FAIR01", 2, ids, 2, 2, now);
+    for (uint32_t k = 0; k < 6000; k++) coop_sync_local(a.eng, COOP_CAT_PROGRESS, 0x10000 + k, 1, now);
+    now = run(&net, now, 2000);
+    uint8_t d[400];
+    size_t n = forge_digest(d, COOP_K_DIGEST_VER);
+    d[5] = d[6] = d[7] = d[8] = 0;   // no rules: only the sums count
+    int ids3[3] = {1, 2, 3};
+    net.present[1] = 1;
+    coop_sync_room(a.eng, "FAIR01", 2, ids3, 3, 2, now);
+    coop_sync_room(c.eng, "FAIR01", 3, ids3, 3, 2, now);
+    for (int t = 0; t < 300; t++) {   // 30 s
+        for (size_t k = 0; k < 4 * COOP_SYNC_SECTIONS; k++) d[n - 4 * COOP_SYNC_SECTIONS + k] = (uint8_t)rnd();
+        coop_sync_receive(a.eng, 1, COOP_K_DIGEST, d, n, now);
+        now = run(&net, now, 100);
+    }
+    unsigned got = 0;
+    for (uint32_t k = 0; k < 6000; k++) got += coop_sync_flag(c.eng, COOP_CAT_PROGRESS, 0x10000 + k) == 1;
+    CHECK(got == 6000, "a late joiner gets the whole state in 30 s while another member asks for everything every 100 ms (%u of 6000)", got);
+    game_free(&a), game_free(&c);
+    free(net.q);
+    printf("coop-probe: sync fair answers: a member asking for everything all the time does not starve a late joiner\n");
+}
+
 // ---- 7. hostile bytes
 
 static uint32_t fuzz_limit(int cat, uint32_t hash, void *user) {
@@ -864,6 +903,7 @@ int probe_coop_sync(void) {
     probe_hostile();
     probe_takeover();
     probe_honest_base();
+    probe_fair_answers();
     probe_sync_fuzz();
     return fails;
 }

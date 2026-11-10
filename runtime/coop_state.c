@@ -97,6 +97,7 @@ struct CoopSync {
     unsigned apply_head, apply_tail, apply_cap;
     uint64_t next_digest;
     uint64_t digest_to;             // members (bit per id) to send a digest now; bit 0: all
+    int turn;                       // the member whose section goes first at the next tick
     int64_t tokens;
     uint64_t tok_at;
     uint64_t rng;
@@ -762,18 +763,24 @@ void coop_sync_tick(CoopSync *s, uint64_t now, CoopSyncSendFn send, void *user) 
     }
     msg_send(s, &m, 0, send, user);
 
-    // sections a peer's digest showed to differ, paced
-    for (int id = 1; id <= COOP_MAX_MEMBERS && s->tokens > 0; id++) {
-        Peer *p = &s->peer[id];
-        if (!p->present) {
-            p->want = 0;
-            continue;
-        }
-        while (p->want && s->tokens > 0) {
+    // sections a peer's digest showed to differ, paced: one section to each peer that wants one, in turn, from a first
+    // peer that moves on at every tick, so a member that asks for everything all the time gets its share of the budget
+    // and the others theirs, and a late joiner catches up beside it
+    for (int id = 1; id <= COOP_MAX_MEMBERS; id++)
+        if (!s->peer[id].present) s->peer[id].want = 0;
+    int first = s->turn;
+    s->turn = (s->turn + 1) % COOP_MAX_MEMBERS;
+    for (int served = 1; served && s->tokens > 0;) {
+        served = 0;
+        for (int k = 0; k < COOP_MAX_MEMBERS && s->tokens > 0; k++) {
+            int id = 1 + (first + k) % COOP_MAX_MEMBERS;
+            Peer *p = &s->peer[id];
+            if (!p->want) continue;
             int sec = __builtin_ctzll(p->want);
             if (!send_section(s, sec, id, send, user)) return;   // the outbox is full: next tick
             p->want &= p->want - 1;
             p->answered_at[sec] = now ? now : 1;
+            served = 1;
         }
     }
 }
