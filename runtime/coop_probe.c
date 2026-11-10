@@ -528,7 +528,7 @@ typedef struct {
     PlatUdp *sock;
     PlatThread *thread;
     uint16_t port;
-    volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay;
+    volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay, steal;
     volatile unsigned forwarded;
     MockRoom rooms[4];
     uint8_t secret[32];
@@ -615,6 +615,20 @@ static void mock_connect(MockRelay *r, const uint8_t *d, size_t n, const CoopHdr
         plat_udp_send(r->sock, from, d3, k);
     }
     if (!room && c.intent == COOP_INTENT_JOIN) return mock_error(r, from, COOP_E_NO_ROOM, c.nonce, c.locator);
+    if (!room && c.intent == COOP_INTENT_CREATE && r->steal) {   // someone else made the room first (after a restart)
+        r->steal = 0;
+        for (int i = 0; i < 4 && !room; i++)
+            if (!r->rooms[i].used) room = &r->rooms[i];
+        if (!room) return;
+        memset(room, 0, sizeof *room);
+        room->used = 1, room->id = 0xC0DE0000u + rnd32() % 0xFFFF + 1;
+        memcpy(room->locator, c.locator, COOP_KEY_LEN);
+        MockMember *thief = &room->m[1];
+        thief->used = 1, thief->maker = 1, thief->cid = 0x7417, thief->session = 0x7417;
+        strcpy(thief->name, "Thief");
+        plat_net_resolve("127.0.0.1", r->port, &thief->addr);   // the mock's own address: what it sends there it drops
+        return mock_error(r, from, COOP_E_ROOM_EXISTS, c.nonce, c.locator);
+    }
     if (room && c.intent == COOP_INTENT_CREATE && !id) return mock_error(r, from, COOP_E_ROOM_EXISTS, c.nonce, c.locator);
     if (!room) {
         for (int i = 0; i < 4 && !room; i++)
@@ -1030,6 +1044,26 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     CHECK(WAIT_FOR(!mock->replay, 3000), "replayed");
     plat_sleep_ms(300);
     CHECK(alice->dups == dups, "a message sent again in the same session is not delivered twice");
+    // Alice joins the room again (under a new name); Bob's session has not changed, so his recorded message is still one
+    // she has seen
+    char srv[32];
+    snprintf(srv, sizeof srv, "127.0.0.1:%u", mock->port);
+    CoopParams ap = {.tag = "Alice", .server = srv, .name = "Alice-again", .client_id = 0xA11CE, .on = 1, .drop_pct = drop, .retry = 1,
+                     .local_port = alice_port};
+    unsigned recon = alice->saw_reconnect;
+    coop_sess_configure(alice->sess, &ap);
+    CHECK(WAIT_FOR(alice->saw_reconnect > recon && in_room(alice, 2), ROSTER_WAIT_MS + 3000), "Alice joined the room again under a new name");
+    plat_sleep_ms(500);
+    mock->replay = 5;
+    CHECK(WAIT_FOR(!mock->replay, 3000), "replayed after Alice joined again");
+    plat_sleep_ms(300);
+    CHECK(alice->dups == dups, "a message of Bob's present session is not delivered again after Alice joined the room again (%u twice)",
+          alice->dups - dups);
+    ap.name = "Alice";
+    recon = alice->saw_reconnect;
+    coop_sess_configure(alice->sess, &ap);
+    CHECK(WAIT_FOR(alice->saw_reconnect > recon && in_room(alice, 2) && !strcmp(view_of(alice).member[0].name, "Alice"), ROSTER_WAIT_MS + 3000),
+          "Alice is Alice again");
     coop_sess_command(bob->sess, COOP_CMD_JOIN, ROOM_SECRET);   // Bob joins again: a new session
     CHECK(WAIT_FOR(in_room(bob, 2) && in_room(alice, 2), ROSTER_WAIT_MS), "Bob is back");
     plat_sleep_ms(1500);   // the roster with Bob's new session has reached Alice
@@ -1201,6 +1235,13 @@ static void probe_sessions(void) {
     // --- the end: LEAVE and BYE, state off
     player_end(&bob);
     CHECK(WAIT_FOR(in_room(&alice, 1), ROSTER_WAIT_MS), "Alice sees Bob go when his session ends");
+    if (mock) {   // the relay restarts and someone else makes the room first: its maker joins it instead of leaving
+        mock->steal = 1;
+        mock->restart = 1;
+        CHECK(WAIT_FOR(view_of(&alice).state == COOP_JOINED && !view_of(&alice).made && view_of(&alice).n == 2, 30000),
+              "after a restart in which another made the room first, its maker joins it (state %d, made %d, %d members, %s)",
+              view_of(&alice).state, view_of(&alice).made, view_of(&alice).n, view_of(&alice).status);
+    }
     player_end(&alice);
     if (mock) mock_stop(mock);
 }

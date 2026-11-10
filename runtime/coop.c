@@ -417,8 +417,10 @@ static void apply_roster(CoopSess *s, const CoopRoster *r) {
         else if (strcmp(old->name, m->name)) say(s, "member %u is now %s", m->id, m->name);
         else if ((old->flags ^ m->flags) & COOP_FLAG_AWAY)
             say(s, "%s (member %u) %s", m->name, m->id, m->flags & COOP_FLAG_AWAY ? "is away" : "is back");
-        if (!old || old->session != m->session) {   // a new member, or a new session of it: nothing heard from it yet
-            s->rw[m->id] = (Window){0};
+        // a new member, or a new session of it: nothing heard from it yet. Its replay window stays: a window belongs to
+        // one session (window_check takes another session as new), so the same session, listed again after this player
+        // joined again, keeps refusing what it already delivered
+        if (!old || old->session != m->session) {
             plat_mutex_lock(&s->lock);
             s->heard_at[m->id] = 0;
             plat_mutex_unlock(&s->lock);
@@ -429,7 +431,6 @@ static void apply_roster(CoopSess *s, const CoopRoster *r) {
         for (int i = 0; i < r->n; i++) found |= r->m[i].id == id;
         if (found) continue;
         say(s, "%s (member %u) left the room", s->roster.m[j].name, id);
-        s->rw[id] = (Window){0};
         plat_mutex_lock(&s->lock);
         s->heard_at[id] = 0;
         plat_mutex_unlock(&s->lock);
@@ -504,8 +505,7 @@ static int on_joined(CoopSess *s, const uint8_t *d, size_t n, const CoopHdr *h, 
     memcpy(s->secret, s->want, sizeof s->secret);
     memcpy(s->token, j.token, COOP_COOKIE_LEN);
     s->have_token = 1;
-    s->roster.n = 0;
-    apply_roster(s, &j.roster);
+    apply_roster(s, &j.roster);   // after a rejoin: against the roster before it, so a member whose session is the same stays as it was
     s->roster_seq = h->seq;
     s->last_rx = now;
     s->next_ping = now + s->ping_ms;
@@ -553,7 +553,18 @@ static void refused(CoopSess *s, uint8_t reason, uint64_t now) {
     case COOP_E_RATE: go_left(s, "too many joins from this network; try again in a minute", 1); break;
     case COOP_E_BAD_TAG: go_left(s, "the relay did not accept the room's tag", 1); break;
     case COOP_E_SERVER_FULL: go_left(s, "the relay is full", 1); break;
-    case COOP_E_ROOM_EXISTS: go_left(s, "a room with this secret is already open on the relay: join it", 1); break;
+    case COOP_E_ROOM_EXISTS:
+        if (s->retry && s->intent == COOP_INTENT_CREATE) {
+            // a session that keeps its room (coop_auto): someone made the room again first after the relay lost it, or
+            // it is open already. Joining it keeps the player in the room they meant; the rules stay the ones the
+            // players accepted, since a game takes them only signed by the maker it pinned (coop_state.h)
+            say(s, "room %s is open already; joining it", label);
+            begin_episode(s, COOP_INTENT_JOIN, s->want, 0, now);
+            set_status(s, "the room is open already; joining it");
+        } else {
+            go_left(s, "a room with this secret is already open on the relay: join it", 1);
+        }
+        break;
     case COOP_E_REMOVED: go_left(s, "the room's maker removed this player", 1); break;
     default: go_left(s, "the relay refused", 1); break;
     }
