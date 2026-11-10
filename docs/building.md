@@ -323,13 +323,20 @@ the wait on it, timed waits keep their time, a cancel ends any wait, and 4,000 s
 each seen. It runs a second time with `NX2NAVI_SYNC_WAKE_ALL=1`. No game files.
 
 A change to the log queue (`runtime/logq.c`) passes `python tests\logq_check.py`, which builds it with the platform
-layer and a destination of its own: 160,000 lines from eight threads arrive whole and in each thread's order, a
-destination that takes 30 ms a write does not hold the threads that log, one that stops while four times the queue's
-size is logged loses nothing, and `logq_sync` returns with everything written. No game files.
+layer and a destination of its own: 160,000 lines from eight threads arrive whole and in each thread's order, a line
+logged while the queue's lock is taken waits and does not pass the lines queued before it, a destination that takes
+30 ms a write does not hold the threads that log, the line about slow writes comes once in ten seconds, a destination
+that stops while four times the queue's size is logged loses nothing, and `logq_sync` returns with everything written.
+The test passes on a busy machine too: it waits for the queue to empty instead of for a time, and counts slow lines
+instead of timing one. No game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`.
+
+A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
+`runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
+the added text by GPU vendor and by why the cache was cold. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
@@ -356,6 +363,9 @@ Runtime probes, each a mode of `nx2navi.exe` (the list is at the top of `runtime
 part of `--probe-vkexec` translate shaders of the census below: they look for `build/<ver>/shaders/jobs.json` of the
 exe's own version first, then of the other one.
 `--probe-vkmem` also checks CPU-backed texture uploads and rewrites, GPU-written texture aliases, and memory write watches.
+A change to the texture detail (`runtime/vk_texture.c` "texture detail": `detail_skip`, `upload`, `astc_bl_regions`)
+passes it three times, with `NX2NAVI_TEXTURE_DETAIL` set to `full`, `reduced` and `low`: each time ASTC textures are
+uploaded and rewritten, and every level and layer of their images must hold the game's level it stands for.
 `--probe-prewarm` runs the boot's pipeline stages without the game, from the caches next to the exe (it skips when
 there are none): the pipeline cache load, the shader prewarm, the recorded pipelines and the compute pipeline prebuild,
 with a `mem: boot stage` log line after each that gives the device memory and the process commit so far. It then asks

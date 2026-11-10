@@ -653,9 +653,23 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     if (!ok) return VK_NULL_HANDLE;
     uint32_t l0 = hv && v->set_levels ? v->base_level : 0;
-    if (l0 >= img->levels) return VK_NULL_HANDLE;
-    uint32_t nl = hv && v->set_levels && v->nlevels ? v->nlevels : img->levels - l0;
-    if (l0 + nl > img->levels) nl = img->levels - l0;
+    uint32_t nl;
+    if (img->skip) {
+        // Texture detail (vk_texture.c): the image was made without the game's top img->skip levels, so the view's
+        // levels [l0, end) of the game are the image's [l0 - skip, end - skip). A view that names only levels the image
+        // lacks shows the first one it has: the nearest content, where a stand-in would show none.
+        uint32_t sk = img->skip, all = img->levels + sk;
+        if (l0 >= all) return VK_NULL_HANDLE;
+        uint32_t end = hv && v->set_levels && v->nlevels ? l0 + v->nlevels : all;
+        if (end > all) end = all;
+        l0 = l0 > sk ? l0 - sk : 0;
+        end = end > sk ? end - sk : 1;
+        nl = end > l0 ? end - l0 : 1;
+    } else {
+        if (l0 >= img->levels) return VK_NULL_HANDLE;
+        nl = hv && v->set_levels && v->nlevels ? v->nlevels : img->levels - l0;
+        if (l0 + nl > img->levels) nl = img->levels - l0;
+    }
     if (storage) nl = 1;
     uint32_t y0 = 0, ny = 1;
     if (vt != VK_IMAGE_VIEW_TYPE_3D) {
@@ -1610,8 +1624,8 @@ static void feedback_written(VkExec *ex, const VkPipeState *s, uint32_t sampled)
     ex->fb_read |= sampled;
 }
 
-static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                          VkDescriptorImageInfo *out, VkImage *image);
+static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
+                         VkDescriptorImageInfo *out, VkImage *image);
 
 // Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: the
 // slot's resolution and texture entry (slot_still) and the samplers (vk_sampler_gen); the layout is set again on every
@@ -1627,6 +1641,7 @@ static struct {
     uint32_t gen, epoch, sgen;
     uint16_t type;
     uint8_t separate, valid;
+    uint8_t reduced;   // the image was made without its top levels and the resource did not mind (GfxShaderRes.exact)
     VkImage image;
     VkDescriptorImageInfo out;
 } TD[TD_N];
@@ -1635,11 +1650,11 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
                             VkDescriptorImageInfo *out) {
     int td_on = td_mode();
     VkImage image;
-    if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out, &image);
+    if (!h || storage || !td_on) return (void)tex_info_full(ex, r, h, storage, separate, out, &image);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
     typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 51];
     if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->sgen == sg &&
-        slot_still(&m->gen, m->tok, h, gen)) {
+        !(m->reduced && r->exact) && slot_still(&m->gen, m->tok, h, gen)) {
         if (m->epoch != ep) {   // the slot's first binding in this submission: only its storage check is due
             vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
             m->epoch = ep;
@@ -1657,14 +1672,17 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
         return;
     }
     uint64_t tok = token_of(h);   // before the lookup
-    tex_info_full(ex, r, h, storage, separate, out, &image);
+    int reduced = tex_info_full(ex, r, h, storage, separate, out, &image);
+    // a lookup that made the texture whole again changed the slot's resolution after the stamps above were read: the
+    // entry never matches, and the next binding fills it
     *m = (typeof(*m)){.h = h, .tok = tok, .gen = gen, .epoch = ep, .sgen = sg, .type = r->type,
-                      .separate = (uint8_t)separate, .valid = 1, .image = image, .out = *out};
+                      .separate = (uint8_t)separate, .valid = 1, .reduced = (uint8_t)reduced, .image = image, .out = *out};
 }
 
-static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                          VkDescriptorImageInfo *out, VkImage *image) {
-    int ms = (r->type & 0x200) != 0;
+// Returns whether the image bound was made without its top mip levels (texture detail, VkTexImage.skip).
+static int tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
+                         VkDescriptorImageInfo *out, VkImage *image) {
+    int ms = (r->type & 0x200) != 0, reduced = 0;
     *image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler samp = VK_NULL_HANDLE;
@@ -1673,6 +1691,10 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
+        // A shader that reads this binding's texels by position, or asks for its size, needs every level of the
+        // texture where the game put it (gfx_shader.c reflect_exact): one made without its top levels is made again.
+        if (img && img->skip && r->exact) img = vk_texture_exact_by_id_locked((int)(h & 0xfffff), &v, &hv);
+        reduced = img && img->skip;
         if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
@@ -1683,7 +1705,8 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
             int point = img && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
                         vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT;
             samp = point ? vk_sampler_point_by_id_locked(sid)
-                 : r->type & 0x400 ? vk_sampler_compare_by_id_locked(sid) : vk_sampler_by_id_locked(sid);
+                 : r->type & 0x400 ? vk_sampler_compare_by_id_locked(sid)
+                 : reduced ? vk_sampler_detail_by_id_locked(sid, img->skip) : vk_sampler_by_id_locked(sid);
         }
     }
     if (!view) {
@@ -1692,6 +1715,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
     }
     if (!samp) samp = r->type & 0x400 ? Z.samp_shadow : Z.samp;
     *out = (VkDescriptorImageInfo){separate || storage ? VK_NULL_HANDLE : samp, view, layout};
+    return reduced;
 }
 
 // ---- texture and sampler pools (bindless)
@@ -3317,7 +3341,15 @@ static int pipe_skip_mode(void) {
 // cold it runs out after a few draws and the rest are skipped as before, so a burst of cold pipelines costs a frame
 // this much and no more. Measured on an RX 7900 XT, first walk through a village with no pipeline recorded: 2,349
 // draws skipped without the budget, with the libraries warm in both runs.
-#define LINK_DRAW_MS 3u
+static uint32_t link_draw_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        long long v = cfg_int("NX2NAVI_PIPE_LINK_DRAW_MS");
+        ms = v < 1 ? 1 : v > 50 ? 50 : (int)v;
+    }
+    return (uint32_t)ms;
+}
+#define LINK_DRAW_MS link_draw_ms()
 // How long a full-screen draw waits on for its pipeline once its frame budget is spent and the previous picture
 // cannot be held any longer (prepare_draw_ex): the longest optimised build of such a pipeline measured was 194 ms.
 #define FULLSCREEN_LAST_MS 500u
@@ -3327,7 +3359,8 @@ static uint64_t *link_budget(void) {
         long long ms = cfg_int("NX2NAVI_PIPE_LINK_MS");
         per_frame = (uint64_t)(ms < 0 ? 0 : ms > 100 ? 100 : ms) * 1000000ull;
         rt_log("vk_exec: draws wait up to %llu ms a frame in all for the fast link of a missing pipeline "
-               "(NX2NAVI_PIPE_LINK_MS)", (unsigned long long)(per_frame / 1000000));
+               "(NX2NAVI_PIPE_LINK_MS), %u ms at most each (NX2NAVI_PIPE_LINK_DRAW_MS)",
+               (unsigned long long)(per_frame / 1000000), LINK_DRAW_MS);
     }
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (f != frame) frame = f, left = per_frame;
@@ -3433,6 +3466,7 @@ uint32_t vk_exec_pending_draws_take(void) {
 static int draw_skipped(const VkExec *ex, int mesh, int why) {
     DRS.skipped[mesh][why]++;
     if (why == SK_SHADER_PENDING || why == SK_PIPE_PENDING) pending_draws++;
+    if (why == SK_PIPE_PENDING) perf_count(PERF_CNT_PIPE_SKIP);   // skipped draws only: a lookup that then waited is none
     if (!(DRS.first[mesh] >> why & 1)) {
         DRS.first[mesh] |= 1u << why;
         rt_log("vk: first %s draw skipped because: %s (program %llu)", mesh ? "mesh" : "vertex", sk_names[why],
@@ -3465,6 +3499,40 @@ static int skip_prog_wanted(uint64_t serial) {
     return 0;
 }
 
+// NX2NAVI_PROG_LEAD=1 (diagnostics): how long before its first draw the game made each program
+// (nvnProgramSetShaders, nvn_api_obj.c nvn_prog_made_ns): the head start a build begun at that moment would have over
+// one begun at the draw, which is where shaders are looked up and pipelines built today. A line for vertex, mesh and
+// compute programs (their first dispatch) each, after every 200 programs first used.
+#define PROG_LEAD_N 16384
+static struct { int on; uint64_t seen[PROG_LEAD_N]; uint64_t n[3][6], logged; } PLD = {-1};
+
+static int prog_lead_on(void) {
+    if (PLD.on < 0) PLD.on = cfg_get("NX2NAVI_PROG_LEAD") != NULL && strcmp(cfg_get("NX2NAVI_PROG_LEAD"), "0") != 0;
+    return PLD.on;
+}
+
+// mesh: 0 a vertex program's draw, 1 a mesh program's, 2 a compute program's dispatch.
+static void prog_lead(const prog_t *p, int mesh) {
+    uint32_t i = (uint32_t)p->serial & (PROG_LEAD_N - 1);
+    if (PLD.seen[i] == p->serial) return;
+    PLD.seen[i] = p->serial;
+    uint64_t made = nvn_prog_made_ns(p->serial);
+    if (!made) return;
+    double ms = (double)(plat_now_ns() - made) / 1e6;
+    PLD.n[mesh][ms < 17 ? 0 : ms < 100 ? 1 : ms < 1000 ? 2 : ms < 5000 ? 3 : ms < 30000 ? 4 : 5]++;
+    uint64_t tot = 0;
+    for (int m = 0; m < 3; m++)
+        for (int k = 0; k < 6; k++) tot += PLD.n[m][k];
+    if (tot - PLD.logged < 200) return;
+    PLD.logged = tot;
+    static const char *const kind[3] = {"vertex", "mesh", "compute"};
+    for (int m = 0; m < 3; m++)
+        rt_log("vk: %s programs were made before their first use by: under 17 ms %llu, 17-100 ms %llu, 0.1-1 s %llu, 1-5 s "
+               "%llu, 5-30 s %llu, longer %llu (NX2NAVI_PROG_LEAD)", kind[m], (unsigned long long)PLD.n[m][0],
+               (unsigned long long)PLD.n[m][1], (unsigned long long)PLD.n[m][2], (unsigned long long)PLD.n[m][3],
+               (unsigned long long)PLD.n[m][4], (unsigned long long)PLD.n[m][5]);
+}
+
 // mesh: a mesh draw (op_draw_mesh): the program's mesh and task stages stand in for the vertex stage, and nothing
 // vertex-related (vertex buffers, motion vector bookkeeping of vertex shaders) is bound or noted.
 static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int mesh) {
@@ -3482,6 +3550,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return draw_skipped(ex, mesh, SK_SCISSOR);
     if (!ex->prog) return draw_skipped(ex, mesh, SK_NO_PROGRAM);
+    if (prog_lead_on()) prog_lead(ex->prog, mesh);
     if (n_skip_prog && skip_prog_wanted(ex->prog->serial)) return draw_skipped(ex, mesh, SK_DISABLED);   // -1 until read
     int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = mesh ? 0 : shader_memo_on();
     int has_ts = 0, ts_wait = 0, vst = mesh ? NVN_STAGE_MESH : NVN_STAGE_VS;
@@ -3509,6 +3578,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait || ts_wait) {
+        vk_exec_ahead(ex);   // the later draws' shaders and stage libraries are queued while this one waits or is skipped
         if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1)))   // skipped until ready
             return perf_count(PERF_CNT_SHADER_SKIP), draw_skipped(ex, mesh, SK_SHADER_PENDING);
         perf_count(PERF_CNT_ONESHOT_WAIT);
@@ -3571,15 +3641,15 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
-        if (linking) {   // nearly every draw finds its pipeline: the clock is read only for one that did not
-            p = vk_pipeline_graphics_async(&s, &info, &pending, 0);
-            if (pending) {
-                t0 = kern_now_ns();
-                p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
-            }
-        } else {
-            w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
-            p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        // Nearly every draw finds its pipeline, so the first lookup waits for nothing and the clock is read only for a
+        // draw that missed. A miss first has the rest of the submission read ahead (vk_exec_ahead: the stage libraries
+        // of the later draws' pipelines build on the workers from here on), inside this draw's wait budget.
+        p = vk_pipeline_graphics_async(&s, &info, &pending, 0);
+        if (pending) {
+            if (linking) t0 = kern_now_ns();
+            else w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;
+            vk_exec_ahead(ex);
+            if (wait_ms) p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
         }
         if (t0 && budget) {
             uint64_t spent = kern_now_ns() - t0;
@@ -3617,9 +3687,10 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         char tg[512];
         wait_logs++;
         vk_exec_targets_describe(ex, tg, sizeof tg);
-        rt_log("vk_exec: frame %llu: a draw waited %.1f ms for its pipeline (%s%s): %u vertices, pass %ux%u, %s",
+        rt_log("vk_exec: frame %llu: a draw waited %.1f ms for its pipeline (%s%s%s): %u vertices, pass %ux%u, %s",
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
-               pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
+               s.feedback ? ", feedback loop" : "", pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h,
+               tg);
     }
     if (pending) return draw_skipped(ex, mesh, SK_PIPE_PENDING);   // a background worker is building it: skipped until it is ready
     if (!p || !info) return draw_skipped(ex, mesh, SK_PIPE_FAILED);
@@ -3666,6 +3737,89 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
 
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     return prepare_draw_ex(ex, prim, count, restart, 0);
+}
+
+// ---- looking ahead (vk_exec.c vk_exec_ahead): the binds and draws of ops the replay has not reached, applied to sx, a
+// copy of the replay state. A draw looks its shaders up as prepare_draw_ex will (one not in memory is queued for its
+// disk read or translation by that lookup) and names its state to vk_pipeline_hint. The last draw looked up is kept:
+// one with the same program, texture binds and state repeats it, as most draws of a pass do.
+uint64_t vk_exec_ahead_draws, vk_exec_ahead_lookups;
+static struct { int valid; const prog_t *prog; uint64_t serial; uint32_t tex_serial; VkPipeState pipe; } AHL;
+
+void vk_exec_ahead_begin(void) { AHL.valid = 0; }
+
+static void ahead_draw(VkExec *sx) {
+    vk_exec_ahead_draws++;
+    if (!sx->prog) return;
+    if (AHL.valid && AHL.prog == sx->prog && AHL.serial == sx->prog->serial && AHL.tex_serial == sx->tex_serial &&
+        !memcmp(&AHL.pipe, &sx->pipe, sizeof AHL.pipe))
+        return;
+    AHL.valid = 1, AHL.prog = sx->prog, AHL.serial = sx->prog->serial, AHL.tex_serial = sx->tex_serial, AHL.pipe = sx->pipe;
+    vk_exec_ahead_lookups++;
+    int has_vs, has_fs, vs_wait = 0, fs_wait = 0;
+    const GfxShader *vs = shader_for(sx, NVN_STAGE_VS, &has_vs, &vs_wait, 0);
+    if (!has_vs) return;   // a mesh program, or none: no libraries
+    const GfxShader *fs = shader_for(sx, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
+    if (!vs || vs_wait || fs_wait || (has_fs && !fs) || shader_skipped(vs) || shader_skipped(fs)) return;
+    VkPipeState s = sx->pipe;
+    s.vs = vs, s.fs = fs, s.ts = NULL;
+    s.feedback = 0;
+    s.prim = NVN_DRAW_PRIMITIVE_TRIANGLES;
+    s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
+    s.y_flip = 1;
+    s.prim_restart = 0;
+    vk_pipeline_hint(&s);
+}
+
+void vk_exec_ahead_op(VkExec *sx, uint32_t op, const void *payload) {
+    switch (op) {
+    case OP_BIND_PROGRAM: {
+        const p_bind_program *b = payload;
+        sx->prog = b->prog, sx->prog_stages = b->stages;
+        break;
+    }
+    case OP_BIND_STATE: {
+        const p_bind_state *b = payload;
+        blend_st bs;
+        switch (b->kind) {
+        case 0:
+            memcpy(&bs, b->bytes, sizeof bs);
+            if (bs.target < 8) sx->pipe.blend[bs.target] = bs;
+            break;
+        case 1: memcpy(&sx->pipe.color, b->bytes, sizeof sx->pipe.color); break;
+        case 2: memcpy(&sx->pipe.chmask, b->bytes, sizeof sx->pipe.chmask); break;
+        case 3: memcpy(&sx->pipe.ms, b->bytes, sizeof sx->pipe.ms); break;
+        case 4: memcpy(&sx->pipe.poly, b->bytes, sizeof sx->pipe.poly); break;
+        case 5: memcpy(&sx->pipe.ds, b->bytes, sizeof sx->pipe.ds); break;
+        }
+        break;
+    }
+    case OP_BIND_VATTR: {
+        const p_bind_vattr *b = payload;
+        if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break;
+        memset(sx->pipe.vattr, 0, sizeof sx->pipe.vattr);
+        memcpy(&sx->pipe.vattr[b->first], b->st, sizeof(uint32_t) * (size_t)b->n);
+        break;
+    }
+    case OP_BIND_VSTREAM: {
+        const p_bind_vstream *b = payload;
+        if (b->first < 0 || b->n < 0 || b->first + b->n > 16) break;
+        memset(sx->pipe.vstream, 0, sizeof sx->pipe.vstream);
+        memcpy(&sx->pipe.vstream[b->first], b->st, sizeof(vs_st) * (size_t)b->n);
+        break;
+    }
+    case OP_BIND_TEX: case OP_BIND_IMG: {
+        const p_bind_handles *b = payload;
+        int cap = op == OP_BIND_TEX ? 128 : 32;
+        if (b->stage < 0 || b->stage >= 8 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) break;
+        memcpy(op == OP_BIND_TEX ? &sx->tex[b->stage][b->first] : &sx->img[b->stage][b->first], b->h,
+               sizeof(uint64_t) * (size_t)b->n);
+        sx->tex_serial++;
+        break;
+    }
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: ahead_draw(sx); break;
+    default: break;
+    }
 }
 
 // ---- per-object motion
@@ -4996,6 +5150,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    if (prog_lead_on()) prog_lead(ex->prog, 2);
     vk_contact_flush(ex);
     cb_res(ex);
     dummies_init();

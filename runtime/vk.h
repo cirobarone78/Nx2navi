@@ -479,6 +479,9 @@ typedef struct {
     uint8_t scale;                 // 1, or NX2NAVI_SHADOW_SCALE for a shadow map made larger than the game's (vk_texture.c
                                    // shadow_scale_of): width and height above are the larger ones, the game's regions
                                    // are multiplied by it
+    uint8_t skip;                  // texture detail (vk_texture.c detail_skip): the game's top mip levels the image was made
+                                   // without. Image level i holds the game's level i + skip, and width, height and levels
+                                   // above are the image's, so the game's level skip is their base. 0 everywhere else.
     uint8_t gone;                  // destroyed (vk_texture.c destroy_tex, texture lock held): the record stays readable until
                                    // the GPU is past the submission being recorded (vk_defer_free), as the replay and DLSS
                                    // keep pointers to render targets across a command buffer; no view of it is cached
@@ -503,6 +506,16 @@ VkSampler vk_sampler_point_by_id_locked(int id);
 // The slot's sampler with its compare on, for a depth-compare read (vk_texture.c, at the definition); the slot's own
 // sampler when it compares already. VK_NULL_HANDLE for an empty slot.
 VkSampler vk_sampler_compare_by_id_locked(int id);
+// Texture detail (vk_texture.c): what texture_detail = auto picks on this device, 0 full, 1 reduced, 2 low (the budget is
+// read at the first call). For the menu's row.
+int vk_texture_detail_auto(void);
+// The slot's sampler for a texture made without its top `skip` mip levels (VkTexImage.skip): its LOD clamp counts the
+// game's levels, so it moves down by skip. The slot's own sampler when its clamp is open or skip is 0.
+VkSampler vk_sampler_detail_by_id_locked(int id, uint32_t skip);
+// Slot id resolved to a texture made without its top levels, and a shader binding that reads texels by position or
+// asks for the size wants it: the texture is made again with every level and stays so (vk_texture.c "texture detail").
+// Returns what the slot resolves to now, as vk_texture_by_id_locked does.
+const VkTexImage *vk_texture_exact_by_id_locked(int id, view_t *view, int *has_view);
 uint32_t vk_texture_slots_gen(void);
 int vk_texture_slot_count_locked(void);
 void vk_texture_create_budget_locked(int n);         // slot lookups create at most n entries (mapped storage only); -1 any
@@ -706,6 +719,9 @@ VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
 // wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to
 // pipeline-keys.bin next to the pipeline cache and prebuilt at the next boot (NX2NAVI_PIPE_PREBUILD=0: not).
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
+// The stage libraries of a draw the replay has not reached yet, queued to the workers when no pipeline is known for its
+// state (vk_pipeline.c "stage libraries ahead of their draws"). Returns the libraries queued.
+int vk_pipeline_hint(const VkPipeState *s);
 // rt_boot calls it unless --shot is given; NX2NAVI_PIPE_SYNC=1 makes it a no-op. Of the probes only --probe-prewarm
 // calls it.
 void vk_pipeline_async_enable(void);

@@ -71,6 +71,7 @@ int vk_ngxfg_wanted(void);              // vk_dlaa.c: DLSS's frame generation th
 int vk_ngxfg_max(void);                 // ... and how many frames it may generate per rendered one (0: it cannot)
 int vk_ffx_available(void);             // vk_ffx.cpp: FSR 3.1 upscaling can run (asked without loading the library)
 int vk_ffx_framegen_available(void);    // ... and FSR 3.1 frame generation
+int vk_texture_detail_auto(void);       // vk_texture.c: the texture detail auto picks on this card, 0 full to 2 low
 double frame_step_limit_hz(void);
 int frame_limit_follows_display(void);
 int frame_limit_adjustable(void);
@@ -672,6 +673,19 @@ static void row_shadow_res(void) {
     opt_choice_list("NX2NAVI_SHADOW_RES", UI_MENU_SHADOW_RES, vals, names, N, UI_MENU_SHADOW_RES_DESC);
 }
 
+// Texture detail (vk_texture.c "texture detail"): large surface textures made without their largest one or two mip
+// levels. Read when the first texture is made, so the row notes the restart. The automatic entry names the level it
+// picks on this card.
+static void row_texture_detail(void) {
+    static const char *const vals[] = {"auto", "full", "reduced", "low"};
+    static const UiTextId level[] = {UI_MENU_TEX_DETAIL_FULL, UI_MENU_TEX_DETAIL_REDUCED, UI_MENU_TEX_DETAIL_LOW};
+    static char picked[96];   // the row keeps the pointer for the frame
+    int a = vk_texture_detail_auto();
+    snprintf(picked, sizeof picked, menu_text(UI_MENU_TEX_DETAIL_AUTO), menu_text(level[a < 0 || a > 2 ? 0 : a]));
+    const char *names[] = {picked, menu_text(level[0]), menu_text(level[1]), menu_text(level[2])};
+    opt_choice_list("NX2NAVI_TEXTURE_DETAIL", UI_MENU_TEX_DETAIL, vals, names, 4, UI_MENU_TEX_DETAIL_DESC);
+}
+
 static void row_shadow_scale(void) {
     static const char *const vals[] = {"1", "2", "3", "4"};
     static const char *const names[] = {"960 (1x)", "1920 (2x)", "2880 (3x)", "3840 (4x)"};
@@ -822,6 +836,10 @@ static void upscaling_name(char *out, size_t size) {
     else snprintf(out, size, mode ? "DLSS %s" : "NVIDIA %s", menu_text(dlss[mode]));
 }
 
+// The Upscaling row's NVIDIA DLSS waits for a restart (vk_dlaa_needs_restart), where DLSS is offered: the row's note and
+// the Restart button's count (restart_pending).
+static bool upscaling_restart(void) { return dlss_offered() && vk_dlaa_needs_restart(); }
+
 static void row_upscaling(void) {
     static const char *const modes[] = {"dlaa", "quality", "balanced", "performance", "ultra_performance"};
     static const UiTextId mode_names[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
@@ -867,7 +885,7 @@ static void row_upscaling(void) {
     // FSR 3.1 still set where it cannot load: nothing upscales, so the row says so under its value
     const char *note = nullptr;
     if (!fsr && now.kind == FSR3) note = menu_text(UI_MENU_FSR3_OFF);
-    else if (dlss && vk_dlaa_needs_restart()) note = menu_text(UI_MENU_AFTER_RESTART);
+    else if (upscaling_restart()) note = menu_text(UI_MENU_AFTER_RESTART);
     int nv = opt_choice_index("NX2NAVI_UPSCALER", UI_MENU_UPSCALING, names, n, cur, 1,
                               !fsr ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
                               note);
@@ -973,6 +991,15 @@ static void row_framegen_mult_ngx(void) {
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FG_MULT", values[nv]);
 }
 
+// Frame generation to or from NVIDIA's waits for a restart: AMD's follows the setting, NVIDIA's is set up with the device
+// (vk_dlssg.c). Through NGX it follows the setting too, once NGX is up, which needs DLSS upscaling on when the game
+// starts. The row's note and the Restart button's count (restart_pending).
+static bool framegen_restart(void) {
+    const bool set = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss");
+    if (!dlss_offered()) return false;
+    return framegen_ngx() ? set && !vk_ngxfg_wanted() : set != (vk_dlssg_wanted() != 0);
+}
+
 // Frame generation (vk_fg.cpp, at once; NVIDIA's after a restart); it needs a temporal upscaler's motion vectors
 static void row_framegen(void) {
     // the generated frames are made from DLSS's or FSR 3.1's motion vectors: without one of them it would do nothing,
@@ -1004,7 +1031,7 @@ static void row_framegen(void) {
     // AMD's follows the setting; NVIDIA's is set up with the device, so only a change to or from it waits for a restart.
     // Through NGX it follows the setting too, once NGX is up, which needs DLSS upscaling on when the game starts.
     const bool ngx = framegen_ngx();
-    const bool restart = ngx ? dlss && cur == 2 && !vk_ngxfg_wanted() : dlss && (cur == 2) != (vk_dlssg_wanted() != 0);
+    const bool restart = framegen_restart();
     if (restart) note = UI_MENU_AFTER_RESTART;
     else if (cur == 1 && !fsr) note = UI_MENU_FSR3_OFF;   // set where it cannot load: "in use: off" and why
     // NVIDIA's set since the start but not running: "in use: off" and why (vk_dlssg_status; the log has the details).
@@ -1035,11 +1062,6 @@ static void tab_screen(float scale) {
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("NX2NAVI_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
-#ifdef _WIN32
-    // The lazy write-back (memory.c "Lazy write-back"), off by default and read at the start: the row notes the restart.
-    // Not offered where its fetch inside the access-fault handler has never run.
-    opt_toggle("NX2NAVI_WB_LAZY", UI_MENU_FPS_BOOST, UI_MENU_FPS_BOOST_DESC);
-#endif
     opt_group(UI_MENU_GRAPHICS);
     // The game resolution needs the output and scene patch sets (resolution.c res_adjustable): Ocarina's build has
     // none and always draws its own size, so the row would change nothing
@@ -1061,6 +1083,7 @@ static void tab_screen(float scale) {
     static const char *const aniso[] = {"game", "2", "4", "8", "16"};
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
+    row_texture_detail();
     opt_end();
 }
 
@@ -1258,6 +1281,17 @@ static const char *prompts_note(bool *restart) {
     case ROMFS_PROMPTS_PATCHES: return menu_text(UI_MENU_PROMPTS_OFF_PATCHES);
     default: *restart = true; return menu_text(UI_MENU_PROMPTS_RESTART);
     }
+}
+
+// How many settings wait for a restart, on the Restart button: the restart-only ones whose value differs from the one the
+// game started with (cfg.c cfg_pending_count), NVIDIA's upscaling, frame generation and HDR while their rows say "after
+// restart" (their settings are live ones, so the rows decide), and the prompts when a changed pad layout asks for
+// others (the prompts setting itself, when changed, is among the first).
+static int restart_pending(void) {
+    bool prompts;
+    prompts_note(&prompts);
+    return cfg_pending_count() + upscaling_restart() + framegen_restart() + (vk_hdr_needs_restart() != 0)
+           + (prompts && !cfg_pending("NX2NAVI_PROMPTS"));
 }
 
 // The confirmation of the menu's Restart button, over the menu; Cancel has the cursor first. Restart writes nx2navi.ini,
@@ -1480,8 +1514,15 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
         ImGui::SetCursorPosY(y + st.FramePadding.y);
         ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "%s", menu_text(UI_MENU_SAVE_FAILED));
     }
-    const char *cont = menu_text(UI_MENU_CONTINUE), *restart = menu_text(UI_MENU_RESTART_YES), *quit = menu_text(UI_MENU_QUIT);
-    float bw = fmaxf(fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(restart).x), ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
+    // Restart says how many settings wait for it (restart_pending); "###restart" keeps the button's id, and so the cursor
+    // on it, when the count changes
+    char shown[80], restart[96];
+    const int pending = restart_pending();
+    if (pending) snprintf(shown, sizeof shown, menu_text(UI_MENU_RESTART_COUNT), pending);
+    else snprintf(shown, sizeof shown, "%s", menu_text(UI_MENU_RESTART_YES));
+    snprintf(restart, sizeof restart, "%s###restart", shown);
+    const char *cont = menu_text(UI_MENU_CONTINUE), *quit = menu_text(UI_MENU_QUIT);
+    float bw = fmaxf(fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(shown).x), ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
     // the save menu's brown buttons, with the game's cursor on the selected one (ui/menu_skin.cpp)
     float gap = st.ItemSpacing.x + skin_cursor_reach(scale);
     // right-aligned; in a window too narrow for all three, from the left edge

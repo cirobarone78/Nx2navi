@@ -41,9 +41,10 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
 - Log: in a game run the lines go through a queue to a thread that writes them (`runtime/logq.c`), so a stalled
-  write to the log file or the console does not hold the thread that logged; a fatal error, the crash report and the
-  end of the process write the queue out first (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is
-  logged.
+  write to the log file or the console does not hold the thread that logged. A thread's lines reach the log in the
+  order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
+  everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
+  (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
@@ -83,12 +84,21 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
 - Uniform snapshot. The game rewrites per-object uniform blocks soon after it submits the frame that reads them; at
   the start of a submission's replay every uniform range it binds from CPU-written pools is copied, and the draws bind
   the copy (`vk_usnap.c`).
+- Event order. Ocarina's queues hand work to each other with events, and its main queue waits each frame for a
+  signal the game gives from the CPU once it has written the frame's data. The replay stops a submission at a wait
+  whose signal has not been replayed and lets it go on after the signal (`vk_exec.c`, "event order across the game's
+  queues"); a CPU signal counts for a submission only when it came before the copies above were taken, and a
+  submission it comes too late for goes on at once in one of its own (`vk_exec_xfer.c`, "events the CPU signals").
+  `NX2NAVI_EVO_TRACE=1` logs the order every frame was replayed in.
 - Driver data. The NVN driver keeps a per-stage constant bank (c0). The back end fills it as the driver does: storage
   and uniform tables, push constants and, for NVN 2 compute, the dispatch's group counts in bytes 0-0xb.
 - Storage buffers the shaders reach through pointer tables in memory are bound at the address the table holds
   (`GfxShaderRes.ptr`, `vk_exec_draw.c ptr_addr`).
 - Bindless textures: the texture and sampler pools are descriptor arrays kept in step with the game's pool writes
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
+  Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
+  cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
+  finalized descriptors may still follow live GPU-owned content.
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
@@ -121,7 +131,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   ring of Vulkan `{x, y, z}` records filled on the GPU.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
   at a new state, an optimised pipeline replacing it from a background thread. A draw whose pipeline is not ready is
-  skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Compute pipelines
+  skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Three things keep
+  that short on a first visit (`runtime/vk_pipeline.c`): a pipeline whose fragment shader reads a target of its own
+  pass is fast-linked like any other, the feedback loop flags being part of the fragment output library alone
+  (`gpl_feedback`); the library workers also link the pipelines of skipped draws, so a burst of new materials is
+  linked on several threads while the pool is inside optimised builds (`lib_worker`, `fast_take`); and the first
+  draw of a submission that misses has the rest of the submission read ahead, which queues the stage libraries of
+  every pipeline the later draws need before the replay reaches them (`runtime/vk_exec.c` `vk_exec_ahead`,
+  `vk_pipeline_hint`). Mesh pipelines have no libraries and are built whole. Compute pipelines
   are compiled outside the pipeline lock, and one compile serves every thread that needs it. The boot builds the
   pipeline of every compute shader play recorded or the shader preparation listed, but keeps only those of the shaders
   dispatched most recently (`compute-used.bin`, `compute_keep`): the others go into the pipeline cache and are
@@ -144,6 +161,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
+- Texture detail (`texture_detail`, `vk_texture.c` "texture detail"): on a card with little video memory the large
+  mipmapped ASTC textures the CPU fills are made without their largest mip level (reduced) or their two largest (low),
+  which is three quarters and fifteen sixteenths of their memory. The image holds the game's levels from the one it
+  starts at, and uploads, views and sampler LOD clamps count from there. A texture a shader reads by texel position, or
+  whose size it uses, is made whole (`gfx_shader.c` `reflect_exact`). `auto` picks by the device-local budget.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`NX2NAVI_DUMP`,
   `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`) and a flight recorder

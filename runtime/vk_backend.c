@@ -308,6 +308,12 @@ static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
 
+// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
+void gfx_event_signalling(const void *value, uint32_t to) {
+    vk_exec_event_cpu(value);
+    vk_exec_evt('c', value, to);
+}
+
 // The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
 uint64_t gfx_replayed_submits(void) {
     if (!gfx_replay_async()) return nvn_submit_count();
@@ -382,6 +388,10 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_present_drain();
     vk_texture_new_submit();
     uint64_t f = vk_sync_submit(handles, n);
+    // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
+    // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
+    // submission's value is the one the game's fence stands for.
+    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
@@ -528,6 +538,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
+        vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
         if (present_held_on()) {   // present_held

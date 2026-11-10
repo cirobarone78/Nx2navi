@@ -1878,9 +1878,11 @@ static void refuse(PoolRec *r, int why, const char *what) {
 // mirrored again, from a whole copy, on its next buffer use. Its freed bytes count as room at once (evict_room), until
 // the GPU is past the submission and the destroy shows in VMA's figures.
 #define MIRROR_IDLE 120
+#define MIRROR_SHARE 2   // the mirrors' share of the budget that the budget check never refuses: one in this many
 #define RETRY_SOON 16
 static int mirror_evict_on = -1;
 static int64_t m_evicted_n, m_evicted_bytes, m_retries;
+static volatile int64_t m_over_n, m_over_bytes;   // mirrors made although the budget check failed (mirror_create)
 static uint64_t room_bytes, room_fence;   // replay: bytes evicted that the budget may still count, until room_fence
 
 static int evict_enabled(void) {
@@ -2011,17 +2013,36 @@ static void mirror_create(PoolRec *r) {
             uint64_t f = mirror_evict(used + n + budget / 8 - budget, MIRROR_IDLE, why);
             used = used > f ? used - f : 0;
         }
+        // Over the budget still. The mirrors keep their place up to MIRROR_SHARE of the budget whatever else fills the
+        // VRAM: on a 6 GiB card a loaded area's textures alone pass the budget before the game's buffers are first
+        // used, every pool was refused, and the GPU read vertices, indices and storage over PCIe at each draw: 70 to
+        // 250 ms of GPU time a frame, 5 to 13 fps, in two reports from RTX 3060 Laptop cards. A mirror the driver cannot
+        // keep in VRAM is paged to system memory, where the imported pool already is, so a mirror never reads slower
+        // than its pool, and what is drawn from every frame is not what the system pages out first. The textures are
+        // still asked for the room. Past that share a pool is refused as before.
         if (used + n + budget / 8 > budget) {
-            char why[128];
-            snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
-                     n / 1048576.0, used / 1048576.0, budget / 1048576.0);
-            refuse(r, MR_BUDGET, why);
-            if (evict && !r->asked_room) {   // idle textures make the rest; asked again once they had the time
-                vk_texture_want_room(used + n + budget / 8 - budget);
-                r->retry_sub = msub + RETRY_SOON ? msub + RETRY_SOON : 1;
-                r->asked_room = 1;   // later refusals wait RETRY_SUBS: the textures had nothing to give
+            uint64_t over = used + n + budget / 8 - budget;
+            if (evict && (uint64_t)m_live_bytes + n <= budget / MIRROR_SHARE) {
+                vk_texture_want_room(over);
+                plat_inc64(&m_over_n);
+                plat_add64(&m_over_bytes, (int64_t)n);
+                if (m_over_n <= 4 || !(m_over_n & 255))
+                    rt_log("mem: mirror of %.1f MiB made over the VRAM budget (%.0f of %.0f MiB in use, mirrors %.0f MiB): "
+                           "%lld such so far, %.0f MiB; idle textures are asked for the room",
+                           n / 1048576.0, used / 1048576.0, budget / 1048576.0, m_live_bytes / 1048576.0,
+                           (long long)m_over_n, m_over_bytes / 1048576.0);
+            } else {
+                char why[128];
+                snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
+                         n / 1048576.0, used / 1048576.0, budget / 1048576.0);
+                refuse(r, MR_BUDGET, why);
+                if (evict && !r->asked_room) {   // idle textures make the rest; asked again once they had the time
+                    vk_texture_want_room(over);
+                    r->retry_sub = msub + RETRY_SOON ? msub + RETRY_SOON : 1;
+                    r->asked_room = 1;   // later refusals wait RETRY_SUBS: the textures had nothing to give
+                }
+                return;
             }
-            return;
         }
     }
     plat_mutex_lock(&gen_lock);
@@ -2687,7 +2708,7 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
     free(f);
 }
 
-// ---- lazy write-back (NX2NAVI_WB_LAZY, default 0; memory.c "Lazy write-back")
+// ---- lazy write-back (NX2NAVI_WB_LAZY, default 1 on Windows; memory.c "Lazy write-back")
 // A range a shader wrote goes back to guest memory once and is then armed (vk_gpu_written_back, mem_lazy_arm). While it
 // stays armed, gpu_wrote leaves the later writes of its pages in the mirror: no snapshot, no merge, no copy. When the
 // CPU touches a page, memory.c calls lazy_fetch with the mirror and the imported buffer of the range: a copy of its

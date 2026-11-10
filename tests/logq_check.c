@@ -39,12 +39,12 @@ void rt_log(const char *fmt, ...) {
 
 // ---- producers: thread t writes lines "t <t> <seq> <padding>\n"
 enum { THREADS = 8 };
-typedef struct { int id, lines, pad; uint64_t worst_ns; } Prod;
+typedef struct { int id, lines, pad, first; uint64_t worst_ns; } Prod;
 static void producer(void *arg) {
     Prod *p = arg;
     char line[512];
     for (int i = 0; i < p->lines; i++) {
-        int n = snprintf(line, sizeof line, "t %d %d %.*s\n", p->id, i, p->pad,
+        int n = snprintf(line, sizeof line, "t %d %d %.*s\n", p->id, p->first + i, p->pad,
                          "................................................................................................"
                          "................................................................................................"
                          "................................................................................................");
@@ -55,9 +55,27 @@ static void producer(void *arg) {
     }
 }
 
-// Waits until the sink has taken everything written so far.
-static void settle(size_t want) {
-    for (int i = 0; i < 20000 && __atomic_load_n(&out_n, __ATOMIC_SEQ_CST) < want; i++) plat_sleep_ms(1);
+// Waits until everything queued so far is written: the queue is empty while no write of it is under way (its io lock).
+static void settle(void) {
+    for (int i = 0; i < 60000; i++) {
+        plat_mutex_lock(&Q.io);
+        plat_mutex_lock(&Q.q);
+        size_t n = Q.n;
+        plat_mutex_unlock(&Q.q);
+        plat_mutex_unlock(&Q.io);
+        if (!n) return;
+        plat_sleep_ms(1);
+    }
+    printf("FATAL: the queue did not empty in a minute\n");
+    exit(3);
+}
+
+// The line about slow writes (logq.c say_slow) comes when a write happened to take 2 ms, which on a busy machine is
+// any write. The checks below count bytes and writes, so the test takes the flag say_slow tries and no such line is
+// written until the test gives the flag back. Taking it waits for a line that is being said.
+static void slow_line(int allowed) {
+    if (allowed) plat_xchg32(&Q.saying, 0);
+    else while (plat_xchg32(&Q.saying, 1)) plat_sleep_ms(1);
 }
 
 // Every line of the output from at on is whole, and each thread's lines come in their order. Returns the lines seen;
@@ -104,6 +122,7 @@ int main(void) {
     Prod pr[THREADS];
     int next[THREADS] = {0}, notes = 0;
     logq_init(sink);
+    slow_line(0);
 
     // 1. Before the queue is on, a line is written by the thread that logs it, before logq_write returns.
     logq_write("t 0 0 \n", 7);
@@ -116,16 +135,38 @@ int main(void) {
     // 2. With the queue: eight threads, 20,000 lines each; every line arrives whole and each thread's in order.
     CHECK(logq_async(), "the log thread did not start");
     size_t want = at + run(pr, THREADS, 20000, 40);
-    settle(want);
+    settle();
     CHECK(out_n == want, "%zu bytes written, %zu queued", (size_t)out_n - at, want - at);
     CHECK(check_lines(at, next, &notes) == THREADS * 20000, "lines lost or doubled");
     CHECK(sink_calls < THREADS * 20000 / 2, "%d writes for %d lines: the queue did not batch", (int)sink_calls, THREADS * 20000);
     at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
-    // 3. A slow destination (30 ms a write) does not hold the threads that log: 100 lines, a millisecond apart.
+    // 3. A thread that finds the queue's lock taken waits for it, so its line does not pass a line queued before it.
+    //    The test takes both locks itself: the first line stays queued, and the second thread finds the lock taken.
+    plat_mutex_lock(&Q.io);
+    logq_write("t 0 0 \n", 7);
+    plat_mutex_lock(&Q.q);
+    pr[0] = (Prod){.id = 0, .lines = 1, .first = 1};
+    PlatThread *late = plat_thread_new(producer, &pr[0], "producer");
+    if (!late) { printf("FATAL: no thread\n"); return 3; }
+    plat_sleep_ms(200);
+    size_t passed = out_n - at;
+    plat_mutex_unlock(&Q.q);
+    plat_mutex_unlock(&Q.io);
+    plat_thread_join(late);
+    settle();
+    CHECK(!passed, "%zu bytes were written past the queue's taken lock", passed);
+    CHECK(check_lines(at, next, &notes) == 2, "the line that waited for the queue's lock");
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 4. A slow destination (30 ms a write) does not hold the threads that log: 100 lines, a millisecond apart. A
+    //    thread that waited for the writes would take 30 ms for most lines; on a busy machine the scheduler alone can
+    //    hold a few that long, so the check is how many did.
     __atomic_store_n(&sink_ms, 30, __ATOMIC_RELEASE);
     uint64_t worst = 0;
+    int waited = 0;
     for (int i = 0; i < 100; i++) {
         char line[64];
         int n = snprintf(line, sizeof line, "t 0 %d \n", i);
@@ -133,41 +174,60 @@ int main(void) {
         logq_write(line, (size_t)n);
         uint64_t d = plat_now_ns() - t0;
         if (d > worst) worst = d;
-        want += (size_t)n;
+        if (d >= 15000000) waited++;
         plat_sleep_ms(1);
     }
-    CHECK(worst < 15000000, "a line waited %.1f ms for a 30 ms write", worst / 1e6);
-    settle(want);
-    __atomic_store_n(&sink_ms, 0, __ATOMIC_RELEASE);
-    settle(want);
-    plat_sleep_ms(50);   // the log thread's line about the slow writes
+    CHECK(waited < 20, "%d of 100 lines waited 15 ms or longer for a 30 ms write, the longest %.1f ms", waited, worst / 1e6);
+    settle();
     CHECK(check_lines(at, next, &notes) == 100, "lines lost behind a slow write");
-    CHECK(notes == 1, "%d lines about slow writes within ten seconds, want 1", notes);
-    want = at = out_n;
+    CHECK(!notes, "%d lines about slow writes while the test held them back", notes);
+    at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
-    // 4. A destination that stops while more is logged than the queue holds: the threads wait, nothing is lost.
+    // 5. The line about slow writes: one after the first slow write, and no second one within ten seconds of it.
+    uint64_t told0 = plat_now_ns();
+    slow_line(1);
+    for (int i = 0; i < 5; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 0 %d \n", i);
+        logq_write(line, (size_t)n);
+        settle();
+        for (int k = 0; !i && k < 20000 && !__atomic_load_n(&Q.said_at, __ATOMIC_RELAXED); k++) plat_sleep_ms(1);
+    }
+    plat_sleep_ms(100);   // the log thread says its line after the write, with no lock held: time for a second one
+    slow_line(0);
+    settle();
+    uint64_t told_s = (plat_now_ns() - told0) / 1000000000ull;
+    __atomic_store_n(&sink_ms, 0, __ATOMIC_RELEASE);
+    CHECK(check_lines(at, next, &notes) == 5, "lines lost beside the line about slow writes");
+    CHECK(notes >= 1 && notes <= 1 + (int)(told_s / 10), "%d lines about slow writes in %d s, want one per ten seconds",
+          notes, (int)told_s);
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
+    // 6. A destination that stops while more is logged than the queue holds: the threads wait, nothing is lost.
     __atomic_store_n(&held, 1, __ATOMIC_RELEASE);
     logq_write("t 0 0 \n", 7);   // the log thread takes it and stops in the sink
-    for (int i = 0; i < 5000 && !__atomic_load_n(&in_sink, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(1);
+    for (int i = 0; i < 20000 && !__atomic_load_n(&in_sink, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(1);
     CHECK(in_sink, "the log thread did not reach the sink");
     PlatThread *th[THREADS];
     for (int i = 0; i < THREADS; i++) {
         pr[i] = (Prod){.id = i, .lines = 2000, .pad = 250};   // 8 x 2000 x 260 bytes: four times the queue
         th[i] = plat_thread_new(producer, &pr[i], "producer");
+        if (!th[i]) { printf("FATAL: no thread\n"); return 3; }
     }
     plat_sleep_ms(200);
     size_t stuck = out_n;
     __atomic_store_n(&held, 0, __ATOMIC_RELEASE);
     for (int i = 0; i < THREADS; i++) plat_thread_join(th[i]);
-    plat_sleep_ms(200);
+    settle();
     CHECK(stuck == at, "%zu bytes were written while the destination was stopped", stuck - at);
     at += 7;   // past the line that stopped the log thread
     CHECK(check_lines(at, next, &notes) == THREADS * 2000, "lines lost at a full queue");
     at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
-    // 5. logq_sync: what is queued is written before it returns, and later lines are written by their own thread.
+    // 7. logq_sync: what is queued is written before it returns, and later lines are written by their own thread.
     __atomic_store_n(&sink_ms, 20, __ATOMIC_RELEASE);
     for (int i = 0; i < 50; i++) {
         char line[64];

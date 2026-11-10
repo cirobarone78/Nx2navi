@@ -57,7 +57,7 @@ static double wanted_ratio(void) {
 
 // NX2NAVI_GAME_RES: the picture's height, 1080 up to 4320 ("window": the window's height, or the monitor's in
 // fullscreen, never below the game's 1440). 1080 is the one height below the game's own: a lighter picture for slower
-// GPUs, its scene and the DLSS modes scaled down with it (wide_present, scale_k).
+// GPUs, whose scene the game sizes against that picture itself, as the comment at scale_k says.
 #define PICTURE_MIN_H 1080
 static unsigned picture_height(void) {
     const char *s = cfg_value("NX2NAVI_GAME_RES");
@@ -109,8 +109,10 @@ static double scene_share(void) {
     return s > 0 ? s : plain;
 }
 
-// The game turns the scale at +240 into a scene size against its own 1440-line picture (a 2160-line picture at 1.0
-// gave a 1440-line scene), so the share goes there times the picture's height over 1440: wide_init sets it.
+// The game turns the scale at +240 into a scene size against its own 1440-line picture while the picture is taller
+// (a 2160-line picture at 1.0 gave a 1440-line scene), so the share goes there times the picture's height over 1440.
+// Under a 1080-line picture the game measures against that picture instead (a share of 1.0 times 1080/1440 gave an
+// 810-line scene, three quarters of the picture), so there the share goes in as it is: wide_init sets the factor.
 static double scale_k = 1.0;
 
 void wide_present(void) {
@@ -204,7 +206,7 @@ void wide_init(void) {
     rt_patch_switch(sa, 1);
     rt_patch_switch(sh, 1);
     rt_patch_switch(sm, 1);
-    scale_k = (double)oh / GAME_H;
+    scale_k = oh > GAME_H ? (double)oh / GAME_H : 1.0;
     rt_log("widescreen: picture %ux%u, scene %ux%u (%.0f%% of it), camera aspect ratio %.4f (16:9 is %.4f), UI and movies "
            "in the middle %.1f%%", ow, oh, sw, sch, f * 100, ratio, game, squeeze * 100);
 }

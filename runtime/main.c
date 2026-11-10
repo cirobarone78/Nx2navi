@@ -597,17 +597,18 @@ int main(int argc, char **argv) {
             if (++i == argc) return usage(argv[0]);
             *path = argv[i];
         } else if (!strcmp(argv[i], "--audio-device")) {
-            // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get), and
-            // nothing has read it yet because the audio renderer opens in rt_boot. An empty value would remove the variable
-            // (plat_setenv) and hand the choice back to nx2navi.ini, so "default" is the spelling for the system default.
+            // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get).
+            // cfg_init has read the settings by now, so the variable goes in through cfg_setenv, which makes the lookups
+            // read again. An empty value would remove the variable (plat_setenv) and hand the choice back to
+            // nx2navi.ini, so "default" is the spelling for the system default.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
-            plat_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
+            cfg_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
         } else if (!strcmp(argv[i], "--monitor")) {
-            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get), and nothing has read it yet:
-            // the window opens in rt_boot. An empty value would remove the variable (plat_setenv) and hand the choice back
-            // to nx2navi.ini, so "auto" is the spelling for "no monitor choice" on the command line.
+            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get); cfg_setenv as above. An empty
+            // value would remove the variable (plat_setenv) and hand the choice back to nx2navi.ini, so "auto" is the
+            // spelling for "no monitor choice" on the command line.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
-            plat_setenv("NX2NAVI_MONITOR", argv[i]);
+            cfg_setenv("NX2NAVI_MONITOR", argv[i]);
         } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);

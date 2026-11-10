@@ -6,9 +6,10 @@
 // else to show for it.
 //
 // With the queue on (logq_async) a line is copied into a buffer under a lock that is held for the copy alone, and the
-// "log" thread writes the buffer out, so lines keep the order they were queued in. logq_sync writes what is queued on
-// the calling thread and turns the queue off for the rest of the run: a fatal error, the crash report and the end of
-// the process call it (rt_log_sync), so no line is lost to an exit and their own lines are written as they are made.
+// "log" thread writes the buffer out, so lines keep the order they were queued in. A line that finds no room is written
+// by its own thread, after everything queued before it (put). logq_sync writes what is queued on the calling thread
+// and turns the queue off for the rest of the run: a fatal error, the crash report and the end of the process call it
+// (rt_log_sync), so no line is lost to an exit and their own lines are written as they are made.
 //
 // Every write is timed. One that took LOGQ_SLOW_NS or longer is counted, and a line says so at most every ten
 // seconds: with the queue that time was the log thread's, without it (NX2NAVI_LOG_ASYNC=0) the logging thread's.
@@ -30,7 +31,7 @@ static struct {
     size_t n;
     LogqSink sink;
     volatile int32_t on, saying;
-    volatile int64_t slow, said, worst_ns, direct;   // slow writes, those reported, the longest; lines written past a busy queue
+    volatile int64_t slow, said, worst_ns, full;   // slow writes, those reported, the longest; lines that found no room
     volatile uint64_t said_at;
 } Q = {.q = PLAT_MUTEX_INIT, .io = PLAT_MUTEX_INIT, .more = PLAT_COND_INIT};
 
@@ -57,10 +58,10 @@ static void say_slow(void) {
     __atomic_store_n(&Q.said, slow, __ATOMIC_RELAXED);
     __atomic_store_n(&Q.said_at, now ? now : 1, __ATOMIC_RELAXED);
     rt_log("log: %lld writes of the log took over %d ms so far, the longest %.1f ms, %s (NX2NAVI_LOG_ASYNC); %lld lines "
-           "were written past a busy queue", (long long)slow, (int)(LOGQ_SLOW_NS / 1000000),
+           "found the queue full and waited for its write", (long long)slow, (int)(LOGQ_SLOW_NS / 1000000),
            __atomic_load_n(&Q.worst_ns, __ATOMIC_RELAXED) / 1e6,
            __atomic_load_n(&Q.on, __ATOMIC_ACQUIRE) ? "on the log thread" : "on the threads that logged",
-           (long long)__atomic_load_n(&Q.direct, __ATOMIC_RELAXED));
+           (long long)__atomic_load_n(&Q.full, __ATOMIC_RELAXED));
     plat_xchg32(&Q.saying, 0);
 }
 
@@ -76,21 +77,24 @@ static void drain(void) {
     plat_mutex_unlock(&Q.io);
 }
 
-// 1 when the bytes were queued, 0 when the caller is to write them. The queue's lock is only tried: a thread that logs
-// while the lock's holder cannot run (stopped for a profile sample or a core hand-over) writes its line itself.
+// 1 when the bytes were queued, 0 when the caller is to write them: the queue is off, or it had no room, and then
+// what it held has been written first (drain). So a thread's lines reach the log in the order it logged them.
+//
+// The queue's lock is waited for. A thread that wrote its line itself because the lock was taken would put that line
+// before the lines it queued earlier, and on a busy machine the lock is taken for a whole time slice whenever its
+// holder loses the processor inside the copy. Waiting cannot hang: the lock is held for the copy alone, the runtime
+// stops a thread only for moments in which it takes no lock and logs nothing (kernel.c ap_try and dg_sample,
+// prof_win.c), and a fatal error or a crash turns the queue off before it logs (logq_sync, which only tries the locks).
 static int put(const char *p, size_t n) {
-    if (!__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE) || n > LOGQ_CAP / 4) return 0;
-    for (int tries = 0; !plat_mutex_trylock(&Q.q); tries++) {
-        if (tries == 4000) {
-            __atomic_add_fetch(&Q.direct, 1, __ATOMIC_RELAXED);
-            return 0;
-        }
-        plat_pause();
-    }
+    if (!__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE)) return 0;
+    plat_mutex_lock(&Q.q);
     int on = __atomic_load_n(&Q.on, __ATOMIC_ACQUIRE);
-    if (!on || Q.n + n > LOGQ_CAP) {   // full: the log thread is held up in a write. What is queued goes out first
+    if (!on || Q.n + n > LOGQ_CAP) {   // no room: the log thread is held up in a write, or the line is larger than the queue
         plat_mutex_unlock(&Q.q);
-        if (on) drain();
+        if (on) {
+            __atomic_add_fetch(&Q.full, 1, __ATOMIC_RELAXED);
+            drain();
+        }
         return 0;
     }
     int first = !Q.n;

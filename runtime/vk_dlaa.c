@@ -1827,11 +1827,16 @@ static int scene_color(VkFormat f) {
 // Two frame shapes. A deferred frame (the G-buffer, several colour targets at the scene size) arms on the light target
 // drawn after it and ends the scene at the first pass a quarter as wide (the bloom), as described above. Ocarina's
 // frame has no G-buffer: its light target (B10G11R11 at the scene size, with the D32F scene depth) is drawn into from the
-// first opaque pass on, half- and quarter-size effect passes come and go in between, and the scene ends at the pass
-// that tonemaps the light target into the 8-bit output target. So without a G-buffer the frame arms on the first
-// scene-size light pass and ends at that output pass: at the output size and without depth when DLSS scales up
-// (DLSS writes the output and the tonemap samples it through vk_dlaa_swap_img), an sRGB target of the scene size in
-// DLAA (DLSS's picture goes back into the light target, which the tonemap then reads).
+// first opaque pass on, half- and quarter-size effect passes come and go in between. Measured (NX2NAVI_DUMP, Kokiri
+// Forest, DLAA in a 2560x1440 picture): the last pass with the scene depth is the bloom composite into a second light
+// target (each such pass at the scene's size takes over the arming, with its depth); the game's upscaler (its stand-in
+// here, vk_tonemap.c) then fills a light-format target without depth, at the picture's size, which the HUD is drawn
+// into; a last draw copies that target into the 8-bit sRGB output target, encoding only, since the game tonemaps before
+// its post pass (vk_tonemap.c, vk_hdr.c). The scene ends at the start of the pass the HUD is drawn into: DLSS reads the
+// armed pair and its picture goes into that target, which the HUD is drawn over and the last draw reads. With an
+// upscaling share that target is larger than the scene; in DLAA it has the scene's size. A frame without it (the
+// menus) ends at the last draw, at the 8-bit output target of the scene's size, and DLSS's picture goes back into the
+// light target, which that draw reads.
 static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
 
 // The output target DLAA runs at. With the game's own HDR (vk_hdr.c vk_hdr_native) the same pass, at the same point of
@@ -1902,12 +1907,26 @@ void vk_dlaa_pass(VkExec *ex) {
         // resolution step) has no such pass: after a frame that missed DLSS the first pass wider than the scene is
         // taken for 120 frames (D.share_off, vk_dlaa_frame), so a mismatch costs one frame rather than every frame.
         double share = wide_dlss_share();
-        int big = D.share_off || share <= 0 || share >= 1 || c->width >= 0.95 * D.color.width / share;
+        int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
+        int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
+        int same = c->width == D.color.width && c->height == D.color.height;
         if (one && big && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
-        } else if (one && output_target(c->format) && c->width == D.color.width &&
-                   c->height == D.color.height) {
+        } else if (one && same && native && scene_color(c->format)) {
+            // DLAA in gameplay: the pass the HUD is drawn into is also at the scene's size, in the light format, and
+            // the game's upscaler (its stand-in here) has just written the picture there. Waiting for the 8-bit output
+            // pass, as in a frame without it, put DLSS's picture back into the armed light target (the bloom
+            // composite's), which nothing reads after the upscaler took it: the frame showed no DLAA at all. With an
+            // upscaling share the HUD's pass is the larger one above, so a pass of this shape is not it and is ignored
+            // there as before.
+            static int told;
+            if (!told++)
+                rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
+                       c->width, c->height, (int)c->format);
+            D.ended = D.done = D.up = 1;
+            evaluate(ex, c);
+        } else if (one && same && output_target(c->format)) {
             D.ended = D.done = 1;
             evaluate(ex, NULL);
         }

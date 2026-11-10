@@ -162,6 +162,14 @@ void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass s
 // rendered for the first time) was rendered in the previous presented frame (per-frame targets); 0 otherwise, or when
 // the pass has none.
 int vk_exec_targets_recent(VkExec *ex, int any);
+// Looking ahead (vk_exec.c): called by a draw that found its shader or pipeline missing, before it waits or is skipped.
+// The rest of the submission being replayed is read once and the stage libraries of the pipelines its later draws need
+// are queued to the workers (vk_pipeline_hint). vk_exec_ahead_op (vk_exec_draw.c) applies one bind or draw op of that
+// scan to sx, a copy of the replay state; vk_exec_ahead_begin starts a scan there.
+void vk_exec_ahead(VkExec *ex);
+void vk_exec_ahead_begin(void);
+void vk_exec_ahead_op(VkExec *sx, uint32_t op, const void *payload);
+extern uint64_t vk_exec_ahead_draws, vk_exec_ahead_lookups;   // draws the scans saw, and those whose shaders they looked up
 // The current pass's targets with their formats, extents and the frames they were last rendered in (diagnostics).
 void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap);
 
@@ -231,10 +239,18 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
 int vk_exec_wait_event(const void *payload);
 int vk_exec_event_met(const void *payload);   // the same test without counting
 extern int vk_exec_signalled;                 // set by every replayed SignalEvent; vk_exec.c clears it
+// Events the CPU signals (vk_exec_xfer.c "events the CPU signals").
+void vk_exec_event_cpu(const void *event);    // any thread: nvnEventSignal is about to write the event's value
+void vk_exec_event_sync(int begin);           // vk_exec_record: its mirror sync and uniform copy are taken now / it ends
+int vk_exec_event_at_sync(void);              // NX2NAVI_EVENT_AT_SYNC
+uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after the copies would have passed, since the last call
 // Since the last call, which resets them: waits, waits reached before their signal, those of them a later replayed
 // signal met, and the sum of how many submissions later it came.
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+// NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
+void vk_exec_evt(char what, const void *event, uint32_t value);
+void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged
 int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
 int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
