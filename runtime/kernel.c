@@ -364,12 +364,27 @@ void kern_free_cores_note(void) {
 
 // NX2NAVI_CORES = 1..NCORE: how many virtual cores run threads (default all NCORE). A core at or above the count is
 // folded onto core (c mod count): a thread pinned to core 5 with NX2NAVI_CORES=3 runs on core 2, one thread per core
-// at a time as always (diagnosis of races that more parallel cores expose).
+// at a time as always (diagnosis of races that more parallel cores expose; the Steam Deck profile's four).
 static int core_allowed(const RtThread *t, int c) {
     if (c >= g_active_cores) return 0;
     for (int j = c; j < NCORE; j += g_active_cores)
         if ((t->mask >> j) & 1) return 1;
     return 0;
+}
+
+// The core number a thread sees (GetCurrentProcessorNumber) while it holds virtual core c. With all NCORE cores that
+// is c. With fewer it is one of the thread's own cores that fold onto c, its ideal core first: the game keys per-core
+// data by this number without locks, so a thread pinned to core 5 must go on using core 5's data when it takes
+// turns with core 1's threads on one virtual core. Seeing 1 there, it used core 1's data in turn with core 1's own
+// threads, and the game died in its draw set-up within seconds of the first frame in play (issue #445; with
+// NX2NAVI_CORES=4 on any machine). No two threads that run guest code see the same number: they hold different
+// virtual cores, and the numbers that fold onto different virtual cores differ.
+static int core_seen(const RtThread *t, int c) {
+    if (g_active_cores >= NCORE) return c;
+    if (t->core >= 0 && t->core < NCORE && t->core % g_active_cores == c && ((t->mask >> t->core) & 1)) return t->core;
+    for (int j = c; j < NCORE; j += g_active_cores)
+        if ((t->mask >> j) & 1) return j;
+    return c;
 }
 
 // ---- asynchronous preemption (NX2NAVI_ASYNC_PREEMPT, on unless 0)
@@ -1707,9 +1722,9 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
         unlock();
         return 1;
     }
-    case 0x10: {   // GetCurrentProcessorNumber: the virtual core held
+    case 0x10: {   // GetCurrentProcessorNumber: the core seen on the virtual core held (core_seen)
         RtThread *t = cur(imm);
-        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core);
+        x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? core_seen(t, t->cur_core) : t->core);
         return 1;
     }
     case 0x36: {   // SynchronizePreemptionState: the SDK's spin locks call it after clearing TLR+0x100 (disable_count)

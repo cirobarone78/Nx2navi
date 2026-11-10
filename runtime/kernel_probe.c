@@ -474,6 +474,46 @@ static void test_cores(Cpu *c) {
     CHECK(ok || !gate, "virtual cores");
 }
 
+// ---- pinned threads: each sees the number of the core it is pinned to, also where NX2NAVI_CORES folds that core
+// onto another one (kernel.c core_seen), and no two that run guest code at once see the same number. Run the probe
+// with NX2NAVI_CORES=4 (the Steam Deck profile's value) to check the folded case; with all cores it holds trivially.
+#define PIN_CORES 6   // kernel.c NCORE
+static volatile int32_t g_pin_wrong, g_pin_clash, g_pin_use[PROBE_CORES];
+static uint64_t a_pin_worker;
+
+static void pin_worker(Cpu *c) {
+    uint32_t own = *(uint32_t *)arg_p(c, 0);
+    for (int i = 0; i < CORE_RUNS; i++) {
+        uint32_t core = sv(c, 0x10, 0, 0, 0, 0);
+        if (core != own) plat_inc32(&g_pin_wrong);
+        int known = core < PROBE_CORES;
+        if (!known || plat_inc32(&g_pin_use[core]) != 1) plat_inc32(&g_pin_clash);
+        uint64_t until = kern_now_ns() + 20000;
+        while (kern_now_ns() < until) {}
+        if (known) plat_dec32(&g_pin_use[core]);
+        sv(c, 0x0B, i % 8 == 7 ? 50000 : 0, 0, 0, 0);
+    }
+    exit_thread(c);
+}
+
+static void test_pinned_cores(Cpu *c) {
+    static uint32_t own[2 * PIN_CORES];
+    uint32_t h[2 * PIN_CORES];
+    g_pin_wrong = g_pin_clash = 0;
+    for (int i = 0; i < 2 * PIN_CORES; i++) {   // two threads per core, so each core's own threads take turns too
+        own[i] = (uint32_t)(i % PIN_CORES);
+        h[i] = create(c, a_pin_worker, &own[i], 44, i % PIN_CORES);
+        start(c, h[i]);
+    }
+    for (int i = 0; i < 2 * PIN_CORES; i++) join(c, h[i]);
+    int gate = !cfg_bool("NX2NAVI_FREE_CORES");
+    int ok = !g_pin_wrong && !g_pin_clash;
+    printf("pinned cores: %d threads on %d cores (%d virtual cores run threads) x %d runs: %d saw another core's "
+           "number, %d core-number clashes: %s\n", 2 * PIN_CORES, PIN_CORES, kern_cores(), CORE_RUNS, g_pin_wrong,
+           g_pin_clash, !gate ? "not checked (NX2NAVI_FREE_CORES is set)" : ok ? "ok" : "FAIL");
+    CHECK(ok || !gate, "pinned cores");
+}
+
 // ---- fibers: two fibers switch to each other; each checks its callee-saved registers, sp and tpidr survive
 typedef struct { uint64_t self, other; int id; } FiberJob;
 static volatile int32_t g_switches, g_runs[3];
@@ -670,6 +710,7 @@ static void probe_main(Cpu *c) {
     test_arbiter(c);
     test_events(c);
     test_cores(c);
+    test_pinned_cores(c);
     test_fibers(c);
     test_exit(c);
     test_lifted_ticks(c);
@@ -740,6 +781,7 @@ int probe_kernel(void) {
     a_arb_waiter = hostfn_register("probe-kernel arbiter waiter", arb_waiter);
     a_event_waiter = hostfn_register("probe-kernel event waiter", event_waiter);
     a_core_worker = hostfn_register("probe-kernel core worker", core_worker);
+    a_pin_worker = hostfn_register("probe-kernel pin worker", pin_worker);
     a_exit_entry = hostfn_register("probe-kernel exit entry", exit_entry);
     a_exit_nested = hostfn_register("probe-kernel exit nested", exit_nested);
     a_fiber_fn = hostfn_register("probe-kernel fiber", fiber_fn);
