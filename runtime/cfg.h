@@ -1,5 +1,6 @@
 // Settings: the NX2NAVI_* environment variables, with nx2navi.ini next to nx2navi.exe behind them.
 #pragma once
+#include <stddef.h>
 
 // getenv for a setting: the environment variable when set, else the nx2navi.ini key (the name without "NX2NAVI_", any
 // case), else the device profile's default (cfg.c: the Steam Deck), else NULL. Same string semantics as getenv; the pointer stays valid for the process (a value cfg_set replaces
