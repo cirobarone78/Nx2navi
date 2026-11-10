@@ -780,11 +780,14 @@ def compiler_ids(clang, env):
     """(id, id up to 0.6.0): what names the compiler in the object cache's keys. The id is its --version text and its
     size. The keys up to 0.6.0 held the file's modification time too, so a tool update that put the same compiler back
     made every object stale, a full compile of the game for nothing; that form is still made, to take those objects
-    over (object_alts)."""
+    over (object_alts). A compiler inside the kit (the Linux AppImage's) names its folder in that text, and the
+    AppImage is mounted at another folder on every run: the kit's folder is written as <kit>, as in the keys' flags,
+    so its objects stay current. A system compiler's text does not name the kit, and its id is unchanged."""
     p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env, errors='replace')
+    text = p.stdout.replace(str(KIT), '<kit>')
     st = os.stat(clang)
-    return (sha256_bytes(f'{p.stdout}\n{st.st_size}'.encode()),
-            sha256_bytes(f'{p.stdout}\n{st.st_size}\n{int(st.st_mtime)}'.encode()))
+    return (sha256_bytes(f'{text}\n{st.st_size}'.encode()),
+            sha256_bytes(f'{text}\n{st.st_size}\n{int(st.st_mtime)}'.encode()))
 
 
 def compiler_id(clang, env):
