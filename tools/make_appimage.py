@@ -74,11 +74,14 @@ if [ "$1" = --events ]; then EVENTS=(--events); shift; fi
 ev step deps '"state":"start"'
 
 missing=()
-for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
-# The Vulkan headers come with this file (the kit's toolchain/vulkan-headers): a distribution's may be too old.
-for h in SDL3/SDL.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
-    [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
-done
+# A kit with its own toolchain (make_appimage.py --linux-toolchain) needs none of the system's compiler or headers
+if [ ! -x "$KIT/linux-toolchain/llvm/bin/clang" ]; then
+    for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+    # The Vulkan headers come with this file (the kit's toolchain/vulkan-headers): a distribution's may be too old.
+    for h in SDL3/SDL.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
+        [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
+    done
+fi
 if [ ${#missing[@]} -gt 0 ]; then
     cat >&2 <<EOF
 Missing: ${missing[*]}
@@ -196,6 +199,9 @@ def main():
     ap.add_argument('--ffx', type=Path, metavar='FOLDER',
                     help='the folder tools/ffx_linux/build.sh wrote libamd_fidelityfx_vk.so and its licence into: FSR 3.1 '
                          'on Linux; without it the game has no FSR 3.1')
+    ap.add_argument('--linux-toolchain', type=Path, metavar='FOLDER',
+                    help='the folder tools/make_linux_toolchain.py wrote: the game then builds with it (LLVM, a Steam '
+                         'Runtime sysroot, its libraries) instead of the system\'s compiler, headers and libraries')
     ap.add_argument('--prompt-art', type=Path, nargs='+', metavar='FOLDER',
                     help='folders holding XGamepad, P5Gamepad and Keyboard_Mouse (or those folders): the button art, as '
                          'make_kit.py --prompt-art takes it (a release zip\'s prompt-art folder does too)')
@@ -243,6 +249,10 @@ def main():
         for f in ('libamd_fidelityfx_vk.so', 'libamd_fidelityfx_vk-LICENSE.txt'):
             shutil.copy2(a.ffx / f, kit / 'ffx' / f)
         print('FSR 3.1: libamd_fidelityfx_vk.so')
+    if a.linux_toolchain:   # tools/make_game.py LINUX_TOOLCHAIN
+        shutil.copytree(a.linux_toolchain, kit / 'linux-toolchain', symlinks=True)
+        print('toolchain: ' + subprocess.run([kit / 'linux-toolchain' / 'llvm' / 'bin' / 'clang', '--version'],
+                                             capture_output=True, text=True).stdout.splitlines()[0])
     if a.prompt_art:
         import prompt_art
         n, size = prompt_art.copy_art(a.prompt_art, kit / prompt_art.FOLDER)

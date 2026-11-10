@@ -17,19 +17,27 @@ find_package(Threads REQUIRED)
 find_package(Vulkan REQUIRED)
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
-add_executable(FidelityFX_SC
-    ffx_sc/ffx_sc.cpp ffx_sc/glsl_compiler.cpp ffx_sc/utils.cpp
-    "${FFX_SC_LIBS}/MD5/md5.cpp" "${FFX_SC_LIBS}/SPIRV-Reflect/spirv_reflect.c"
-    "${FFX_SC_LIBS}/tiny-process-library/process.cpp" "${FFX_SC_LIBS}/tiny-process-library/process_unix.cpp")
-target_include_directories(FidelityFX_SC PRIVATE ffx_sc
-    "${FFX_SC_LIBS}/MD5" "${FFX_SC_LIBS}/SPIRV-Reflect" "${FFX_SC_LIBS}/tiny-process-library")
-target_link_libraries(FidelityFX_SC PRIVATE Threads::Threads)
+# The shader compiler runs during the build only. FFX_SC_EXECUTABLE names one built beforehand, for a cross build whose
+# sysroot's C++ library is too old for it (build.sh with NX2NAVI_LINUX_TOOLCHAIN).
+set(FFX_SC_EXECUTABLE "" CACHE FILEPATH "a FidelityFX_SC built beforehand (default: build it here)")
+if(FFX_SC_EXECUTABLE)
+    set(FFX_SC "${FFX_SC_EXECUTABLE}")
+else()
+    add_executable(FidelityFX_SC
+        ffx_sc/ffx_sc.cpp ffx_sc/glsl_compiler.cpp ffx_sc/utils.cpp
+        "${FFX_SC_LIBS}/MD5/md5.cpp" "${FFX_SC_LIBS}/SPIRV-Reflect/spirv_reflect.c"
+        "${FFX_SC_LIBS}/tiny-process-library/process.cpp" "${FFX_SC_LIBS}/tiny-process-library/process_unix.cpp")
+    target_include_directories(FidelityFX_SC PRIVATE ffx_sc
+        "${FFX_SC_LIBS}/MD5" "${FFX_SC_LIBS}/SPIRV-Reflect" "${FFX_SC_LIBS}/tiny-process-library")
+    target_link_libraries(FidelityFX_SC PRIVATE Threads::Threads)
+    set(FFX_SC $<TARGET_FILE:FidelityFX_SC>)
+endif()
 
 set(FFX_SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 add_custom_command(OUTPUT "${FFX_SHADER_OUT}/stamp"
-    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_shaders.sh" $<TARGET_FILE:FidelityFX_SC> "${FFX_SDK}" "${FFX_SHADER_OUT}"
+    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_shaders.sh" "${FFX_SC}" "${FFX_SDK}" "${FFX_SHADER_OUT}"
     COMMAND ${CMAKE_COMMAND} -E touch "${FFX_SHADER_OUT}/stamp"
-    DEPENDS FidelityFX_SC gen_shaders.sh COMMENT "FSR 3.1 upscaler, frame interpolation and optical flow Vulkan shader permutations")
+    DEPENDS "$<IF:$<BOOL:${FFX_SC_EXECUTABLE}>,${FFX_SC_EXECUTABLE},FidelityFX_SC>" gen_shaders.sh COMMENT "FSR 3.1 upscaler, frame interpolation and optical flow Vulkan shader permutations")
 add_custom_target(fsr3_shaders DEPENDS "${FFX_SHADER_OUT}/stamp")
 
 add_library(amd_fidelityfx_vk SHARED
