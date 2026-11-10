@@ -113,6 +113,10 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
+- On an NVIDIA card, set **Shader Cache Size** to **Unlimited** in the NVIDIA app (Graphics, Global Settings). The
+  driver keeps the prepared shaders' libraries in that cache, and a smaller limit drops the oldest as new ones come in
+  (a 2048 MB cache could not hold them): every start then builds them again in the background, and play stutters, with
+  some things missing for a few frames, until that is done. The log's `library warm` lines say when this happens.
 - **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
   on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
   DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
