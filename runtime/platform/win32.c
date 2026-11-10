@@ -771,8 +771,9 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 
 // ---- virtual memory: VirtualAlloc reservations, MEM_WRITE_WATCH for the watched ones.
 
-int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
-    void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
+int plat_mem_reserve(uint64_t addr, uint64_t n, int flags) {   // PLAT_HOST_VIEW: none here (plat_mem_host_view)
+    void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (flags & PLAT_WATCH ? MEM_WRITE_WATCH : 0),
+                           PAGE_NOACCESS);
     if (p && p != (void *)(uintptr_t)addr) {
         VirtualFree(p, 0, MEM_RELEASE);
         p = NULL;
@@ -864,6 +865,12 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
 }
 
 void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) { access_hook = fn; }
+
+// GetWriteWatch has no view that bypasses it.
+void *plat_mem_host_view(uint64_t addr, uint64_t n) {
+    (void)addr, (void)n;
+    return NULL;
+}
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;

@@ -251,6 +251,13 @@ reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue
 Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+On Linux the watched guest memory is a memfd mapped at the guest address, with a second mapping of it that the write
+watch does not cover (`runtime/platform/linux.c` `plat_mem_host_view`). The fence write-back goes through that second
+mapping, so the GPU's bytes neither take a protection fault per page nor come back from the write watch as CPU writes;
+the shadow and mirror syncs read only what the CPU and host paths wrote. Before that, the 65 MiB a frame the game's
+compute passes write in Kokiri Forest went down to guest memory and came straight back up into the shadow and the VRAM
+mirrors every frame (19 fps there on an RX 9070 XT, 36 fps after). Direct imports (`NX2NAVI_SHADOW=0`) keep private
+memory, which is the only kind amdgpu imports as host memory.
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for

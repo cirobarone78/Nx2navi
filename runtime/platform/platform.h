@@ -236,9 +236,11 @@ static inline void *plat_casp(void *volatile *p, void *xchg, void *cmp) {
 // at 4 KiB granularity.
 enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW };
 enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1 };   // plat_mem_state besides PLAT_PROT_* for committed pages
-// Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. watch: writes to its pages are
-// tracked for plat_mem_written.
-int plat_mem_reserve(uint64_t addr, uint64_t n, int watch);
+// Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. flags: PLAT_WATCH, writes to its
+// pages are tracked for plat_mem_written; PLAT_HOST_VIEW with it, the pages also get an unwatched view
+// (plat_mem_host_view) where the platform can give one.
+enum { PLAT_WATCH = 1, PLAT_HOST_VIEW = 2 };
+int plat_mem_reserve(uint64_t addr, uint64_t n, int flags);
 // n bytes of read-write memory anywhere, zero, backed only as pages are first written (plat_mem_protect may seal them);
 // NULL on failure. Kept until exit.
 void *plat_mem_alloc(size_t n);
@@ -265,6 +267,10 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr));
 // write-fault hook; fn returns 1 when it made the page accessible and the access should run again, 0 to let the fault
 // go on. fn sees every access violation of the process and tells its own pages apart. One hook per process.
 void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
+// The pages of a PLAT_HOST_VIEW reservation [addr, addr + n) through a mapping without the write watch, or NULL where
+// there is none (Windows; Linux without shared-memory write protection). A host write there changes the guest's pages
+// and is not reported by plat_mem_written.
+void *plat_mem_host_view(uint64_t addr, uint64_t n);
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);

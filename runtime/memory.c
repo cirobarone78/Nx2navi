@@ -57,7 +57,7 @@ static uint8_t *module_perm[MOD_COUNT];   // per data page of each module: perm 
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
-static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_reserve(at, size, watch); }
+static int reserve_at(uint64_t at, uint64_t size, int flags) { return plat_mem_reserve(at, size, flags); }
 
 // ---- frozen regions
 // A 2 MiB region of the watched reservations that nothing wrote for a while can be made read-only (mem_freeze), so the
@@ -619,13 +619,17 @@ void mem_init(void) {
     if (!reserve_at(RT_KERNEL_BASE, RT_KERNEL_SIZE, 0)) reexec_or_fail("the kernel region");
     if (!reserve_at(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
 
-    // Stack and heap block, then the alias region above it, both searched below the module window.
+    // Stack and heap block, then the alias region above it, both searched below the module window. Both are watched and
+    // get the host view the shadow storage writes the GPU's bytes back through (vk_memory.c gpu_written), unless the
+    // GPU imports guest memory itself (NX2NAVI_SHADOW=0), which Linux allows only for private memory.
+    const char *sh = cfg_get("NX2NAVI_SHADOW");
+    int guest = PLAT_WATCH | (sh && !strcmp(sh, "0") ? 0 : PLAT_HOST_VIEW);
     uint64_t low = 0, alias = 0;
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)
-        if (reserve_at(at, LOW_SIZE, 1)) low = at;
+        if (reserve_at(at, LOW_SIZE, guest)) low = at;
     if (!low) reexec_or_fail("a 14 GiB stack and heap block below 2^39");
     for (uint64_t at = align_up(low + LOW_SIZE, ALIAS_ALIGN); at + ALIAS_SIZE <= mods_lo && !alias; at += ALIAS_ALIGN)
-        if (reserve_at(at, ALIAS_SIZE, 1)) alias = at;
+        if (reserve_at(at, ALIAS_SIZE, guest)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
 
     plat_mem_fault_hook(thaw_fault);   // before the crash handler

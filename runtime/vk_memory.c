@@ -731,10 +731,11 @@ static uint64_t gen_pages[1024];
 // sync skips regions with nothing newer than its pool's mirror.
 #define REG_SHIFT 21
 static uint32_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
-// The same two tables without the stamps of a mirror's own write-back (vk_gpu_written_back): what the CPU and the host
-// paths wrote. The mirror sync reads these, so the bytes a mirror wrote back into guest memory are not copied up into it
-// again at its next sync: the storage buffers the game's compute shaders write went down and came back up every frame,
-// 20 MiB a frame over PCIe in Kokiri Forest (2026-11-09).
+// The same two tables without the stamps of GPU writes the host already holds elsewhere: a mirror's own write-back
+// (vk_gpu_written_back) and a write-back out of a shadow no mirror stands in front of (gpu_written). What the CPU and
+// the host paths wrote. The mirror and shadow syncs read these, so the bytes the GPU wrote back into guest memory are
+// not copied up again at the next sync: the storage buffers the game's compute shaders write went down and came back
+// up every frame, 20 MiB a frame over PCIe in Kokiri Forest (2026-11-09).
 static uint32_t *cgen_chunk[GEN_CHUNKS];
 static uint32_t creg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 
@@ -980,10 +981,12 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // invalidates the buffer, about 1.3 ms per 16 MiB at the next submit, and the import's write pinning clears the
 // write watch), a CPU-visible pool gets a host-visible buffer of its own instead, at the offsets the import would have:
 // - CPU -> shadow: right before each submit (vk_mem_shadow_sync), the pools the replay resolved since the last one are
-//   queried for written pages; pages stamped after a pool's sgen are copied in by the CPU. A part whose shaders read
-//   through the device address table gets every pool the table names brought up to date the same way (vk_mem_gpa_sync).
+//   queried for written pages; pages the CPU or a host path wrote since a pool's sgen are copied in by the CPU. A part
+//   whose shaders read through the device address table gets every pool the table names brought up to date the same
+//   way (vk_mem_gpa_sync).
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
-//   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory.
+//   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory, through the
+//   platform's unwatched view where it has one (plat_mem_host_view).
 // - Pages both write: a GPU write is noted with the whole range its binding names, and the CPU writes other fields of the
 //   same records meanwhile. Each page such a range covers keeps a base copy from its first note on, the bytes guest
 //   memory and the shadow last agreed on. A copy-in takes only the bytes where guest memory differs from the base (the
@@ -1184,9 +1187,9 @@ static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b) {
 // touched pool at every part's submit was about 380 write-watch calls and 10 ms a frame of the submitting thread in
 // Kokiri Forest, while the GPU waited for the next part (RTX 4090, 2026-11-09). A page the CPU writes after its
 // region's snapshot goes in at the next guest submission's, as it does into a VRAM mirror.
-// cpu (wb_no_reup): the pages are read from the tables without the stamps of a mirror's write-back (stamp_page_as),
-// since that write-back went through the shadow, which holds those bytes already; with the other tables every storage
-// buffer the game's compute shaders wrote was compared again at the next copy-in.
+// cpu: the pages are read from the CPU-side tables, without the stamps of a write-back (stamp_page_as), since every
+// write-back went through the shadow, which holds those bytes already; with the other tables every storage buffer the
+// game's compute shaders wrote was compared again at the next copy-in.
 static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -1238,7 +1241,10 @@ void vk_mem_shadow_sync(void) {
     if (!shadow_on) return;
     uint64_t t0 = qpc();
     uint32_t epoch = vk_texture_epoch();
-    int cpu = vk_mirror_on && wb_no_reup();   // before the locks: its first call logs
+    // The CPU-side tables in every mode: a write-back out of the shadow is stamped as one (gpu_written, in_shadow), and a
+    // mirror's goes through the shadow too, so the shadow already holds every page those tables leave out. With the
+    // texture tables the 65 MiB a frame the compute passes write in Kokiri Forest came straight back in at the next copy-in.
+    int cpu = 1;
     plat_mutex_lock(&shadow_lock);
     if (nstouch) {
         plat_mutex_lock(&gen_lock);
@@ -1297,8 +1303,11 @@ static int shadow_bulk_write(void) {
 }
 
 // Completion thread: the GPU's bytes of [addr, addr+size) from the shadow into guest memory (merge_page against the
-// base copies; a page without one whole). Returns the bytes moved.
-static uint64_t shadow_write_back(uint64_t addr, uint64_t size) {
+// base copies; a page without one whole). Through the unwatched view where the platform has one (Linux): the copy is
+// the GPU's write, so the write watch must not report it as the CPU's, and it costs no protection fault per page.
+// Elsewhere the guest pages must be writable for it. Returns the bytes moved; *in_shadow: 1 when the bytes came out of
+// a shadow that no mirror stands in front of.
+static uint64_t shadow_write_back(uint64_t addr, uint64_t size, int *in_shadow) {
     uint64_t moved = 0;
     int bulk = shadow_bulk_write();   // before the locks: its first call logs
     plat_mutex_lock_shared(&pool_lock);
@@ -1307,15 +1316,20 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size) {
     plat_mutex_lock(&shadow_lock);
     if (r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi) {
         uint64_t t0 = qpc();
-        mem_thaw(addr, size);
-        if (bulk) plat_mem_prepare_write(addr, size);
+        uint8_t *dst = plat_mem_host_view(addr, size);
+        if (!dst) {   // through the watched mapping: writable first
+            mem_thaw(addr, size);
+            if (bulk) plat_mem_prepare_write(addr, size);
+            dst = (uint8_t *)(uintptr_t)addr;
+        }
         for (uint64_t a = addr, end = addr + size; a < end;) {
             uint64_t pg = a & ~(SB_PAGE - 1), pe = pg + SB_PAGE < end ? pg + SB_PAGE : end;
-            uint8_t *base = sbase_find(r, pg), *s = r->smap + (a - r->import_lo);
-            if (base) moved += merge_page((uint8_t *)(uintptr_t)a, s, base + (a - pg), pe - a);
-            else memcpy((void *)(uintptr_t)a, s, pe - a), moved += pe - a;   // a write never noted as pending
+            uint8_t *base = sbase_find(r, pg), *s = r->smap + (a - r->import_lo), *g = dst + (a - addr);
+            if (base) moved += merge_page(g, s, base + (a - pg), pe - a);
+            else memcpy(g, s, pe - a), moved += pe - a;   // a write never noted as pending
             a = pe;
         }
+        if (in_shadow) *in_shadow = r->mstate != MS_ON;
         s_wb_bytes += moved, s_wb_seen += size, s_wb_ticks += qpc() - t0;
     }
     plat_mutex_unlock(&shadow_lock);
@@ -1326,10 +1340,12 @@ static uint64_t shadow_write_back(uint64_t addr, uint64_t size) {
 static void gpu_written(uint64_t addr, uint64_t size, int back) {
     // back: the bytes are in a VRAM mirror, and its write-back brings them into the shadow; that submission's
     // shadow_wb_cb, after the replay's own callbacks, then copies them into guest memory.
-    if (shadow_on && size && !back) shadow_write_back(addr, size);
+    int in_shadow = 0;   // the bytes came out of a shadow that no mirror stands in front of
+    if (shadow_on && size && !back) shadow_write_back(addr, size, &in_shadow);
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
-    back = back && wb_no_reup();   // read before gen_lock: its first call logs
+    // The CPU-side tables drive the shadow and mirror syncs: bytes the shadow already holds need neither
+    back = (back && wb_no_reup()) || in_shadow;   // read before gen_lock: its first call logs
     plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page_as(a, g, back);
@@ -2021,7 +2037,7 @@ void vk_mem_gpa_sync(void) {
     if (!shadow_on) return;
     uint64_t t0 = qpc(), run0 = 0, run1 = 0;
     uint32_t epoch = vk_texture_epoch();
-    int cpu = vk_mirror_on && wb_no_reup(), have = 0;   // before the locks: its first call logs
+    int cpu = 1, have = 0;   // as vk_mem_shadow_sync
     plat_mutex_lock_shared(&pool_lock);
     plat_mutex_lock(&shadow_lock);
     plat_mutex_lock(&gen_lock);
@@ -2324,7 +2340,7 @@ static void swl_add(uint64_t addr, uint64_t size, uint32_t mark0) {
 
 // Completion thread: [a, b) into guest memory, and the pages that changed stamped as the mirror's write-back.
 static void swb_run(uint64_t a, uint64_t b) {
-    if (b <= a || !shadow_write_back(a, b - a) || nvn_gpu_only(a)) return;
+    if (b <= a || !shadow_write_back(a, b - a, NULL) || nvn_gpu_only(a)) return;
     int back = wb_no_reup();
     plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;

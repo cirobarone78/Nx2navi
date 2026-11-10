@@ -1086,54 +1086,106 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 }
 
 // ---- virtual memory. Reservations are PROT_NONE MAP_NORESERVE mappings; commit is mprotect read-write, decommit
-// MADV_DONTNEED (private anonymous pages read zero afterwards) and PROT_NONE. Linux keeps no committed/reserved
-// distinction, so a byte per guest page records it (pstate, mapped lazily: only the pages touched cost memory).
+// drops the pages (they read zero afterwards) and sets PROT_NONE. Linux keeps no committed/reserved distinction, so a
+// byte per guest page records it (pstate, mapped lazily: only the pages touched cost memory).
 //
 // Write watch: a userfaultfd in asynchronous write-protect mode (Linux 6.7) over the watched reservations. The kernel
 // clears a page's protection on the first write without a round trip to us, and PAGEMAP_SCAN lists the pages whose
 // protection was cleared and protects them again. Without it (an older kernel), plat_mem_written reports the ranges as
 // untracked and the back end uploads them in full.
+//
+// Host writes: where the write watch covers shared memory (UFFD_FEATURE_WP_HUGETLBFS_SHMEM), a watched reservation is
+// a memfd mapped MAP_SHARED at its address instead of private anonymous memory, and mapped a second time elsewhere
+// without the watch (plat_mem_host_view). A write through that view changes the guest's pages without clearing their
+// write protection, so bytes the host puts there for the GPU (shadow storage written back at a fence, vk_memory.c)
+// neither cost a protection fault per page nor come back from the write watch as CPU writes, as a GPU write into an
+// imported page does not on Windows.
 
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
 enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
 static uint8_t *pstate;
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
+static int ww_shmem;                 // the write watch covers shared memory: watched reservations are memfds
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
+
+// The memfd-backed reservations and their unwatched views.
+typedef struct { uint64_t lo, hi; int fd; uint8_t *view; } SharedRegion;
+static SharedRegion shared_regions[4];
+static int n_shared_regions;
 
 static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
     if (addr < PS_LIMIT) memset(pstate + addr / PG, v, (size_t)((n + PG - 1) / PG));
 }
 
+static SharedRegion *shared_region(uint64_t addr) {
+    for (int i = 0; i < n_shared_regions; i++)
+        if (addr >= shared_regions[i].lo && addr < shared_regions[i].hi) return &shared_regions[i];
+    return NULL;
+}
+
 static void ww_open(void) {
     int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
-    struct uffdio_api api = {.api = UFFD_API,
-                             .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
-    if (fd < 0 || ioctl(fd, UFFDIO_API, &api)) {
+    struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED |
+                                                         UFFD_FEATURE_WP_HUGETLBFS_SHMEM};
+    ww_shmem = fd >= 0 && !ioctl(fd, UFFDIO_API, &api);
+    if (fd >= 0 && !ww_shmem) {   // the API handshake is once per descriptor: ask again without shared memory
+        close(fd);
+        fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        api = (struct uffdio_api){.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+    }
+    if (fd < 0 || (!ww_shmem && ioctl(fd, UFFDIO_API, &api))) {
         fprintf(stderr, "platform: no asynchronous userfaultfd write protection (%s): written memory is not tracked\n",
                 strerror(errno));
         if (fd >= 0) close(fd);
+        ww_shmem = 0;
         return;
     }
     pm_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
     if (pm_fd < 0) {
         close(fd);
+        ww_shmem = 0;
         return;
     }
     ww_fd = fd;
 }
 
-int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
+// vm_lock held: a watched reservation as a memfd mapped shared at addr, plus its unwatched view; MAP_FAILED when that
+// is not possible.
+static void *reserve_shared(uint64_t addr, uint64_t n) {
+    if (!ww_shmem || n_shared_regions == (int)(sizeof shared_regions / sizeof *shared_regions)) return MAP_FAILED;
+    int fd = memfd_create("nx2navi guest memory", MFD_CLOEXEC);
+    void *p = MAP_FAILED, *view = MAP_FAILED;
+    if (fd >= 0 && !ftruncate(fd, (off_t)n)) {
+        p = mmap((void *)(uintptr_t)addr, n, PROT_NONE, MAP_SHARED | MAP_NORESERVE | MAP_FIXED_NOREPLACE, fd, 0);
+        view = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
+    }
+    if (p != MAP_FAILED && (p != (void *)(uintptr_t)addr || view == MAP_FAILED)) munmap(p, n), p = MAP_FAILED;
+    if (p == MAP_FAILED) {
+        if (view != MAP_FAILED) munmap(view, n);
+        if (fd >= 0) close(fd);
+        return MAP_FAILED;
+    }
+    madvise(view, n, MADV_NOHUGEPAGE);
+    shared_regions[n_shared_regions++] = (SharedRegion){addr, addr + n, fd, view};
+    return p;
+}
+
+int plat_mem_reserve(uint64_t addr, uint64_t n, int flags) {
+    int watch = flags & PLAT_WATCH;
     plat_mutex_lock(&vm_lock);
     if (!pstate) {
         void *p = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         pstate = p == MAP_FAILED ? NULL : p;
     }
     if (watch && ww_fd < 0 && pm_fd < 0) ww_open();
-    void *p = pstate && addr + n <= PS_LIMIT
-                  ? mmap((void *)(uintptr_t)addr, n, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0)
-                  : MAP_FAILED;
+    void *p = MAP_FAILED;
+    if (pstate && addr + n <= PS_LIMIT) {
+        if (watch && (flags & PLAT_HOST_VIEW)) p = reserve_shared(addr, n);
+        if (p == MAP_FAILED)
+            p = mmap((void *)(uintptr_t)addr, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+                     -1, 0);
+    }
     int ok = p == (void *)(uintptr_t)addr;
     if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
     if (ok) {
@@ -1162,9 +1214,20 @@ int plat_mem_commit(uint64_t addr, size_t n) {
 }
 
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
-    if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
+    SharedRegion *s = shared_region(addr);
+    if (s) {   // shared memory keeps its pages when unmapped: free them from the file
+        if (fallocate(s->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(addr - s->lo), (off_t)n)) return 0;
+    } else if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED)) {
+        return 0;
+    }
+    if (mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
     ps_set(addr, n, PS_RESERVED);
     return 1;
+}
+
+void *plat_mem_host_view(uint64_t addr, uint64_t n) {
+    SharedRegion *s = shared_region(addr);
+    return s && addr + n <= s->hi ? s->view + (addr - s->lo) : NULL;
 }
 
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
