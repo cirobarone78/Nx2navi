@@ -120,10 +120,9 @@ def tar_extract(name, dest, members, strip=0):
 
 # ---- llvm/ and the sysroot -------------------------------------------------------------------------------------------
 
-def build_llvm(out):
+def build_llvm(dst):
     top = f'LLVM-{LLVM_VERSION}-Linux-X64'
     src = tar_extract('llvm-linux', WORK / 'llvm-linux', [f'{top}/{m}' for m in LLVM_MEMBERS], strip=1)
-    dst = out / 'llvm'
     shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns('.unpacked'))
     strip(dst / 'bin', dst / 'bin' / 'llvm-strip')
     r = subprocess.run([str(dst / 'bin' / 'clang'), '--version'], capture_output=True, text=True)
@@ -296,8 +295,7 @@ def link_chain(path):
     return hops
 
 
-def build_sysroot(out, sysroot, files):
-    dst = out / 'llvm' / 'sysroot'
+def build_sysroot(dst, sysroot, files):
     files = {Path(os.path.normpath(h)) for f in files for h in link_chain(f)}
     for f in sorted(files):
         rel = f.relative_to(sysroot)
@@ -572,12 +570,12 @@ def main():
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    llvm = build_llvm(out)
+    llvm = build_llvm(out / 'llvm')
     sysroot = full_sysroot()
     build_deps(out, llvm, sysroot)
     build_bin(out, llvm, sysroot)
     rtlib = runtime_lib(out, llvm, sysroot)
-    build_sysroot(out, sysroot, used_sysroot_files(out, llvm, sysroot, rtlib))
+    build_sysroot(out / 'llvm' / 'sysroot', sysroot, used_sysroot_files(out, llvm, sysroot, rtlib))
     build_python(out, llvm, sysroot)
     mr.build_sources(out, {})   # no profiles: the Linux setup compiles without one (installer/layout.py, pgo_dir)
     collect_licenses(out, sysroot)
