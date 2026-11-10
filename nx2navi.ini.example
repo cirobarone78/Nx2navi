@@ -509,6 +509,23 @@
 # coop_room =
 # Test: percent of received co-op datagrams thrown away, 0 to 100.
 # coop_drop = 0
+# Test, no menu row: sets flags by hash at given frames of play, "hash=value@frame,..." (hash in hex, frames counted from
+# when a save is being played), for automated tests of progress sync.
+# coop_test_set =
+# The rules of a room you make (a room you join uses its maker's; the log names them). Take effect at once.
+# Story, world and dungeon progress: shared or own.
+# coop_progress = shared
+# Equipment, key items, upgrades; songs; medallions, stones and the other quest items: shared or own. Own only with
+# coop_progress = own: in a shared world a chest one player opened is empty for the others.
+# coop_items = shared
+# coop_songs = shared
+# coop_quest = shared
+# Small keys: pool = every key anyone picks up goes into the dungeon's pool and every door anyone opens takes one out of it;
+# own = keys stay with the player who picked them up (doors still open for everyone). Own with coop_progress = own.
+# coop_keys = pool
+# Rupees and ammunition: own, or pool = one count every player adds to and spends from.
+# coop_rupees = own
+# coop_ammo = own
 
 [audio]
 # none mixes without opening an audio device.

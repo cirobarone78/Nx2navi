@@ -43,6 +43,7 @@
 
 #include "cfg.h"
 #include "coop.h"
+#include "coop_game.h"
 #include "host.h"
 #include "logq.h"
 #include "prof.h"
@@ -634,6 +635,7 @@ int main(int argc, char **argv) {
         vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
         coop_init();      // the co-op thread (coop.c); the same, idle while the COOP setting is off
+        coop_game_init(); // progress sync's hooks on that thread and the game's frames (coop_game.c)
         rt_boot();
         return 0;
     }

@@ -12,6 +12,7 @@
 
 #include "gfx.h"
 #include "cfg.h"
+#include "coop_game.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
@@ -861,6 +862,7 @@ NVN_API(nvnQueuePresentTexture) {
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
+    coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);

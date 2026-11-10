@@ -72,6 +72,8 @@ static const char *const known[] = {
     "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET", "POOL_CREATE_MS", "POOL_LOAD_BACKLOG", "POOL_LOAD_MS",
     "VMA_BLOCK_MB", "ASTC_BC_PROBE", "SYNC_WAKE_ALL", "LOG_ASYNC",
     "COOP", "COOP_NAME", "COOP_SERVER", "COOP_PORT", "COOP_ROOM", "COOP_AUTO", "COOP_DROP",   // co-op (coop.c); the last three have no menu row
+    "COOP_PROGRESS", "COOP_ITEMS", "COOP_SONGS", "COOP_QUEST", "COOP_KEYS", "COOP_RUPEES", "COOP_AMMO",   // the room's rules (coop_game.c)
+    "COOP_TEST_SET",   // test: sets flags by hash at given frames (coop_game.c); no menu row
 };
 
 // The nx2navi.ini section a key cfg_set may write goes to when the file lacks it (nx2navi.ini.example's sections).
@@ -95,6 +97,8 @@ static const struct { const char *key, *section; } sections[] = {
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"COOP", "coop"}, {"COOP_NAME", "coop"}, {"COOP_SERVER", "coop"}, {"COOP_PORT", "coop"},
+    {"COOP_PROGRESS", "coop"}, {"COOP_ITEMS", "coop"}, {"COOP_SONGS", "coop"}, {"COOP_QUEST", "coop"}, {"COOP_KEYS", "coop"},
+    {"COOP_RUPEES", "coop"}, {"COOP_AMMO", "coop"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
     {"PCSS", "display"},
     {"MODS_DIR", "mods"}, {"MODS_ORDER", "mods"}, {"MODS_DISABLED", "mods"}, {"MODS_REBUILD", "mods"},
@@ -219,9 +223,13 @@ static const CfgMeta metas[] = {
     {"DISCORD_IMAGE", NX2NAVI_DISCORD_IMAGE_DEFAULT, NULL, LIVE},
     // Co-op (coop.c): off until the player turns it on. The server is host[:port] of a relay (tools/coop_relay.py), and has no
     // default until coop_app.h names one; the name is at most 24 bytes, empty for Player-xxxx; the port is the local UDP port
-    // (0: any). COOP_ROOM, COOP_AUTO and COOP_DROP are read with cfg_get, no row.
+    // (0: any). COOP_ROOM, COOP_AUTO, COOP_DROP and COOP_TEST_SET are read with cfg_get, no row.
     {"COOP", "0", "0|1", LIVE}, {"COOP_NAME", "", NULL, LIVE},
     {"COOP_SERVER", NX2NAVI_COOP_SERVER_DEFAULT, NULL, LIVE}, {"COOP_PORT", "0", "0..65535", RESTART},
+    // The rules a room made by this player syncs by (coop_state.h, docs/coop.md); a joiner's own are not used in the room.
+    {"COOP_PROGRESS", "shared", "shared|own", LIVE}, {"COOP_ITEMS", "shared", "shared|own", LIVE},
+    {"COOP_SONGS", "shared", "shared|own", LIVE}, {"COOP_QUEST", "shared", "shared|own", LIVE},
+    {"COOP_KEYS", "pool", "pool|own", LIVE}, {"COOP_RUPEES", "own", "own|pool", LIVE}, {"COOP_AMMO", "own", "own|pool", LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
