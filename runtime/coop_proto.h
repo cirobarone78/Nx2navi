@@ -47,7 +47,7 @@ enum { COOP_T_CONNECT = 1, COOP_T_CHALLENGE = 2, COOP_T_JOINED = 3, COOP_T_ERROR
        COOP_T_PONG = 8, COOP_T_LEAVE = 9, COOP_T_KICK = 11, COOP_T_DATA = 0x10 };
 enum { COOP_INTENT_CREATE = 1, COOP_INTENT_JOIN = 2 };   // CONNECT: make the room of a locator or join it
 enum { COOP_E_NO_ROOM = 1, COOP_E_ROOM_FULL = 2, COOP_E_PROTO = 3, COOP_E_RATE = 4, COOP_E_BAD_TAG = 5, COOP_E_SERVER_FULL = 6,
-       COOP_E_ROOM_EXISTS = 7, COOP_E_REMOVED = 8 };
+       COOP_E_ROOM_EXISTS = 7, COOP_E_REMOVED = 8, COOP_E_SESSION_USED = 9 };   // 9: a session used in the room before
 enum { COOP_FLAG_AWAY = 1, COOP_FLAG_MAKER = 2 };   // roster flags: not heard from for a while; made the room
 
 // The kinds of player messages (the first byte of a sealed message). coop.c only carries them; HELLO, POS, DIGEST,

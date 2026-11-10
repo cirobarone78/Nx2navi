@@ -41,7 +41,10 @@ typedef struct {
     char label[8];              // its first characters, for logs ("XXX…")
     int self;                   // this player's member id; 0 outside a room
     int maker;                  // the member id of the room's maker, 0 when the maker is not in the room
-    int made;                   // this player made the room (its settings are the room's rules, coop_state.h)
+    int made;                   // this player's session made the room (its own CREATE, not the relay's mark: its
+                                // settings are the room's rules, coop_state.h)
+    int room_lost;              // the relay lost the room and the session is joining it again (every session in it ended)
+    char name[COOP_NAME_MAX + 1];   // this player's own name (COOP_NAME, cleaned), whatever the relay's roster says
     int n;                      // members of the room, this player included, by id
     CoopPeer member[COOP_MAX_MEMBERS];
     uint32_t ping_ms;           // round trip to the relay; 0 until measured

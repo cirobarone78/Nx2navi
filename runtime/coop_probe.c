@@ -529,6 +529,7 @@ typedef struct {
     PlatThread *thread;
     uint16_t port;
     volatile int stop, restart, corrupt_next, fuzz, forge, lie, record_from, replay, steal;
+    volatile int mark, spoof;   // the roster names this member the maker (toggles), or lists another session for it
     volatile unsigned forwarded;
     MockRoom rooms[4];
     uint8_t secret[32];
@@ -783,6 +784,13 @@ static void mock_main(void *arg) {
         if (r->fuzz) mock_fuzz(r), r->fuzz = 0;
         if (r->forge) mock_forge(r), r->forge = 0;
         for (; r->replay; r->replay--) mock_replay(r);   // several copies: the test's loss may drop some
+        if (r->mark || r->spoof) {
+            MockRoom *room = mock_room_of(r, r->mark ? r->mark : r->spoof);
+            if (room && r->mark) room->m[r->mark].maker = !room->m[r->mark].maker;
+            if (room && r->spoof) room->m[r->spoof].session ^= 0x5005;
+            if (room) mock_roster_to_all(r, room, 0);
+            r->mark = r->spoof = 0;
+        }
         int n = plat_udp_recv(r->sock, buf, sizeof buf, &from, 10);
         if (n > 0) mock_handle(r, buf, (size_t)n, &from);
         if (plat_now_ms() >= r->next_roster) {   // the roster again every second: a lost update repairs itself
@@ -1082,6 +1090,18 @@ static void probe_hostile_relay(MockRelay *mock, Player *alice, Player *bob, uin
     CHECK(view_of(alice).lost > lost, "the garbage was counted as thrown away (%u)", view_of(alice).lost - lost);
     CHECK(WAIT_FOR(in_room(alice, 2) && in_room(bob, 2), ROSTER_WAIT_MS), "after the garbage both are still in the room");
     exchange(alice, bob, drop, "after the hostile relay", first);
+
+    // the relay marks Bob as the room's maker: Bob's game did not make the room, so it does not take it as made
+    int bob_id = view_of(bob).self;
+    mock->mark = bob_id;
+    CHECK(WAIT_FOR(view_of(bob).maker == bob_id, ROSTER_WAIT_MS) && !view_of(bob).made, "F5: a member the relay marks as the maker does not take the room as made by it (made %d)",
+          view_of(bob).made);
+    mock->mark = bob_id;
+    CHECK(WAIT_FOR(view_of(bob).maker != bob_id, ROSTER_WAIT_MS), "and the mark is gone again");
+    // someone on the path rejoined Alice with a session of its own: the relay lists that one; Alice notices and rejoins
+    mock->spoof = view_of(alice).self;
+    plat_sleep_ms(2500);
+    exchange(alice, bob, drop, "F9: after a spoofed rejoin of Alice", first);
 
     // an outsider's datagrams to Alice's port are not the relay's: thrown away
     PlatUdp *evil = plat_udp_open(0, 0);
