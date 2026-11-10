@@ -155,6 +155,40 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+// The L3 cache of each logical processor: the cache/index<k> of /sys/devices/system/cpu/cpu<n> whose level is 3, its
+// size in KiB ("98304K").
+uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
+    cpu_set_t set;
+    *l3_kb = 0;
+    if (sched_getaffinity(0, sizeof set, &set)) return 0;
+    uint64_t die = 0, in_set = 0;
+    uint32_t big = 0, small = ~0u;
+    for (int i = 0; i < 64; i++) {
+        uint32_t kb = 0;
+        for (int k = 0; k < 8 && !kb; k++) {
+            char path[96], text[32] = "";
+            uint64_t level = 0;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cache/index%d/level", i, k);
+            if (!read_u64_file(path, &level)) break;
+            if (level != 3) continue;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cache/index%d/size", i, k);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(text, sizeof text, f)) kb = (uint32_t)strtoul(text, NULL, 10) * (strchr(text, 'M') ? 1024 : 1);
+                fclose(f);
+            }
+        }
+        if (!kb) continue;
+        if (kb > big) big = kb, die = 0;
+        if (kb == big) die |= 1ull << i;
+        if (kb < small) small = kb;
+        if (CPU_ISSET(i, &set)) in_set |= 1ull << i;
+    }
+    if (!die || big == small) return 0;
+    *l3_kb = big;
+    return die & in_set;
+}
+
 // Linux has no process-wide affinity: each thread of /proc/self/task gets the mask, and threads started later inherit
 // it from the thread that starts them.
 int plat_process_affinity(uint64_t mask) {

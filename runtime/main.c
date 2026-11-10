@@ -546,6 +546,7 @@ int main(int argc, char **argv) {
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
     // costs a full tick. NX2NAVI_TIMER_1MS=0 keeps the default for comparison.
     if (cfg_bool("NX2NAVI_TIMER_1MS")) plat_timer_1ms();
+    perf_cpu_start();   // before any thread pool counts the usable processors
     {   // NX2NAVI_POWER_FULL=0 leaves Windows' power throttling of an unfocused window in place (A/B runs)
         const char *pf = cfg_get("NX2NAVI_POWER_FULL");
         if (!(pf && !strcmp(pf, "0"))) {
