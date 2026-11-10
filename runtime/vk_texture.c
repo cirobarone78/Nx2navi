@@ -2783,6 +2783,16 @@ static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *
     return 1;
 }
 
+// Host writes into a texture's storage (texels the GPU rendered, WriteTexels' bytes): through a shared pool's own map
+// where there is one (vk_mem_host_ptr), so they take no protection fault on the watched storage, which cost ~1 ms a
+// frame of faults under the texture lock in Kokiri Forest. The caller stamps them (vk_guest_written).
+static int storage_write(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *src) {
+    tex_t h = *t;
+    uint8_t *view = vk_mem_host_ptr((uintptr_t)t->mem, t->L.size);
+    if (view) h.mem = (void *)view;
+    return storage_texels(&h, g, r, src, 1);
+}
+
 static int read_aspect(const Tex *e, VkImageAspectFlags *a) {
     if (!e->f.depth && !e->f.stencil) { *a = VK_IMAGE_ASPECT_COLOR_BIT; return 1; }
     switch (e->t.d.format) {   // packed depth-stencil storage has no single-aspect copy
@@ -2985,7 +2995,7 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
     lock();
     Tex *e = entry_of(t);
     if (e && e->pub.mirrored) {
-        if (!storage_texels(t, &g, r, (uint8_t *)src, 1))
+        if (!storage_write(t, &g, r, (uint8_t *)src))
             log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
         vk_guest_written((uintptr_t)t->mem, t->L.size);
         if (e->pub.gpu_owned) image_texels(e, &g, r, (uint8_t *)src, 1);
@@ -3040,7 +3050,8 @@ static void write_back_n(Tex **v, int n) {
         uint8_t *buf = malloc(q->g.img * (size_t)q->g.nz);
         if (!buf) rt_fatal("vk: out of memory for a texture write-back");
         texels_read_take(q->e, &q->g, &q->t, buf);
-        storage_texels(&q->e->t, &q->g, &q->r, buf, 1);
+        storage_write(&q->e->t, &q->g, &q->r, buf);
+        vk_guest_written(q->e->pub.addr, q->e->t.L.size);   // what a write through the guest address reported
         free(buf);
     }
     free(p);

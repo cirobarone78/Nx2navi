@@ -1475,6 +1475,17 @@ void vk_gpu_written_back(uint64_t addr, uint64_t size) {
     }
 }
 
+uint8_t *vk_mem_host_ptr(uint64_t addr, uint64_t size) {
+    if (!size || !share_state) return NULL;
+    uint8_t *p = NULL;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, addr, size);
+    const PoolRec *r = e ? e->buf : NULL;
+    if (r && r->shared && addr >= r->import_lo && addr + size <= r->import_hi) p = r->smap + (addr - r->import_lo);
+    plat_mutex_unlock_shared(&pool_lock);
+    return p;
+}
+
 int vk_mem_mirrored(uint64_t addr, uint64_t size) {
     VkMemSpan sp;
     if (!vk_mirror_on || !size || !vk_mem_lookup(addr, size, &sp) || !sp.pool) return 0;

@@ -347,6 +347,9 @@ void vk_gpu_written(uint64_t addr, uint64_t size);
 // buffer was picked (VK_MEM_USE / VK_MEM_PICK): 1 when [addr, addr+size) lies in one pool whose mirror is on.
 void vk_gpu_written_back(uint64_t addr, uint64_t size);
 int vk_mem_mirrored(uint64_t addr, uint64_t size);
+// [addr, addr + size) of a shared pool (vk_memory.c share_pool) through the pool's own map, which no write tracking
+// covers, or NULL: for host writes that are not the guest CPU's, which would otherwise fault on watched pages.
+uint8_t *vk_mem_host_ptr(uint64_t addr, uint64_t size);
 int vk_mem_flush_add_probe(void);        // --probe-vkexec: the flush range list; 0 or the number of the failed check
 uint64_t vk_mem_mirror_uploaded(void);   // --probe-vkexec: bytes copied into mirrors since the last summary line
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
