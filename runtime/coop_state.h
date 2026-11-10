@@ -18,24 +18,32 @@
 // change goes out at once and again 80 and 250 ms later. Sending is paced (32 KB/s) under the relay's per-member limit.
 //
 // Identities. Each game has a signing key for each room and start of the game (from coop_sync_seed's random value and the
-// room's secret), and signs its identity in that room: the key, the name and the session the relay lists for it. A
-// game takes values only from a member whose identity it checked, an identity is bound to one session, and a session
-// that ended is never taken again, so an identity cannot be copied or reused by another member.
+// room's secret; the room's maker keeps one per room across starts, coop_sync_room_seed), and signs its identity in that
+// room: the key, the name and the session the relay lists for it. A game takes values only from a member whose
+// identity it checked, an identity is bound to one session, and a session of a key that ended is never taken again, so
+// an identity cannot be copied or reused by another member. A signature that fails its check counts against the
+// member that sent it, as a refused value does, and each member gets a bounded number of checks a second.
 //
 // Rules belong to the room: every game merges the same way. The maker's game signs a charter: the rules (the maker's
 // settings, coop_sync_settings), the identities admitted to the pools, the identities removed and the pools' epoch,
 // with an epoch it raises at each change; it rides in every DIGEST, so every member passes it on. A game takes a
-// charter only signed by the key it pinned when its player accepted the room (coop_sync_accept); before that, by the
-// key of the member the relay names as the maker, or, while no maker is there, by the one key every member's charter
-// carries. A member the relay marks later (a restart, a hostile relay) changes nothing for a player who accepted. A
-// category switched to shared starts merging (its digest sums differ, the sections are exchanged); one switched to per
-// player stops; what was merged stays. A removed identity's messages are ignored and its records dropped everywhere; a
-// pool reset (a new pools' epoch) drops every record, and the games join the pools again with what they hold.
+// charter only signed by the key it pinned when its player accepted the room (coop_sync_accept); before that, its own
+// for a room it made in this session; else the key of the member the relay names as the maker, but only while no
+// identified member carries a charter of another key; else, while no maker is there, the one key every member's
+// charter carries. A member the relay marks later (a restart, a hostile relay) changes nothing for a player who
+// accepted. A category switched to shared starts merging (its digest sums differ, the sections are exchanged); one
+// switched to per player stops; what was merged stays. A removed identity's messages are ignored and its records
+// dropped everywhere, and each game keeps every removal it saw in the room; a pool reset starts a new pools' epoch in
+// which the games join the pools again with what each held for the identities the reset admits.
 //
-// Acceptance. Nothing is handed to the game (coop_sync_take) until its player accepted the room as it is now (the
-// identities in it, the rules, the maker's key and the save being played: coop_sync_offer) and a copy of the save was
-// made (coop_sync_copied). The offer's number is keyed with this start's random value, so nobody can compute it in
-// advance; it changes with any of those, and so does the acceptance.
+// Acceptance. Flags are taken (stored, passed on, applied) only from a member whose key this player accepted in this
+// room: what a member brings that the player did not accept never enters this game's state. Acceptance is transitive:
+// a member the player accepted passes on what it took from members it accepted. Nothing is handed to the game
+// (coop_sync_take) until its player accepted the room as it is now (the identities in it, the rules, the maker's key
+// and the save being played: coop_sync_offer) and a copy of the save was made (coop_sync_copied); a member that is
+// present and has not identified itself after a few seconds keeps the room unaccepted. The offer's number is keyed
+// with this start's random value, so nobody can compute it in advance; it changes with any of those, and so does the
+// acceptance.
 //
 // Threads: none of its own and no lock. coop_game.c holds one lock around every call.
 #pragma once
@@ -102,13 +110,20 @@ unsigned coop_sync_ignored(const CoopSync *s);
 
 // ---- the room (the coop thread)
 // The room and who is in it: code "" when in none. A new code (or none) forgets the peers and everything merged:
-// nothing of one room reaches the next. The acceptance, the pinned maker and the charter stay while the code comes
-// back the same (the relay lost the room and the session reached it again); another room starts them anew.
+// nothing of one room reaches the next. The acceptance, the pinned maker, the charter, the removals, the sessions that
+// ended and this game's own pool records stay while the code comes back the same (the session reached the room again);
+// another room starts them anew.
 // self: this player's member id; ids and sessions: every member's (self included; sessions NULL: each id's own
 // number); maker: the member the relay names as the room's maker, 0 when none is in the room.
 void coop_sync_room(CoopSync *s, const char *code, int self, const int *ids, const uint64_t *sessions, int n, int maker,
                     uint64_t now_ms);
-// This player's own rule settings, and whether it made the room (its settings are the room's).
+// The relay lost the room (the session is joining it again): every session in it ended, so an identity bound to one of
+// them is never taken again. Call before the room goes to "".
+void coop_sync_room_lost(CoopSync *s);
+// The room's own seed for this player's key in the room of that code (the maker's, kept in its profile so that its key
+// outlives a restart of the game); without it the key comes from coop_sync_seed's value of this start.
+void coop_sync_room_seed(CoopSync *s, const char *code, const uint8_t seed[32]);
+// This player's own rule settings, and whether it made the room in this session (its settings are the room's).
 void coop_sync_settings(CoopSync *s, const CoopRules *mine, int made_room);
 // A peer message (kind COOP_K_DIGEST or COOP_K_SECTION, the bytes after the kind) from member from.
 void coop_sync_receive(CoopSync *s, int from, uint8_t kind, const uint8_t *bytes, size_t n, uint64_t now_ms);
@@ -126,8 +141,9 @@ void coop_sync_seed(CoopSync *s, const uint8_t seed[32]);
 void coop_sync_name(CoopSync *s, const char *name);   // this player's name, signed into its identity
 // What joining the room means, for the player to accept: the other members (by the names their identities carry), the
 // rules and the key that signed them. heard: its identity was checked (a member not identified a few seconds after
-// it appeared shows with heard 0 and nothing is taken from it); removed: the maker removed it. No offer (token 0)
-// outside a room, before the rules are known, and while a member that just appeared is not identified yet.
+// it appeared shows with heard 0, counts in unidentified and keeps the room unaccepted); removed: the maker removed
+// it. No offer (token 0) outside a room, before the rules are known (the members and disagree are filled in), and
+// while a member that just appeared is not identified yet.
 typedef struct {
     int id, heard, maker, removed;
     char name[COOP_NAME_MAX + 1];   // the name it signed; "" until heard (coop_game.c shows the relay's)
@@ -144,21 +160,40 @@ typedef struct {
     int new_save;       // another save was loaded since the last acceptance: it gets the room's progress, which holds
                         // what every save played in the room brought (the last one's too)
     int copy;           // the copy of the save for this acceptance: 0 not yet, 1 made, -1 failed (accept again to retry)
+    int unidentified;   // members in the room that never identified themselves: the room cannot be accepted meanwhile
+    int disagree;       // members carry rules signed by different keys (or by another than the one in force)
 } CoopOffer;
 int coop_sync_offer(CoopSync *s, CoopOffer *out, uint64_t now_ms);   // 1 when there is an offer
 // Accepts the offer of that number: its identities, rules and maker's key (pinned from now on in this room). 1 when
-// token is the current offer's. A copy of the save is wanted when none was made for the save being played.
+// token is the current offer's and no member in the room is unidentified. A copy of the save is wanted when none was
+// made for the save being played.
 int coop_sync_accept(CoopSync *s, uint32_t token);
 int coop_sync_copy_wanted(const CoopSync *s);
 void coop_sync_copied(CoopSync *s, int ok);
 // Values are handed out: the current offer is accepted and its copy made (coop_sync_take checks it itself).
 int coop_sync_open(CoopSync *s);
-// The maker's game (it holds the key the charter is signed with): removes a member (its identity is dropped by every
-// game: its messages ignored, its pool records gone), or resets the pools (every record dropped; the games join them
-// again with what they hold). 1 when done.
+// The maker's game (it holds the key the charter is signed with): removes a member in the room (by member id) or any
+// key the room knew (admitted to the pools, accepted by this player, or a member's; by key id, also once it left): its
+// identity is dropped by every game, its messages ignored, its pool records gone. Or resets the pools: a new pools'
+// epoch that admits this player and the members it accepted that are in the room, and in which every game joins the
+// pools again with what they held for those. 1 when done.
 int coop_sync_remove(CoopSync *s, int member);
+int coop_sync_remove_key(CoopSync *s, uint64_t kid);
 int coop_sync_reset_pools(CoopSync *s);
 int coop_sync_is_maker(const CoopSync *s);
+// A key's fingerprint as the offer shows it (xxxx-xxxx-xxxx-xxxx, or the 16 hex digits) into its id; 1 when it is one.
+int coop_sync_key_parse(const char *text, uint64_t *kid);
+// The identities the pools admit, with what each spent beyond what it gained (summed over the pools of keys, rupees
+// and ammunition): whom a maker would remove after a drain. Their count (at most max).
+typedef struct {
+    char key[20];                   // its fingerprint
+    int member;                     // its member id in the room, 0 when it is not in it
+    int self;                       // this player's
+    int removed;                    // the maker removed it
+    char name[COOP_NAME_MAX + 1];   // the name its identity signed, while it is in the room
+    int64_t spent[3];               // keys, rupees, ammunition: spends minus gains (negative: it brought more)
+} CoopContributor;
+int coop_sync_contributors(const CoopSync *s, CoopContributor *out, int max);
 // 1 once every peer's digest matched this player's after it joined (or it is alone): the room's pools are known.
 int coop_sync_caught_up(const CoopSync *s);
 
@@ -193,7 +228,10 @@ typedef struct {
     unsigned sent_msgs, recv_msgs, sent_bytes;
     unsigned merged;                // registers a message raised
     unsigned pools_bound;
-    unsigned rejected;              // values refused (not shared here, out of range, the state full)
+    unsigned rejected;              // values refused (not shared here, out of range, the state full, failed signatures)
+    unsigned unaccepted;            // flags dropped because their sender's key is not one this player accepted
+    unsigned sig_checks;            // signatures checked
+    unsigned sig_skipped;           // messages dropped because their sender's budget of checks was spent
     unsigned rate_dropped;          // messages over a member's rate
     unsigned probe_max;             // the longest run of index slots an insert walked
 } CoopSyncStats;

@@ -22,6 +22,9 @@
 //    at most what the pool can hold, and the maker's removal gives that back. Identities: acceptance is by key, a
 //    removed member or a copied identity changes nothing, and the rules' key is pinned. Answers are fair.
 // 7. Random bytes into the receiver.
+// 8. The third review: flags only from keys the player accepted, a drain the maker's restarted game undoes, identity
+//    replays, the relay's maker mark against the members' rules, signed names, failed signatures, own pool records
+//    after the room came back, removals that stay.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +169,8 @@ typedef struct {
     Game *games[MAX_PLAYERS];
     int present[MAX_PLAYERS];
     int sending;                   // the member a send comes from
+    int only[9];                   // by sender id: deliver its messages to this member only (0: as addressed)
+    int mute[9];                   // by sender id: deliver none of its messages
     unsigned sent, lost;
 } Net;
 
@@ -189,6 +194,7 @@ static void deliver_one(Net *net, const Packet *p, uint64_t now) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Game *g = net->games[i];
         if (!g || !net->present[i] || g->id == p->from || (p->to && p->to != g->id)) continue;
+        if (p->from >= 1 && p->from <= 8 && (net->mute[p->from] || (net->only[p->from] && net->only[p->from] != g->id))) continue;
         if (rnd() % 100 < net->loss) {
             net->lost++;
             continue;
@@ -347,6 +353,8 @@ static void probe_algebra(void) {
         coop_sync_tick(g.eng, 1000, net_send, &none);   // it made the room: its rules (the defaults) are in force
         free(none.q);
         coop_sync_receive(g.eng, 8, COOP_K_DIGEST, digest.b, digest.n, 1050);   // member 8's identity
+        CoopOffer off;   // whose key this player accepts: flags are taken only from accepted keys
+        if (coop_sync_offer(g.eng, &off, 1050)) coop_sync_accept(g.eng, off.token);
         for (int k = 0; k < 3; k++) {
             const int si = orders[o][k];
             for (int m = 0; m < counts[si]; m++)
@@ -811,7 +819,7 @@ static void probe_pool_hostile(void) {
     now = run(&net, now, 3000);
     int64_t v;
     coop_sync_pool(b.eng, KEYS_FOREST, &v);
-    CHECK(v >= 2 - 15 && value_of(&b, KEYS_FOREST) == 0, "pool: a member's spend of 2^20 counts at most its gains plus the limit of 15 (pool %lld)",
+    CHECK(v >= 0 && value_of(&b, KEYS_FOREST) == 0, "pool: a member's spend of 2^20 counts at most what entered the pool (pool %lld)",
           (long long)v);
     CHECK(coop_sync_remove(a.eng, 3) && !coop_sync_remove(b.eng, 1), "pool: the maker removes a member, another member cannot");
     net.present[2] = 0;
@@ -1195,6 +1203,430 @@ static void probe_sync_fuzz(void) {
     printf("coop-probe: sync fuzz: 200000 random messages, %u registers made\n", st.regs);
 }
 
+// ---- 8. the third review's findings
+
+// A DIGEST of an identity signed with the key of seed for member id in session (name: nl raw bytes), schema 0xC0FFEE,
+// with a charter (pk, epoch, a signature that is not one) when charter_pk is set. bad: the identity's signature broken.
+static size_t make_digest(uint8_t *out, const char *code, const uint8_t seed[32], int id, uint64_t session, const char *name, size_t nl,
+                          int bad, const uint8_t *charter_pk, uint32_t epoch) {
+    uint8_t sk[COOP_SK_LEN], pk[COOP_PK_LEN], ctx[16], m[160], *at = m, *p = out;
+    coop_sign_keypair(seed, sk, pk);
+    coop_blake2b(ctx, sizeof ctx, code, strlen(code), "nx2navi-coop/3 sign", 19);
+    memcpy(at, "nx2navi-coop/3 member", 21), at += 21;
+    memcpy(at, ctx, sizeof ctx), at += sizeof ctx;
+    *at++ = (uint8_t)id;
+    at = put_le(at, session, 8);
+    memcpy(at, pk, sizeof pk), at += sizeof pk;
+    *at++ = (uint8_t)nl;
+    memcpy(at, name, nl), at += nl;
+    *p++ = COOP_K_DIGEST_VER;
+    p = put_le(p, 0xC0FFEE, 4);
+    memcpy(p, pk, sizeof pk), p += sizeof pk;
+    *p++ = (uint8_t)nl;
+    memcpy(p, name, nl), p += nl;
+    coop_sign(p, sk, m, (size_t)(at - m));
+    if (bad) p[bad % COOP_SIG_LEN] ^= (uint8_t)(1 + bad / COOP_SIG_LEN);
+    p += COOP_SIG_LEN;
+    *p++ = charter_pk != NULL;
+    if (charter_pk) {
+        p = put_le(p, epoch, 4);
+        *p++ = COOP_CAT_N;
+        static const uint8_t modes[COOP_CAT_N] = {1, 1, 1, 1, 2, 0, 0};
+        memcpy(p, modes, COOP_CAT_N), p += COOP_CAT_N;
+        p = put_le(p, 0, 4);
+        *p++ = 0, *p++ = 0;
+        memcpy(p, charter_pk, COOP_PK_LEN), p += COOP_PK_LEN;
+        for (int i = 0; i < COOP_SIG_LEN; i++) *p++ = (uint8_t)(epoch * 31 + (uint32_t)i);
+    }
+    *p++ = COOP_SYNC_SECTIONS;
+    memset(p, 0, 4 * COOP_SYNC_SECTIONS), p += 4 * COOP_SYNC_SECTIONS;
+    return (size_t)(p - out);
+}
+
+// The offer's member of that id (NULL when none).
+static const CoopOfferMember *offer_member(const CoopOffer *o, int id) {
+    for (int i = 0; i < o->n; i++)
+        if (o->member[i].id == id) return &o->member[i];
+    return NULL;
+}
+
+static int flags_held(Game **gs, int n, uint32_t first, uint32_t last) {
+    int got = 0;
+    for (int k = 0; k < n; k++)
+        for (uint32_t h = first; h <= last; h++) got += coop_sync_flag(gs[k]->eng, COOP_CAT_PROGRESS, h) != 0 || value_of(gs[k], h) > 0;
+    return got;
+}
+
+// Finding 1: values only from keys this player accepted, and no acceptance while a member is not identified.
+static void probe_h3_accepted_only(void) {
+    Net net = {0};
+    Game a, b, c, m, u;
+    game_init(&a, 1, 0x3101), game_init(&b, 2, 0x3102), game_init(&c, 3, 0x3103), game_init(&m, 4, 0x3104), game_init(&u, 4, 0x3105);
+    defaults(&a, 1), defaults(&b, 0), defaults(&c, 0), defaults(&m, 0), defaults(&u, 0);
+    net.games[0] = &a, net.games[1] = &b, net.games[2] = &c;
+    net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F1", 1000), 1000), 3000);
+    a.ask = b.ask = c.ask = 1;   // the three accepted each other; their players accept nothing more by themselves
+    Game *abc[3] = {&a, &b, &c};
+    CoopOffer o;
+    // M tells only B who it is and sends only B its flags (201..210, earned by nobody)
+    for (int k = 200; k < 210; k++) m.f[k].value = 1;
+    net.games[3] = &m, net.present[3] = 1, net.only[4] = 2;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 8000);
+    int at_b = flags_held(&abc[1], 1, 201, 210), at_c = flags_held(&abc[2], 1, 201, 210);
+    coop_sync_offer(c.eng, &o, now);
+    CHECK(!at_b, "F1: B, whose player did not accept M, stores none of M's flags (%d of 10)", at_b);
+    CHECK(!at_c, "F1: C gets none of M's flags through B (%d of 10)", at_c);
+    CHECK(o.token && !o.accepted, "F1: C's room is not accepted while M is in it unidentified (accepted %d)", o.accepted);
+    // M tells everyone; nobody accepts it; M leaves: none of its flags arrives anywhere
+    for (int k = 210; k < 220; k++) m.f[k].value = 1;
+    net.only[4] = 0;
+    now = run(&net, now, 4000);
+    net.present[3] = 0;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 4000);
+    int got = flags_held(abc, 3, 211, 220);
+    CHECK(!got, "F1: the flags of a newcomer nobody accepted reach nobody once it left (%d)", got);
+    // M back (a new session), declined; the maker removes it, which opens the room again: still nothing of M's
+    for (int k = 220; k < 230; k++) m.f[k].value = 1;
+    m.session ^= 0x20;
+    net.present[3] = 1;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 4000);
+    int removed_m = coop_sync_remove(a.eng, 4);
+    now = run(&net, now, 4000);
+    got = flags_held(abc, 3, 221, 230);
+    coop_sync_offer(b.eng, &o, now);
+    CHECK(removed_m && o.accepted && !got, "F1: the maker's removal opens the room again and none of M's flags is applied (%d, accepted %d)", got,
+          o.accepted);
+    // U never identifies; B's player accepts meanwhile; then U tells B who it is, sends its flags and leaves
+    net.present[3] = 0;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 1000);
+    for (int k = 230; k < 240; k++) u.f[k].value = 1;
+    net.games[3] = &u, net.present[3] = 1, net.mute[4] = 1;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 6000);
+    coop_sync_offer(b.eng, &o, now);
+    int took = coop_sync_accept(b.eng, o.token);
+    coop_sync_offer(b.eng, &o, now);
+    CHECK(!o.accepted, "F1: a room with a member that never identified is not accepted (accept %d, accepted %d)", took, o.accepted);
+    net.mute[4] = 0, net.only[4] = 2;
+    now = run(&net, now, 4000);
+    net.present[3] = 0;
+    now = run(&net, (net_roster(&net, "H3F1", now), now), 4000);
+    got = flags_held(abc, 3, 231, 240);
+    CHECK(!got, "F1: the flags of a member that identified after the player accepted reach nobody (%d)", got);
+    CHECK(!a.lowered && !b.lowered && !c.lowered, "F1: no apply lowered a flag");
+    game_free(&a), game_free(&b), game_free(&c), game_free(&m), game_free(&u);
+    free(net.q);
+    printf("coop-probe: sync accepted keys only: no flag of a member nobody accepted is stored, passed on or applied, "
+           "and a member that never identified keeps the room unaccepted\n");
+}
+
+// Finding 2: a drain takes at most what entered the pool; the maker's game, started again, removes the drainer who left,
+// and the keys come back in every game; a pool reset brings them back too.
+static void probe_h3_drain(void) {
+    static const uint8_t maker_seed[32] = {0x4D, 0x4B, 0x33};   // the maker's key for the room, kept in its profile
+    Net net = {0};
+    Game a, b, m, a2;
+    game_init(&a, 1, 0x3201), game_init(&b, 2, 0x3202), game_init(&m, 3, 0x3203);
+    coop_sync_room_seed(a.eng, "H3F2", maker_seed);
+    defaults(&a, 1), defaults(&b, 0), defaults(&m, 0);
+    flag_of(&a, KEYS_FOREST)->value = 2;
+    net.games[0] = &a, net.games[1] = &b, net.games[2] = &m, net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F2", 1000), 1000), 5000);
+    CoopOffer o;
+    coop_sync_offer(b.eng, &o, now);
+    char fp[20] = "";
+    if (offer_member(&o, 3)) snprintf(fp, sizeof fp, "%s", offer_member(&o, 3)->key);
+    flag_of(&m, KEYS_FOREST)->value -= 2000000;   // M's own record spends two million keys
+    now = run(&net, now, 3000);
+    flag_of(&a, KEYS_FOREST)->value += 1;         // A picks up a key meanwhile
+    now = run(&net, now, 3000);
+    int64_t v;
+    coop_sync_pool(b.eng, KEYS_FOREST, &v);
+    CHECK(v >= 0 && value_of(&b, KEYS_FOREST) == 0, "F2: a drain takes at most what entered the pool, no debt beyond it (pool %lld)", (long long)v);
+    // M leaves, and so does the maker's game
+    net.present[2] = 0, net.present[0] = 0;
+    now = run(&net, (net_roster(&net, "H3F2", now), now), 3000);
+    // the maker's game starts again: a new engine and session, the room's key from the profile; the relay marks nobody
+    game_init(&a2, 1, 0x3204);
+    coop_sync_room_seed(a2.eng, "H3F2", maker_seed);
+    defaults(&a2, 0);
+    flag_of(&a2, KEYS_FOREST)->value = value_of(&a, KEYS_FOREST);   // its save as the drain left it
+    net.games[0] = &a2, net.present[0] = 1;
+    now = run(&net, (net_roster(&net, "H3F2", now), now), 6000);
+    CHECK(coop_sync_is_maker(a2.eng), "F2: the maker's game, started again, holds the room's key and makes the rules again");
+    uint64_t kid = 0;
+    int parsed = coop_sync_key_parse(fp, &kid), removed_m = parsed && coop_sync_remove_key(a2.eng, kid);
+    CHECK(removed_m, "F2: the maker removes M, who left, by its key %s (parsed %d)", fp, parsed);
+    now = run(&net, now, 5000);
+    CHECK(value_of(&b, KEYS_FOREST) == 3 && value_of(&a2, KEYS_FOREST) == 3,
+          "F2: the keys come back in every game, the one picked up during the drain too (%d %d)", value_of(&b, KEYS_FOREST), value_of(&a2, KEYS_FOREST));
+    game_free(&a), game_free(&b), game_free(&m), game_free(&a2);
+    free(net.q);
+
+    // the same drain; M leaves and nobody removes it; the maker resets the pools: they count what the players in the room
+    // brought, and the keys come back
+    Net n2 = {0};
+    Game c, d, mm;
+    game_init(&c, 1, 0x3211), game_init(&d, 2, 0x3212), game_init(&mm, 3, 0x3213);
+    defaults(&c, 1), defaults(&d, 0), defaults(&mm, 0);
+    flag_of(&c, KEYS_FOREST)->value = 2;
+    n2.games[0] = &c, n2.games[1] = &d, n2.games[2] = &mm, n2.present[0] = n2.present[1] = n2.present[2] = 1;
+    now = run(&n2, (net_roster(&n2, "H3F2R", now), now), 5000);
+    flag_of(&mm, KEYS_FOREST)->value -= 2000000;
+    now = run(&n2, now, 3000);
+    n2.present[2] = 0;
+    now = run(&n2, (net_roster(&n2, "H3F2R", now), now), 2000);
+    int reset = coop_sync_reset_pools(c.eng);
+    now = run(&n2, now, 8000);
+    CHECK(reset && value_of(&c, KEYS_FOREST) == 2 && value_of(&d, KEYS_FOREST) == 2, "F2: after a pool reset the keys come back in every game (%d %d)",
+          value_of(&c, KEYS_FOREST), value_of(&d, KEYS_FOREST));
+#ifndef COOP_BEFORE
+    CoopContributor who[8];
+    int nw = coop_sync_contributors(c.eng, who, 8), seen = 0;
+    for (int i = 0; i < nw; i++) seen |= who[i].member == 2;
+    CHECK(nw >= 2 && seen, "F2: the maker's game lists the pools' contributors (%d)", nw);
+#endif
+    game_free(&c), game_free(&d), game_free(&mm);
+    free(n2.q);
+    printf("coop-probe: sync drain: a member's spends take at most what entered a pool; the maker's game, started again, removes the "
+           "drainer who left, or resets the pools, and the keys come back everywhere\n");
+}
+
+// Finding 4: an identity of a session that ended is not taken again, after any number of other sessions or a room lost.
+static void probe_h3_replay(void) {
+    Net net = {0};
+    Game a, b, c;
+    game_init(&a, 1, 0x3401), game_init(&b, 2, 0x3402), game_init(&c, 3, 0x3403);
+    defaults(&a, 1), defaults(&b, 0), defaults(&c, 0);
+    net.games[0] = &a, net.games[1] = &b, net.games[2] = &c, net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F4", 1000), 1000), 3000);
+    Net cap = {0};
+    cap.sending = 2;
+    coop_sync_tick(b.eng, now + 3000, net_send, &cap);
+    Packet dig = {0};
+    for (int i = 0; i < cap.n; i++)
+        if (cap.q[i].kind == COOP_K_DIGEST) dig = cap.q[i];
+    free(cap.q);
+    uint64_t bsess = b.session;
+    // B leaves; then 64 sessions come and go
+    net.present[1] = 0;
+    now = run(&net, (net_roster(&net, "H3F4", now), now), 1000);
+    int ids[3] = {1, 3, 5};
+    uint64_t sess[3] = {a.session, c.session, 0};
+    for (int k = 0; k < 64; k++) sess[2] = 0x5000 + (uint64_t)k, coop_sync_room(c.eng, "H3F4", 3, ids, sess, 3, 1, now += 50);
+    coop_sync_room(c.eng, "H3F4", 3, ids, sess, 2, 1, now += 50);
+    // M: member 2 in B's old session, with B's identity
+    int ids2[3] = {1, 2, 3};
+    uint64_t sess2[3] = {a.session, bsess, c.session};
+    coop_sync_room(c.eng, "H3F4", 3, ids2, sess2, 3, 1, now += 50);
+    coop_sync_receive(c.eng, 2, COOP_K_DIGEST, dig.b, dig.n, now += 10);
+    CoopOffer o;
+    coop_sync_offer(c.eng, &o, now);
+    const CoopOfferMember *x = offer_member(&o, 2);
+    CHECK(dig.n && !(x && x->heard), "F4: B's identity in B's old session is not taken after 64 other sessions ended (heard %d)", x ? x->heard : -1);
+    // B back in a new session; the room is lost while B is in it; B is gone when it is back; M takes B's session from before
+    int ids3[3] = {1, 2, 3};
+    uint64_t sess3[3] = {a.session, bsess ^ 0x99, c.session};
+    coop_sync_room(c.eng, "H3F4", 3, ids3, sess3, 3, 1, now += 50);
+    Net cap2 = {0};
+    cap2.sending = 2;
+    b.session = bsess ^ 0x99;
+    net.present[1] = 1;
+    net_roster(&net, "H3F4", now);
+    coop_sync_tick(b.eng, now + 3000, net_send, &cap2);
+    for (int i = 0; i < cap2.n; i++)
+        if (cap2.q[i].kind == COOP_K_DIGEST) dig = cap2.q[i], coop_sync_receive(c.eng, 2, COOP_K_DIGEST, dig.b, dig.n, now += 10);
+    free(cap2.q);
+    coop_sync_offer(c.eng, &o, now);
+    x = offer_member(&o, 2);
+    int heard_before = x && x->heard;
+    coop_sync_room_lost(c.eng);
+    coop_sync_room(c.eng, "", 0, NULL, NULL, 0, 0, now += 50);
+    coop_sync_room(c.eng, "H3F4", 3, ids3, sess3, 3, 1, now += 50);
+    coop_sync_receive(c.eng, 2, COOP_K_DIGEST, dig.b, dig.n, now += 10);
+    coop_sync_offer(c.eng, &o, now);
+    x = offer_member(&o, 2);
+    CHECK(heard_before && !(x && x->heard), "F4: after the room was lost, B's identity of the session before is not taken again (heard %d, %d)",
+          heard_before, x ? x->heard : -1);
+    game_free(&a), game_free(&b), game_free(&c);
+    free(net.q);
+    printf("coop-probe: sync replay: an identity of a session that ended is never taken again\n");
+}
+
+// Finding 5: the relay's mark gives no rules that the members' charters contradict, and a game's own mark is not taken
+// for its own creation.
+static void probe_h3_mark(void) {
+    Net net = {0};
+    Game a, b, h, n;
+    game_init(&a, 1, 0x3501), game_init(&b, 2, 0x3502), game_init(&h, 3, 0x3503), game_init(&n, 4, 0x3504);
+    defaults(&a, 1), defaults(&b, 0);
+    net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F5", 1000), 1000), 3000);
+    // A is gone; H made the room again (the relay marks it) and signs rules of its own
+    net.present[0] = 0;
+    defaults(&h, 1), h.ask = 1;
+    net.games[2] = &h, net.present[2] = 1;
+    now = run(&net, (net_roster(&net, "H3F5", now), now), 4000);
+    defaults(&n, 0), n.ask = 1;
+    net.games[3] = &n, net.present[3] = 1;
+    now = run(&net, (net_roster(&net, "H3F5", now), now), 6000);
+    CoopRules rn;
+    coop_sync_rules(n.eng, &rn);
+    CHECK(!(rn.epoch && rn.maker == 3), "F5: a newcomer does not take the rules of the marked member while another member carries another key's (rules by %d)",
+          rn.maker);
+#ifndef COOP_BEFORE
+    CoopOffer o;
+    coop_sync_offer(n.eng, &o, now);
+    CHECK(o.disagree, "F5: the newcomer's offer says the members carry rules of different keys");
+#endif
+    game_free(&a), game_free(&b), game_free(&h), game_free(&n);
+    free(net.q);
+
+    // a hostile relay marks the newcomer X as the maker in X's own roster
+    Net n2 = {0};
+    Game p, q, x;
+    game_init(&p, 1, 0x3511), game_init(&q, 2, 0x3512), game_init(&x, 3, 0x3513);
+    defaults(&p, 1), defaults(&q, 0), defaults(&x, 0);
+    n2.games[0] = &p, n2.games[1] = &q, n2.present[0] = n2.present[1] = 1;
+    now = run(&n2, (net_roster(&n2, "H3F5X", now), now), 3000);
+    n2.games[2] = &x, n2.present[2] = 1;
+    net_roster(&n2, "H3F5X", now);
+    int ids[3] = {1, 2, 3};
+    uint64_t sess[3] = {p.session, q.session, x.session};
+    coop_sync_room(x.eng, "H3F5X", 3, ids, sess, 3, 3, now);
+    now = run(&n2, now, 6000);
+    CoopRules rx;
+    coop_sync_rules(x.eng, &rx);
+    CHECK(rx.epoch && rx.maker == 1, "F5: a newcomer the relay marks in its own roster takes the maker's rules, not its own (epoch %u, by %d)", rx.epoch,
+          rx.maker);
+    game_free(&p), game_free(&q), game_free(&x);
+    free(n2.q);
+    printf("coop-probe: sync mark: the relay's maker mark gives no rules the members' charters contradict\n");
+}
+
+// Findings 6 and 8: a signed name is shown cleaned; identities and charters that fail their check count against the
+// sender, are not checked twice and are capped.
+static void probe_h3_signatures(void) {
+    Net net = {0};
+    Game a, b;
+    game_init(&a, 1, 0x3601), game_init(&b, 2, 0x3602);
+    defaults(&a, 1), defaults(&b, 0);
+    net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F6", 1000), 1000), 3000);
+    int ids[4] = {1, 2, 4, 5};
+    uint64_t sess[4] = {a.session, b.session, 0x4444, 0x5555};
+    coop_sync_room(b.eng, "H3F6", 2, ids, sess, 4, 1, now);
+    static const char evil[] = "Ev\x1b[31m\nroom accepted\xe2\x80\xae";
+    uint8_t d[COOP_MAX_PAYLOAD], seed4[32] = {4, 4}, seed5[32] = {5, 5};
+    size_t dn = make_digest(d, "H3F6", seed4, 4, 0x4444, evil, sizeof evil - 1, 0, NULL, 0);
+    coop_sync_receive(b.eng, 4, COOP_K_DIGEST, d, dn, now += 10);
+    CoopOffer o;
+    coop_sync_offer(b.eng, &o, now + 6000);
+    const CoopOfferMember *x = offer_member(&o, 4);
+    int raw = 0;
+    for (const char *c = x ? x->name : ""; *c; c++) raw |= (uint8_t)*c < 0x20 || *c == 0x7f || !memcmp(c, "\xe2\x80\xae", 3);
+    CHECK(x && x->heard && !raw, "F6: a signed name with control and reordering characters is shown cleaned (heard %d)", x ? x->heard : -1);
+    // member 5: an identity that never checks out, the same bytes again and again, then new ones
+    size_t bn = make_digest(d, "H3F6", seed5, 5, 0x5555, "Mal", 3, 1, NULL, 0);
+    uint64_t t0 = now;
+    for (int i = 0; i < 300; i++) coop_sync_receive(b.eng, 5, COOP_K_DIGEST, d, bn, now += 3);
+    for (int i = 0; i < 300; i++) bn = make_digest(d, "H3F6", seed5, 5, 0x5555, "Mal", 3, 2 + i, NULL, 0), coop_sync_receive(b.eng, 5, COOP_K_DIGEST, d, bn, now += 3);
+    CHECK(coop_sync_ignored(b.eng) >> 5 & 1, "F8: a member whose identity fails its check again and again is ignored");
+    // member 4, identified: charters claiming A's key with a later epoch and no valid signature
+    uint8_t apk[COOP_PK_LEN] = {0};
+    Net cap = {0};
+    cap.sending = 1;
+    coop_sync_tick(a.eng, now + 3000, net_send, &cap);
+    for (int i = 0; i < cap.n; i++)
+        if (cap.q[i].kind == COOP_K_DIGEST) memcpy(apk, cap.q[i].b + 5, COOP_PK_LEN);
+    free(cap.q);
+    for (int i = 0; i < 300; i++)
+        dn = make_digest(d, "H3F6", seed4, 4, 0x4444, evil, sizeof evil - 1, 0, apk, 1000 + (uint32_t)i), coop_sync_receive(b.eng, 4, COOP_K_DIGEST, d, dn, now += 3);
+    CHECK(coop_sync_ignored(b.eng) >> 4 & 1, "F8: a member that sends charters in the maker's name that fail their check is ignored");
+#ifndef COOP_BEFORE
+    CoopSyncStats st;
+    coop_sync_stats(b.eng, &st);
+    CHECK(st.sig_checks <= 2 * 33 + 4, "F8: at most what the refusal limit allows was checked (%u checks in %llu ms)", st.sig_checks,
+          (unsigned long long)(now - t0));
+#endif
+    (void)t0;
+    game_free(&a), game_free(&b);
+    free(net.q);
+    printf("coop-probe: sync signatures: signed names are shown cleaned; failed checks count against the sender and are capped\n");
+}
+
+// Finding 10: a game's own pool record is not rolled back after the room came back.
+static void probe_h3_own_records(void) {
+    Net net = {0};
+    Game x, y, z;
+    game_init(&x, 1, 0x3A01), game_init(&y, 2, 0x3A02), game_init(&z, 3, 0x3A03);
+    defaults(&x, 1), defaults(&y, 0), defaults(&z, 0);
+    flag_of(&x, KEYS_FOREST)->value = 2;
+    net.games[0] = &x, net.games[1] = &y, net.games[2] = &z, net.present[0] = net.present[1] = net.present[2] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F10", 1000), 1000), 5000);
+    uint8_t old[REC_BYTES], buf[COOP_MAX_PAYLOAD];
+    flag_of(&y, KEYS_FOREST)->value += 1;
+    int caught = catch_record(&net, &y, KEYS_FOREST, &now, old);
+    for (int i = 0; i < 3; i++) flag_of(&y, KEYS_FOREST)->value += 1, now = run(&net, now, 2000);
+    // the relay lost the room; Y is back in it, and Z (identified to Y first) hands Y its own old record before the
+    // room's records arrive
+    coop_sync_room(y.eng, "", 0, NULL, NULL, 0, 0, now);
+    net_roster(&net, "H3F10", now += 8);
+    Net cap = {0};
+    cap.sending = 3;
+    coop_sync_tick(z.eng, now + 3000, net_send, &cap);
+    for (int i = 0; i < cap.n; i++)
+        if (cap.q[i].kind == COOP_K_DIGEST) coop_sync_receive(y.eng, 3, COOP_K_DIGEST, cap.q[i].b, cap.q[i].n, now);
+    free(cap.q);
+    memcpy(buf + 6, old, REC_BYTES);
+    inject(&y, NULL, 3, buf, buf + 6 + REC_BYTES, 1, now += 1);
+    now = run(&net, now, 5000);
+    flag_of(&y, KEYS_FOREST)->value += 1;
+    now = run(&net, now, 4000);
+    int64_t vx, vy;
+    coop_sync_pool(x.eng, KEYS_FOREST, &vx);
+    coop_sync_pool(y.eng, KEYS_FOREST, &vy);
+    CHECK(caught && vx == 7 && vy == 7, "F10: Y's own record is not rolled back: both pools hold 2 + 5 (X %lld, Y %lld)", (long long)vx, (long long)vy);
+    game_free(&x), game_free(&y), game_free(&z);
+    free(net.q);
+    printf("coop-probe: sync own records: a game's own pool record survives the room coming back, and an old one changes nothing\n");
+}
+
+// Finding 12: a key the maker removed stays removed however many removals follow.
+static void probe_h3_removals(void) {
+    Net net = {0};
+    Game a, b, h;
+    game_init(&a, 1, 0x3C01), game_init(&b, 2, 0x3C02);
+    defaults(&a, 1), defaults(&b, 0);
+    net.games[0] = &a, net.games[1] = &b, net.present[0] = net.present[1] = 1;
+    uint64_t now = run(&net, (net_roster(&net, "H3F12", 1000), 1000), 3000);
+    int done = 0;
+    for (int k = 0; k < 17; k++) {
+        game_init(&h, 3, 0x3C10 + (uint64_t)k);
+        defaults(&h, 0);
+        net.games[2] = &h, net.present[2] = 1;
+        now = run(&net, (net_roster(&net, "H3F12", now), now), 1500);
+        done += coop_sync_remove(a.eng, 3);
+        now = run(&net, now, 1500);
+        net.present[2] = 0;
+        now = run(&net, (net_roster(&net, "H3F12", now), now), 500);
+        game_free(&h);
+    }
+    game_init(&h, 3, 0x3C10);   // the first one again: the same key, a new session
+    h.session ^= 0x77;
+    defaults(&h, 0);
+    net.present[2] = 1;
+    now = run(&net, (net_roster(&net, "H3F12", now), now), 2000);
+    CoopOffer o;
+    coop_sync_offer(b.eng, &o, now);
+    const CoopOfferMember *x = offer_member(&o, 3);
+    CHECK(done == 17 && x && x->heard && x->removed, "F12: a key removed 17 removals ago is still removed (%d removals, heard %d, removed %d)", done,
+          x ? x->heard : -1, x ? x->removed : -1);
+    game_free(&a), game_free(&b), game_free(&h);
+    free(net.q);
+    printf("coop-probe: sync removals: a removed key stays removed after any number of later removals\n");
+}
+
 int probe_coop_sync(void) {
     fails = 0;
     probe_algebra();
@@ -1214,5 +1646,12 @@ int probe_coop_sync(void) {
     probe_honest_base();
     probe_fair_answers();
     probe_sync_fuzz();
+    probe_h3_accepted_only();
+    probe_h3_drain();
+    probe_h3_replay();
+    probe_h3_mark();
+    probe_h3_signatures();
+    probe_h3_own_records();
+    probe_h3_removals();
     return fails;
 }
