@@ -84,6 +84,7 @@ SESSIONS_KEPT = 4096  # sessions a room remembers having seen, so that none is t
 ACTIVE = 2           # a room that forwarded to someone within this many seconds shares the forwarding budget
 FAILED_KEPT = 4096   # join attempts whose refusal is remembered, so that the same attempt again costs nothing
 FAILED_TTL = 120     # and for this long (a cookie lasts one to two minutes)
+MEMBER_CHALLENGES = (2, 8)   # challenges a second, and at once, for CONNECTs with a member's token: from its own network, and from others
 
 
 def normalize_secret(text):
@@ -300,7 +301,7 @@ class Bucket:
 
 class Member:
     __slots__ = ('id', 'cid', 'session', 'name', 'addr', 'last_seen', 'away', 'live', 'connect_seq', 'pkts', 'bytes',
-                 'token', 'maker')
+                 'token', 'maker', 'home_challenges', 'away_challenges')
 
     def __init__(self, mid, cid, session, name, addr, now, connect_seq, pkts, bytes_, maker):
         self.id, self.cid, self.session, self.name, self.addr = mid, cid, session, name, addr
@@ -308,6 +309,9 @@ class Member:
         self.pkts, self.bytes = pkts, bytes_
         self.token = secrets.token_bytes(COOKIE_LEN)
         self.maker = maker
+        # its own challenges, apart from its packets: anyone who saw its join has its token, and a flood of CONNECTs with
+        # it from another network takes neither the member's messages nor the challenge of its own rejoin from its network
+        self.home_challenges, self.away_challenges = Bucket(*MEMBER_CHALLENGES, now), Bucket(*MEMBER_CHALLENGES, now)
 
 
 class Room:
@@ -460,11 +464,13 @@ class Relay:
     def take_challenge(self, addr, now, member=None):
         """A challenge (or an answer to another protocol version) for addr: the relay's budget first (a flood it refuses
         leaves no state behind), then its network's. A CONNECT that carries a member's valid token (a rejoin) takes from
-        a share set aside for those, which a flood without a token never reaches, and from that member's own budget."""
+        a share set aside for those, which a flood without a token never reaches, and from that member's own challenges
+        for its network or for the others (MEMBER_CHALLENGES), never from its packets."""
         if member is not None:
             if self.rejoin_challenges is None:
                 self.rejoin_challenges = Bucket(self.rejoin_challenge_rate, self.rejoin_challenge_rate, now)
-            return member.pkts.take(1, now) and self.rejoin_challenges.take(1, now)
+            mine = member.home_challenges if prefix_of(addr) == prefix_of(member.addr) else member.away_challenges
+            return mine.take(1, now) and self.rejoin_challenges.take(1, now)
         if self.challenges is None:
             self.challenges = Bucket(self.challenge_rate, self.challenge_rate, now)
         self.challenges.refill(now)

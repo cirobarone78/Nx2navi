@@ -829,6 +829,27 @@ class RelayTest(unittest.TestCase):
         flood = parsed(relay.handle(Client(ip='10.200.0.1').connect(cr.INTENT_CREATE), ('10.200.0.1', 5), cr.SILENT_DROP + 2))
         self.assertEqual(flood, [])   # the flood's own share is spent
 
+    def test_a_flood_of_rejoins_with_a_members_token_takes_neither_its_packets_nor_its_own_rejoin(self):
+        """Someone who saw a member's join (its client id and token travel in the clear) sends 250 CONNECTs a second with
+        them and no cookie from another network, for ten seconds. The member's own messages still pass, its rejoin in a
+        new session from its own network still gets a challenge, and the flood gets a few challenges, not hundreds."""
+        (a, b), secret = self.room_of(2)
+        flood = Client(ip='10.66.0.9', cid=a.cid, secret=secret)
+        flood.token = a.token
+        challenged = passed = sent = 0
+        for i in range(2500):
+            now = 1 + i / 250
+            flood.seq, flood.nonce = flood.seq + 1, i
+            challenged += len(self.relay.handle(flood.connect(cr.INTENT_JOIN), flood.addr, now))
+            if i % 25 == 0 and i >= 2000:   # the member's messages in the last two seconds, ten a second
+                out, _ = a.send(self.relay, cr.T_DATA, b'\x01sealed', dst=cr.DST_ALL, now=now)
+                sent, passed = sent + 1, passed + any(to == b.addr for to, d in out)
+        a.session = random.getrandbits(64)   # the member joins again in a new session, from its own network
+        a.seq, a.nonce = a.seq + 1, 77
+        out = parsed(self.relay.handle(a.connect(cr.INTENT_JOIN), a.addr, 11))
+        self.assertEqual((passed, [dg.type for to, dg in out]), (sent, [cr.T_CHALLENGE]))
+        self.assertLessEqual(challenged, 8 + 2 * 11)
+
     def test_challenges_are_limited_per_network_so_one_cannot_lock_out_the_rest(self):
         relay = cr.Relay(challenge_rate=100, prefix_challenge_rate=10, prefix_challenge_burst=10)
         flood = sum(len(relay.handle(Client(ip=f'10.1.0.{i}').connect(cr.INTENT_CREATE), (f'10.1.0.{i}', 5), 0)) for i in range(200))
