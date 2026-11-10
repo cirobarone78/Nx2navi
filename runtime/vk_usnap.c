@@ -143,7 +143,7 @@ static void collect(const op_hdr *h, int depth) {
                     if (k && known) {
                         if (!(nc[ci].ok >> (k + 1) & 1)) continue;
                     } else if (k) {
-                        if (!vk_mem_resolve(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
+                        if (!vk_mem_lookup(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
                             (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
                             continue;
                         ok |= 1 << (k + 1);
@@ -267,7 +267,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         for (i++; i < U.ncol && U.col[i].lo <= hi; i++)
             if (U.col[i].hi > hi) hi = U.col[i].hi;
         VkMemSpan sp;
-        if (!vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
+        if (!vk_mem_lookup(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
             (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC)) {
             U.refused++;
             continue;
@@ -350,7 +350,7 @@ static int wr_overlaps(uint64_t lo, uint64_t hi) {
 
 static int cpu_written(uint64_t addr, uint64_t n) {   // the same test vk_usnap_begin keeps regions by
     VkMemSpan sp;
-    return vk_mem_resolve(addr, n, &sp) && !sp.alloc && sp.pool && sp.avail >= n &&
+    return vk_mem_lookup(addr, n, &sp) && !sp.alloc && sp.pool && sp.avail >= n &&
            (sp.cls == VK_MCLS_HOST_CACHED || sp.cls == VK_MCLS_HOST_UNC);
 }
 

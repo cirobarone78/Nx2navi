@@ -353,6 +353,9 @@ void vk_headroom_stop(void);   // before vmaDestroyAllocator
 uint64_t vk_headroom_held(void);        // bytes the spare blocks' anchors hold
 VkDeviceSize vk_vma_block_size(void);   // VMA's block size on heaps over 1 GiB (NX2NAVI_VMA_BLOCK_MB)
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// vk_mem_resolve for a caller that reads guest memory itself or only asks what backs it: with shadow storage the pool
+// is not copied in for it (vk_memory.c, mem_resolve).
+int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
