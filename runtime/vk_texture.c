@@ -89,6 +89,8 @@ typedef struct Tex {
     uint64_t ow_frame;            // gfx_counters.frames when overwritten was set
     uint8_t overwritten;          // released, and a texture at another address was drawn over its storage (overwrite_others)
     uint8_t in_gwin;              // in gwin[]
+    int pidx;                     // 1 + its index in pent[] (vk_texture_pool_note_locked); 0: not listed
+    int ph;                       // 1 + its index in pref[] (pool_ref); 0: none
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -296,32 +298,135 @@ static void tex_gen_flip(Tex *e, int plain) {
     dirty_push(DIRTY_BUCKET | b);
 }
 
-// Moves slot id into bucket b's list (the lists exist once a slot was registered: vk_texture_register).
-static void slot_rebucket(int id, uint32_t b) {
+// Slot groups: the GPU-written slots of one address bucket that share a descriptor hash (TexSlot.khash) resolve alike
+// under the same address and entry generations, as the texture pool's memo has it (vk_exec_draw.c pool_fill). Ocarina
+// keeps up to ~400 descriptors of each transient render target registered over its storage, and the fullest bucket,
+// 1,281 slots, moves 8 times a submission in Kokiri Forest: 12,800 of the 17,600 slots a submission's dirty walks
+// refilled held their views already. The dirty walk can hand each group to the pool whole (vk_texture_dirty_slots_locked's
+// gfn), which leaves its members alone when their resolution did not change (NX2NAVI_POOL_GROUP). A slot is in its
+// bucket's own list (khash 0: a CPU-written texture) or in its group's member list, through the same links. A slot that
+// joins a group goes to its tail and leaves the group's stamp as it was: its registration put it on the dirty ring, so
+// the walk that follows refills it on its own, and the head, whose state the pool tests, is a member from before. (The
+// game's 118 registrations a submission cleared the stamps of the groups they joined, and the walk at a submission's
+// start went member by member as before: 11,300 of 11,550 slots.)
+typedef struct { VkSlotGroup pub; int32_t gnext, gprev, tail; uint32_t bucket; } SlotGroup;
+static SlotGroup *grp;
+static int ngrp, cgrp, grp_free = -1, ngrp_live;
+static uint64_t n_grouped;               // slots in groups
+static int32_t bucket_ghead[AGEN_N];     // per bucket: its first group (-1: none; set with the lists)
+static int32_t *slot_grp;                // per slot id: its group, -1 none
+typedef struct { uint64_t kh, b; } GrpKey;
+static nvn_hmap grp_by = {.klen = sizeof(GrpKey)};   // -> group + 1
+
+static int grp_get(uint64_t kh, uint32_t b) {
+    GrpKey k = {kh, b};
+    void *v = nvn_hm_get(&grp_by, &k);
+    if (v) return (int)((intptr_t)v - 1);
+    int g;
+    if (grp_free >= 0) {
+        g = grp_free, grp_free = grp[g].gnext;
+    } else {
+        if (ngrp == cgrp) {
+            int n = cgrp ? cgrp * 2 : 1024;
+            SlotGroup *p = realloc(grp, sizeof *p * (size_t)n);
+            if (!p) rt_fatal("vk: out of memory for texture slot groups");
+            grp = p, cgrp = n;
+        }
+        g = ngrp++;
+    }
+    SlotGroup *G = &grp[g];
+    memset(G, 0, sizeof *G);
+    G->pub.kh = kh, G->pub.head = G->tail = -1, G->bucket = b;
+    G->gprev = -1, G->gnext = bucket_ghead[b];
+    if (G->gnext >= 0) grp[G->gnext].gprev = g;
+    bucket_ghead[b] = g;
+    nvn_hm_put(&grp_by, &k, (void *)(intptr_t)(g + 1));
+    ngrp_live++;
+    return g;
+}
+
+static void grp_drop(int g) {
+    SlotGroup *G = &grp[g];
+    GrpKey k = {G->pub.kh, G->bucket};
+    nvn_hm_del(&grp_by, &k);
+    if (G->gprev >= 0) grp[G->gprev].gnext = G->gnext;
+    else bucket_ghead[G->bucket] = G->gnext;
+    if (G->gnext >= 0) grp[G->gnext].gprev = G->gprev;
+    G->pub.kh = 0, G->pub.head = G->tail = -1, G->pub.n = 0, G->pub.stamp = 0;
+    G->gnext = grp_free, grp_free = g;
+    ngrp_live--;
+}
+
+// Places slot id in bucket b: at the tail of its group when it has a descriptor hash, else at the head of the bucket's
+// own list (the lists exist once a slot was registered: vk_texture_register).
+static void slot_place(int id, uint32_t b, uint64_t kh) {
     if (slot_prev[id] != -2) {   // out of its old list
+        int32_t g = slot_grp[id];
+        int32_t *head = g >= 0 ? &grp[g].pub.head : &bucket_head[slot_bucket[id]];
         if (slot_prev[id] >= 0) slot_next[slot_prev[id]] = slot_next[id];
-        else bucket_head[slot_bucket[id]] = slot_next[id];
+        else *head = slot_next[id];
         if (slot_next[id] >= 0) slot_prev[slot_next[id]] = slot_prev[id];
+        else if (g >= 0) grp[g].tail = slot_prev[id];
+        slot_grp[id] = -1;
+        if (g >= 0) {
+            n_grouped--;
+            if (!--grp[g].pub.n) grp_drop(g);
+        }
     }
     slot_bucket[id] = (uint16_t)b;
+    if (kh) {
+        int g = grp_get(kh, b);   // may move grp
+        SlotGroup *G = &grp[g];
+        slot_grp[id] = g;
+        G->pub.n++, n_grouped++;
+        slot_next[id] = -1;
+        slot_prev[id] = G->tail;
+        if (G->tail >= 0) slot_next[G->tail] = id;
+        else G->pub.head = id;
+        G->tail = id;
+        return;
+    }
     slot_prev[id] = -1;
     slot_next[id] = bucket_head[b];
     if (bucket_head[b] >= 0) slot_prev[bucket_head[b]] = id;
     bucket_head[b] = id;
 }
 
+VkSlotGroup *vk_texture_group_locked(int g) { return &grp[g].pub; }
+int vk_texture_group_next_locked(int id) { return slot_next[id]; }
+void vk_texture_groups_unstamp_locked(void) {
+    for (int g = 0; g < ngrp; g++) grp[g].pub.stamp = 0;
+}
+
 uint64_t vk_texture_dirty_pos_locked(void) { return ndirty; }
 
-int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg) {
+// A bucket listed several times since *pos is walked once a round: the walk reads its slots' tokens after every change
+// listed before the round began (the lock is held). Changes the walk itself makes (an entry a lookup created) are the
+// next round's. A bucket's slot groups go to gfn when given, else their members to fn.
+int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void (*gfn)(int g, void *arg), void *arg) {
     if (!slot_next || ndirty - *pos > DIRTY_N) {
         *pos = ndirty;
         return 0;
     }
-    for (uint64_t q = *pos; q < ndirty; q++) {
-        uint32_t x = dirty[q % DIRTY_N];
-        if (x & DIRTY_BUCKET)
-            for (int32_t id = bucket_head[x & ~DIRTY_BUCKET]; id >= 0; id = slot_next[id]) fn(id, arg);
-        else fn((int)x, arg);
+    static uint32_t seen[AGEN_N], round;
+    for (uint64_t q = *pos; q < ndirty;) {
+        uint64_t end = ndirty;
+        if (!++round) memset(seen, 0, sizeof seen), round = 1;
+        for (; q < end; q++) {
+            uint32_t x = dirty[q % DIRTY_N];
+            if (x & DIRTY_BUCKET) {
+                uint32_t b = x & ~DIRTY_BUCKET;
+                if (seen[b] == round) continue;
+                seen[b] = round;
+                for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id]) fn(id, arg);
+                for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext) {   // the walk registers nothing
+                    if (gfn) gfn(g, arg);
+                    else for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id]) fn(id, arg);
+                }
+            } else {
+                fn((int)x, arg);
+            }
+        }
     }
     *pos = ndirty;
     return 1;
@@ -1121,10 +1226,189 @@ static void rel_unlink(Tex *e) {
     e->rel_prev = e->rel_next = NULL;
 }
 
+// The entries the bindless texture pool's slots resolved to, for a submission's freshness check (make_fresh_snap once
+// per entry), which looked at every slot instead: 33,000 slots, 1.5 ms of the replay thread a submission in Kokiri
+// Forest. vk_exec_draw.c pool_fill notes a slot's entry after it resolved the slot; only entries whose content the CPU
+// provides are listed (the check does nothing for the others; one the GPU took over, gpu_owned, never uploads again
+// and leaves), and an entry stays listed until it is destroyed: the list holds every entry a slot resolves to, and
+// some that no slot does any more. Each keeps its storage range and the page generation of its last check here, so
+// that the check of an entry whose 2 MiB regions took no write since (vk_mem_unchanged_locked, one shared lock for the
+// whole list) touches neither the entry nor the lock: 5,600 entries took 0.77 ms a submission one by one. Texture lock
+// held.
+typedef struct { Tex *e; uint64_t addr, size; uint32_t since; int ok; } PEnt;   // ok: uploaded as of since
+static PEnt *pent;
+static int npent, cpent, *pq, cpq;
+static uint64_t n_pool_checks, n_pool_skips;
+// The region check's misses (vk_mem_unchanged_why_locked): not uploaded, a region without this epoch's snapshot yet, one
+// untracked, one written since, nothing to check; and the snapshot queries its own pass made (NX2NAVI_POOL_PRESNAP).
+static uint64_t n_pool_miss[5], n_presnap_q;
+static void make_fresh_snap(Tex *e);
+
+static void pool_unlist(Tex *e) {
+    if (!e->pidx) return;
+    int i = e->pidx - 1;
+    pent[i] = pent[--npent];
+    pent[i].e->pidx = i + 1;
+    e->pidx = 0;
+}
+
+// The entries the pool's slots hold: for each, how many slots' last fill resolved to it (vk_exec_draw.c pool_hold; a fill
+// that shared another slot's lookup counts for the entry that lookup found). The walk over every slot looked each slot
+// up in each submission, which left its entry's use stamp (touch): the idle clock reads it, and start_at's alias rule
+// reads the frame of an entry with GPU content. The check by list is no lookup, so it leaves the stamps from these
+// counts (pool_touch): in each submission for the GPU-owned entries, in turn for the others, each once in
+// POOL_TOUCH_DIV submissions (IDLE_ROUNDS is 240 of them). An entry keeps its place until it is destroyed and no slot
+// holds it any more: a destroyed one is refilled out of its slots by the bump of its bucket.
+#define POOL_TOUCH_DIV 64
+typedef struct { Tex *e; uint32_t refs; int next; uint8_t gown; } PRef;   // e NULL: destroyed, or free (refs 0, next)
+static PRef *pref;
+static int npref, cpref, pref_free;   // pref_free: 1 + the first free place
+static void touch(Tex *e);
+
+static uint32_t pool_ref(Tex *e) {
+    if (e->ph) return (uint32_t)e->ph;
+    int i;
+    if (pref_free) {
+        i = pref_free - 1, pref_free = pref[i].next;
+    } else {
+        if (npref == cpref) {
+            int n = cpref ? cpref * 2 : 1024;
+            PRef *q = realloc(pref, sizeof *q * (size_t)n);
+            if (!q) rt_fatal("vk: out of memory for the texture pool's entry counts");
+            pref = q, cpref = n;
+        }
+        i = npref++;
+    }
+    pref[i] = (PRef){e, 0, 0, e->pub.gpu_owned};
+    return (uint32_t)(e->ph = i + 1);
+}
+
+void vk_texture_pool_hold_locked(uint32_t old, uint32_t ent) {
+    if (ent) pref[ent - 1].refs++;
+    if (old && !--pref[old - 1].refs && !pref[old - 1].e) pref[old - 1].next = pref_free, pref_free = (int)old;
+}
+
+static void pool_forget(Tex *e) {   // destroy_tex
+    if (!e->ph) return;
+    PRef *q = &pref[e->ph - 1];
+    q->e = NULL;
+    if (!q->refs) q->next = pref_free, pref_free = e->ph;
+    e->ph = 0;
+}
+
+static void pool_touch(void) {
+    static int at;
+    for (int i = 0; i < npref; i++)
+        if (pref[i].gown && pref[i].refs && pref[i].e) touch(pref[i].e);
+    for (int k = (npref + POOL_TOUCH_DIV - 1) / POOL_TOUCH_DIV; k-- > 0;) {
+        if (at >= npref) at = 0;
+        const PRef *q = &pref[at++];
+        if (!q->gown && q->refs && q->e) touch(q->e);
+    }
+}
+
+// e becomes GPU-owned: the list's check does nothing for it any more, and its use stamp is left in each submission.
+static void pool_gpu_owned(Tex *e) {
+    pool_unlist(e);
+    if (e->ph) pref[e->ph - 1].gown = 1;
+}
+
+int vk_texture_pool_note_locked(int id, uint32_t *ent) {
+    *ent = 0;
+    if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
+    // The caller's lookups left the slot resolved under its bucket's generation, unless it made none (a fill without a
+    // token or a kind): an entry cached under another generation may be destroyed, so the slot is looked up first.
+    if (tslots[id].ce && tslots[id].cgen != agen[sinfo[id] & 0xffff]) vk_texture_by_id_locked(id, NULL, NULL);
+    Tex *e = tslots[id].ce;
+    if (!e) return 0;
+    if (!e->pidx && e->pub.mirrored && !e->pub.gpu_owned) {
+        if (npent == cpent) {
+            int n = cpent ? cpent * 2 : 1024;
+            PEnt *p = realloc(pent, sizeof *p * (size_t)n);
+            int *q = realloc(pq, sizeof *q * (size_t)n);
+            if (!p || !q) rt_fatal("vk: out of memory for the texture pool's entry list");
+            pent = p, pq = q, cpent = cpq = n;
+        }
+        pent[npent++] = (PEnt){e, e->pub.addr, e->t.L.size, 0, 0};
+        e->pidx = npent;
+    }
+    *ent = pool_ref(e);
+    return 1;
+}
+
+// Released entries are left out: a slot resolves to none of those whose content the CPU provides (slot_resolve's stale
+// rule), and the game may be unmapping their storage.
+// NX2NAVI_POOL_PRESNAP=1 (default), 0, ab: the check takes the write-watch snapshot of an entry's regions that have
+// none in this submission yet before it looks at them (one exclusive hold of the generation table's lock for the list),
+// so an unchanged entry in such a region passes there. Without it 97 % of the 5,600 entries missed the region check for
+// want of a snapshot and went the long way, one entry and one lock at a time. With it 97 % pass, 3.5 snapshot queries
+// a submission: the check 0.50 to 0.19 ms a submission, the replay thread -0.37 ms against the control.
+static int pool_presnap(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("POOL_PRESNAP", "1");
+    return RT_KNOB_ON(mode);
+}
+
+// The submission being recorded checked the pool's entries by this list: for the idle clock it walked the pool
+// (vk_texture_new_submit).
+static int pool_by_list;
+
+int vk_texture_pool_fresh_locked(void) {
+    int nq = 0, ps = pool_presnap();
+    pool_by_list = 1;
+    if (ps) vk_mem_gen_lock();
+    else vk_mem_gen_lock_shared();
+    for (int i = 0; i < npent; i++) {
+        const PEnt *p = &pent[i];
+        if (p->ok) {
+            if (ps) n_presnap_q += vk_mem_snap_range_locked(p->addr, p->size, submit_epoch);
+            int why = vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
+            if (!why) continue;
+            n_pool_miss[why]++;
+        } else {
+            n_pool_miss[0]++;
+        }
+        pq[nq++] = i;
+    }
+    if (ps) vk_mem_gen_unlock();
+    else vk_mem_gen_unlock_shared();
+    n_pool_skips += (uint64_t)(npent - nq);
+    for (int k = nq; k-- > 0;) {   // from the end: an entry leaving swaps the last one into its place
+        int i = pq[k];
+        PEnt *p = &pent[i];
+        Tex *e = p->e;
+        if (e->pub.gpu_owned) {
+            pool_unlist(e);
+            continue;
+        }
+        if (e->released) continue;
+        if (!e->uploaded || e->checked != submit_epoch) {
+            make_fresh_snap(e);
+            e->checked = submit_epoch;
+            n_pool_checks++;
+        }
+        p->since = e->wgen, p->ok = e->uploaded;
+    }
+    pool_touch();
+    return npent;
+}
+
+// slot_resolve's last answer was none because of its stale rule (vk_texture_slot_retry_locked)
+static int resolve_stale;
+
+int vk_texture_slot_retry_locked(int id) {
+    if (id < 0 || id >= ntslots || !tslots[id].used || !tslots[id].t.mem) return -1;
+    resolve_stale = 0;
+    if (vk_texture_by_id_locked(id, NULL, NULL)) return 1;
+    return resolve_stale ? -1 : 0;
+}
+
 static void retire_remove(Tex *e);
 
 static void destroy_tex(Tex *e) {
     if (e->retiring) retire_remove(e);
+    pool_unlist(e);
+    pool_forget(e);
     own_remove(e);
     gwin_remove(e);
     n_site[0]++;
@@ -1186,6 +1470,10 @@ static int comes_back_intact(const Tex *e) { return e->pub.mirrored && !e->pub.g
 // texture object, nothing samples it. The clock is look_round, which only a submission whose slot checks reached half
 // of the registered pool slots moves on (vk_texture_new_submit): counted in submissions, a pause screen or a fade that
 // draws nothing through the pool made the whole world's textures idle within seconds.
+// With NX2NAVI_POOL_FAST the refresh checks the entries by list instead (vk_texture_pool_fresh_locked), which is no
+// lookup. Such a submission counts for the clock all the same, and the entries the pool's slots hold get their stamp
+// from the count of those slots (pool_touch), each at least once in POOL_TOUCH_DIV submissions: an entry a slot names
+// never comes near IDLE_ROUNDS.
 #define IDLE_ROUNDS 240
 static uint32_t look_round = 1;     // submissions whose lookups walked the texture pool
 static uint32_t round_checks;       // slot checks of the submission being recorded (vk_texture_by_id_locked)
@@ -1198,6 +1486,7 @@ static void touch(Tex *e) {
 }
 
 void vk_texture_pool_ctx(int on) { pool_ctx = on; }
+
 static int idle(const Tex *e, uint64_t now);
 
 // NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the installed memory, 512 MiB to 2 GiB; 0 = no limit) bounds the
@@ -1552,6 +1841,7 @@ static uint64_t evict_disused(uint64_t want) {
         }
         retiring[nretiring++] = e;
         e->retiring = 1, e->retire_takes = takes, e->retire_due = 0;
+        pool_unlist(e);   // no slot resolves to it in the pool refresh; taken back, the refill of its slots lists it again
         retiring_bytes += e->bytes;
         freed += e->bytes;
         tex_gen_bump(e->key.addr);
@@ -2336,6 +2626,7 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
         if (e->pub.mirrored) {   // the content is src's GPU render, newer than the storage bytes
             vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
             e->uploaded = 1;
+            pool_gpu_owned(e);
             e->pub.gpu_owned = 1;
         }
         e->chash_ok = 0;
@@ -2491,6 +2782,7 @@ void vk_texture_gpu_written(const tex_t *t) {
             e->scan_frame = now + 1;
             overwrite_others(e, now);
         }
+        pool_gpu_owned(e);
         e->pub.gpu_owned = 1;
         e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
         if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
@@ -2578,10 +2870,11 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (!sinfo) {
         uint64_t *p = calloc(1 << 20, sizeof *p);
         slot_next = malloc(sizeof *slot_next << 20), slot_prev = malloc(sizeof *slot_prev << 20);
+        slot_grp = malloc(sizeof *slot_grp << 20);
         slot_bucket = calloc(1 << 20, sizeof *slot_bucket);
-        if (!p || !slot_next || !slot_prev || !slot_bucket) rt_fatal("vk: out of memory for texture slot tokens");
-        for (int i = 0; i < (1 << 20); i++) slot_prev[i] = -2, slot_next[i] = -1;
-        for (int i = 0; i < AGEN_N; i++) bucket_head[i] = -1;
+        if (!p || !slot_next || !slot_prev || !slot_grp || !slot_bucket) rt_fatal("vk: out of memory for texture slot tokens");
+        for (int i = 0; i < (1 << 20); i++) slot_prev[i] = -2, slot_next[i] = -1, slot_grp[i] = -1;
+        for (int i = 0; i < AGEN_N; i++) bucket_head[i] = -1, bucket_ghead[i] = -1;
         __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
     }
     TexSlot *s = &tslots[id];
@@ -2607,7 +2900,6 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     slots_gen++;
     if (!++reg_serial) reg_serial = 1;
     __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
-    slot_rebucket(id, agen_idx((uintptr_t)t->mem));
     dirty_push((uint32_t)id);
     s->has_view = v != NULL;
     if (v) s->v = *v;
@@ -2623,6 +2915,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         for (size_t i = 0; i < sizeof s->v; i++) h = (h ^ b[i]) * 0x100000001b3ull;
         s->khash = (h ^ s->has_view) | 1;
     }
+    slot_place(id, agen_idx((uintptr_t)t->mem), s->khash);
     unlock();
 }
 
@@ -2689,6 +2982,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         else if (!e && !cpu_slot) e = own && own->superseded ? NULL : own;   // a superseded one: entry_of takes it back
         else if (!e && cpu_slot && s->finalized) stale = 1;
     }
+    resolve_stale = stale;
     if (!e && s->t.mem && !stale) {
         // evicted by disuse: the pool refresh keeps the stand-in, without spending the creation budget on it
         if (pool_ctx && holds.n && nvn_hm_get(&holds, &k)) resolve_held = 1;
@@ -2752,7 +3046,27 @@ void vk_texture_bucket_stats(char *out, size_t n) {
              (unsigned long long)n_site[2], (unsigned long long)n_site[3], (unsigned long long)n_undone,
              (unsigned long long)hot, occ[top[0]], occ[top[1]], occ[top[2]], occ[top[3]],
              bump_count[top[0]], bump_count[top[1]], bump_count[top[2]], bump_count[top[3]]);
-    n_bumps = n_undone = 0;
+    size_t used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; pool freshness check: %llu entries checked, %llu passed by their regions (missed: "
+                 "%llu not uploaded, %llu a region without a snapshot yet, %llu untracked, %llu written since, %llu "
+                 "nothing to check; %llu snapshot queries of NX2NAVI_POOL_PRESNAP)",
+                 (unsigned long long)n_pool_checks, (unsigned long long)n_pool_skips,
+                 (unsigned long long)n_pool_miss[0], (unsigned long long)n_pool_miss[1],
+                 (unsigned long long)n_pool_miss[2], (unsigned long long)n_pool_miss[3],
+                 (unsigned long long)n_pool_miss[4], (unsigned long long)n_presnap_q);
+    used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; %d slot groups holding %llu slots", ngrp_live, (unsigned long long)n_grouped);
+    int held = 0, gown = 0;
+    for (int i = 0; i < npref; i++)
+        if (pref[i].refs && pref[i].e) held++, gown += pref[i].gown;
+    used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; pool slots hold %d entries, %d of them GPU-owned (stamped in each submission "
+                 "checked by list)", held, gown);
+    n_bumps = n_undone = n_pool_checks = n_pool_skips = n_presnap_q = 0;
+    memset(n_pool_miss, 0, sizeof n_pool_miss);
     memset(n_site, 0, sizeof n_site);
     memset(bump_count, 0, sizeof bump_count);
     unlock();
@@ -2795,8 +3109,9 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         s->cheld = (uint8_t)(!s->ce && resolve_held);
     }
     Tex *e = s->ce;
-    // a draw binding: the texture is in use, whether or not the pool walk checked it first in this submission
-    if (e && !pool_ctx) e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    // a draw binding: the texture is in use, whether or not the pool's refresh checked it first in this submission
+    // (by list that check is no lookup, vk_texture_pool_fresh_locked, so the stamp of the use is left here too)
+    if (e && !pool_ctx) touch(e);
     // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
     // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do. A
@@ -2853,8 +3168,9 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 
 void vk_texture_new_submit(void) {
     lock();
-    if (round_checks && (uint64_t)round_checks * 2 >= pool_slots) look_round++;   // the last one walked the pool
-    round_checks = 0;
+    // the last one walked the pool, or checked its entries by list
+    if (pool_by_list || (round_checks && (uint64_t)round_checks * 2 >= pool_slots)) look_round++;
+    round_checks = 0, pool_by_list = 0;
     if (!++submit_epoch) submit_epoch = 1;
     rate_tick();
     sweep_pressure();

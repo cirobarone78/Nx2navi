@@ -683,6 +683,11 @@ static uint64_t image_bytes(void) {
 static int overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) { return a < b + m && b < a + n; }
 static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <= r.size && a - r.base <= r.size - n; }
 
+// Bumped (lock held exclusively) by every change of what is mapped or readable: vk_exec_draw.c's texture pool looks the
+// slots over unreadable storage up again only then (and now and then).
+static uint32_t map_gen;
+uint32_t mem_map_gen(void) { return __atomic_load_n(&map_gen, __ATOMIC_ACQUIRE); }
+
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     plat_mutex_lock(&lock);
@@ -693,6 +698,7 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     if (size > heap_size) commit(L.heap.base + heap_size, size - heap_size, "heap");
     if (size < heap_size) decommit(L.heap.base + size, heap_size - size, "heap");
     heap_size = size;
+    __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     if (addr) *addr = L.heap.base;
     return R_OK;
@@ -749,6 +755,7 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
         }
     memset(t, (int)perm, n / PAGE);
     protect(a, n, perm == PERM_RW ? PLAT_PROT_RW : perm == PERM_R ? PLAT_PROT_READ : PLAT_PROT_NONE, "module data");
+    __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     rt_log("%s data permission +%#llx size %#llx perm %u", m->name, (unsigned long long)(a - m->base),
            (unsigned long long)n, perm);
@@ -820,6 +827,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
     }
 out:
+    __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     return r;
 }
@@ -872,6 +880,7 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
         alias_bytes += fresh * PAGE;
     }
 out:
+    __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&lock);
     if (r) rt_log("%sMapPhysicalMemory %#llx+%#llx failed %#x (alias %#llx used, heap %#llx)", unmap ? "Un" : "",
                   (unsigned long long)a, (unsigned long long)n, r, (unsigned long long)alias_bytes,
