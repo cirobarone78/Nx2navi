@@ -247,25 +247,15 @@ amdgpu), and importing pins the pages, which drops their write protection. Each 
 host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wrote go in before each submit, and the GPU's
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
-reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
-Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
-5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
-well: the shadow copies are chosen for the measured cost above, not for a missing extension.
-
-The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
-pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
-the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, and its prologue brings
-the shadow of every pool in the table up to date with the pages the CPU wrote and queues the same pages for those
-pools' VRAM mirrors (`vk_memory.c` `vk_mem_gpa_sync`). That copies the written pages of every CPU-visible pool in
-each such part, which the cost above does not include. What a shader stores through the table into a shadow copy does
-not come back to guest memory. `--probe-vkmem` checks the read: a shader follows the table to a word of a pool that is
-never bound, and must read `0x13579BDF` and, after a plain CPU write, `0x2468ACE0`. On Linux, run it for each backing:
-
-```sh
-for shadow in 0 1; do for memory in import mirror; do
-    NX2NAVI_GPA=1 NX2NAVI_SHADOW=$shadow NX2NAVI_MEMORY=$memory ./ocarina --probe-vkmem
-done; done
-```
+reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. The device
+address table names the shadows, and since its readers reach pools the replay never resolves (the foliage's instance
+data, Navi), a guest submission with a shader that reads the table brings the CPU's writes into every shadow in it
+once. In Kokiri Forest (1.1.1, RTX 4090) that costs about 9 ms a frame (copy-in 3.9 ms, write-back 5 ms), and the
+copies hold about 5 GB: 43 fps there against 72 fps for the same build without the table's shadows, which leaves
+the tree canopies, the ferns and Navi out. Most of the copy-in is the uniform pools the foliage reads its instances
+from; the write-back is the output of the passes that read them. `NX2NAVI_SHADOW=1` turns it on under Windows too.
+The Steam Deck's RADV has `VK_EXT_external_memory_host` as well: the shadow copies are chosen for the measured cost
+above, not for a missing extension.
 
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.

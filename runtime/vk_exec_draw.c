@@ -1365,10 +1365,9 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     // The device address table (vk_gpa.c, translator patch 0030). Mirrored pools are not synced for its readers: a sync
     // of every mirror at a table reader's draw copied stale guest bytes over what the GPU had written into the mirrors
     // earlier in the frame, and Kokiri Forest's lit areas went black. A pool read only through the table is rarely a
-    // mirrored one (mirrors are made for pools bound as buffers, which sync then). With shadow storage every pool the
-    // table names is a copy of guest memory, and nothing resolves the pools such a reader reaches: bind_resources
-    // marks the part (vk_mem_gpa_use) and its prologue brings those copies up to date (vk_memory.c vk_mem_gpa_sync).
+    // mirrored one (mirrors are made for pools bound as buffers, which sync then).
     if (r->cbuf_slot == VK_GPA_CB_SLOT) {
+        vk_mem_shadow_table_read();   // shadow storage: the table's shadows are synced before this part is submitted
         VkDescriptorBufferInfo t = vk_gpa_info();
         return t.buffer ? t : (VkDescriptorBufferInfo){Z.zbuf, 0, VK_WHOLE_SIZE};
     }
@@ -2959,7 +2958,6 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     static VkDescSlot d[MAX_DESC];
     static VkBufferView bv[MAX_DESC];
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
-    if (info->gpa) vk_mem_gpa_use();   // before the early returns for reused descriptors: the shader still reads the table
     bind_stats(info);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
     int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = B.res_valid;
@@ -4080,7 +4078,6 @@ static void mo_emit(VkCommandBuffer cb) {
     for (int n = 0; n < MQ.n; p = &MQ.d[n++]) {
         const MoDraw *q = &MQ.d[n];
         const VkPipeInfo *info = q->info;
-        if (info->gpa) vk_mem_gpa_use();   // these draws bind packed descriptors without bind_resources, maybe in a later part
         if (q->pipe != pipe) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, q->pipe), pipe = q->pipe, MO.e_pipe++;
         if (q->st != st) vk_pipeline_set_dynamic(cb, &MQ.st[q->st]), st = q->st, MO.e_dyn++;
         if (!p || memcmp(&q->v, &p->v, sizeof q->v)) vkCmdSetViewportWithCount(cb, 1, &q->v);

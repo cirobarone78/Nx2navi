@@ -332,12 +332,9 @@ void vk_mem_lazy_handed(void);
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
 void vk_mem_shadow_sync(void);
-// A shader of the part being recorded reads through the device address table (vk_gpa.c), also when its descriptors
-// are reused: with shadow storage the part's prologue (vk_mem_gpa_sync) then brings every pool the table names up to
-// date with the CPU's writes, since the pools such a shader reaches are never resolved.
-void vk_mem_gpa_use(void);
-void vk_mem_gpa_sync(void);
-int vk_mem_shadow_storage(void);   // CPU-visible pools are shadow copies of guest memory, not imports (NX2NAVI_SHADOW)
+// Record time: a shader of the submission being recorded reads the device address table, so the next
+// vk_mem_shadow_sync brings the CPU's writes into every shadow the table names (once per guest submission).
+void vk_mem_shadow_table_read(void);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
 // The same for a GPU write into a VRAM mirror, which went back to guest memory with the submission: the texture checks
@@ -601,9 +598,6 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
-// --probe-vkmem: record gives the submission's commands in place of the replay, under the same submission lock,
-// recorder, memory prologue and fence.
-uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg);
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 // The executed timeline (vk_sync.c): a submission's own commands are through the GPU, its write-backs maybe not yet.
@@ -701,7 +695,6 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // a stage indexes the texture or sampler pool: bind set 2 (the pools)
-    int gpa;                               // a stage accesses guest pointers through the device address table
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.

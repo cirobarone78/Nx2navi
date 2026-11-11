@@ -82,6 +82,7 @@ typedef struct PoolRec {
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
     uint32_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
+    uint32_t stab_i;                   // shadow_lock: 1 + its index in stab (a shadow in the device address table), 0 none
     // shadow_lock: base copies of the pages a noted GPU write covers (merge_page), open addressing by page address;
     // csb a power of two, page 0 an empty slot
     struct SBase { uint64_t page; uint8_t *base; } *sb;
@@ -97,8 +98,9 @@ static int shadow_on;                    // shadow mode: imported pools get shad
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
 static void shadow_forget(PoolRec *r);
-static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_retire (or vk_mem_shutdown)
-static void mirror_retire(void *arg);    // completion thread: destroys a finalized mirrored pool's record
+static void pool_retiring(PoolRec *r);   // vk_pool_fini: kept until pool_retire (or vk_mem_shutdown)
+static void pool_retire(void *arg);      // completion thread: destroys a finalized pool's record
+static void shadow_table_add(PoolRec *r);
 static void grow(void **arr, int *cap, size_t elem);
 
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;
@@ -322,10 +324,13 @@ int vk_pool_init(pool_t *p) {
         phys_list[nphys++] = r;
     }
     plat_mutex_unlock(&pool_lock);
-    // The pool's pages go into the device address table: shaders that read a pointer from memory reach them there. An
-    // import and a shadow copy both have buf; only the import owns mem.
-    if (r->kind == POOL_IMPORT && r->buf && r->import_hi > r->import_lo)
+    // The imported pages, or the shadow that stands for them, go into the device address table: shaders that read a
+    // pointer from memory reach them there. A shadow is then kept up to date for the table's readers once per guest
+    // submission whether or not the replay resolves it (vk_mem_shadow_sync).
+    if (r->kind == POOL_IMPORT && (r->mem || r->smap) && r->buf && r->import_hi > r->import_lo) {
         r->gpa_rec = vk_gpa_map(r->import_lo, r->import_hi, r->buf, r->import_lo);
+        if (r->smap && r->gpa_rec) shadow_table_add(r);
+    }
     return 1;
 }
 
@@ -342,8 +347,6 @@ static uint32_t gpa_cover(uint64_t a) {
     plat_mutex_unlock_shared(&pool_lock);
     return rec;
 }
-
-static void gpa_retire(void *arg) { destroy_rec(vk_ctx(), arg); }
 
 void vk_pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
@@ -385,13 +388,14 @@ void vk_pool_fini(pool_t *p) {
         vk_queue_unlock();
     }
     vk_mem_collect();
-    // A mirrored pool's record and buffers outlive the submission being recorded, whose sync copies and write-backs may
-    // name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be queued).
-    if (r->mbuf) mirror_retiring(r), vk_completion_add(vk_sync_issued() + 1, mirror_retire, r);
-    else if (r->gpa_rec && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);   // the queue was not drained
-    // an unused physical pool may still be read through the virtual pages that mapped it (device addresses, which do not
-    // mark it used): its buffer outlives the submission being recorded too
-    else if (r->kind == POOL_PHYS && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);
+    // These records and buffers outlive the submission being recorded: a mirrored pool's, whose sync copies and
+    // write-backs may name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be
+    // queued); an unused one in the device address table, as the queue was not drained; an unused physical pool, which
+    // may still be read through the virtual pages that mapped it (device addresses, which do not mark it used). They go
+    // on the retiring list, so that vk_mem_shutdown destroys those whose submission never comes: a shadow's buffer is a
+    // VMA allocation, and the allocator refuses to go while one is left.
+    if (r->mbuf || (r->gpa_rec && !r->used) || (r->kind == POOL_PHYS && !r->used))
+        pool_retiring(r), vk_completion_add(vk_sync_issued() + 1, pool_retire, r);
     else destroy_rec(c, r);
 }
 
@@ -472,8 +476,8 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
 
 // touch: the GPU may read the pool's buffer in the submission being recorded, so its shadow goes on the touched list
 // (shadow storage). A lookup (vk_mem_lookup) leaves it off: the caller reads guest memory itself or only asks what
-// backs the address. Shaders that reach a pool through the device address table resolve nothing: the part they run in
-// brings every pool of the table up to date (vk_mem_gpa_sync).
+// backs the address. The shaders that reach a shadow through the device address table need no touch: those shadows
+// are synced once per guest submission anyway (vk_mem_shadow_sync).
 static int mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
@@ -523,7 +527,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touc
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
-        if (r->smap && touch && !r->stouched) shadow_touch(r);
+        if (touch && r->smap && !r->stouched) shadow_touch(r);
         ok = 1;
     } else if (r && r->kind == POOL_PHYS) {
         out->buffer = r->buf;
@@ -980,8 +984,20 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // invalidates the buffer, about 1.3 ms per 16 MiB at the next submit, and the import's write pinning clears the
 // write watch), a CPU-visible pool gets a host-visible buffer of its own instead, at the offsets the import would have:
 // - CPU -> shadow: right before each submit (vk_mem_shadow_sync), the pools the replay resolved since the last one are
-//   queried for written pages; pages stamped after a pool's sgen are copied in by the CPU. A part whose shaders read
-//   through the device address table gets every pool the table names brought up to date the same way (vk_mem_gpa_sync).
+//   queried for written pages; pages stamped after a pool's sgen are copied in by the CPU.
+// - The device address table (vk_gpa.c) names the shadows, and its readers reach pools the replay never resolves: the
+//   instanced foliage's and Navi's data, through pointers read from other buffers. Without a sync those shadows held
+//   what guest memory held when they were made, and Kokiri Forest's trees were bare trunks, without ferns or grass
+//   tufts. So a guest submission with a shader that reads the table (vk_mem_shadow_table_read, at the record of its
+//   binding) syncs every shadow in the table, once, before the first part with such a shader is submitted. A shadow's
+//   sync costs a few comparisons when nothing in its 2 MiB regions was written since the last one (the regions' newest
+//   stamps, creg_max), and the queries are the guest submission's snapshots, which every other check shares
+//   (snap_regions). In Kokiri Forest (RTX 4090) that is one sync of the table's 4,536 shadows a frame, 3.9 ms of
+//   copy-in a frame in all, about 11 MiB; syncing at every guest submission instead, about six a frame, took 9.8 ms,
+//   with 888 write-watch queries a frame against 92. Most of the bytes are the six 2 MiB uniform pools the game rewrites
+//   for every object, and the foliage reads its instances there: left out, the trees were bare again.
+//   What the GPU writes through the table stays in the shadow: no write is noted for it, so guest memory does not see
+//   it, and a later copy-in of a page the CPU also writes puts the guest bytes over it.
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
 //   reports it at the fence (vk_gpu_written), which copies the GPU's bytes back into guest memory.
 // - Pages both write: a GPU write is noted with the whole range its binding names, and the CPU writes other fields of the
@@ -997,6 +1013,11 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 static PlatMutex shadow_lock = PLAT_MUTEX_INIT;   // after pool_lock; before gen_lock
 static PoolRec **stouch;                          // shadow_lock: pools resolved since the last sync
 static int nstouch, cstouch;
+static PoolRec **stab;                            // shadow_lock: shadows in the device address table (stab_i)
+static int nstab, cstab;
+static uint32_t stab_epoch;                       // shadow_lock: the guest submission stab was last synced for
+static uint32_t stab_want;                        // the last guest submission whose record bound the table
+static uint64_t s_tsyncs;                         // shadow_lock: syncs of stab's pools since the last log
 static uint64_t s_sb_pages;                       // shadow_lock: base copies kept (sbase_make)
 static int64_t s_live_n, s_live_bytes;            // shadow_lock
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
@@ -1032,6 +1053,16 @@ static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&shadow_lock);
     plat_inc32(&n_imports);
     return 1;
+}
+
+static void shadow_table_add(PoolRec *r) {
+    plat_mutex_lock(&shadow_lock);
+    if (!r->stab_i) {
+        if (nstab == cstab) grow((void **)&stab, &cstab, sizeof *stab);
+        stab[nstab++] = r;
+        r->stab_i = (uint32_t)nstab;
+    }
+    plat_mutex_unlock(&shadow_lock);
 }
 
 static void shadow_touch(PoolRec *r) {
@@ -1151,6 +1182,11 @@ static void shadow_forget(PoolRec *r) {
     plat_mutex_lock(&shadow_lock);
     for (int i = 0; i < nstouch; i++)
         if (stouch[i] == r) { stouch[i] = stouch[--nstouch]; break; }
+    if (r->stab_i) {
+        PoolRec *last = stab[--nstab];
+        stab[r->stab_i - 1] = last, last->stab_i = r->stab_i;
+        r->stab_i = 0;
+    }
     s_live_n--, s_live_bytes -= (int64_t)(r->import_hi - r->import_lo);
     sbase_free(r);
     plat_mutex_unlock(&shadow_lock);
@@ -1240,15 +1276,26 @@ void vk_mem_shadow_sync(void) {
     uint32_t epoch = vk_texture_epoch();
     int cpu = vk_mirror_on && wb_no_reup();   // before the locks: its first call logs
     plat_mutex_lock(&shadow_lock);
-    if (nstouch) {
+    int table = epoch && epoch != stab_epoch && __atomic_load_n(&stab_want, __ATOMIC_RELAXED) == epoch && nstab;
+    if (nstouch || table) {
         plat_mutex_lock(&gen_lock);
-        for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i], epoch, cpu), stouch[i]->stouched = 0;
+        for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i], epoch, cpu);
+        if (table) {   // the table's readers: the shadows not synced above
+            stab_epoch = epoch;
+            for (int i = 0; i < nstab; i++)
+                if (!stab[i]->stouched) shadow_sync_pool(stab[i], epoch, cpu), s_tsyncs++;
+        }
+        for (int i = 0; i < nstouch; i++) stouch[i]->stouched = 0;
         plat_mutex_unlock(&gen_lock);
         s_syncs += (uint64_t)nstouch;
         nstouch = 0;
     }
     s_ticks += qpc() - t0;
     plat_mutex_unlock(&shadow_lock);
+}
+
+void vk_mem_shadow_table_read(void) {
+    if (shadow_on) __atomic_store_n(&stab_want, vk_texture_epoch(), __ATOMIC_RELAXED);
 }
 
 // Record time: the GPU may write [addr, addr+size) of CPU-visible memory. With shadow storage the pages it covers get
@@ -1363,13 +1410,14 @@ int vk_mem_mirrored(uint64_t addr, uint64_t size) {
 static void shadow_log(uint64_t frame) {
     if (!shadow_on) return;
     plat_mutex_lock(&shadow_lock);
-    rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB; since the last: %llu pool syncs, %llu queries, %.1f MiB "
+    rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB (%d in the device address table); since the last: %llu pool "
+           "syncs and %llu for the table's readers, %llu queries, %.1f MiB "
            "copied in (%llu untracked), %.2f ms (queries %.2f); %.1f MiB written back of %.1f MiB the GPU may have written, %.2f ms; %llu "
            "pages the GPU writes keep a base copy",
-           (unsigned long long)frame, (long long)s_live_n, s_live_bytes / 1048576.0, (unsigned long long)s_syncs,
-           (unsigned long long)s_queries, s_copied / 1048576.0, (unsigned long long)s_untracked, qpc_ms(s_ticks),
+           (unsigned long long)frame, (long long)s_live_n, s_live_bytes / 1048576.0, nstab, (unsigned long long)s_syncs,
+           (unsigned long long)s_tsyncs, (unsigned long long)s_queries, s_copied / 1048576.0, (unsigned long long)s_untracked, qpc_ms(s_ticks),
            qpc_ms(s_q_ticks), s_wb_bytes / 1048576.0, s_wb_seen / 1048576.0, qpc_ms(s_wb_ticks), (unsigned long long)s_sb_pages);
-    s_syncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_ticks = s_wb_seen = s_wb_ticks = s_q_ticks = 0;
+    s_syncs = s_tsyncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_ticks = s_wb_seen = s_wb_ticks = s_q_ticks = 0;
     plat_mutex_unlock(&shadow_lock);
 }
 
@@ -1938,19 +1986,19 @@ static void mirror_forget(PoolRec *r) {
         }
 }
 
-// Finalized mirrored pools waiting for mirror_retire; vk_mem_shutdown destroys those whose callback never ran.
+// Finalized pools waiting for pool_retire (vk_pool_fini); vk_mem_shutdown destroys those whose callback never ran.
 static PoolRec **retiring;
 static int nretiring, cretiring;
 static PlatMutex retire_lock = PLAT_MUTEX_INIT;
 
-static void mirror_retiring(PoolRec *r) {
+static void pool_retiring(PoolRec *r) {
     plat_mutex_lock(&retire_lock);
     if (nretiring == cretiring) grow((void **)&retiring, &cretiring, sizeof *retiring);
     retiring[nretiring++] = r;
     plat_mutex_unlock(&retire_lock);
 }
 
-static void mirror_retire(void *arg) {
+static void pool_retire(void *arg) {
     plat_mutex_lock(&retire_lock);
     for (int i = 0; i < nretiring; i++)
         if (retiring[i] == arg) { retiring[i] = retiring[--nretiring]; break; }
@@ -2019,62 +2067,6 @@ static void mirror_sync(PoolRec *r) {
     }
     mrep.syncs++, r->st_syncs++;
     mrep.sync_t += qpc() - t0;
-}
-
-// ---- shadow storage: the device address table's readers
-// A shader that follows a pointer through the table (vk_gpa.c) can reach any pool the table names, and the replay
-// never resolves that pool, so nothing put it on the touched list and its shadow kept the bytes of its last use as a
-// buffer. vk_exec_draw.c marks a part whose pipelines declare the table (vk_mem_gpa_use: at the draw or dispatch, not
-// where descriptors are written, which are reused), and the part's prologue (vk_sync.c) calls vk_mem_gpa_sync: the
-// shadows of every pool in the table get the pages the CPU wrote, and those of them that have a VRAM mirror, which
-// the table then names, queue the same pages for upload unless this submission synced the mirror already. No mirror
-// is made for a reader of the table. Without shadow storage nothing is done: an imported pool is guest memory, and
-// mirrors stay unsynced for the table's readers (vk_exec_draw.c ssbo_info).
-static int gpa_part_used;   // replay thread: the part being recorded uses the table
-void vk_mem_gpa_use(void) { gpa_part_used = 1; }
-int vk_mem_shadow_storage(void) { return shadow_on; }
-
-static int gpa_shadow_pool(const PoolRec *r) { return r->kind == POOL_IMPORT && r->gpa_rec && r->smap; }
-
-void vk_mem_gpa_sync(void) {
-    if (!gpa_part_used) return;
-    gpa_part_used = 0;
-    if (!shadow_on) return;
-    uint64_t t0 = qpc(), run0 = 0, run1 = 0;
-    uint32_t epoch = vk_texture_epoch();
-    int cpu = vk_mirror_on && wb_no_reup(), have = 0;   // before the locks: its first call logs
-    plat_mutex_lock_shared(&pool_lock);
-    plat_mutex_lock(&shadow_lock);
-    plat_mutex_lock(&gen_lock);
-    // one write-watch query per run of regions the pools cover (the index is sorted by address) instead of one a pool;
-    // shadow_sync_pool then finds its regions snapped
-    for (int i = 0; epoch && i < pool_index.n; i++) {
-        const PoolRec *r = pool_index.e[i].buf;
-        if (!gpa_shadow_pool(r)) continue;
-        uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
-        if (b >= SNAP_REGIONS) continue;
-        if (have && a <= run1 + 1) {
-            if (b > run1) run1 = b;
-        } else {
-            if (have) s_queries += snap_regions(run0, run1, epoch);
-            run0 = a, run1 = b, have = 1;
-        }
-    }
-    if (have) s_queries += snap_regions(run0, run1, epoch);
-    for (int i = 0; i < pool_index.n; i++) {
-        PoolRec *r = pool_index.e[i].buf;
-        if (gpa_shadow_pool(r)) shadow_sync_pool(r, epoch, cpu), s_syncs++;
-    }
-    plat_mutex_unlock(&gen_lock);
-    // The uploads read the shadows just brought up to date, and the prologue records them ahead of the part, after
-    // the write-backs of the submissions before it.
-    for (int i = 0; i < pool_index.n; i++) {
-        PoolRec *r = pool_index.e[i].buf;
-        if (gpa_shadow_pool(r) && r->mstate == MS_ON && r->acc_sub != msub) mirror_sync(r);
-    }
-    s_ticks += qpc() - t0;
-    plat_mutex_unlock(&shadow_lock);
-    plat_mutex_unlock_shared(&pool_lock);
 }
 
 void vk_mem_use(VkMemSpan *sp) {
@@ -3820,7 +3812,7 @@ void vk_mem_shutdown(void) {
     nsnap_pool = 0, snap_pool_bytes = 0;
     plat_mutex_unlock(&snap_pool_lock);
     plat_mutex_lock(&shadow_lock);
-    nstouch = 0, s_sb_pages = 0;   // shadows too (their base copies went with their records)
+    nstouch = nstab = 0, s_sb_pages = 0;   // shadows too (their base copies went with their records)
     s_live_n = s_live_bytes = 0;
     plat_mutex_unlock(&shadow_lock);
     for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i]);   // finalized ones whose callback never ran
