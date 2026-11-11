@@ -1541,13 +1541,14 @@ class MakeGameTest(Tmp):
         (kits[1] / 'runtime' / 'h.h').write_text('#define V 2\n')        # the new version changed the header
         self.assertEqual(go(kits[1])[:2], (1, 0))
 
-    def main_with(self, romfs, lift, compile_):
-        """make_game.main() in this process for a first build, with the given step functions in place of the real
+    def main_with(self, romfs, lift, compile_, rebuild=False):
+        """make_game.main() in this process, with the given step functions in place of the real
         lift and compile (they need real modules and clang). Returns the SystemExit code, or 0."""
         sys.path.insert(0, str(self.layout.pydeps))   # the fake zbic
         saved = (self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv)
         self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile = romfs, lift, compile_
-        sys.argv = ['make_game.py', '--nup', str(self.nup), '--out', str(self.out), '--msys', str(self.msys),
+        source = ['--rebuild'] if rebuild else ['--nup', str(self.nup)]
+        sys.argv = ['make_game.py', *source, '--out', str(self.out), '--msys', str(self.msys),
                     '--until', 'compile']   # the shaders step needs the shader translator
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -1558,6 +1559,37 @@ class MakeGameTest(Tmp):
         finally:
             self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv = saved
             sys.path.remove(str(self.layout.pydeps))
+
+    def test_retry_interrupted_lift_after_cache_cleanup(self):
+        layout = self.out / 'build-cache' / 'lift' / 'layout.json'
+        ran = []
+
+        def lift(out, cache):
+            ran.append('lift')
+            layout.parent.mkdir(exist_ok=True)
+            layout.write_text('[]')
+
+        def compile_(out, cache, msys, jobs, romfs_job, update):
+            ran.append('compile')
+            self.assertTrue(layout.is_file())
+
+        def interrupted(out, cache):
+            lift(out, cache)
+            raise SystemExit(1)  # layout exists again, but the lift did not finish
+
+        with mock.patch.object(self.mg, 'WIN', True):  # use the fixture's MSYS toolchain check
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_), 0)
+            self.nup.unlink()
+            ran.clear()
+            shutil.rmtree(layout.parent)
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, [])  # cleaning the cache alone does not require a compile
+
+            with mock.patch.object(self.mg, 'kit_version', return_value='updated kit'):
+                self.assertEqual(self.main_with(self.mg.step_romfs, interrupted, compile_, rebuild=True), 1)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, ['lift', 'lift', 'compile'])
 
     def test_romfs_beside_lift_and_compile(self):
         """A first build packs the RomFS image while the lift and the compile run; the compile gets the running step

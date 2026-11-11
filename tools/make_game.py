@@ -2397,6 +2397,10 @@ def build_main():
                     for later in STEPS[STEPS.index(name):]:
                         if later == name or not ({name, later} & set(OWN_KEY_STEPS) or (name, later) in UNAFFECTED):
                             state['steps'].pop(later, None)
+                if name == 'lift':
+                    # The generator writes layout.json before the sources. A retry must finish an interrupted lift
+                    # even if the layout is back and the previous lift key still matches its inputs.
+                    save()
                 say(f'{name}:')
                 emit('step', step=name, state='start')
                 if name in ('shaders', 'prompts', 'scan') and romfs_job:   # they read the RomFS image
