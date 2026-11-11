@@ -31,6 +31,7 @@
 #include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
+#include "vk_xess.h"
 #include "dlaa_mv_spv.h"
 
 typedef int NgxResult;   // NVSDK_NGX_Result: 1 success, 0xBAD00000 | n failures
@@ -167,10 +168,21 @@ static int fsr_frame;   // fsr3() as vk_dlaa_init and then vk_dlaa_frame read it
 // that runs.
 int vk_dlaa_fsr3(void) { return vk_dlaa_wanted() && fsr3() && vk_ffx_available(); }
 
+// Intel XeSS (vk_xess.cpp) is the third upscaler: the same inputs as FSR 3.1, but it wants device extensions and device
+// features at device creation, so it runs only when the device was made for it (taa = xess in the ini at start);
+// vk_dlaa_needs_restart reports the case where the menu switched to it in a run whose device has them off.
+static int xess_on(void) { return !N.ngx_up && !strcmp(cfg_value("NX2NAVI_TAA"), "xess") && vk_xess_device_ready(); }
+int vk_dlaa_xess(void) { return vk_dlaa_wanted() && xess_on(); }
+// libxess.dll is beside the game: XeSS can be offered in the menu's list (choosing it there takes a restart, since the
+// device was made without its extensions). The file's presence, not a successful load: in a run started with taa = fsr3
+// the library is never loaded, and keying the list on that took the XeSS entries away with no way back.
+int vk_dlaa_xess_available(void) { return vk_xess_present(); }
+
 // The upscaler the menu has set cannot start in this run: DLSS when NGX was never tried (a device made without its
 // extensions), FSR 3.1 while NGX is up and serves the run. A DLSS this PC could not bring up is not waiting for a restart.
 int vk_dlaa_needs_restart(void) {
     if (!cfg_bool("NX2NAVI_DLAA")) return 0;
+    if (!strcmp(cfg_value("NX2NAVI_TAA"), "xess")) return !vk_xess_device_ready();
     return strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? !N.ngx_up && !N.tried : N.ngx_up;
 }
 
@@ -370,6 +382,13 @@ static int utf8_to_wide(const char *in, wchar_t *out, size_t cap) {
 #endif
 
 void vk_dlaa_init(void) {
+    if (vk_dlaa_wanted() && !strcmp(cfg_value("NX2NAVI_TAA"), "xess")) {
+        N.available = vk_xess_load() && vk_xess_device_ready();
+        rt_log("dlaa: the temporal upscaler is Intel XeSS%s",
+               N.available ? "" : vk_xess_device_ready() ? ", whose libxess.dll is missing: the game's own scaling"
+                                                         : ", which this device was not made for (restart needed): the game's own scaling");
+        return;
+    }
     if (vk_dlaa_wanted() && fsr3()) {
         fsr_frame = 1;
         N.available = vk_ffx_load();
@@ -1614,10 +1633,12 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         __atomic_store_n(&size_changed, 1, __ATOMIC_RELEASE);
     }
     // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
-    // checks below, which would send the rest of this function to DLSS's path without NGX after all.
+    // checks below, which would send the rest of this function to DLSS's path without NGX after all. XeSS is read for
+    // the same reason: its branches record their own upscaler and never touch the NGX parameters.
     const int fsr = use_fsr();
-    if (!fsr && !N.ngx_up) return;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
-    if (!fsr && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
+    const int xess = xess_on();
+    if (!fsr && !xess && !N.ngx_up) return;   // neither runs this frame: vk_dlaa_frame turns DLAA off at the next present
+    if (!fsr && !xess && !D.params && !NGX_OK(N.alloc_params(&D.params))) return dl_fail("parameter allocation", 0);
     NgxParam *p = D.params;
     VkImageView zv = vk_exec_target_view(z->img, z->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, z->level,
                                          z->base_layer, 1, 0);
@@ -1641,6 +1662,16 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     uint64_t c0 = timed ? kern_now_ns() : 0;
     rec_drain();   // NGX records into the command buffer itself: the recorder thread must have made every call so far
     if (timed) T.cpu_drain += kern_now_ns() - c0;
+    if (xess) {   // Intel XeSS (vk_xess.cpp) in DLSS's place: the same images, then the same blit below
+        if (t->level || t->base_layer || z->level || z->base_layer) return dl_fail("XeSS on a target that is not level 0, layer 0", 0);
+        if (D.last_color != t->image) target_changed(t);
+        if (!vk_xess_upscale(cb, t->image, t->format, z->image, z->format, e->mv, e->out, w, h, ow, oh, jx, jy, D.reset))
+            return dl_fail("XeSS", 0);
+        static int told;
+        if (!told++) rt_log("dlaa: XeSS at %ux%u -> %ux%u (scene format %d, depth format %d)", w, h, ow, oh,
+                            (int)t->format, (int)z->format);
+        goto evaluated;
+    }
     if (fsr) {   // FSR 3.1 (vk_ffx.cpp) in DLSS's place: the same images, then the same blit below
         if (t->level || t->base_layer || z->level || z->base_layer) return dl_fail("FSR 3.1 on a target that is not level 0, layer 0", 0);
         if (D.last_color != t->image) target_changed(t);
@@ -1911,6 +1942,18 @@ void vk_dlaa_pass(VkExec *ex) {
         return;
     }
     if (!D.armed) return;
+    // NX2NAVI_DLAA_TRACE=1 (test): every pass shape of an armed frame, to see which one ends Ocarina's scene
+    static int trace = -1;
+    if (trace < 0) trace = rt_knob("DLAA_TRACE", "0");
+    if (trace && c->image && c->width > D.color.width && c->height > D.color.height) {
+        static unsigned n;
+        if (n < 40)
+            rt_log("dlaa trace %u: wider pass %ux%u fmt %d, %d colour, depth %d, samples %u, 3d %d, light %d, out %d; "
+                   "scene %ux%u, res_sizes out %ux%u scene %ux%u, adjustable %d, deferred %d, arm %d, mode %s",
+                   n++, c->width, c->height, (int)c->format, ex->pass_ncolor, z->image ? 1 : 0, c->samples, c->is3d,
+                   c->image == D.color.image, output_target(c->format), D.color.width, D.color.height, o[0], o[1], s[0],
+                   s[1], res_adjustable(), deferred, D.armed, cfg_value("NX2NAVI_DLSS"));
+    }
     if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
         int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
                   !c->is3d;
@@ -1922,7 +1965,12 @@ void vk_dlaa_pass(VkExec *ex) {
         // taken for 120 frames (D.share_off, vk_dlaa_frame), so a mismatch costs one frame rather than every frame.
         double share = wide_dlss_share();
         int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
-        int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
+        // A build without the output and scene patch sets (Ocarina) renders at the size the game chose, not at the mode's
+        // share, so the ratio can never match: 1440x810 against a "quality" share of 2/3 wants 2050 pixels wide and the
+        // output pass at 1920 was rejected every frame (1291 frames without the DLAA point). There any pass wider than
+        // the scene is the output pass. With the patch sets the share is what the game was told to render at, and a pass
+        // at another ratio is a different frame (the first presents before the scale takes, a dynamic resolution step).
+        int big = D.share_off || native || !res_adjustable() || c->width >= 0.95 * D.color.width / share;
         int same = c->width == D.color.width && c->height == D.color.height;
         if (one && big && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
@@ -2019,9 +2067,13 @@ void vk_dlaa_frame(void) {
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
     dlss_mode();
     preset_check();
-    if (!N.ngx_up) {   // FSR 3.1 follows the setting
+    // FSR 3.1 and XeSS follow the setting from frame to frame; DLSS, set up with the device, does not. XeSS has to be
+    // named here as well: it is the one upscaler chosen outside NGX, and the FSR 3.1 test alone replaced its answer with
+    // 0 every frame, so taa = xess ran with no temporal upscaler at all (its log line was printed once and never used).
+    if (!N.ngx_up) {   // FSR 3.1 and XeSS follow the setting
         fsr_frame = fsr3();
-        N.available = fsr_frame && cfg_bool("NX2NAVI_DLAA") && vk_ffx_load();
+        int xess = !strcmp(cfg_value("NX2NAVI_TAA"), "xess") && vk_xess_load() && vk_xess_device_ready();
+        N.available = cfg_bool("NX2NAVI_DLAA") && (xess || (fsr_frame && vk_ffx_load()));
     }
     int on = N.available && cfg_bool("NX2NAVI_DLAA");
     if (on != D.on) {

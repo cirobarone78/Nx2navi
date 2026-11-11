@@ -20,6 +20,8 @@ void vk_ngxfg_reset(void);   // the next generation starts without history (a re
 int vk_ngxfg_evaluate(VkCommandBuffer cb, const VkNgxImage *bb, const VkNgxImage *hudless, const VkNgxImage *out, int count,
                       const VkNgxImage *real);
 int vk_dlaa_fsr3(void);   // the setting is on and its upscaler is AMD FSR 3.1, which loads
+int vk_dlaa_xess(void);   // Intel XeSS (vk_xess.cpp) instead of DLSS/FSR 3.1, when the device was made for it
+int vk_dlaa_xess_available(void);   // libxess.dll is beside the game: the menu offers XeSS (a restart applies it)
 int vk_dlaa_needs_restart(void);   // the menu's upscaler cannot start in this run
 // Frame generation (vk_fg.cpp): the depth and motion vectors of the frame DLSS or FSR 3.1 last ran on, with its jitter
 // and whether its history reset; 1 once per evaluation (0: none since the last call). The images stay valid until the

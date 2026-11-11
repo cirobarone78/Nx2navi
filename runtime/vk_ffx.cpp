@@ -36,6 +36,7 @@ struct Api {
     PfnFfxConfigure configure = nullptr;
     PfnFfxQuery query = nullptr;
     PfnFfxDispatch dispatch = nullptr;
+    ffxReturnCode_t (*configure_global)(ffxConfigureDescGlobalDebug1 *) = nullptr;
     int tried = 0, ok = 0;
 } A;
 
@@ -161,8 +162,17 @@ extern "C" int vk_ffx_load(void) {
     A.configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
+    A.configure_global =
+        (ffxReturnCode_t (*)(ffxConfigureDescGlobalDebug1 *))(void *)GetProcAddress(m, "ffxConfigureGlobal");
     A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
     rt_log("ffx: amd_fidelityfx_vk.dll %s", A.ok ? "loaded" : "lacks the API entry points: FSR 3.1 off");
+    if (A.ok && A.configure_global) {   // its own diagnosis of a context it refuses, not just the return code
+        ffxConfigureDescGlobalDebug1 g = {};
+        g.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+        g.fpMessage = message;
+        g.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS;
+        A.configure_global(&g);
+    }
 #else
     // Only the Windows build loads AMD's library: there is nothing to load here
     rt_log("ffx: this build has no FSR 3.1 (it needs amd_fidelityfx_vk.dll, which only the Windows build loads): FSR 3.1 off");

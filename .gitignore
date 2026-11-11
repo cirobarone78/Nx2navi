@@ -41,6 +41,7 @@ __pycache__/
 *.spv
 
 # Build outputs
+/bin/
 *.exe
 *.dll
 *.pdb

@@ -5,7 +5,14 @@
 
 int vk_fg_wanted(void);                      // NX2NAVI_FRAMEGEN = fsr3 with DLSS or FSR 3.1 upscaling on (live), where FSR 3.1 loads
 uint32_t vk_fg_queue_count(void);            // graphics-family queues the device creates
-void vk_fg_queues(VkQueue present, VkQueue acquire);   // vk_device.c, after the device exists
+
+// A queue and the family it came from: AMD's frame generation wants the presenting queue on a family of its own (the
+// game's graphics family has a single queue on Intel), and the swapchain then has to be shared between the two.
+typedef struct {
+    VkQueue queue;
+    uint32_t family;
+} VkFgQueue;
+void vk_fg_queues(VkFgQueue present, VkFgQueue acquire, VkFgQueue compute);   // vk_device.c, after the device exists
 int vk_fg_active(void);                      // the frame generation swapchain exists
 int vk_fg_generating(void);                  // ... and the last frame had generation on (not paused for the menu)
 // gfx_present.c's swapchain calls while vk_fg_wanted: the first create makes AMD's swapchain context, later ones

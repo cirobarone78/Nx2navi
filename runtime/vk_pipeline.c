@@ -513,10 +513,12 @@ static void pb_log(const char *when) {
 typedef struct { VkStructureType sType; const void *pNext; VkPipelineCreateFlags flags; } PipeCiHead;
 
 // Builds into P.cache against reads of its data. Every create with P.cache holds this shared (pipe_create_in); the
-// copy of the data in cache_save holds it exclusively and only takes it when no build is running. The Vulkan rules
-// allow reading a cache created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT while pipelines are
-// built into it, but Intel's Windows driver (101.8991 on an Arc 140V) crashed inside vkGetPipelineCacheData during the
-// copy, reading through a null entry, with compute and library builds running beside the autosave.
+// copy of the data in cache_save holds it exclusively and only takes it when no build is running. P.cache is created
+// with VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so these calls are its only synchronisation: without that
+// bit the driver has to synchronise it itself, and Intel's Windows driver does not. igvk64 (101.8991 on an Arc 140V,
+// 101.9150 too) crashed inside vkGetPipelineCacheData during the copy, reading through a null entry (igvk64+0x79ddf3
+// reading 0x190), with compute and library builds running beside the autosave (2026-11-10, all 11 crash logs of the
+// day; docs/nx2navi-intel-xe3-port.html 5.4).
 static PlatMutex cache_rw = PLAT_MUTEX_INIT;
 
 // A pipeline cache of this thread's own that its creates build into in place of P.cache; VK_NULL_HANDLE (every thread
@@ -628,7 +630,10 @@ static void cache_load(VkCtx *c) {
             size = 0;
         }
     }
-    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = size,
+    // Externally synchronised: this runtime keeps building threads off the cache while the autosave copies it out, see
+    // cache_rw. Left off, igvk64 faults inside that copy (igvk64+0x79ddf3 reading 0x190) while a worker builds.
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                    .flags = VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, .initialDataSize = size,
                                     .pInitialData = size ? data : NULL};
     if (vkCreatePipelineCache(c->device, &ci, NULL, &P.cache) != VK_SUCCESS) {
         ci.initialDataSize = 0, ci.pInitialData = NULL;
@@ -2590,6 +2595,47 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+// NX2NAVI_SPV_OVERRIDE (test): defined with the compute path further down, applied to the fragment stage here too
+static uint32_t *spv_override(const char *stage, const uint32_t *code, uint64_t words, uint64_t *out);
+
+// NX2NAVI_NO_IGN (test): the game's interleaved gradient noise becomes a constant. The function is
+// ign(px) = fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715)))): zeroing the two direction constants
+// makes the inner dot 0 and ign() 0, which turns a per-texel offset that a low-resolution pass carries into a lattice
+// under upscaling (the dots across ground fog) into a flat one, while the march itself still steps. Matched by the
+// literal's bits, which is how the shader carrying it is found; a copy with them zeroed comes back, or NULL if none.
+static uint32_t *spirv_no_ign(const uint32_t *w, uint64_t words) {
+    union { float f; uint32_t u; } dx = {0.06711056f}, dy = {0.00583715f};
+    uint32_t *c = malloc((size_t)words * 4);
+    if (!c) return NULL;
+    memcpy(c, w, (size_t)words * 4);
+    int n = 0;
+    static int nlogged;
+    for (uint64_t i = 0; i < words; i++)
+        if (c[i] == dx.u || c[i] == dy.u) c[i] = 0, n++;
+    if (!n) {
+        free(c);
+        return NULL;
+    }
+    // The shader that came in goes next to the override directory as <hash>.orig.spv, the bytes the override is keyed
+    // by, so it can be disassembled and a smaller edit than zeroing the whole noise tried on it.
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < words * 4; i++) h = (h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+    const char *dir = cfg_get("NX2NAVI_SPV_OVERRIDE");
+    if (dir && *dir) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/%016llx.orig.spv", dir, (unsigned long long)h);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(w, 4, (size_t)words, f);
+            fclose(f);
+        }
+    }
+    if (nlogged++ < 8)
+        rt_log("vk_pipeline: interleaved gradient noise: %d constant(s) zeroed in a fragment shader %016llx (NX2NAVI_NO_IGN)", n,
+               (unsigned long long)h);
+    return c;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
@@ -2643,7 +2689,21 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw, !k->a2c), fm_hash = mm_hash;
+        // NX2NAVI_SPV_OVERRIDE also reaches the fragment stage: a game shader whose own pattern (a dither, say) has to
+        // be seen or changed runs an edited copy with the same interface, which is the only way it can be touched
+        // without the game's source.
+        if (fcode) {
+            uint64_t ow = 0;
+            uint32_t *over = spv_override("fragment", fcode, fw, &ow);
+            if (over) free(fpatched), fcode = fpatched = over, fw = ow;
+            static int no_ign = -1;
+            if (no_ign < 0) no_ign = cfg_bool("NX2NAVI_NO_IGN");
+            if (no_ign) {   // the game's per-texel noise starts a march; a low-resolution pass shows it as a lattice
+                uint32_t *ng = spirv_no_ign(fcode, fw);
+                if (ng) free(fpatched), fcode = fpatched = ng;
+            }
+            fm = make_module(fcode, fw, !k->a2c), fm_hash = mm_hash;
+        }
     }
     vm = make_module(vcode, vw, 0), vm_hash = mm_hash;
     free(vpatched), free(fpatched);
@@ -3167,9 +3227,9 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
 // until a worker publishes the handle. The job holds copies of the state and the key. What they point to outlives it:
 // shaders (gfx_shader_get results) live for the process (gfx_shader_drop_memory is the shader probe's, which builds no
 // pipelines), layouts until vk_pipeline_shutdown, which drains the queue first. Workers call vkCreateGraphicsPipelines
-// without P.lock: P.cache is created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so the driver
-// synchronises builds into it; only the copy of its data in cache_save is kept apart from them (cache_rw). Compute
-// pipelines stay synchronous: a skipped
+// without P.lock: P.cache is created with VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so every create that
+// carries it takes cache_rw shared (pipe_create_in) and cache_save takes it exclusively around the copy of its data.
+// Compute pipelines stay synchronous: a skipped
 // dispatch can change what the game computes.
 //
 // Two queues: draws' misses (A.head) and the boot prebuild (A.low, see "pipeline keys" below). Workers take the low
@@ -3187,7 +3247,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
+#define MAX_WORKERS 8
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3574,11 +3634,17 @@ static void pipe_worker(void *arg) {
 
 static int hint_on(void);
 
-// Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
+// Starts the pool on first use: NX2NAVI_PIPE_WORKERS when set, else half of the logical processors, 2 to 8. Caller holds
+// P.lock. A pipeline miss compiles for about a second on this GPU and a boot meets hundreds of them, while the guest
+// runs on one or two cores: the pool takes the idle ones (a quarter of the processors left a 14-core machine at 3
+// workers and spent minutes compiling what 7 could have done in a third of the time).
 static int workers_start(void) {
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
-    int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
+    int n = (int)cfg_int("NX2NAVI_PIPE_WORKERS");
+    if (n <= 0) n = (int)(cpus / 2);
+    if (n < 2) n = 2;
+    if (n > MAX_WORKERS) n = MAX_WORKERS;
     for (int i = 0; i < n; i++) {
         PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "pipe worker");
         if (!t) break;
@@ -4229,10 +4295,11 @@ static void prebuild_start(void) {
     plat_mutex_unlock(&P.lock);
 }
 
-// NX2NAVI_SPV_OVERRIDE=<dir> (test): a compute shader whose SPIR-V hashes (FNV-1a over its bytes, the name vk_dump.c
-// gives it) to a file <dir>/<hash>.spv runs that SPIR-V instead, an edited copy with the same interface, to see a
-// shader's intermediate values in a frame dump. NULL: no override (malloc'd words otherwise).
-static uint32_t *spv_override(const uint32_t *code, uint64_t words, uint64_t *out) {
+// NX2NAVI_SPV_OVERRIDE=<dir> (test): a shader whose SPIR-V hashes (FNV-1a over its bytes, the name vk_dump.c gives
+// it) to a file <dir>/<hash>.spv runs that SPIR-V instead, an edited copy with the same interface, to see a shader's
+// intermediate values in a frame dump. Both compute and fragment stages; a fragment shader with no file is named in
+// the log once, which is how a frame dump points at the file to write. NULL: no override (malloc'd words otherwise).
+static uint32_t *spv_override(const char *stage, const uint32_t *code, uint64_t words, uint64_t *out) {
     const char *dir = cfg_get("NX2NAVI_SPV_OVERRIDE");
     if (!dir || !*dir) return NULL;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -4240,14 +4307,21 @@ static uint32_t *spv_override(const uint32_t *code, uint64_t words, uint64_t *ou
     char path[600];
     snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)h);
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) {   // name it once: the hash is what an override file is called
+        static uint64_t seen[64];
+        static int nseen;
+        for (int i = 0; i < nseen; i++) if (seen[i] == h) return NULL;
+        if (nseen < (int)(sizeof seen / sizeof seen[0])) seen[nseen++] = h;
+        rt_log("vk_pipeline: %s shader %016llx has no override file", stage, (unsigned long long)h);
+        return NULL;
+    }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     uint32_t *w = n > 20 && n % 4 == 0 ? malloc((size_t)n) : NULL;
     if (w && fread(w, 1, (size_t)n, f) != (size_t)n) free(w), w = NULL;
     fclose(f);
-    if (w) *out = (uint64_t)n / 4, rt_log("vk_pipeline: compute shader %016llx replaced by %s", (unsigned long long)h, path);
+    if (w) *out = (uint64_t)n / 4, rt_log("vk_pipeline: %s shader %016llx replaced by %s", stage, (unsigned long long)h, path);
     return w;
 }
 
@@ -4334,14 +4408,15 @@ static uint32_t *spirv_fog_keep_froxels(const uint32_t *w, uint64_t n) {
     return o;
 }
 
-// A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
+// A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. It goes through pipe_create, which takes cache_rw
+// shared around the create because P.cache is externally synchronised (see cache_rw).
 // cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
 // neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     uint64_t ow = 0;
-    uint32_t *over = spv_override(code, words, &ow);
+    uint32_t *over = spv_override("compute", code, words, &ow);
     if (over) code = over, words = ow;
     uint32_t *fog = spirv_fog_keep_froxels(code, words);
     if (fog) free(over), over = fog, code = fog;
@@ -5701,18 +5776,30 @@ static void lb_warm_worker(void *arg) {
     }
 }
 
-// Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
-static void lb_warm_prepared(const char *dir) {
+// Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority. With shards > 1 only the
+// variants whose list index is `shard` modulo `shards` are built: a 40,000-variant driver build is 1.5 h in one run, and an
+// installer cannot ask a player to leave a window open that long (NX2NAVI_PREPARE_SHARD / --shard, 8.4 of the port report).
+// Translation above stays whole: it is cached per shader and a second run translates only what changed.
+static void lb_warm_prepared(const char *dir, int shard, int shards) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
     uint64_t size = 0;
     uint8_t *f = plat_file_read(path, &size);
     size_t n = f && size >= 16 ? (size_t)(size - 16) / 36 : 0;
     LB.e = n ? calloc(n, sizeof *LB.e) : NULL;
-    for (size_t i = 0; LB.e && i < n; i++)
-        memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
+    size_t keep = 0;
+    for (size_t i = 0; LB.e && i < n; i++) {
+        if (shards > 1 && (int)(i % (size_t)shards) != shard) continue;
+        memcpy(LB.e[keep].iid, f + 16 + 36 * i + 4, 32), LB.e[keep].stage = f[16 + 36 * i],
+            LB.e[keep].prio = f[16 + 36 * i + 1], keep++;
+    }
     free(f);
     if (!LB.e) return;
+    if (shards > 1) {   // stdout like the progress lines: a --prepare-shaders run opens no log
+        printf("prepare-shaders: shard %d of %d, %zu of %zu variants of shader-prepared.bin\n", shard + 1, shards, keep, n);
+        fflush(stdout);
+    }
+    n = keep;
     skip_init(dir);
     char jp[PLAT_PATH_MAX * 2 + 48];
     snprintf(jp, sizeof jp, "%s/shader-prepare-journal.bin", dir);
@@ -5744,12 +5831,12 @@ static void lb_warm_prepared(const char *dir) {
     unsigned long long skipped = LB.skipped;
     size_t tried = n - (size_t)skipped;
     if (LB.nolib)
-        printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "
+        printf("prepare-shaders: %zu variants on %d threads in %.0f ms%s, %llu vertex/fragment variants skipped (graphics "
                "pipeline library off, they build at their first draw)\n", tried, k, now_ms() - LB.t0,
-               (unsigned long long)LB.nolib);
+               shards > 1 ? " (this shard)" : "", (unsigned long long)LB.nolib);
     else
-        printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", tried, k,
-               now_ms() - LB.t0);
+        printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms%s\n", tried, k,
+               now_ms() - LB.t0, shards > 1 ? " (this shard)" : "");
     if (skipped)   // installer/steps.py Prepare reads this line
         printf("prepare-shaders: %llu variants skipped: the graphics driver crashed while building them in an earlier "
                "run (shader-prepare-skip.txt); they build at their first draw\n", skipped);
@@ -5759,7 +5846,7 @@ static void lb_warm_prepared(const char *dir) {
 // nx2navi.exe --prepare-shaders (tools/prepare_shaders.py): the device sets the translator's host answers (they are in every
 // cache key), the seed next to nx2navi.exe is translated on every core, then every prepared variant's stage library or
 // compute pipeline is built once into the driver's disk cache (lb_warm_prepared). No game runs.
-int vk_pipeline_prepare_shaders(void) {
+int vk_pipeline_prepare_shaders(int shard, int shards) {
     if (!ensure_init()) {
         fprintf(stderr, "prepare-shaders: no Vulkan device\n");
         return 1;
@@ -5770,7 +5857,7 @@ int vk_pipeline_prepare_shaders(void) {
     const char *pe = cfg_get("NX2NAVI_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
-    if (!rc) lb_warm_prepared(dir);
+    if (!rc) lb_warm_prepared(dir, shard, shards);
     return rc;
 }
 
@@ -5778,7 +5865,7 @@ int vk_pipeline_prepare_shaders(void) {
 // cache, without translating the seed. The AMD cache is keyed to the exe path (a relink keeps it: 29,587 variants in
 // 1.8 s) and holds a limited amount: preparing another build dir evicted this one's libraries, and a library a draw
 // needed then took 40-220 ms in play instead of 0.2 ms. Seconds when the libraries are still there.
-int vk_pipeline_warm_shaders(void) {
+int vk_pipeline_warm_shaders(int shard, int shards) {
     if (!ensure_init()) {
         fprintf(stderr, "warm-shaders: no Vulkan device\n");
         return 1;
@@ -5791,7 +5878,7 @@ int vk_pipeline_warm_shaders(void) {
         fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
         return 1;
     }
-    lb_warm_prepared(dir);
+    lb_warm_prepared(dir, shard, shards);
     return 0;
 }
 
@@ -6198,8 +6285,10 @@ void vk_pipeline_shutdown(void) {
         layouts[i] = NULL;
     }
     plat_mutex_lock(&save_lock);   // not while the autosave thread copies it
+    plat_mutex_lock(&cache_rw);    // nor while a builder is inside a create that carries it
     if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
     P.cache = VK_NULL_HANDLE;
+    plat_mutex_unlock(&cache_rw);
     plat_mutex_unlock(&save_lock);
     memset(&P.stats, 0, sizeof P.stats);
     plat_xchg32(&P.ready, 0);

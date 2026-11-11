@@ -29,6 +29,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
@@ -140,14 +141,16 @@ static int profile_exists(void) {
     if (need > sizeof list)
         rt_log("frame rate: RivaTuner Statistics Server lists %lu bytes of profiles; reading the first %zu", need, sizeof list);
     size_t n = strlen(profile);
+    int found = 0;
     for (char *s = list; *s;) {
         char *end = strchr(s, ',');
         size_t len = end ? (size_t)(end - s) : strlen(s);
-        if (len == n && !_strnicmp(s, profile, n)) return 1;
+        if (len == n && !_strnicmp(s, profile, n)) { found = 1; break; }
         if (!end) break;
         s = end + 1;
     }
-    return 0;
+    free(list);
+    return found;
 }
 
 // Writes limit/denominator into the profile and reads them back from the saved file: 1 when they stuck, 0 when RTSS

@@ -1585,18 +1585,106 @@ static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
 static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
+// The storage CPU-visible pools get when NX2NAVI_MEMORY is auto: the GPU profile's (vk_caps.c, docs/nx2navi-intel-xe3-
+// port.html 8.1), which is shadow on Intel (igvk64 faults on imported host pointers), mirror on a discrete card (every
+// draw would read the pools over PCIe) and import on an integrated one. Linux and Wine have no import path worth the
+// name and copy the pools as they always have.
+static const char *auto_storage(void) {
+#ifdef _WIN32
+    if (plat_is_wine()) return "shadow";
+    return vk_profile.memory && *vk_profile.memory ? vk_profile.memory : "import";
+#else
+    return "shadow";
+#endif
+}
+
+// One "key=value" field of the run marker (platform.h); empty when the marker has no such field.
+static void marker_field(const char *text, const char *key, char *out, size_t cap) {
+    size_t k = strlen(key);
+    out[0] = 0;
+    for (const char *p = text; p && *p;) {
+        if (!strncmp(p, key, k) && p[k] == '=') {
+            size_t n = strcspn(p + k + 1, " \t\r\n");
+            if (n >= cap) n = cap - 1;
+            memcpy(out, p + k + 1, n);
+            out[n] = 0;
+            return;
+        }
+        const char *nl = strchr(p, '\n');
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+static int mem_decided;      // mirror_mode ran: vk_mem_storage has an answer
+static int mem_downgraded;   // this run took shadow storage because the run before it died
+
+static const char *storage_name(void) {
+    return shadow_on ? "shadow" : mirror_verify ? "verify" : vk_mirror_on ? "mirror" : "import";
+}
+
+const char *vk_mem_storage(void) { return mem_decided ? storage_name() : ""; }
+int vk_mem_downgraded(void) { return mem_downgraded; }
+
+// The storage mode for this run, at device selection: NX2NAVI_MEMORY (auto, import, shadow, mirror, verify) over the GPU
+// profile's auto default, NX2NAVI_SHADOW over that (0 clears shadow, anything else forces it, as before), and shadow when
+// the run before this one died without an exit (a driver crash, a kill) instead of starting into the same fault at every
+// start. The choice and the profile go into the run marker so the next start can tell what this one used.
 static void mirror_mode(int discrete) {
     const char *e = cfg_value("NX2NAVI_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
-    const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
+    const char *auto_m = auto_storage(), *storage = auto_m;
+#ifdef _WIN32
+    int wine = plat_is_wine();
+#else
+    int wine = 1;
+#endif
+    char whybuf[64];
+    const char *why;
+    if (wine) why = "auto, wine";
+    else if (vk_profile.memory && !strcmp(auto_m, vk_profile.memory))
+        snprintf(whybuf, sizeof whybuf, "auto, %s profile", vk_profile.name), why = whybuf;
+    else why = !strcmp(auto_m, "mirror") ? "auto, discrete gpu" : "auto, uma";
     if (strcmp(e, "auto")) {
-        if (!strcmp(e, "import")) mode = 0, why = "NX2NAVI_MEMORY=import";
-        else if (!strcmp(e, "mirror")) mode = 1, why = "NX2NAVI_MEMORY=mirror";
-        else if (!strcmp(e, "verify")) mode = 2, why = "NX2NAVI_MEMORY=verify";
-        else rt_log("mem: NX2NAVI_MEMORY=%s is not import, mirror, verify or auto: auto", e);
+        if (!strcmp(e, "import")) mode = 0, storage = "import", why = "NX2NAVI_MEMORY=import";
+        else if (!strcmp(e, "shadow")) mode = 0, storage = "shadow", why = "NX2NAVI_MEMORY=shadow";
+        else if (!strcmp(e, "mirror")) mode = 1, storage = "mirror", why = "NX2NAVI_MEMORY=mirror";
+        else if (!strcmp(e, "verify")) mode = 2, storage = "verify", why = "NX2NAVI_MEMORY=verify";
+        else {
+            rt_log("mem: NX2NAVI_MEMORY=%s is not auto, import, shadow, mirror or verify: auto", e);
+            storage = auto_m;   // the auto default; mode stays the one for the device class
+        }
     }
+    int shadow = !strcmp(storage, "shadow");
+    const char *sh = cfg_get("NX2NAVI_SHADOW");
+    if (sh && *sh) shadow = strcmp(sh, "0") != 0, why = "NX2NAVI_SHADOW";
+    char prev[256], prev_storage[32];
+    int died = plat_run_marker_take(prev, sizeof prev);
+    marker_field(prev, "storage", prev_storage, sizeof prev_storage);
+    // The downgrade is a default for auto only. A storage the ini names is what the player chose: on this game's Intel
+    // machine shadow storage draws the 3D black, so rewriting memory = import to shadow after a crash would hand the next
+    // start a black screen instead of the crash to look at.
+    if (died && !strcmp(e, "auto") && strcmp(prev_storage, "shadow") && !shadow) {
+        // The last run never reached plat_exit: with the storage it used, that is the driver faulting or a kill. Shadow
+        // storage keeps the driver off the guest's pointers, so this run takes it, and nx2navi.ini follows when the
+        // environment does not pin the setting: a crash that repeats at every start helps nobody.
+        rt_log("mem: the run before this one ended without an exit (storage %s): shadow storage for this run",
+               prev_storage[0] ? prev_storage : "unknown");
+        shadow = 1, why = "after a crash", mem_downgraded = 1;
+        if (cfg_from_env("NX2NAVI_MEMORY"))
+            rt_log("mem: NX2NAVI_MEMORY is set in the environment; nx2navi.ini keeps its value");
+        else {
+            cfg_set("NX2NAVI_MEMORY", "shadow");
+            rt_log("mem: memory = shadow written to nx2navi.ini%s", cfg_save() ? "" : " (the write failed, this run keeps it)");
+        }
+    } else if (died) {
+        rt_log("mem: the run before this one ended without an exit (storage %s); its storage stays",
+               prev_storage[0] ? prev_storage : "unknown");
+    }
+    if (shadow) mode = 0;
+    shadow_on = shadow;
     vk_mirror_on = mode > 0;
     mirror_verify = mode == 2;
+    mem_decided = 1;
     const char *g = cfg_get("NX2NAVI_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
     if (mirror_gap < 0) mirror_gap = 0;
@@ -1611,21 +1699,21 @@ static void mirror_mode(int discrete) {
     const char *fi = cfg_get("NX2NAVI_FREEZE_IDLE");
     freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
-    const char *sh = cfg_get("NX2NAVI_SHADOW");
-#ifdef _WIN32
-    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
-#else
-    shadow_on = !sh || !*sh || strcmp(sh, "0");
-#endif
-    if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
-                          sh && *sh ? " (NX2NAVI_SHADOW)" : "");
-    rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
-           mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
+    if (shadow_on)
+        rt_log("mem: storage shadow (%s): CPU-visible pools are host-visible copies of guest memory, not imports", why);
+    else
+        rt_log("mem: storage %s (%s), mode %s: %s", storage_name(), why, mode == 2 ? "verify" : mode ? "mirror" : "import",
+               mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
     // Import is the integrated-GPU mode. On a discrete card every draw reads the pools over PCIe (the comment above
     // this section has the measurements), which is the difference between playable and 5 fps when it is not intended.
-    if (!mode && discrete)
+    if (!mode && discrete && !shadow_on)
         rt_log("mem: warning: import on a discrete GPU: the GPU reads the game's pools over PCIe on every draw, far "
                "slower than mirror (the auto default on a discrete GPU); use memory = auto unless testing");
+    char line[160];
+    snprintf(line, sizeof line, "storage=%s profile=%s vendor=%#x device=%#x mode=%s\n", storage_name(), vk_profile.name,
+             vk_profile.vendor, vk_profile.device, cfg_value("NX2NAVI_MEMORY"));
+    if (!plat_run_marker(line))
+        rt_log("mem: the run marker could not be written; a start after a crash will not know how this run ended");
 }
 
 static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, uint64_t size) {

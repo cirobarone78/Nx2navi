@@ -657,7 +657,12 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
     if (d->target != NVN_TEXTURE_TARGET_2D_ARRAY || d->width != d->height || d->width < 256 || d->depth < 2 || d->depth > 4)
         return 1;
     uint32_t most = vk_ctx()->props.limits.maxImageDimension2D;
-    return d->width * (uint32_t)scale <= most ? scale : 1;
+    int ok = d->width * (uint32_t)scale <= most ? scale : 1;
+    static int told;
+    if (ok > 1 && told++ < 4)
+        rt_log("vk: shadow map %ux%u x%u layer(s) -> %ux%u (NX2NAVI_SHADOW_SCALE)", d->width, d->height, d->depth,
+               d->width * ok, d->height * ok);
+    return ok;
 }
 
 // NX2NAVI_ASTC_BC_PROBE=1 (astc_bc_probe in nx2navi.ini): measures, without changing any format, how much of the ASTC
@@ -858,8 +863,26 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     // NVN renders into a 3D texture slice by slice (a view's min layer is the depth plane, nvn_mtl.m), e.g. the
     // grading LUT of the menu background blur. Vulkan needs a 2D view of the slice for that.
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    // NX2NAVI_MIPGEN (0|1): a 2D colour texture that arrives with one level gets a full mip chain, filled on the GPU
+    // right after the upload (gen_mips below). The 3DS drew its repeating detail maps — the ground fog and water noise
+    // among them — at 400x240 with one level, where a texel was about a pixel; at 1080p the same texels show as squares
+    // as soon as the surface is seen at a shallow angle, and nothing short of a mip chain removes them. Only small,
+    // sampled-only textures take it: attachments, storage images and anything past 1024 keep their own level count.
+    static int mipgen = -1;
+    if (mipgen < 0) {
+        mipgen = rt_knob("MIPGEN", "0");
+        rt_log("vk: mip generation for single-level textures %s (NX2NAVI_MIPGEN=%d)", mipgen ? "on" : "off", mipgen);
+    }
+    uint32_t img_levels = levels;
+    if (mipgen && levels == 1 && !ds && samples == 1 && type == VK_IMAGE_TYPE_2D && layers == 1 && w >= 32 && h >= 32 &&
+        w <= 1024 && h <= 1024 && !(d->flags & NVN_TEXTURE_FLAGS_IMAGE) &&
+        (ff & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (ff & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        img_levels = most;
+        static volatile int32_t n_gen;
+        log_limited(&n_gen, "vk: %ux%u texture gets a generated mip chain of %u levels (NX2NAVI_MIPGEN)", w, h, img_levels);
+    }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = f.vk,
-                            .extent = {w, h, depth}, .mipLevels = levels, .arrayLayers = layers,
+                            .extent = {w, h, depth}, .mipLevels = img_levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     int bw, bh, block_views = 0;
@@ -1877,6 +1900,45 @@ static int astc_arena(void) {
     return on;
 }
 
+// Fills the levels the storage does not have (NX2NAVI_MIPGEN images, whose chain the image was made with) by blitting
+// each level from the one before it, in the same upload batch as the copy of level 0.
+static void gen_mips(Tex *e, uint32_t from) {
+    uint32_t to = e->ik.levels, w = e->pub.width, h = e->pub.height;
+    if (to <= from || !e->pub.image) return;
+    VkCommandBuffer cb = vk_upload_begin();
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT,
+                               .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                               .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .image = e->pub.image,
+                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, to, 0, 1}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                           .imageMemoryBarrierCount = 1,
+                           .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(cb, &di);
+    for (uint32_t lv = from; lv < to; lv++) {
+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv - 1, 0, 1},
+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1}};
+        bl.srcOffsets[1] = (VkOffset3D){(int32_t)umax(w >> (lv - 1), 1), (int32_t)umax(h >> (lv - 1), 1), 1};
+        bl.dstOffsets[1] = (VkOffset3D){(int32_t)umax(w >> lv, 1), (int32_t)umax(h >> lv, 1), 1};
+        vkCmdBlitImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                       VK_FILTER_LINEAR);
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier2(cb, &di);
+    }
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    vkCmdPipelineBarrier2(cb, &di);
+    vk_upload_end();
+}
+
 // Copies the whole storage into the image (every level and layer the image has). An image made without its top levels
 // (texture detail, VkTexImage.skip) has the game's level lv + skip at its level lv: the loops below run over the image's
 // levels and read the storage at the game's.
@@ -2074,6 +2136,7 @@ static void upload(Tex *e) {
     } else {
         n_uploads++, perf_count(PERF_CNT_TEX_UP);
     }
+    if (e->ik.levels > levels) gen_mips(e, levels);   // NX2NAVI_MIPGEN: the chain above what the storage holds
     e->wt_n = 0;
     e->uploaded = 1;
     e->n_up++;
@@ -3453,6 +3516,33 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     si.maxLod = d->lod_max > 1000 ? VK_LOD_CLAMP_NONE : d->lod_max;
     if (mf <= NVN_MIN_FILTER_LINEAR) si.maxLod = si.minLod + 0.25f;   // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
+    // NX2NAVI_MIP0 (test): every colour sampler stays on the base level. A surface that is sharp head-on and breaks
+    // into squares at a shallow angle is reading a lower level there, so this says whether the squares live in the
+    // levels above 0 — a deswizzled or decoded level whose layout is wrong.
+    static int m0 = -1;
+    if (m0 < 0) m0 = rt_knob("MIP0", "0");
+    if (m0 && !d->cmp_mode) si.maxLod = si.minLod;
+    // NX2NAVI_MIPGEN: the textures it filled a chain for are sampled through it, so a sampler the game left unmipmapped
+    // may climb the chain. Vulkan clamps maxLod to the image's own level count, so a texture without one is unaffected.
+    static int mg = -1;
+    if (mg < 0) mg = rt_knob("MIPGEN", "0");
+    if (mg && !d->cmp_mode && mf <= NVN_MIN_FILTER_LINEAR && si.magFilter == VK_FILTER_LINEAR &&
+        si.minFilter == VK_FILTER_LINEAR) {
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+    }
+    // NX2NAVI_TEX_LINEAR (test): every sampler that is not a depth compare gets linear magnification, minification and
+    // mip interpolation, whatever the descriptor asked for; 2 also raises the anisotropic level. The 3DS drew its
+    // repeating detail maps — the ground fog and water noise among them — point sampled at 400x240, where a texel was
+    // about one pixel. At 1080p the same texels show as squares, and a surface seen at a shallow angle breaks into them.
+    static int lin = -1;
+    if (lin < 0) lin = rt_knob("TEX_LINEAR", "0");
+    if (lin && !d->cmp_mode) {
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+    }
     float lim = c->props.limits.maxSamplerLodBias;
     si.mipLodBias = fmaxf(-lim, fminf(lim, d->lod_bias));
     // d->aniso holds NX2NAVI_ANISO's level where it applies (sampler_for, aniso_raised)

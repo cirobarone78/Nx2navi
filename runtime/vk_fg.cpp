@@ -34,7 +34,7 @@ extern "C" {
 namespace {
 
 struct {
-    VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
+    VkFgQueue present = {VK_NULL_HANDLE, 0}, acquire = {VK_NULL_HANDLE, 0}, compute = {VK_NULL_HANDLE, 0};
     ffxContext sc = nullptr;   // the swapchain context
     ffxContext fg = nullptr;   // the frame generation context
     VkExtent2D fg_ext = {0, 0};
@@ -110,11 +110,11 @@ extern "C" int vk_fg_wanted(void) {
 }
 
 // Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.
-extern "C" uint32_t vk_fg_queue_count(void) { return 3; }
+extern "C" uint32_t vk_fg_queue_count(void) { return 4; }   // game, present, acquire, async compute
 
-extern "C" void vk_fg_queues(VkQueue present, VkQueue acquire) {
-    F.present = present, F.acquire = acquire;
-    vk_fg4_queues(present, acquire);
+extern "C" void vk_fg_queues(VkFgQueue present, VkFgQueue acquire, VkFgQueue compute) {
+    F.present = present, F.acquire = acquire, F.compute = compute;
+    vk_fg4_queues(present.queue, acquire.queue);
 }
 
 // AMD's swapchain is in place: the window's swapchain handle is AMD's object, and every swapchain call has to go
@@ -135,7 +135,13 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
         // it failed before its swapchain existed and said so (use4 is 0 from here on): the FSR 3.1 library's below
     }
     if (F.sc) return F.fn.pOutCreateSwapchainFFXAPI(vk_ctx()->device, ci, nullptr, sc, F.sc);
-    if (!vk_fg_wanted() || F.failed || !F.present || !vk_ffx_load()) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!vk_fg_wanted() || F.failed || !F.present.queue || !vk_ffx_load()) {
+        static int told;
+        if (!told)
+            told = 1, rt_log("fg: no frame generation: wanted %d, failed %d, present queue %d, ffx %d", vk_fg_wanted(),
+                             F.failed, F.present.queue != VK_NULL_HANDLE, vk_ffx_load());
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     const VkCtx *c = vk_ctx();
     ffxCreateContextDescFrameGenerationSwapChainVK d = {};
     d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
@@ -145,10 +151,24 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
     d.swapchain = &none;
     d.createInfo = *ci;
     d.createInfo.oldSwapchain = VK_NULL_HANDLE;
+    // Its back end copies every generated frame out of the swapchain image, so the usage has to allow that even when
+    // the game's own create info does not ask for it.
+    d.createInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // The game submits on the graphics family and AMD's back end presents on its own family: the images have to be
+    // visible to both, so sharing is concurrent over the two families (single-family queues keep exclusive sharing).
+    uint32_t fams[2] = {c->gfx_family, F.present.family};
+    if (F.present.family != c->gfx_family) {
+        d.createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        d.createInfo.queueFamilyIndexCount = 2;
+        d.createInfo.pQueueFamilyIndices = fams;
+    }
+    rt_log("fg: asking FFX for a swapchain: %ux%u fmt %d, present mode %d, usage 0x%x, images %u, families %u+%u",
+           ci->imageExtent.width, ci->imageExtent.height, (int)ci->imageFormat, (int)ci->presentMode, ci->imageUsage,
+           ci->minImageCount, c->gfx_family, F.present.family);
     d.gameQueue = {c->gfx_queue, c->gfx_family, submit_game};
-    d.asyncComputeQueue = {VK_NULL_HANDLE, c->gfx_family, nullptr};
-    d.presentQueue = {F.present, c->gfx_family, nullptr};
-    d.imageAcquireQueue = {F.acquire, c->gfx_family, nullptr};
+    d.asyncComputeQueue = {F.compute.queue, F.compute.family, nullptr};
+    d.presentQueue = {F.present.queue, F.present.family, nullptr};
+    d.imageAcquireQueue = {F.acquire.queue, F.acquire.family, nullptr};
     ffxReturnCode_t r = vk_ffx_create(&F.sc, &d.header);
     if (r != FFX_API_RETURN_OK) {
         F.sc = nullptr;
@@ -300,8 +320,18 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     p.frameTimeDelta = dt > 0 && dt < 100 ? (float)dt : 16.67f;
     p.cameraNear = 0.1f;   // Ocarina's projection: near 0.1, far at infinity (vk_ffx.cpp)
     p.cameraFar = 1e8f;
-    p.cameraFovAngleVertical = 1.0f;
+    // The real vertical field of view, read off the projection matrix (vk_dlaa.c c->fov_y). A hardcoded 1.0 rad (57.3
+    // degrees) is not what the game draws with, and an interpolation that reprojects the depth through a wrong
+    // intrinsics smears moving edges - the ghosting this used to show. 0.1..2.8 rad is the sane range of a game camera.
+    VkDlaaCamera cam;
+    int have_cam = vk_dlaa_fg_camera(&cam);
+    p.cameraFovAngleVertical = have_cam && cam.fov_y > 0.1f && cam.fov_y < 2.8f ? cam.fov_y : 1.0f;
     p.viewSpaceToMetersFactor = 0.01f;
+    static float last_fov = -1;
+    if (p.cameraFovAngleVertical < last_fov - 0.01f || p.cameraFovAngleVertical > last_fov + 0.01f)
+        last_fov = p.cameraFovAngleVertical,
+        rt_log("fg: camera %s, vertical fov %.3f rad (%.1f deg)", have_cam ? "known" : "missing",
+               p.cameraFovAngleVertical, p.cameraFovAngleVertical * 57.2958f);
     p.depth = image(&depth);
     p.motionVectors = image(&mv);
     r = vk_ffx_dispatch(&F.fg, &p.header);
