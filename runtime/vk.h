@@ -525,6 +525,15 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
+// The replay workers (vk_exec.c "replay workers"): a chunk's lookup that would make or take back a texture entry
+// before the chunk's turn returns nothing and says so here; the chunk replays the op again in turn
+// (vk_texture_deferred_take clears it). vk_exec_turn_due: the calling thread records a chunk whose earlier chunks may not
+// be done yet; vk_exec_turn waits until they are (no-op elsewhere).
+int vk_texture_deferred(void);
+int vk_texture_deferred_take(void);
+int vk_exec_turn_due(void);
+int vk_exec_in_chunk(void);   // the calling thread records a chunk of a parallel group
+void vk_exec_turn(void);
 VkSampler vk_sampler_by_id_locked(int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler. VK_NULL_HANDLE

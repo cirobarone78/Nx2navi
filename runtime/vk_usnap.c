@@ -417,7 +417,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (!U.on || !n) return 0;
     // Consecutive bindings mostly name the region the last one did: that one is tried before the binary search. The
     // regions are sorted and disjoint, so the region that holds addr is the one first_above finds.
-    static int hint;
+    static _Thread_local int hint;   // per thread: the replay workers look up at once
     int i = hint;
     if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
@@ -431,13 +431,17 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
+static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders write storage at once
+
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
+    plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    if (U.on)
+        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
+            if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&drop_lock);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

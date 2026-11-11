@@ -25,6 +25,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_dlaa.h"
@@ -131,9 +132,18 @@ void vk_mvprev_draw(VkExec *ex) {
     P.ns_draw += kern_now_ns() - t0;
 }
 
+static void mvprev_draw_locked(VkExec *ex);
+static PlatMutex draw_lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws note blocks at once
+
 static void mvprev_draw_(VkExec *ex) {
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
+    plat_mutex_lock(&draw_lock);
+    mvprev_draw_locked(ex);
+    plat_mutex_unlock(&draw_lock);
+}
+
+static void mvprev_draw_locked(VkExec *ex) {
     int check = P.bytes[0] != NULL;   // NX2NAVI_MVPREV_CHECK=1: the summary's checks (3.6 ms a frame)
     for (int index = 0; index < BANKS; index++) {
         if (!(P.mask >> index & 1)) continue;

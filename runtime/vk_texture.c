@@ -3431,10 +3431,25 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
         start_line(e, NULL, gone_desc, gone_rel, e->og_start == START_COPY_GONE ? 2 : filled ? 3 : copied);
 }
 
+// A replay worker's chunk before its turn (vk_exec.c "replay workers"): a lookup that would make or take back an entry
+// returns nothing and sets this; the chunk replays the op again once every earlier chunk is done, so entries are made,
+// initialised and taken back in the order of the stream, as the replay would.
+static _Thread_local int tex_deferred;
+int vk_texture_deferred(void) { return tex_deferred; }
+int vk_texture_deferred_take(void) {
+    int d = tex_deferred;
+    tex_deferred = 0;
+    return d;
+}
+
 static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
+    if ((!e || e->retiring || e->released) && vk_exec_turn_due()) {
+        tex_deferred = 1;
+        return NULL;
+    }
     if (e && e->retiring) {   // retired by disuse: the pool refresh leaves it out, any other lookup takes it back
         if (pool_ctx) return NULL;
         retire_cancel(e);

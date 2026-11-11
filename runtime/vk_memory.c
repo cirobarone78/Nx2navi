@@ -2541,7 +2541,24 @@ void vk_mem_shadow_sync(uint64_t fence) {
     plat_mutex_unlock(&shadow_lock);
 }
 
+// The replay workers (vk_exec.c) bind and write from several threads at once: a mirror's first use in a submission
+// (creation, sync) and the notes of GPU writes go under use_lock. A use the submission already synced takes no lock.
+static PlatMutex use_lock = PLAT_MUTEX_INIT;
+
+static void mem_use_locked(VkMemSpan *sp);
 void vk_mem_use(VkMemSpan *sp) {
+    PoolRec *r = sp->pool;
+    if (r->mstate == MS_ON && r->acc_sub == msub) {
+        r->vd_use_sub = msub;
+        sp->buffer = r->mbuf;
+        return;
+    }
+    plat_mutex_lock(&use_lock);
+    mem_use_locked(sp);
+    plat_mutex_unlock(&use_lock);
+}
+
+static void mem_use_locked(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (r->mstate == MS_REFUSED && r->retry_sub && (int32_t)(msub - r->retry_sub) >= 0 && evict_enabled()) {
         plat_dec64(&m_refused_n[r->refused_why]);   // counted again if refused again
@@ -2559,7 +2576,11 @@ void vk_mem_use(VkMemSpan *sp) {
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
-    if (r->acc_sub != msub) mirror_sync(r);
+    if (r->acc_sub != msub) {
+        plat_mutex_lock(&use_lock);
+        if (r->acc_sub != msub) mirror_sync(r);
+        plat_mutex_unlock(&use_lock);
+    }
     sp->buffer = r->mbuf;
 }
 
@@ -3146,8 +3167,16 @@ static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader) {
     r->st_wb += size - o;
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset + o, size - o);   // what found no snapshot room
 }
-void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) { gpu_wrote(sp, size, 0); }
-void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size) { gpu_wrote(sp, size, 1); }
+void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
+    plat_mutex_lock(&use_lock);
+    gpu_wrote(sp, size, 0);
+    plat_mutex_unlock(&use_lock);
+}
+void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size) {
+    plat_mutex_lock(&use_lock);
+    gpu_wrote(sp, size, 1);
+    plat_mutex_unlock(&use_lock);
+}
 
 // Adds [a, b) to l, n sorted ranges that do not touch; returns the new count. Above cap ranges (l holds cap + 1) the two
 // nearest merge, so a full list copies the fewest bytes that were not flushed; cap 1 keeps one span over all flushes.

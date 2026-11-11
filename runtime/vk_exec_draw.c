@@ -275,6 +275,7 @@ typedef struct DrawCtx {
     VkDescriptorBufferInfo mo_ovr[2][32];   // [vertex, fragment][slot]; buffer 0: not replaced
     struct { int valid, has_fs; MemoKey k; const GfxShader *vs, *fs; } SM;   // the shader memo (shader_memo_on)
     struct { int valid; VkPipeState s; const VkPipeInfo *info; } PM;          // the pipeline memo (pipe_memo_on)
+    void *fm;                            // feedback_scan's memo per texture handle (FmEnt[FM_N]), made at first use
     VkWriteDescriptorSet bind_w[MAX_BINDINGS];   // bind_resources: write structs, packed descriptors, texel views
     VkDescSlot bind_d[MAX_DESC];
     VkBufferView bind_bv[MAX_DESC];
@@ -290,6 +291,10 @@ void *vk_exec_draw_ctx_new(void) {
 }
 
 void vk_exec_draw_ctx_use(void *c) { dc = c ? c : &dc_main; }
+
+static PlatMutex shader_lock = PLAT_MUTEX_INIT;   // shader_tab: the replay workers look shaders up at once
+static PlatMutex rs_lock = PLAT_MUTEX_INIT;       // rs_lists
+static PlatMutex pool_mt = PLAT_MUTEX_INIT;       // pool_sync from a chunk of a parallel group
 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
@@ -1046,6 +1051,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
         set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
+        plat_mutex_lock(&shader_lock);
         for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
             ShaderEnt *e = &set[w];
             if (e->serial != serial || e->stage != st || memcmp(&e->a, &a, sizeof a)) continue;
@@ -1054,8 +1060,11 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                 memmove(&set[1], &set[0], w * sizeof *set);
                 set[0] = hit;
             }
-            return set[0].s;
+            const GfxShader *found = set[0].s;
+            plat_mutex_unlock(&shader_lock);
+            return found;
         }
+        plat_mutex_unlock(&shader_lock);
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : st == NVN_STAGE_TASK ? GFX_STAGE_TS
            : st == NVN_STAGE_MESH ? GFX_STAGE_MS : GFX_STAGE_CS;
@@ -1069,8 +1078,10 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
     else if (set) {   // in front, the least recently used way drops out
+        plat_mutex_lock(&shader_lock);
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
+        plat_mutex_unlock(&shader_lock);
     }
     return s;
 }
@@ -1587,7 +1598,7 @@ static int td_mode(void) {
 // texture bindings change the whole-scan memo below, but the handles they bind were mostly looked up before, in this
 // pass or an earlier one. Direct-mapped.
 #define FM_N 8192
-static struct { uint64_t h, tok; uint32_t gen; SubRange r; } FM[FM_N];
+typedef struct { uint64_t h, tok; uint32_t gen; SubRange r; } FmEnt;   // DrawCtx.fm: one table per recording thread
 
 static SubRange sampled_sub(uint64_t h) {   // texture lock held
     view_t v;
@@ -1604,6 +1615,8 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     int n = gfx_shader_resources(fs, GFX_RES_TEX, &res);
     uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
     int memo = td_mode(), locked = 0;
+    FmEnt *fm = ex->dc->fm;
+    if (!fm && !(fm = ex->dc->fm = calloc(FM_N, sizeof *fm))) rt_fatal("vk: out of memory (feedback memo)");
     for (int r = 0; r < n; r++) {
         // Only bound slots (0..127) are looked at. The texture and sampler pool arrays (res.pool: 32768 and 4096
         // descriptors, bindless handles) have slot -1: walking them ran up to about 100,000 empty iterations per scan,
@@ -1615,7 +1628,7 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
             int slot = res[r].slot + k;
             uint64_t h = ex->tex[NVN_STAGE_FS][slot];
             if (!h) continue;
-            typeof(FM[0]) *f = &FM[(h * 0x9E3779B97F4A7C15ull) >> 51];
+            FmEnt *f = &fm[(h * 0x9E3779B97F4A7C15ull) >> 51];
             if (memo && f->h == h && slot_still(&f->gen, f->tok, h, gen)) {
                 if (memo == 2) {
                     if (!locked) vk_texture_lock(), locked = 1;
@@ -2419,6 +2432,26 @@ static int pool_fill(VkExec *ex, uint32_t id, uint32_t mask, uint64_t tok) {
 
 static void pool_sync_entries(VkExec *ex);
 
+static void pool_sync(VkExec *ex);
+
+// A chunk of a parallel group (vk_exec.c "replay workers") binds the set as vk_exec_draw_group_begin left it, up to date
+// when the group began; the chunk that takes this submission's first set takes it in turn, under pool_mt. Elsewhere the
+// replay syncs the pools at every draw that binds them, as before.
+static void pool_sync_draw(VkExec *ex) {
+    if (!vk_exec_in_chunk()) return pool_sync(ex);
+    if (__atomic_load_n(&PL.cur_fence, __ATOMIC_ACQUIRE) == ex->fence) return;
+    vk_exec_turn();
+    plat_mutex_lock(&pool_mt);
+    pool_sync(ex);
+    plat_mutex_unlock(&pool_mt);
+}
+
+void vk_exec_draw_group_begin(VkExec *ex) {
+    dummies_init();
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    if (pool_on() && PL.cur_fence == ex->fence && !PL.sealed) pool_sync(ex);   // the set this submission took
+}
+
 static void pool_sync(VkExec *ex) {
     if (!PL.layout) vk_pool_set_layout();
     uint64_t from = 0, pre = PL.logn;
@@ -3037,6 +3070,7 @@ static void rs_add(RsRange *r, uint32_t *n, const VkExec *ex, const void *at, si
 static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     DrawCtx *const cx = ex->dc;
     if (info == cx->rs_last) return cx->rs_last_l;
+    plat_mutex_lock(&rs_lock);
     if (!rs_lists.klen) nvn_hm_init(&rs_lists, sizeof info);
     RsList *l = nvn_hm_get(&rs_lists, &info);
     if (!l) {
@@ -3086,6 +3120,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         memcpy(l->r, tmp, sizeof *tmp * n);
         nvn_hm_put(&rs_lists, &info, l);
     }
+    plat_mutex_unlock(&rs_lock);
     cx->rs_last = info, cx->rs_last_l = l;
     return l;
 }
@@ -3472,7 +3507,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
     }
     if (info->pool) {   // set 2: the texture and sampler pools
-        pool_sync(ex);
+        pool_sync_draw(ex);
         vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 2, 1, &PL.set, 0, NULL);
         cx->RS.volatile_ = 1;   // the pools may change under an equal draw: build the next one again
     }
@@ -4163,11 +4198,13 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         vk_exec_frame.bind_ns += (uint64_t)(bt_now() - bt);
         vk_exec_frame.bind_calls++;
     }
+    if (vk_texture_deferred()) return 0;   // a chunk's lookup waits for its turn: the op is replayed again
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s, fbl);
     if (!mesh) bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info, mesh && !fb);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
+    if (vk_texture_deferred()) return 0;
     vk_exec_oq_draw(ex);
     DRS.issued[mesh]++;
     draw_stats_tick();
@@ -4712,6 +4749,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     int nu = gfx_shader_resources(cx->B.st.vs, GFX_RES_UBO, &ur), reads = 0;
     for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
     if (!reads) return;
+    vk_exec_turn();   // a replay worker's chunk: the motion list follows the stream
     MO.cand++;
     uint64_t tp = t0 ? kern_now_ns() : 0;
     if (t0) MO.ns_part[0] += tp - t0, MO.n_part[0]++;

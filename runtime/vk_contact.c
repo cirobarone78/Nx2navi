@@ -112,6 +112,8 @@ static void mem_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &d);
 }
 
+int vk_contact_pending(void) { return C.pending; }
+
 void vk_contact_flush(VkExec *ex) {
     if (!C.pending) return;
     C.pending = 0;

@@ -1453,8 +1453,16 @@ void vk_dlaa_viewport(VkExec *ex, VkViewport *v) {
 
 static int scene_color(VkFormat f);
 
+static void dlaa_draw_locked(VkExec *ex);
 void vk_dlaa_draw(VkExec *ex) {
     if (!dl_active() || D.ended) return;
+    static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once
+    plat_mutex_lock(&lock);
+    dlaa_draw_locked(ex);
+    plat_mutex_unlock(&lock);
+}
+
+static void dlaa_draw_locked(VkExec *ex) {
     static int survey = -1;   // NX2NAVI_DLAA_SURVEY=1 (test): what is drawn into the armed light target
     if (survey < 0) survey = rt_knob("DLAA_SURVEY", "0");
     static uint64_t dfn[16];   // scene draws writing depth, by depth test (reversed depth: GREATER/GEQUAL)
