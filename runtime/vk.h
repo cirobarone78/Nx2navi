@@ -22,6 +22,7 @@ typedef struct VkCtx {
     VkPhysicalDeviceMemoryProperties mem_props;
     uint32_t gfx_family;                    // graphics + compute + presentation on win32
     uint32_t xfer_family;                   // a transfer-only family when the GPU has one, else gfx_family
+    uint32_t fg_family;                     // a second presentable family for frame generation, else gfx_family
     VkQueue gfx_queue;                      // graphics + present
     VkQueue xfer_queue;                     // equals gfx_queue when xfer_shared
     int xfer_shared;                        // 1: no separate queue; serialise with gfx_queue
@@ -40,6 +41,7 @@ typedef struct VkCtx {
         has_mesh_shader, has_vrs,           // VK_EXT_mesh_shader with taskShader and meshShader (NVN2 task/mesh stages)
         has_maximal_reconvergence,          // VK_KHR_shader_maximal_reconvergence (vk_pipeline.c spirv_reconverge)
         has_pipeline_binary,                // VK_KHR_pipeline_binary with VK_KHR_maintenance5 (vk_pipeline.c pipe_create)
+        has_present_id,                     // VK_KHR_present_id + present_wait (FSR 3.1 frame generation, vk_fg.cpp)
         has_mesh_queries;                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. NX2NAVI_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -65,6 +67,20 @@ typedef struct {
     int mesa;                          // a Mesa driver the game runs on: RADV, ANV or NVK
 } VkCaps;
 extern VkCaps vk_caps;
+
+// The GPU profile (vk_caps.c, docs/nx2navi-intel-xe3-port.html 8.1): what the port assumes of one GPU family and its
+// driver, decided once per device before vkCreateDevice and read where a per-vendor default is needed. The place a new
+// GPU's level lives instead of a vendor test at each use.
+typedef struct {
+    const char *name;    // "intel_xe3", "intel", "amd", "nvidia", "other"
+    uint32_t vendor, device;
+    const char *memory;  // storage NX2NAVI_MEMORY=auto picks: "shadow" (Intel's driver faults on imported host memory),
+                         // "mirror" (a discrete card reads its pools over PCIe) or "import"
+} VkProfile;
+extern VkProfile vk_profile;
+// From the physical device's properties, before vk_mem_class_log decides the memory mode (vk_device.c pick_device); the
+// memory default is needed there, before vk_caps_driver has the driver's name. Logs the profile.
+void vk_profile_init(const VkPhysicalDeviceProperties *p);
 void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, amd_llpc, mesa
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (NX2NAVI_VK_NO_FLOAT64 clears shaderFloat64)
 // Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
@@ -272,6 +288,12 @@ extern PFN_vkGetDeviceProcAddr vk_dpa;
 uint64_t vk_gpu_busy_all(void);
 #define VK_MEM_BOUND(sp) do { if ((rt_trace & RT_TRACE_PERF) && (sp).pool) vk_mem_bound_note((sp).pool); } while (0)
 void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its lock, before the replay
+// The storage CPU-visible pools got at device selection (vk_memory.c mirror_mode): "import", "shadow", "mirror" or
+// "verify", "" before the device exists. vk_mem_downgraded: 1 when a run that died without a clean exit made this one
+// take shadow storage instead (G1, the Intel driver's import path). The menu's Memory row shows both.
+const char *vk_mem_storage(void);
+int vk_mem_downgraded(void);
+
 // VRAM mirror of buffer-bound pools (vk_memory.c). vk_mirror_on: NX2NAVI_MEMORY=mirror|verify, or the
 // device class is discrete and NX2NAVI_MEMORY is unset or auto; set at device selection. The replay (submitting thread
 // under vk_sync_submit's lock) calls:

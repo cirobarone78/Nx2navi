@@ -182,12 +182,15 @@
 # heap is under 20 GiB or the system reports less than 47 GiB of RAM (allowing for a nominal 48 GiB PC). If the RAM
 # size is unknown, only the GPU heap decides. Look for "NX2NAVI_ASTC_BC unset" in the game log to see the decision.
 # astc_bc = 1
-# Game memory shared with the GPU: auto (mirror on a discrete GPU, import on an integrated one), import (host memory
-# imported into Vulkan), mirror (pools used as buffers get a copy in video memory) or verify (mirror plus a check of
-# every copy; slow). On a discrete GPU import can be far slower than mirror, not slightly slower: the GPU reads the
-# game's pools over PCIe. A 5070 Ti Laptop went from 6 ms to 135-230 ms of GPU time per frame with import (5 fps on the
-# title screen, bound: gpu, every line of the perf window waiting on a fence). The log names the mode in use: "mem:
-# mode import" or "mem: mode mirror".
+# Game memory shared with the GPU: auto (the GPU profile's choice: shadow on Intel, whose Windows driver faults on
+# imported host memory, mirror on a discrete card, import on an integrated one), import (host memory imported into
+# Vulkan), shadow (a host-visible copy of game memory per pool, the driver never sees the game's pointers), mirror
+# (pools used as buffers get a copy in video memory) or verify (mirror plus a check of every copy; slow). On a discrete
+# GPU import can be far slower than mirror, not slightly slower: the GPU reads the game's pools over PCIe. A 5070 Ti
+# Laptop went from 6 ms to 135-230 ms of GPU time per frame with import (5 fps on the title screen, bound: gpu, every
+# line of the perf window waiting on a fence). The log names the mode in use: "mem: storage import (auto, ...)" or
+# "mem: storage shadow (...)". A run that dies without an exit turns auto into shadow for the next one and writes that
+# here; a storage named in this file is never rewritten.
 # memory = auto
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
@@ -388,6 +391,13 @@
 # NVIDIA driver's libnvidia-ngx.so.1 installed); elsewhere the setting does nothing. The HUD is drawn after it and is not touched.
 # Read at start.
 # dlaa = 0
+# Which temporal upscaler scales the 3D scene when dlaa = 1: dlss (NVIDIA NGX, RTX cards), fsr3 (AMD FidelityFX Super
+# Resolution 3.1, any GPU, amd_fidelityfx_vk.dll next to the executable) or xess (Intel XeSS 2, any Arc or other Xe
+# GPU, libxess.dll next to the executable; it needs its Vulkan device extensions at device creation, so it applies at
+# the next start, unlike dlss and fsr3). The dlss mode below (dlaa, quality, balanced, performance, ultra_performance)
+# decides the scene size for all three; XeSS additionally needs a size its quality setting expects exactly, which the
+# 67, 58, 50 and 33 % modes usually are.
+# taa = dlss
 # What DLSS works from: dlaa (the 3D scene at full size), quality, balanced, performance or ultra_performance (the
 # scene at 67, 58, 50 or 33 % of the output, scaled up by DLSS; these replace render_scale and sharpen texture filtering
 # to match). They apply only with dlaa = 1 and the DLSS model next to the executable; otherwise the scene follows

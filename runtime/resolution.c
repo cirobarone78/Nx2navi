@@ -294,7 +294,7 @@ static void shadow_init(uint8_t *page) {
         return;
     }
     int set = rt_patch_set("shadow");
-    if (set < 0) {
+    if (set < 0 || !page) {
         rt_log("resolution: the generated C has no shadow patch set: the game sizes its shadow map");
         return;
     }
@@ -325,8 +325,12 @@ static void res_shadow_range(void) {
 }
 
 void res_init(void) {
+    decide();   // R.shadow (NX2NAVI_SHADOW_RES) is read there, and the shadow set does not need output or scene
     res_shadow_range();
     if (!res_adjustable()) {
+        // The shadow set stands on its own: a game whose output and scene this build cannot resize (Ocarina) still gets
+        // the fixed sun shadow map, which is what keeps foliage shadows from going blocky near the ground.
+        shadow_init(rt_patch_page());
         rt_log("resolution: the game's own (this build has no output and scene patch sets; output_res and render_scale "
                "do nothing)");
         return;

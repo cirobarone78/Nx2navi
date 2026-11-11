@@ -22,6 +22,7 @@
 #include "vk_gpa.h"
 
 VkCaps vk_caps = {.float64 = 1, .sg_size = 32};
+VkProfile vk_profile = {.name = "other", .memory = "import"};
 static int f64_supported;
 static VkBool32 gpl_lib, gpl_fast;   // the driver's graphicsPipelineLibrary (feature), ...FastLinking (property)
 
@@ -80,6 +81,33 @@ static void driver_version(char *o, size_t n, uint32_t vendor, uint32_t v) {
     if (vendor == 0x10de) snprintf(o, n, "%u.%u.%u.%u", v >> 22, v >> 14 & 0xff, v >> 6 & 0xff, v & 0x3f);
     else if (vendor == 0x8086) snprintf(o, n, "%u.%u", v >> 14, v & 0x3fff);
     else snprintf(o, n, "%u.%u.%u", VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), VK_API_VERSION_PATCH(v));
+}
+
+// The GPU profile (vk.h): one table of what the port assumes of a GPU family, so that a default for a vendor or a driver
+// is written once instead of at every use. Called by vk_device.c pick_device, before vk_mem_class_log takes its memory
+// mode (the Intel default is a memory mode), so nothing here may wait for the driver's name.
+//
+// Intel: the Arc B390's igvk64.dll (driver 101.9150) used to fault at igvk64+0x79ddf3 reading 0x190, and shadow storage
+// was made its default to keep the driver off the guest's pointers. That reading was wrong: the fault is inside
+// vkGetPipelineCacheData in vk_pipeline_save while a worker builds from the same VkPipelineCache, and shadow runs crash
+// at it just as import ones do (docs/nx2navi-intel-xe3-port.html 5.4, with cache_rw the fix). Shadow storage also draws
+// this game's 3D black on the machine the port was measured on, so Intel keeps the ordinary default; intel_xe3 (Arc B
+// series) names the family, not a memory mode.
+void vk_profile_init(const VkPhysicalDeviceProperties *p) {
+    int discrete = p->deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    const char *name = "other", *memory = discrete ? "mirror" : "import";
+    if (p->vendorID == 0x8086) {
+        name = p->deviceID == 0xb080 ? "intel_xe3" : "intel";
+    } else if (p->vendorID == 0x10de) {
+        name = "nvidia";
+    } else if (p->vendorID == 0x1002) {
+        name = "amd";
+    }
+    vk_profile.name = name, vk_profile.vendor = p->vendorID, vk_profile.device = p->deviceID, vk_profile.memory = memory;
+    char dv[32];
+    driver_version(dv, sizeof dv, p->vendorID, p->driverVersion);
+    rt_log("vk profile: %s (vendor %#06x device %#06x, driver %s): auto memory %s", vk_profile.name, vk_profile.vendor,
+           vk_profile.device, dv, vk_profile.memory);
 }
 
 void vk_caps_init(VkCtx *c) {

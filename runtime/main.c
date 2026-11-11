@@ -514,7 +514,7 @@ static int usage(const char *argv0) {
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
-                    "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--prepare-shaders [--shard I/N] | --warm-shaders [--shard I/N] | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -590,6 +590,20 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *mode = NULL;
+    // --shard I/N and NX2NAVI_PREPARE_SHARD I/N (--prepare-shaders, --warm-shaders): the build step of a prepared shader
+    // cache split into N runs of a few minutes each (docs/nx2navi-intel-xe3-port.html 8.4). The environment spelling lets
+    // a tool that only knows the command line split it without changing it (tools/build_game.py, installer steps).
+    int shard = 0, shards = 1;
+    const char *sh_env = cfg_get("NX2NAVI_PREPARE_SHARD");
+    if (sh_env && *sh_env) {
+        char *end;
+        long a = strtol(sh_env, &end, 10), b = 0;
+        if (*end == '/' && a >= 1 && a <= 64) b = strtol(end + 1, &end, 10);
+        if (*end || a < 1 || b < a || b > 64)
+            rt_log("cfg: NX2NAVI_PREPARE_SHARD=%s is not I/N (1 <= I <= N <= 64): preparing everything", sh_env);
+        else
+            shard = (int)a - 1, shards = (int)b;
+    }
     for (int i = 1; i < argc; i++) {
         const char **path = !strcmp(argv[i], "--exefs") ? &cfg.exefs : !strcmp(argv[i], "--romfs") ? &cfg.romfs
                           : !strcmp(argv[i], "--profile") ? &cfg.profile : NULL;
@@ -615,6 +629,16 @@ int main(int argc, char **argv) {
             double s = strtod(argv[i], &end);
             if (*end || !(s > 0) || s > 1e6) return usage(argv[0]);
             cfg.seconds = s;
+        } else if (!strcmp(argv[i], "--shard")) {
+            char *end;
+            if (++i == argc) return usage(argv[0]);
+            long a = strtol(argv[i], &end, 10), b = 0;
+            if (*end == '/' && a >= 1 && a <= 64) b = strtol(end + 1, &end, 10);
+            if (*end || a < 1 || b < a || b > 64) {
+                rt_logf("--shard takes I/N with 1 <= I <= N <= 64, not '%s'\n", argv[i]);
+                return usage(argv[0]);
+            }
+            shard = (int)a - 1, shards = (int)b;   // the command line wins over NX2NAVI_PREPARE_SHARD
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];
@@ -662,8 +686,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
-    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
-    if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders(shard, shards);
+    if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders(shard, shards);
     if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);

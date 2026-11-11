@@ -1365,6 +1365,13 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
             copy_if_changed(KIT / 'bin' / name, out / name)
         if (KIT / 'bin' / FFX4_FG_DLL).is_file():   # its frame generation (runtime/vk_fg4.cpp)
             copy_if_changed(KIT / 'bin' / FFX4_FG_DLL, out / FFX4_FG_DLL)
+    # Intel XeSS (runtime/vk_xess.cpp): loaded at runtime as libxess.dll from beside the game, with the licence text the
+    # Intel Simplified Software License asks to travel with the binary. Without it, taa = xess falls back to no upscaling.
+    if WIN and (KIT / 'bin' / 'libxess.dll').is_file():
+        copy_if_changed(KIT / 'bin' / 'libxess.dll', out / 'libxess.dll')
+        copy_if_changed(KIT / 'runtime' / 'licenses' / 'xess-LICENSE.txt', out / 'libxess-LICENSE.txt')
+    elif WIN and not (out / 'libxess.dll').is_file():
+        say('  note: bin/libxess.dll is absent: Intel XeSS (taa = xess) will not be available')
     kept = place_dlss(out, linux=not WIN)   # NVIDIA DLSS (runtime/vk_dlaa.c): this platform's library from the kit
     if kept:
         say(f'  {kept}')

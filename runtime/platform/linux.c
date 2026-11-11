@@ -1681,6 +1681,7 @@ void plat_exit(int code) {
 #endif
     fflush(stdout);
     fflush(stderr);
+    plat_run_marker_clear();   // an orderly end: the next start is not a run after a crash
     _exit(code);
 }
 
@@ -2448,4 +2449,45 @@ int plat_restart_wait(uint32_t timeout_ms) {
     }
     close(fd);
     return r;
+}
+
+// ---- the run marker (platform.h): .running beside the executable until plat_exit
+static char run_marker_buf[PLAT_PATH_MAX];
+
+static const char *run_marker_path(void) {
+    if (run_marker_buf[0]) return run_marker_buf;
+    char exe[PLAT_PATH_MAX];
+    if (!plat_exe_path(exe, sizeof exe)) return NULL;
+    char *cut = plat_last_sep(exe);
+    if (!cut) return NULL;
+    snprintf(cut, sizeof exe - (size_t)(cut - exe), "/.running");
+    snprintf(run_marker_buf, sizeof run_marker_buf, "%s", exe);
+    return run_marker_buf;
+}
+
+int plat_run_marker(const char *text) {
+    const char *p = run_marker_path();
+    if (!p) return 0;
+    FILE *f = fopen(p, "wb");
+    if (!f) return 0;
+    size_t n = strlen(text);
+    int ok = fwrite(text, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+
+int plat_run_marker_take(char *out, size_t cap) {
+    if (out && cap) out[0] = 0;
+    const char *p = run_marker_path();
+    if (!p || !out || cap < 2) return 0;
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = 0;
+    return 1;   // the file was there: the run before this one did not exit
+}
+
+void plat_run_marker_clear(void) {
+    const char *p = run_marker_path();
+    if (p) unlink(p);
 }

@@ -524,3 +524,12 @@ int plat_spawn(const char *const *argv, const char *cwd);
 // In a process plat_restart started: waits, at most timeout_ms, until the process that started it has exited. 1 after
 // the wait, -1 on timeout, 0 when there is nothing to wait for (not started by plat_restart, or that process is gone).
 int plat_restart_wait(uint32_t timeout_ms);
+
+// ---- the run marker: whether the run before this one ended without an exit
+// The file ".running" beside the executable, written by the runtime once it knows what it is doing (vk_memory.c writes
+// the storage mode it starts with) and deleted by plat_exit. A start that finds it knows the process before it died
+// inside the driver or was killed. plat_run_marker: 1 when the text was written. plat_run_marker_take: 1 when an
+// earlier run left a marker, its text (NUL-terminated) in out, the file now this process's.
+int plat_run_marker(const char *text);
+int plat_run_marker_take(char *out, size_t cap);
+void plat_run_marker_clear(void);

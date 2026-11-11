@@ -1150,6 +1150,7 @@ void plat_exit(int code) {
     // dead pointer in its detach on the window thread after the window was closed (an access violation in
     // _nvngx.dll after the last save, once in 5 scripted runs that had freed and made a DLSS feature again), and the
     // crash handler wrote a FATAL for a run that had ended cleanly.
+    plat_run_marker_clear();   // an orderly end: the next start is not a run after a crash
     TerminateProcess(GetCurrentProcess(), (UINT)code);
     ExitProcess((UINT)code);   // not reached
 }
@@ -2156,4 +2157,48 @@ int plat_restart_wait(uint32_t timeout_ms) {
     int r = process_created(h) != created ? 0 : WaitForSingleObject(h, timeout_ms) == WAIT_OBJECT_0 ? 1 : -1;
     CloseHandle(h);
     return r;
+}
+
+// ---- the run marker (platform.h): .running beside the executable until plat_exit
+static wchar_t run_marker_w[WPATH];
+
+static const wchar_t *run_marker_path(void) {
+    if (run_marker_w[0]) return run_marker_w;
+    char exe[PLAT_PATH_MAX];
+    int n = plat_exe_path(exe, sizeof exe);
+    char *cut = n > 0 && n < (int)sizeof exe ? plat_last_sep(exe) : NULL;
+    if (!cut) return NULL;
+    snprintf(cut, sizeof exe - (size_t)(cut - exe), "/.running");
+    return widen(exe, run_marker_w, WPATH) ? run_marker_w : NULL;
+}
+
+int plat_run_marker(const char *text) {
+    const wchar_t *p = run_marker_path();
+    if (!p) return 0;
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD n = 0, len = (DWORD)strlen(text);
+    int ok = WriteFile(h, text, len, &n, NULL) && n == len;
+    CloseHandle(h);
+    return ok;
+}
+
+int plat_run_marker_take(char *out, size_t cap) {
+    if (out && cap) out[0] = 0;
+    if (!out || cap < 2) return 0;
+    const wchar_t *p = run_marker_path();
+    if (!p) return 0;
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD n = 0;
+    int ok = ReadFile(h, out, (DWORD)(cap - 1), &n, NULL) != 0;
+    CloseHandle(h);
+    out[ok ? n : 0] = 0;
+    return 1;   // the file was there: the run before this one did not exit
+}
+
+void plat_run_marker_clear(void) {
+    const wchar_t *p = run_marker_path();
+    if (p) DeleteFileW(p);
 }

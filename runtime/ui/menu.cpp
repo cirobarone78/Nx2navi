@@ -59,6 +59,7 @@ extern "C" {
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+const char *vk_mem_storage(void);   // "import", "shadow", "mirror" or "verify"; "" before the device exists
 void res_sizes(unsigned out[2], unsigned scene[2]);
 int res_adjustable(void);
 int wide_available(void);
@@ -78,6 +79,8 @@ int vk_fg4_failed(void);                // ... it failed in this run, FSR 3.1's 
 int vk_fg4_active(void);                // ... its swapchain is in place
 const char *vk_fg4_name(void);          // ... the version the library runs here ("3.1.6", "4.0.2")
 int vk_texture_detail_auto(void);       // vk_texture.c: the texture detail auto picks on this card, 0 full to 2 low
+int vk_dlaa_xess_available(void);       // vk_dlaa.c: Intel XeSS is offered (libxess.dll beside the game)
+int vk_dlssg_wanted(void);              // vk_dlssg.c: DLSS's frame generation through Streamline
 double frame_step_limit_hz(void);
 int frame_limit_follows_display(void);
 int frame_limit_adjustable(void);
@@ -840,6 +843,7 @@ static void upscaling_name(char *out, size_t size) {
         if (!strcmp(cfg_value("NX2NAVI_DLSS"), modes[i])) mode = i;
     if (!strcmp(cfg_value("NX2NAVI_TAA"), "fsr3"))
         snprintf(out, size, vk_ffx_fsr4() ? "AMD FSR 4 %s" : "AMD FSR 3.1 %s", menu_text(fsr3[mode]));
+    else if (!strcmp(cfg_value("NX2NAVI_TAA"), "xess")) snprintf(out, size, "Intel XeSS %s", menu_text(fsr3[mode]));
     else snprintf(out, size, mode ? "DLSS %s" : "NVIDIA %s", menu_text(dlss[mode]));
 }
 
@@ -855,20 +859,21 @@ static void row_upscaling(void) {
     static const UiTextId fsr_names[] = {UI_MENU_FSR3_NATIVE, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                          UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     // FSR 4 (vk_ffx4.cpp) is the same setting as FSR 3.1 with NX2NAVI_FSR4 on, and takes the same modes: listed where
-    // it runs on this device, after FSR 3.1's
-    enum { BILINEAR, FSR1, DLSS, FSR3, FSR4 };
+    // it runs on this device, after FSR 3.1's. XeSS (vk_xess.cpp) takes the same modes as well, listed last.
+    enum { BILINEAR, FSR1, DLSS, FSR3, FSR4, XESS };
     struct Entry { int kind, mode; };
-    static char text[15][96];
-    Entry list[18];
-    const char *names[18];
+    static char text[23][96];
+    Entry list[23];
+    const char *names[23];
     int n = 0;
     auto add = [&](int kind, int mode) {
         list[n] = {kind, mode};
         if (kind == BILINEAR) names[n] = menu_text(UI_MENU_UPSCALER_BILINEAR);
         else if (kind == FSR1) names[n] = menu_text(UI_MENU_UPSCALER_FSR);
         else {
-            char *t = text[(kind == FSR4 ? 10 : kind == FSR3 ? 5 : 0) + mode];
+            char *t = text[(kind == XESS ? 15 : kind == FSR4 ? 10 : kind == FSR3 ? 5 : 0) + mode];
             if (kind == DLSS) snprintf(t, sizeof text[0], mode ? "DLSS %s" : "NVIDIA %s", menu_text(mode_names[mode]));
+            else if (kind == XESS) snprintf(t, sizeof text[0], "Intel XeSS %s", menu_text(fsr_names[mode]));
             else snprintf(t, sizeof text[0], kind == FSR4 ? "AMD FSR 4 %s" : "AMD FSR 3.1 %s", menu_text(fsr_names[mode]));
             names[n] = t;
         }
@@ -877,18 +882,24 @@ static void row_upscaling(void) {
     // what is set now
     Entry now = {strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") ? BILINEAR : FSR1, 0};
     if (cfg_bool("NX2NAVI_DLAA")) {
-        now = {strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? DLSS : vk_ffx_fsr4() ? FSR4 : FSR3, 0};   // set where it does
-        for (int i = 0; i < 5; i++)                                                                // not run: FSR 3.1 does
+        const char *taa = cfg_value("NX2NAVI_TAA");
+        now = {!strcmp(taa, "xess") ? XESS : !strcmp(taa, "fsr3") ? (vk_ffx_fsr4() ? FSR4 : FSR3) : DLSS, 0};   // set where it does
+        for (int i = 0; i < 5; i++)                                                                           // not run: FSR 3.1 does
             if (!strcmp(cfg_value("NX2NAVI_DLSS"), modes[i])) now.mode = i;
     }
-    const bool dlss = dlss_offered(), fsr = vk_ffx_available(), fsr4 = fsr && vk_ffx4_available();
+    const bool dlss = dlss_offered(), fsr = vk_ffx_available(), fsr4 = fsr && vk_ffx4_available(),
+               xess = vk_dlaa_xess_available();
     add(BILINEAR, 0);
     add(FSR1, 0);
     for (int i = 0; dlss && i < 5; i++) add(DLSS, i);
     for (int i = 0; fsr && i < 5; i++) add(FSR3, i);
     for (int i = 0; fsr4 && i < 5; i++) add(FSR4, i);
+    // XeSS's modes are the same render scales; it is offered where libxess.dll is beside the game, and always applies at
+    // the next start (its device extensions are asked for at device creation).
+    for (int i = 0; xess && i < 5; i++) add(XESS, i);
     if (!dlss && now.kind == DLSS) add(DLSS, now.mode);
     if (!fsr && now.kind == FSR3) add(FSR3, now.mode);
+    if (!xess && now.kind == XESS) add(XESS, now.mode);
     int cur = 0;
     for (int i = 0; i < n; i++)
         if (list[i].kind == now.kind && list[i].mode == now.mode) cur = i;
@@ -897,7 +908,7 @@ static void row_upscaling(void) {
     if (!fsr && now.kind == FSR3) note = menu_text(UI_MENU_FSR3_OFF);
     else if (upscaling_restart()) note = menu_text(UI_MENU_AFTER_RESTART);
     int nv = opt_choice_index("NX2NAVI_UPSCALER", UI_MENU_UPSCALING, names, n, cur, 1,
-                              !fsr ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
+                              !fsr ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss || xess ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
                               note);
     if (nv < 0 || nv >= n) return;
     const Entry e = list[nv];
@@ -905,7 +916,7 @@ static void row_upscaling(void) {
     opt_apply("NX2NAVI_DLAA", e.kind >= DLSS ? "1" : "0");
     if (e.kind < DLSS) opt_apply("NX2NAVI_FRAMEGEN", "off");   // it needs DLSS's or FSR 3.1's motion vectors (row_framegen)
     if (e.kind >= DLSS) opt_apply("NX2NAVI_DLSS", modes[e.mode]);
-    if (e.kind >= DLSS) opt_apply("NX2NAVI_TAA", e.kind >= FSR3 ? "fsr3" : "dlss");
+    if (e.kind >= DLSS) opt_apply("NX2NAVI_TAA", e.kind == XESS ? "xess" : e.kind >= FSR3 ? "fsr3" : "dlss");
     if (e.kind >= FSR3) opt_apply("NX2NAVI_FSR4", e.kind == FSR4 ? "1" : "0");
 }
 
@@ -1093,6 +1104,23 @@ static void row_game_res(void) {
     opt_choice_list("NX2NAVI_GAME_RES", UI_MENU_GAME_RES, values, names, 6, UI_MENU_GAME_RES_DESC);
 }
 
+// The row's value is the setting; the note under it is the storage the pools got (vk_memory.c mirror_mode), which auto
+// resolves elsewhere than the row reads: the GPU profile picks shadow on Intel, where the driver faults on imported host
+// memory, and mirror on a discrete card; a run after a crash takes shadow whatever the setting says.
+static void row_memory(void) {
+    static const UiTextId mem[] = {UI_MENU_MEMORY_AUTO, UI_MENU_MEMORY_IMPORT, UI_MENU_MEMORY_SHADOW, UI_MENU_MEMORY_MIRROR,
+                                   UI_MENU_MEMORY_VERIFY};
+    const char *s = vk_mem_storage();
+    UiTextId id = !strcmp(s, "shadow")   ? UI_MENU_MEMORY_SHADOW
+                  : !strcmp(s, "mirror") ? UI_MENU_MEMORY_MIRROR
+                  : !strcmp(s, "verify") ? UI_MENU_MEMORY_VERIFY
+                  : !strcmp(s, "import") ? UI_MENU_MEMORY_IMPORT
+                                         : UI_MENU_MEMORY_AUTO;
+    static char note[128];
+    if (*s) snprintf(note, sizeof note, menu_text(UI_MENU_PRESENT_IN_USE), menu_text(id));
+    opt_choice("NX2NAVI_MEMORY", UI_MENU_MEMORY, mem, 5, UI_MENU_MEMORY_DESC, *s ? note : nullptr);
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
     opt_toggle("NX2NAVI_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -1101,6 +1129,7 @@ static void tab_screen(float scale) {
     // game to 30 at every slow frame on a 60 Hz display. A fifo already saved also reads as on.
     opt_toggle_value("NX2NAVI_VK_PRESENT", UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_DESC, "mailbox", "immediate", vsync_note());
     row_gpu();
+    row_memory();   // the storage the pools get: the GPU row's counterpart, on the page's first screen
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("NX2NAVI_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
     opt_group(UI_MENU_GRAPHICS);
