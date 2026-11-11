@@ -165,6 +165,17 @@ void vk_exec_bc_gone(VkImage image);
 // vk_hdr.c: with NX2NAVI_HDR=1, notes a draw into a presented window texture (vk_hdr_track: set by the first present).
 extern int vk_hdr_track;
 void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info);
+// The game's tonemapping draw supplies its scene, bloom, and grading constants together.
+typedef struct {
+    VkImage raw, graded;
+    VkDescriptorImageInfo scene, bloom;
+    VkDescriptorBufferInfo support, uniforms;
+    uint64_t fence, frame;
+} VkSceneGrade;
+extern VkSceneGrade vk_scene_grade;
+int vk_scene_grade_prepare(const GfxShader *shader);
+void vk_scene_grade_record(VkCommandBuffer cb, const VkSceneGrade *g, VkImageView scene, VkImageView dst, uint32_t w, uint32_t h);
+
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
 // vk_exec_draw.c: orders the open pass's earlier sampled reads of the attachments in written (bit i colour i, bit 8

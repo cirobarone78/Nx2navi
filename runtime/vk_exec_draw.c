@@ -3894,6 +3894,41 @@ static void prog_lead(const prog_t *p, int mesh) {
                (unsigned long long)PLD.n[m][4], (unsigned long long)PLD.n[m][5]);
 }
 
+VkSceneGrade vk_scene_grade;
+
+// Record the exact resources used by this draw. The resolve accepts them only when
+// the scaler reads this draw's output in the same submission and frame.
+static void scene_grade_draw(VkExec *ex, const GfxShader *fs) {
+    if (!fs || ex->pass_ncolor != 1 || ex->depth.image || ex->color[0].format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !vk_dlaa_scene_wanted()) return;
+    const uint8_t *ctl, *code;
+    uint32_t size;
+    if (!find_stage(ex->prog, NVN_STAGE_FS, &ctl, &code, &size) || size != 1280 ||
+        nvn_hm_hash(code, size) != UINT64_C(0x0aa8eb8fe3d26fa0)) return;
+    const GfxShaderRes *tex, *ubo;
+    if (gfx_shader_resources(fs, GFX_RES_UBO, &ubo) != 1 || ubo->slot != 3 || ubo->set || ubo->binding != 3 ||
+        gfx_shader_resources(fs, GFX_RES_TEX, &tex) != 2 || !B.sup_valid || !vk_scene_grade_prepare(fs)) return;
+    VkSceneGrade g = {.graded = ex->color[0].image, .fence = ex->fence,
+                      .frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+                      .support = {B.sup_buf, B.sup_off, SUPPORT_BYTES}, .uniforms = ubo_info(ex, NVN_STAGE_FS, 3)};
+    vk_texture_lock();
+    for (int i = 0; i < 2; ++i) {
+        int slot = tex[i].slot;
+        if ((unsigned)slot > 1 || tex[i].binding != 2 - slot || tex[i].set || tex[i].separate) continue;
+        uint64_t handle = ex->tex[NVN_STAGE_FS][slot];
+        const VkTexImage *image = vk_texture_by_id_locked(NVN_HANDLE_TEX(handle), NULL, NULL);
+        if (!image || image->format != ex->color[0].format || image->type != VK_IMAGE_TYPE_2D || image->samples != 1 ||
+            image->layers != 1 || image->levels != 1 || tex[i].type != 3) continue;
+        VkDescriptorImageInfo *desc = slot ? &g.bloom : &g.scene;
+        tex_info_lookup(ex, &tex[i], handle, 0, 0, desc);
+        if (!slot && image->width == ex->color[0].width && image->height == ex->color[0].height) g.raw = image->image;
+    }
+    vk_texture_unlock();
+    VkImageView dummy = Z.img[dummy_index(VK_IMAGE_VIEW_TYPE_2D, 0)].view;
+    if (g.raw && g.scene.imageView && g.bloom.imageView && g.scene.imageView != dummy && g.bloom.imageView != dummy &&
+        g.scene.imageLayout == VK_IMAGE_LAYOUT_GENERAL &&
+        g.bloom.imageLayout == VK_IMAGE_LAYOUT_GENERAL && g.uniforms.buffer) vk_scene_grade = g;
+}
+
 // mesh: a mesh draw (op_draw_mesh): the program's mesh and task stages stand in for the vertex stage, and nothing
 // vertex-related (vertex buffers, motion vector bookkeeping of vertex shaders) is bound or noted. 2: a mesh draw of
 // the mesh fallback (mfb_draw): the vertex stage is mfb_cur_vs, in an ordinary pipeline without vertex input.
@@ -4111,6 +4146,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     feedback_written(ex, &s, fbl);
     if (!mesh) bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info, mesh && !fb);
+    if (!mesh) scene_grade_draw(ex, fs);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
     vk_exec_oq_draw(ex);
     DRS.issued[mesh]++;

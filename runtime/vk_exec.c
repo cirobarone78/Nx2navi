@@ -1605,6 +1605,19 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
             h = nvn_op_next(h);
             continue;
         }
+        // A captured grade may be replayed only across bindings and synchronization.
+        // Any intervening GPU work could have overwritten its bloom, scene, or uniform buffer.
+        if (vk_scene_grade.graded) {
+            switch (h->op) {
+            case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_CLEAR_TEX: case OP_CLEAR_BUF:
+            case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T:
+            case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+            case OP_DISPATCH: case OP_DISPATCH_IND: case OP_UPDATE_UB: case OP_REPORT_COUNTER: case OP_SIGNAL_EVENT:
+                vk_scene_grade.graded = VK_NULL_HANDLE;
+                break;
+            default: break;
+            }
+        }
         switch (h->op) {
         case OP_END: return NULL;
         case OP_BEGIN: break;
