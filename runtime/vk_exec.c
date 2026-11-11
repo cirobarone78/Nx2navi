@@ -27,6 +27,7 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_dlaa.h"
+#include "vk_ao.h"
 
 #define WEAK __attribute__((weak))
 #define CALL_DEPTH 8
@@ -65,6 +66,7 @@ uint64_t vk_exec_submit_seq;
 
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     vk_exec_cond_frame_end(frame);   // a frame boundary in replay order (present_image runs on the replay thread)
+    vk_ao_frame();
     if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
     uint64_t ew, eu, el, ed;

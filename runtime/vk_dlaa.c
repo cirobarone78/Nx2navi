@@ -28,6 +28,7 @@
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
+#include "vk_ao.h"
 #include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
@@ -594,6 +595,7 @@ const VkTexImage *vk_dlaa_swap_img;
 VkImageView vk_dlaa_swap_view;
 
 static int dl_active(void) { return N.available && !D.failed && D.on; }
+int vk_dlaa_active(void) { return dl_active(); }
 // The upscaler this frame runs with, as vk_dlaa_frame read it. The menu can set NX2NAVI_TAA to dlss between that and
 // evaluate; read again there while NGX is not up (DLSS starts only after a restart), it sent evaluate to DLSS's path
 // with NGX's functions not loaded, a call to address 0 (issue #325).
@@ -1716,6 +1718,7 @@ evaluated:
     if (D.evals % 600 == 0) query_vram();
     stale_sizes(e);
     full_barrier(cb);
+    vk_ao_record(cb, e->out_view, ow, oh, z->image);
     vk_mvcheck_output(cb, e->out, ow, oh);   // NX2NAVI_MV_CHECK (test)
     // the result into the scene target (DLAA: the bloom, the post passes and the HUD read it and draw over it) or into
     // the scaling pass's target (the HUD draws over it)

@@ -8,6 +8,8 @@
 #include "cfg.h"
 #include "fallback_tonemap_spv.h"
 #include "host.h"
+#include "vk_ao.h"
+#include "vk_dlaa.h"
 
 // The game's upscaler (tensor-core, untranslatable) reads the post pass's picture, whose channels hold the square root of
 // their linear value packed as RGB9E5 (prog 102), and writes the linear picture the HUD is drawn over; the frame's last
@@ -144,6 +146,9 @@ VkImage vk_tonemap_record(VkCommandBuffer cb, VkImage src, VkFormat sf, uint32_t
                               .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
     VkDependencyInfo dep2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &after};
     vkCmdPipelineBarrier2(cb, &dep2);
+    // Temporal upscalers normally replace this picture later; apply AO only to their output. If that evaluation
+    // point is missed, leave this frame unoccluded: a late fallback could darken the already composed HUD.
+    if (disp && !vk_dlaa_active()) vk_ao_record(cb, TM.out_view, dw, dh, VK_NULL_HANDLE);
     return TM.out;
 }
 

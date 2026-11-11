@@ -1059,6 +1059,17 @@ static void row_game_res(void) {
     opt_choice_list("NX2NAVI_GAME_RES", UI_MENU_GAME_RES, values, names, 6, UI_MENU_GAME_RES_DESC);
 }
 
+static void row_ambient_occlusion(void) {
+    static const char *const modes[] = {"off", "ssao", "hbao"};
+    const char *names[] = {menu_text(UI_MENU_OFF), "SSAO", "HBAO"};
+    opt_choice_list("NX2NAVI_AO", UI_MENU_AO, modes, names, 3, UI_MENU_AO_DESC);
+    if (!strcmp(cfg_value("NX2NAVI_AO"), "off")) return;
+    opt_slider("NX2NAVI_AO_STRENGTH", UI_MENU_AO_STRENGTH, 0, 100, UI_MENU_AO_STRENGTH_DESC, 1, "%.0f %%");
+    opt_slider("NX2NAVI_AO_RADIUS", UI_MENU_AO_RADIUS, 1, 100, UI_MENU_AO_RADIUS_DESC);
+    static const UiTextId quality[] = {UI_MENU_AO_LOW, UI_MENU_AO_MEDIUM, UI_MENU_AO_HIGH};
+    opt_choice("NX2NAVI_AO_QUALITY", UI_MENU_AO_QUALITY, quality, 3, UI_MENU_AO_QUALITY_DESC);
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
     opt_toggle("NX2NAVI_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -1070,6 +1081,7 @@ static void tab_screen(float scale) {
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("NX2NAVI_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
     opt_group(UI_MENU_GRAPHICS);
+    row_ambient_occlusion();
     // The game resolution needs the output and scene patch sets (resolution.c res_adjustable): Ocarina's build has
     // none and always draws its own size, so the row would change nothing
     if (res_adjustable()) row_output_res();

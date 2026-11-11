@@ -31,6 +31,7 @@
 #include "vk_gpa.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_ao.h"
 
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
@@ -758,6 +759,7 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
 int vk_exec_image_gone(VkImage image) {
     vk_exec_bc_gone(image);
     vk_hdr_image_gone(image);
+    vk_ao_image_gone(image);
     if (!views_by_image.klen) return 0;
     int purged = 0;
     for (ViewNode *n = nvn_hm_del(&views_by_image, &image), *next; n; n = next, purged++) {
@@ -3712,6 +3714,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         if (ex->mark && vk_exec_frame.draws == ex->mark_draws0) ex->mark->first[0] = vs, ex->mark->first[1] = fs;
     }
     if (!mesh) {
+        vk_ao_draw(ex);
         vk_dlaa_draw(ex);
         vk_mvsurvey_draw(ex);
         vk_mvprev_draw(ex);

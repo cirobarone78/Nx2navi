@@ -28,6 +28,7 @@
 #include "vk.h"
 #include "vk_fg.h"
 #include "vk_dlaa.h"
+#include "vk_ao.h"
 #include "vk_dlssg.h"
 
 #define FRAMES 2
@@ -1617,6 +1618,7 @@ void gfx_window_release_vk(void) {
         vk_color_release();
         vk_hdr_release();
         vk_contact_release();
+        vk_ao_release();
         free_capture();
         free_thumbs();
         for (int i = 0; i < FRAMES; i++) {

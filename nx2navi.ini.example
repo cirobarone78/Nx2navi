@@ -343,6 +343,15 @@
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr
 # sharpness = 80
+# Experimental additional screen-space ambient occlusion: off, ssao or hbao. Requires the standard Ocarina depth and
+# camera inputs; it skips when they are unavailable. It can double-darken existing shading, cannot see offscreen
+# geometry, and transparent effects may inherit the underlying depth. No temporal denoiser; costs extra GPU time.
+# Strength is 0..100 percent, radius 1..100 view-space units (not meters), quality 0 low, 1 medium, 2 high.
+# All four settings change live. HBAO here is not HBAO+, GTAO, or ray tracing.
+# ao = off
+# ao_strength = 50
+# ao_radius = 20
+# ao_quality = 1
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at

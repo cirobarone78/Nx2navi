@@ -287,6 +287,19 @@ With `--romfs <extracted RomFS folder>` it draws the game's interface textures a
 both decode the game's files, so they run with `.venv-py314\Scripts\python` (`compression.zstd` and numpy). What they
 write is decoded game data: keep it under `build/`.
 
+Ambient occlusion has game-free checks: `python tests/ambient_occlusion_menu_check.py --cc <clang++>` checks the real
+Screen rows, settings defaults, live updates and save/reload in a fresh process.
+`python tests/ambient_occlusion_record_check.py --cc <clang>` compiles the real draw/record bodies with recording
+Vulkan stubs to check input rejection, depth identity, dispatch count, push-constant layout and frame/image lifetime.
+It stubs pipeline creation and texture locking; it does not exercise a real GPU or concurrent rendering.
+`python tests/ambient_occlusion_runtime_check.py --cc <clang>` compiles the
+actual renderer's scene-selection functions and checks projection guards, camera selection, size changes and image
+retirement. `python tests/ambient_occlusion_gpu.py` compiles and dispatches the real AO shader on small synthetic
+D32F/RGBA16F images with Vulkan. It needs the test-only Python `vulkan` package, `glslc` and `spirv-val` on PATH
+(or the `GLSLC` and `SPIRV_VAL` environment variables). It covers both algorithms, flat/sloped planes, sky, nearby
+occlusion, radius rejection, invalid depth and different depth/output sizes. These checks do not launch the game or
+establish gameplay appearance or performance. See [Ambient occlusion](ambient-occlusion.md) for the rendering boundary.
+
 A change to the shared save (`runtime/save_zip.c`, `runtime/save_share.c`, the save import in `runtime/fs_host.c`)
 passes `python tests\save_zip_check.py` and `python tests\save_share_check.py`. The first builds `save_zip.c` alone
 and checks its deflate, inflate, zip writer and reader against Python's zlib and zipfile both ways, and that the
