@@ -48,6 +48,14 @@ site osolver main 38afd10 bd440d02 1e2a1002   # the same three words in the seco
 site osolver main 38afd1c 1f010800 1f218800
 site osolver main 38afd20 1e380001 1e280001
 
+# Item count popup ("8/20" over Link after a pickup: rupees, nuts, seeds, the rest): the popup's update (the function at
+# main+0xa67e50) rolls the shown count (+0x360) toward the real one (+0x35c) by max(1, |difference| / 50) times frames
+# per update each frame, truncated, and the popup closes once the two agree. Above 60 fps frames per update is under 1,
+# so the last steps truncate to 0 and the count stops one short: the popup stayed up until a frame slower than 1/60 s
+# (issue #281; a 45 fps limit cleared it). The step rounds up instead, so the count moves at least 1 a frame; it then
+# finishes a little sooner above 60 fps than at 60. w12 is written here only.
+site ostep main a68300 1e38000c 1e28000c   # fcvtzs w12, s0 -> fcvtps w12, s0 (round up)
+
 # Game image: the graphics setup (main+0x1202ce0) fills the renderer's configuration with the size of the picture the
 # game presents, 2560x1440 at every console mode (config +0x14, copied to renderer +0x9c, which main+0x346be50 reads
 # for the main render target set, main+0xf49040), and the display settings object (main+0x31f3890) stores the same size
