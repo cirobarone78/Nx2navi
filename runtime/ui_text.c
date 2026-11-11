@@ -422,7 +422,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PREWARM_XLATE] = "Translator prewarm",
     [UI_MENU_PREWARM_XLATE_DESC] = "Threads that translate known shaders at start; Automatic takes half the CPU threads, at most 16.",
     [UI_MENU_GPL] = "Graphics pipeline library",
-    [UI_MENU_GPL_DESC] = "Uses the Vulkan pipeline library extension; turn off if your driver misbehaves with it.",
+    [UI_MENU_GPL_DESC] = "Uses the Vulkan pipeline library extension. Default: off on AMD's driver for RDNA 1 and 2, "
+                         "which crashes when it links a burst of new pipelines, on elsewhere.",
     [UI_MENU_ASTC] = "ASTC texture decoding", [UI_MENU_ASTC_DESC] = "Where compressed ASTC textures are decoded.",
     [UI_MENU_ASTC_AUTO] = "Automatic", [UI_MENU_ASTC_GPU] = "GPU shader", [UI_MENU_ASTC_NATIVE] = "Native",
     [UI_MENU_ASTC_CPU] = "CPU",
@@ -984,7 +985,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PREWARM_XLATE] = "Прогрев транслятора",
     [UI_MENU_PREWARM_XLATE_DESC] = "Потоки, которые при запуске переводят известные шейдеры; «Автоматически» — половина потоков процессора, не больше 16.",
     [UI_MENU_GPL] = "Библиотека графических конвейеров",
-    [UI_MENU_GPL_DESC] = "Использует расширение Vulkan для библиотек конвейеров; выключите, если драйвер с ним сбоит.",
+    [UI_MENU_GPL_DESC] = "Использует расширение Vulkan для библиотек конвейеров. По умолчанию выключено на драйвере AMD "
+                         "для RDNA 1 и 2, который падает, когда связывает много новых конвейеров, включено везде.",
     [UI_MENU_ASTC] = "Распаковка текстур ASTC", [UI_MENU_ASTC_DESC] = "Где распаковываются сжатые текстуры ASTC.",
     [UI_MENU_ASTC_AUTO] = "Автоматически", [UI_MENU_ASTC_GPU] = "Шейдер GPU", [UI_MENU_ASTC_NATIVE] = "Аппаратно",
     [UI_MENU_ASTC_CPU] = "Процессор",
@@ -1373,7 +1375,8 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_PREWARM_XLATE] = "Pré-aquecimento do tradutor",
     [UI_MENU_PREWARM_XLATE_DESC] = "Threads que traduzem os shaders conhecidos ao iniciar; Automático usa metade das threads da CPU, no máximo 16.",
     [UI_MENU_GPL] = "Biblioteca de pipelines gráficos",
-    [UI_MENU_GPL_DESC] = "Usa a extensão de biblioteca de pipelines do Vulkan; desligue se o seu driver tiver problemas com ela.",
+    [UI_MENU_GPL_DESC] = "Usa a extensão de biblioteca de pipelines do Vulkan. Padrão: desligado no driver da AMD para "
+                         "RDNA 1 e 2, que trava ao vincular uma rajada de pipelines novos, ligado nos demais.",
     [UI_MENU_ASTC] = "Decodificação de texturas ASTC",
     [UI_MENU_ASTC_DESC] = "Onde as texturas comprimidas em ASTC são decodificadas.",
     [UI_MENU_ASTC_AUTO] = "Automático", [UI_MENU_ASTC_GPU] = "Shader da GPU", [UI_MENU_ASTC_NATIVE] = "Nativo",
@@ -2022,7 +2025,8 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PREWARM_XLATE_DESC] = "启动时转译已知着色器的线程数；自动取 CPU 线程数的一半，"
                                    "最多 16。",
     [UI_MENU_GPL] = "图形管线库",
-    [UI_MENU_GPL_DESC] = "使用 Vulkan 管线库扩展；驱动对此有问题时请关闭。",
+    [UI_MENU_GPL_DESC] = "使用 Vulkan 管线库扩展。默认：在 AMD RDNA 1 和 2 驱动上关闭，因为驱动在链接大量新管线时会崩溃，"
+                         "其他平台默认开启。",
     [UI_MENU_ASTC] = "ASTC 纹理解码",
     [UI_MENU_ASTC_DESC] = "压缩的 ASTC 纹理在哪里解码。",
     [UI_MENU_ASTC_AUTO] = "自动",

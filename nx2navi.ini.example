@@ -169,7 +169,9 @@
 # the new translator cannot translate keeps its old translation. 0: shaders the new translator has not translated yet
 # are translated before they are used (at start or when the game first draws them), as earlier versions did.
 # shader_carry = 1
-# Vulkan graphics pipeline library, 0 or 1. Default: on.
+# Vulkan graphics pipeline library, 0 or 1. Default: on, except on AMD's driver for RDNA 1 and 2 (RX 5000 and 6000
+# series), which crashes when it links a burst of new pipelines, e.g. after killing a mob; there it is off, and setting
+# gpl = 1 turns it back on if the driver handles it.
 # gpl = 1
 
 # Textures and memory.
