@@ -40,6 +40,7 @@ layout(push_constant) uniform P {
     float zprev_ok;// 1: depth_prev holds last frame's view distances at this size
     vec4 dz;       // the projection's [2][2], [2][3], [3][2], [3][3] (row-major)
     float zmask;   // the depth check's mask value (0: the vectors are checked, no mask)
+    vec2 prev_jitter; // raster offset of the previous depth and character images
 } pc;
 
 // View distance from ndc depth; 0 for the sky and other points at or past the far plane.
@@ -96,10 +97,10 @@ void main() {
         // (sub-pixel position and the depth buffer's precision); a character a step away from the wall behind it is
         // 10 % and more
         const float TOL = 0.04;
-        float cam = there > 0.0 ? miss(win + mv, there) : 1e9;
+        float cam = there > 0.0 ? miss(win + mv + pc.prev_jitter, there) : 1e9;
         if (cam > TOL) {
             moved = 1.0;
-            if (miss(win, here) < TOL) mv = vec2(0.0);   // it kept its place on screen: the followed character
+            if (miss(win + pc.prev_jitter, here) < TOL) mv = vec2(0.0);   // it kept its place on screen: the followed character
         }
     }
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
@@ -109,7 +110,7 @@ void main() {
     imageStore(chars_out, p, vec4(ch));
     float was = 0.0;
     if (pc.prev_ok > 0.5) {
-        ivec2 q = ivec2(floor(win + mv)), hi = ivec2(pc.size) - 1;
+        ivec2 q = ivec2(floor(win + mv + pc.prev_jitter)), hi = ivec2(pc.size) - 1;
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++)
                 was = max(was, imageLoad(chars_prev, clamp(q + ivec2(dx, dy), ivec2(0), hi)).r);

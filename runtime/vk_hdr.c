@@ -38,6 +38,7 @@
 #include "gfx.h"
 #include "hdr_encode_spv.h"
 #include "hdr_fullscreen_spv.h"
+#include "scene_fullscreen_spv.h"
 #include "hdr_tonemap_spv.h"
 #include "hdr_ui_spv.h"
 #include "host.h"
@@ -969,7 +970,7 @@ static VkDescriptorSetLayout set_layout(VkCtx *c, const VkDescriptorSetLayoutBin
 static VkPipelineLayout pipe_layout(VkCtx *c, VkDescriptorSetLayout *dsl, VkShaderStageFlags st, uint32_t pc) {
     VkPushConstantRange pr = {st, 0, pc};
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                     .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+                                     .pSetLayouts = dsl, .pushConstantRangeCount = pc != 0, .pPushConstantRanges = &pr};
     VkPipelineLayout l = VK_NULL_HANDLE;
     return vkCreatePipelineLayout(c->device, &li, NULL, &l) == VK_SUCCESS ? l : VK_NULL_HANDLE;
 }
@@ -1076,17 +1077,11 @@ VkImageView vk_hdr_ui_target(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     return H.menu.view;
 }
 
-static int ui_pipeline(VkCtx *c, VkFormat fmt) {
-    if (H.ui && H.ui_fmt == fmt) return 1;
-    if (H.ui) {   // another swapchain format: earlier presents may still use the old pipeline
-        vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
-        vk_queue_unlock();
-        vkDestroyPipeline(c->device, H.ui, NULL);
-        H.ui = VK_NULL_HANDLE;
-    }
-    VkShaderModule vs = module(c, hdr_fullscreen_spv, sizeof hdr_fullscreen_spv),
-                   fs = module(c, hdr_ui_spv, sizeof hdr_ui_spv);
+static VkResult fullscreen_pipeline(VkCtx *c, VkFormat fmt, VkPipelineLayout layout, const uint32_t *vertex,
+                                    size_t vertex_bytes, const uint32_t *fragment, size_t fragment_bytes,
+                                    VkBool32 blend, int counted, VkPipeline *pipeline) {
+    VkShaderModule vs = module(c, vertex, vertex_bytes),
+                   fs = module(c, fragment, fragment_bytes);
     VkPipelineShaderStageCreateInfo st[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs,
          .pName = "main"},
@@ -1096,20 +1091,21 @@ static int ui_pipeline(VkCtx *c, VkFormat fmt) {
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-                                            .viewportCount = 1, .scissorCount = 1};
+                                            .viewportCount = counted ? 0 : 1, .scissorCount = counted ? 0 : 1};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
                                                  .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
                                                  .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState ba = {
-        .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .blendEnable = blend, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .attachmentCount = 1, .pAttachments = &ba};
-    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkDynamicState dyn[2] = {counted ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT,
+                             counted ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = 2, .pDynamicStates = dyn};
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
@@ -1118,10 +1114,75 @@ static int ui_pipeline(VkCtx *c, VkFormat fmt) {
                                        .stageCount = 2, .pStages = st, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds,
-                                       .layout = H.ui_layout};
-    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, &H.ui) : VK_ERROR_UNKNOWN;
+                                       .layout = layout};
+    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, pipeline) : VK_ERROR_UNKNOWN;
     if (vs) vkDestroyShaderModule(c->device, vs, NULL);
     if (fs) vkDestroyShaderModule(c->device, fs, NULL);
+    return r;
+}
+
+static struct {
+    VkDescriptorSetLayout set;
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+    PFN_vkCmdPushDescriptorSetKHR push;
+    const GfxShader *shader;
+} grade;
+
+int vk_scene_grade_prepare(const GfxShader *shader) {
+    if (grade.shader) return grade.shader == shader && grade.pipeline;
+    grade.shader = shader;
+    VkCtx *c = vk_ctx();
+    grade.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
+    VkDescriptorSetLayoutBinding bindings[4];
+    for (unsigned i = 0; i < 4; ++i)
+        bindings[i] = (VkDescriptorSetLayoutBinding){.binding = i, .descriptorCount = 1,
+            .descriptorType = i == 1 || i == 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+    uint64_t words = 0;
+    const uint32_t *fragment = gfx_shader_spirv(shader, &words);
+    if (!fragment || !words || !grade.push || !(grade.set = set_layout(c, bindings, 4)) ||
+        !(grade.layout = pipe_layout(c, &grade.set, VK_SHADER_STAGE_FRAGMENT_BIT, 0))) return 0;
+    return fullscreen_pipeline(c, VK_FORMAT_B10G11R11_UFLOAT_PACK32, grade.layout, scene_fullscreen_spv,
+                               sizeof scene_fullscreen_spv, fragment, words * 4, VK_FALSE, 1, &grade.pipeline) == VK_SUCCESS;
+}
+
+void vk_scene_grade_record(VkCommandBuffer cb, const VkSceneGrade *g, VkImageView scene, VkImageView dst, uint32_t w, uint32_t h) {
+    VkRenderingAttachmentInfo color = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRect2D area = {{0, 0}, {w, h}};
+    VkRenderingInfo pass = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = area, .layerCount = 1,
+                            .colorAttachmentCount = 1, .pColorAttachments = &color};
+    vkCmdBeginRendering(cb, &pass);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, grade.pipeline);
+    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
+    vkCmdSetViewportWithCount(cb, 1, &vp);
+    vkCmdSetScissorWithCount(cb, 1, &area);
+    VkDescriptorImageInfo reconstructed = {g->scene.sampler, scene, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[4];
+    for (unsigned i = 0; i < 4; ++i) {
+        int sampled = i == 1 || i == 2;
+        wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pImageInfo = sampled ? (i == 1 ? &g->bloom : &reconstructed) : NULL,
+            .pBufferInfo = sampled ? NULL : (i == 0 ? &g->support : &g->uniforms)};
+    }
+    rec_push(grade.push, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, grade.layout, 0, 4, wr);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+}
+
+static int ui_pipeline(VkCtx *c, VkFormat fmt) {
+    if (H.ui && H.ui_fmt == fmt) return 1;
+    if (H.ui) {   // another swapchain format: earlier presents may still use the old pipeline
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        vkDestroyPipeline(c->device, H.ui, NULL);
+        H.ui = VK_NULL_HANDLE;
+    }
+    VkResult r = fullscreen_pipeline(c, fmt, H.ui_layout, hdr_fullscreen_spv, sizeof hdr_fullscreen_spv,
+                                     hdr_ui_spv, sizeof hdr_ui_spv, VK_TRUE, 0, &H.ui);
     if (r != VK_SUCCESS) {
         H.ui = VK_NULL_HANDLE;
         rt_log("hdr: the menu pass could not be created; the menu is not shown");
@@ -1166,6 +1227,11 @@ void vk_hdr_release(void) {
         if (H.src_view[i]) vkDestroyImageView(c->device, H.src_view[i], NULL), H.src_view[i] = VK_NULL_HANDLE;
     img_free(c, &H.out);
     img_free(c, &H.menu);
+    if (grade.pipeline) vkDestroyPipeline(c->device, grade.pipeline, NULL);
+    if (grade.layout) vkDestroyPipelineLayout(c->device, grade.layout, NULL);
+    if (grade.set) vkDestroyDescriptorSetLayout(c->device, grade.set, NULL);
+    memset(&grade, 0, sizeof grade);
+    memset(&vk_scene_grade, 0, sizeof vk_scene_grade);
     if (H.enc) vkDestroyPipeline(c->device, H.enc, NULL);
     if (H.ui) vkDestroyPipeline(c->device, H.ui, NULL);
     if (H.enc_layout) vkDestroyPipelineLayout(c->device, H.enc_layout, NULL);

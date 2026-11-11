@@ -42,6 +42,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_dlaa.h"
 
 enum { W_FORMAT, W_REGION, W_BUFFER, W_OVERLAP, W_COPY, W_CLEAR, W_QUERY, W_COUNT };
 
@@ -845,6 +846,13 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     }
     ex->recorded++;
     vk_texture_gpu_written(p->dst);
+    if (d.aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+        int whole = same_size && same_format && !s.x && !s.y && !d.x && !d.y && !sl.mipLevel && !dl.mipLevel &&
+                    !sl.baseArrayLayer && !dl.baseArrayLayer && sl.layerCount == 1 && dl.layerCount == 1 &&
+                    s.w == s.img->width && s.h == s.img->height &&
+                    d.w == d.img->width && d.h == d.img->height;
+        vk_dlaa_depth_copy(s.img->image, d.img->image, whole);
+    }
     static int lg = -1;
     if (lg < 0) lg = rt_knob("LOG_RCOND", "0");
     if (lg == 2 && (d.img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && d.w >= 1600)
