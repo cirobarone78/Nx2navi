@@ -727,6 +727,11 @@ def mask_of(img, rel):
     return out
 
 
+def note_texture(art, rel, box):
+    pic = fit(load_art(art, rel), box, (93, 93))
+    return astc_encode(bleed(pic))
+
+
 def draw_textures(data, glyph, note, art, cache):
     """Paints the action prompt's letters (from glyph) and the ocarina's note buttons (from note; both Switch button ->
     picture) into the BNTX data (a bytearray) in place. A new letter takes the height and centre of the game's own
@@ -752,8 +757,9 @@ def draw_textures(data, glyph, note, art, cache):
             assert t['fmt'] == ASTC_4X4_SRGB and (t['w'], t['h']) == (93, 93), f'{name}: format {t["fmt"]:#x}, ' \
                 f'{t["w"]}x{t["h"]}'
             box = NOTE_BOXES['shoulder' if button in 'LR' else 'disc']
-            pic = fit(load_art(art, note[button]), box, (t['w'], t['h']))
-            write_level(data, t, astc_encode(bleed(pic)), wb * 16, hb)
+            rel = note[button]
+            encoded = cache(('note', rel, box), lambda: note_texture(art, rel, box))
+            write_level(data, t, encoded, wb * 16, hb)
 
 
 # Where the game's own note buttons are opaque in their 93x93 textures (1.1.1), which the new ones fill: the face
