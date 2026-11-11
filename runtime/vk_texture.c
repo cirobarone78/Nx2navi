@@ -1357,7 +1357,9 @@ static void rel_append(Tex *e) {
     if (e->reusable && tex_reuse_on()) ru_link(e);
 }
 
+static Tex *sweep_at;   // where sweep_released goes on
 static void rel_unlink(Tex *e) {
+    if (sweep_at == e) sweep_at = e->rel_next;
     ru_unlink(e);
     rel_bytes -= e->bytes;
     if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
@@ -1742,11 +1744,45 @@ static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
 // With this rule a player's session of 30,000 frames through eight areas kept the list at its limit, dropped
 // 50,182 entries past it, and showed none of those frames (2026-11-11, a hand test; no scripted run was made).
 // When every released entry was sampled within SWEEP_UNSAMPLED presents, the one sampled longest ago goes.
+//
+// That rule holds from RELEASED_HARD entries on. Between RELEASED_MAX and RELEASED_HARD only an entry that loses
+// nothing goes: one that comes back intact or an overwritten one, released STALE_FRAMES presents ago or earlier (a
+// younger one is mostly taken back within frames). An entry whose content exists only in its image can be used again
+// long after anything sampled it. In Kokiri Forest the count stays at RELEASED_MAX, and two render targets at one
+// address (a 40x24x64 volume and a 2240x1260 picture), released at the area's load and last sampled within seconds
+// of it, went as unsampled about two minutes later; the game used them again after that, they were made again empty,
+// and one frame came out with the scene black. On an 85 s route there (Link running, six runs a batch): a black
+// frame in 10 of 24 runs with the oldest release going; in 1 of 12 with the unsampled one going (the two targets went
+// in 7 of those runs and were made again empty in 4; the black frame is one in which the sweep took a row of render
+// targets); in 0 of 18 with such entries kept. Kept, the count reached 6,200 in the runs that pass the busiest part
+// of the route early and 2,300 to 2,500 in the others; frame times and the peak of the device memory in use were the
+// same in all three forms, the device memory at the end of a run 0.3 to 0.5 GiB higher with 6,200 kept.
+// A kept entry bound into pool memory owns no memory and goes with its pool (vk_texture_range_gone); the memory of
+// the others is bounded by NX2NAVI_TEX_RELEASED_MB (drop_stale).
+// Each call looks at up to SWEEP_LOOK entries from where the last one stopped (sweep_at; rel_unlink moves it off an
+// entry that leaves): with thousands of entries that stay, a walk from the head at every release would cross them all.
 #define RELEASED_MAX 2048
+#define RELEASED_HARD 16384
+#define SWEEP_LOOK 64
 #define SWEEP_UNSAMPLED PRESENTS(120)
 
+static int comes_back_intact(const Tex *e);
+
 static void sweep_released(void) {
-    while (nreleased > RELEASED_MAX && rel_head) {
+    if (nreleased <= RELEASED_MAX) return;
+    {
+        uint64_t now = frames_now();
+        const uint64_t stale = PRESENTS(120);   // STALE_FRAMES, defined below
+        Tex *e = sweep_at ? sweep_at : rel_head;
+        for (int n = 0; n < SWEEP_LOOK && nreleased > RELEASED_MAX; n++) {
+            if (!e || now - e->rel_frame < stale) { e = rel_head; break; }   // the rest is younger: from the oldest again
+            Tex *next = e->rel_next;
+            if (comes_back_intact(e) || e->overwritten) drop_tex(e, DROP_MAX);
+            e = next;
+        }
+        sweep_at = e;
+    }
+    while (nreleased > RELEASED_HARD && rel_head) {
         uint64_t now = frames_now();
         Tex *gone = NULL, *lru = rel_head;
         for (Tex *e = rel_head; e && !gone; e = e->rel_next) {   // in release order
