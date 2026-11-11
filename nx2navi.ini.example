@@ -148,8 +148,10 @@
 # big_build_max_mb = 4096
 # 1: the log says how many pipelines came from pipeline-cache.bin; 2 also logs every compute pipeline built. 0: off.
 # pipe_feedback = 1
-# pipeline-cache.bin larger than this (MB) starts empty and is rewritten (0: no limit).
-# pipeline_cache_max_mb = 512
+# pipeline-cache.bin larger than this (MB) starts empty and is rewritten (0: no limit). Unset: from the machine, a
+# sixteenth of the installed memory and an eighth of the free commit at the start, between 512 and 4096 (16 GB
+# gives 1024, 64 GB 4096). The file is held in memory about twice at the start and once more at each save.
+# pipeline_cache_max_mb = 1024
 # 1: where the driver has VK_KHR_pipeline_binary, compiled pipelines are kept in pipeline-binaries.bin under the
 # runtime's own keys, so a renamed or updated exe starts without compiling them again (pipeline-cache.bin is then
 # not used). Default 0 (pipeline-cache.bin only) while it is being tested.

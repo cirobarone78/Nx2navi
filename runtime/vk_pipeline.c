@@ -589,6 +589,35 @@ static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
     return r;
 }
 
+// The largest pipeline-cache.bin a boot reads, in bytes; 0 no limit. NX2NAVI_PIPELINE_CACHE_MAX_MB when the player
+// sets it (0: no limit). Unset, it comes from the machine: the file sits in process memory twice at the boot (the read
+// and the driver's copy) and once more at every save, so it is bounded by an eighth of the commit headroom left now
+// and a sixteenth of the installed memory, between CACHE_CAP_MIN_MB and CACHE_CAP_MAX_MB. The fixed 512 MB it
+// replaces sat under what one session writes on a machine with room to spare: with the library warm, a 0.7.1 session
+// on a 64 GB machine wrote 2.2 GB, which every next boot threw away and compiled again. 16 GB gives 1 GB, 64 GB 4 GB.
+#define CACHE_CAP_MIN_MB 512
+#define CACHE_CAP_MAX_MB 4096
+static uint64_t cache_cap(void) {
+    const char *s = cfg_get("NX2NAVI_PIPELINE_CACHE_MAX_MB");
+    if (s && *s) {
+        uint64_t mb = strtoull(s, NULL, 10);
+        rt_log("vk_pipeline: pipeline-cache.bin read up to %s (NX2NAVI_PIPELINE_CACHE_MAX_MB)", mb ? s : "any size");
+        return mb << 20;
+    }
+    float used, total, proc_ws;
+    double proc, cused, climit;
+    plat_mem_info(&used, &total, &proc_ws);
+    plat_commit_info(&proc, &cused, &climit);
+    double mb = total > 0 ? total / 16 : CACHE_CAP_MIN_MB;
+    double room = climit > 0 && cused >= 0 ? (climit - cused) / 8 : -1;
+    if (room >= 0 && room < mb) mb = room;
+    if (mb < CACHE_CAP_MIN_MB) mb = CACHE_CAP_MIN_MB;
+    if (mb > CACHE_CAP_MAX_MB) mb = CACHE_CAP_MAX_MB;
+    rt_log("vk_pipeline: pipeline-cache.bin read up to %.0f MB (from %.0f MB installed and %.0f MB of commit headroom; "
+           "NX2NAVI_PIPELINE_CACHE_MAX_MB sets it)", mb, total, room >= 0 ? room * 8 : -1.0);
+    return (uint64_t)mb << 20;
+}
+
 // Cache data whose header names another device or driver is dropped before Vulkan sees it.
 static void cache_load(VkCtx *c) {
     cache_path_init();
@@ -604,6 +633,17 @@ static void cache_load(VkCtx *c) {
         fseek(f, 0, SEEK_END);
         long len = ftell(f);
         fseek(f, 0, SEEK_SET);
+        // A file over the cap (cache_cap) starts the run empty, and the run's saves replace it. The file only grows:
+        // entries of earlier translators and builds stay, and on NVIDIA (621.01) an entry another executable wrote is
+        // neither used nor written again, so a renamed or updated exe compiles while the file keeps its size
+        // (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). Checked before the read, so a file that is
+        // dropped never takes its size in memory.
+        uint64_t cap = cache_cap();
+        if (len > 0 && cap && (uint64_t)len > cap) {
+            rt_log("vk_pipeline: %s holds %.0f MB, over the %llu MB it may hold: starting empty; this run rewrites it",
+                   P.cache_path, len / 1048576.0, (unsigned long long)(cap >> 20));
+            len = 0;
+        }
         if (len > (long)sizeof(VkPipelineCacheHeaderVersionOne) && (data = malloc((size_t)len)) &&
             fread(data, 1, (size_t)len, f) == (size_t)len)
             size = (size_t)len;
@@ -613,18 +653,6 @@ static void cache_load(VkCtx *c) {
         if (size && (h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != c->props.vendorID ||
                      h.deviceID != c->props.deviceID || memcmp(h.pipelineCacheUUID, c->props.pipelineCacheUUID, VK_UUID_SIZE))) {
             rt_log("vk_pipeline: %s was written by another device or driver; starting empty", P.cache_path);
-            size = 0;
-        }
-        // NX2NAVI_PIPELINE_CACHE_MAX_MB (default 512; 0 no limit): a larger file starts the run empty, and the run's
-        // saves replace it. The file only grows: entries of earlier translators and builds stay, and on NVIDIA
-        // (621.01) an entry another executable wrote is neither used nor written again, so a renamed or updated exe
-        // compiles while the file keeps its size (2026-11-09: 650 MB, 15-18 % of the pipelines read from it). The
-        // whole file sits in process memory twice at the boot (this read and the driver's copy) and is copied out
-        // at every save, which a 16 GB machine near its commit limit cannot spare.
-        uint64_t cap = (uint64_t)strtoull(cfg_value("NX2NAVI_PIPELINE_CACHE_MAX_MB"), NULL, 10) << 20;
-        if (size && cap && size > cap) {
-            rt_log("vk_pipeline: %s holds %.0f MB, over NX2NAVI_PIPELINE_CACHE_MAX_MB %llu: starting empty; this run "
-                   "rewrites it", P.cache_path, size / 1048576.0, (unsigned long long)(cap >> 20));
             size = 0;
         }
     }

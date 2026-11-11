@@ -243,7 +243,7 @@ static const CfgMeta metas[] = {
     {"LIB_WARM", "1", "0|1|force", RESTART},   // vk_pipeline.c lw_start: the driver's cache of stage libraries, warmed when cold
     {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "1", "0|1", RESTART},
     {"LIB_PREBUILD_BIG_BG", "1", "0|1", RESTART}, {"PIPE_FEEDBACK", "1", "0|1|2", RESTART},
-    {"PIPELINE_CACHE_MAX_MB", "512", "0..65536", RESTART}, {"PIPE_BINARIES", "0", "0|1", RESTART}, {"ONESHOT_WAIT_MS", "30000", "0..60000", RESTART}, {"ONESHOT_BUDGET", "0", "0|1", RESTART}, {"PIPE_BINARIES_MAX_MB", "1024", "0..65536", RESTART}, {"BIG_BUILD_FREE_MB", "8192", "0..262144", RESTART},
+    {"PIPELINE_CACHE_MAX_MB", "", "0..65536", RESTART}, {"PIPE_BINARIES", "0", "0|1", RESTART}, {"ONESHOT_WAIT_MS", "30000", "0..60000", RESTART}, {"ONESHOT_BUDGET", "0", "0|1", RESTART}, {"PIPE_BINARIES_MAX_MB", "1024", "0..65536", RESTART}, {"BIG_BUILD_FREE_MB", "8192", "0..262144", RESTART},
     {"BIG_BUILD_MAX_MB", "4096", "0..262144", RESTART},
     // all|<count>: the compute pipelines the boot keeps, those dispatched most recently (vk_pipeline.c, compute-used.bin)
     {"COMPUTE_KEEP", "512", NULL, RESTART},
