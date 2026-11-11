@@ -19,6 +19,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "layout.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
 #include "platform/platform.h"
@@ -1469,6 +1470,62 @@ void vk_exec_ahead(VkExec *ex) {
     }
 }
 
+static int scene_record(const op_hdr *h, size_t payload) {
+    return h->size >= sizeof(*h) + payload && !(h->size & 7) && h->op < OP_COUNT_;
+}
+
+static int scene_clear(const p_clear_tex *p, int format) {
+    return p->tex && p->tex->d.format == format && p->mask == 15 &&
+           !p->r.xoffset && !p->r.yoffset && !p->r.zoffset && p->r.depth == 1 &&
+           p->r.width == (int)p->tex->d.width && p->r.height == (int)p->tex->d.height &&
+           !p->c.u[0] && !p->c.u[1] && !p->c.u[2] && !p->c.u[3];
+}
+
+// The 1.1.1 scene scaler records both SMAA clears, three SMAA dispatches and a tensor
+// dispatch in one command list. Verify the complete sequence before replacing any GPU
+// work. Bindings and buffer updates still replay so subsequent commands inherit their state.
+static const op_hdr *scene_scaler(VkExec *ex, const op_hdr *first) {
+    if (!vk_dlaa_scene_wanted() || !scene_record(first, sizeof(p_clear_tex))) return NULL;
+    const p_clear_tex *clear = nvn_op_payload(first);
+    if (!scene_clear(clear, NVN_FORMAT_RG16UI) || rt_game_version != 111) return NULL;
+    const op_hdr *h = nvn_op_next(first);
+    if (!scene_record(h, sizeof(p_clear_tex)) || h->op != OP_CLEAR_TEX || !scene_clear(nvn_op_payload(h), NVN_FORMAT_RGBA8)) return NULL;
+    const uint32_t sites[] = {0x14e3a4c, 0x14e3a94, 0x14e3b24, 0x251bc0};
+    unsigned dispatch = 0;
+    uint64_t source = 0, destination = 0;
+    for (int i = 0; i < 64; ++i) {
+        h = nvn_op_next(h);
+        if (!scene_record(h, 0)) return NULL;
+        const void *a = nvn_op_payload(h);
+        switch (h->op) {
+        case OP_BIND_TEX: case OP_BIND_IMG: {
+            if (!scene_record(h, offsetof(p_bind_handles, h))) return NULL;
+            const p_bind_handles *b = a;
+            if (b->stage != NVN_SHADER_STAGE_COMPUTE || b->n <= 0 || b->n > 32 || b->first < 0) return NULL;
+            if (!scene_record(h, offsetof(p_bind_handles, h) + (size_t)b->n * sizeof(b->h[0]))) return NULL;
+            if (!dispatch && h->op == OP_BIND_TEX && b->first <= 3 && 3 - b->first < b->n)
+                source = b->h[3 - b->first];
+            if (dispatch == 3 && h->op == OP_BIND_IMG && b->first <= 1 && 1 - b->first < b->n)
+                destination = b->h[1 - b->first];
+            break;
+        }
+        case OP_DISPATCH: case OP_DISPATCH_IND: {
+            int indirect = h->op == OP_DISPATCH_IND;
+            if (!scene_record(h, indirect ? sizeof(p_dispatch_ind) : sizeof(p_dispatch))) return NULL;
+            uint64_t caller = indirect ? ((const p_dispatch_ind *)a)->caller : ((const p_dispatch *)a)->caller;
+            if (indirect != (dispatch == 1) || caller != MOD_MAIN_BASE + sites[dispatch]) return NULL;
+            if (++dispatch == 4)
+                return source && destination && vk_dlaa_scene_resolve(ex, source, destination) ? h : NULL;
+            break;
+        }
+        case OP_PUSH_CC: case OP_BIND_SSBO: case OP_BIND_UBO: case OP_BIND_PROGRAM: case OP_BARRIER: break;
+        case OP_CLEAR_BUF: if (dispatch != 3) return NULL; break;
+        default: return NULL;
+        }
+    }
+    return NULL;
+}
+
 // Ops that only store state or draw: nothing they record runs outside a pass, and the walk goes on with the op after
 // them. Counter reports and resets are among them: they close and open an occlusion query inside the pass, and the
 // value reaches guest memory from the completion thread once the submission's fence has passed (vk_exec_xfer.c
@@ -1535,12 +1592,19 @@ int vk_exec_mesh_run(const void *cur, const void **out, int max) {
 }
 
 static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
+    const op_hdr *scene_end = NULL;
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
         AH.at[depth] = h, AH.depth = depth;   // where vk_exec_ahead reads on from
         if (!op_linear(h->op)) vk_exec_brk++;
+        if (!scene_end && h->op == OP_CLEAR_TEX) scene_end = scene_scaler(ex, h);
+        if (scene_end && (h->op == OP_CLEAR_TEX || h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND)) {
+            if (h == scene_end) scene_end = NULL;
+            h = nvn_op_next(h);
+            continue;
+        }
         switch (h->op) {
         case OP_END: return NULL;
         case OP_BEGIN: break;
