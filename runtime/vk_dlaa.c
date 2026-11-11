@@ -486,6 +486,7 @@ static struct {
     NgxParam *params;
     int failed, reset;
     uint64_t evals, frames_missed;
+    uint64_t evaluated_extent; // successful render/output widths, shared with the present thread
     int share_off;   // frames left that pick the output pass without the mode's share (vk_dlaa_pass, vk_dlaa_frame)
     // jitter (vk_dlaa_viewport)
     VkImage jdepth;              // the scene depth of the last frame DLAA ran on: passes drawing with it are jittered
@@ -1808,6 +1809,7 @@ evaluated:
     D.last = e, e->used = D.evals + 1;
     if (D.evals % 600 == 0) query_vram();
     stale_sizes(e);
+    __atomic_store_n(&D.evaluated_extent, ((uint64_t)w << 32) | ow, __ATOMIC_RELAXED);
     full_barrier(cb);
     vk_mvcheck_output(cb, e->out, ow, oh);   // NX2NAVI_MV_CHECK (test)
     // the result into the scene target (DLAA: the bloom, the post passes and the HUD read it and draw over it) or into
@@ -2043,16 +2045,27 @@ void vk_dlaa_pass(VkExec *ex) {
 // texture bias that goes with it while DLSS runs.
 static void dlss_mode(void) {
     static char mode[32];
-    static int bias_on = -1;
+    static float previous_bias;
     const char *m = dynres_override();   // dynamic resolution's step (dynres.c) while it differs from the setting
     if (!m) m = cfg_value("NX2NAVI_DLSS");
     if (strcmp(m, mode)) {
         snprintf(mode, sizeof mode, "%s", m);
         res_dlss_mode(m);
-        bias_on = -1;
     }
-    int b = dl_active();
-    if (b != bias_on) bias_on = b, vk_sampler_dlss_bias(b ? res_dlss_lod_bias() : 0.0f);
+    float bias = 0;
+    if (dl_active()) {
+        uint64_t extent = __atomic_load_n(&D.evaluated_extent, __ATOMIC_RELAXED);
+        uint32_t w = extent >> 32, ow = (uint32_t)extent;
+        if (use_fsr()) bias = res_dlss_lod_bias();
+        else if (w && w <= ow) bias = log2f((float)w / ow) - 1.0f;
+    } else {
+        __atomic_store_n(&D.evaluated_extent, 0, __ATOMIC_RELAXED);
+    }
+    if (bias != previous_bias) {
+        vk_sampler_dlss_bias(bias);
+        rt_log("dlaa: material mip bias %.3f", bias);
+        previous_bias = bias;
+    }
 }
 
 
