@@ -260,7 +260,8 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
 // Turning generation on or off is an slDLSSGSetOptions call and Streamline's own rebuild, and it can be seen: around a
 // menu, a fade or a swapchain change the depth and motion-vector views come and go for a frame or two. Following them
 // frame by frame switched generation off and on dozens of times a second (a run logged 32 changes, in pairs, a frame
-// apart), so a change waits until the new state has held for FG_SETTLE_FRAMES frames.
+// apart). Wait for FG_SETTLE_FRAMES before resuming or changing mode for a menu. Losing the inputs must suspend
+// generation on that present: its depth and motion tags were valid only through the previous present.
 #define FG_SETTLE_FRAMES 12
 
 void vk_dlssg_frame_start(void) {
@@ -289,8 +290,13 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
     VkDlaaCamera c;
     float jx = 0, jy = 0;
     int reset = 0;
-    int have = vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset) && vk_dlaa_fg_views(&dv, &mvv) && vk_dlaa_fg_camera(&c);
-    int want = have && !menu_is_open();
+    if (!vk_dlaa_fg_inputs(&d, &m, &jx, &jy, &reset) || !vk_dlaa_fg_views(&dv, &mvv) || !vk_dlaa_fg_camera(&c)) {
+        S.mode = S.pending = 0;
+        __atomic_store_n(&S.shown_mult, 1, __ATOMIC_RELAXED);
+        S.frame(cb, NULL, NULL, NULL, NULL, ext.width, ext.height, 0, S.cur);
+        return;
+    }
+    int want = !menu_is_open();
     if (want == S.mode) S.pending = 0;
     else if (++S.pending >= FG_SETTLE_FRAMES) { S.mode = want; S.pending = 0; }
     else want = S.mode;   // hold the state it has until the new one stays
@@ -302,17 +308,15 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
     Nx2SlCamera k;
     memset(&k, 0, sizeof k);
-    if (have) {
-        memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
-        memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
-        memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
-        k.jitter[0] = jx, k.jitter[1] = jy;
-        k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
-        k.reset = reset;
-    }
+    memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
+    memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
+    memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
+    k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+    k.jitter[0] = jx, k.jitter[1] = jy;
+    k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
+    k.reset = reset;
     // the frames to generate between two rendered ones: the multiplier less the rendered one, 0 off
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
+    S.frame(cb, &zd, &zm, NULL, &k, ext.width, ext.height, on ? mult - 1 : 0, S.cur);
 }
 
 void vk_dlssg_release(void) {
