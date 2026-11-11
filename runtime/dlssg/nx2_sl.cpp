@@ -20,6 +20,7 @@
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -151,10 +152,20 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     sl::DLSSGState s{};
     if (g_available && p_dlssg_state && p_dlssg_state(sl::ViewportHandle(0), s, nullptr) == sl::Result::eOk)
         g_max.store(s.numFramesToGenerateMax);
-    if (!g_available) say("dlssg: DLSS Frame Generation not available on this GPU or driver");
+    if (!g_available) say("dlssg: frame generation unavailable (DLSS-G plugin loaded: %d, DLSS-G options: %d, PCL marker: %d)",
+                          loaded, p_dlssg_options != nullptr, p_marker != nullptr);
     else if (g_max.load()) say("dlssg: DLSS Frame Generation available, up to %ux", g_max.load() + 1);
     else say("dlssg: DLSS Frame Generation available (its most frames per rendered frame not reported yet)");
     return g_available;
+}
+
+extern "C" NX2SL_API void nx2sl_log_unavailable(VkPhysicalDevice physical) {
+    auto supported = proc<PFun_slIsFeatureSupported>("slIsFeatureSupported");
+    if (!supported) return say("dlssg: Streamline has no adapter support query");
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = physical;
+    sl::Result r = supported(sl::kFeatureDLSS_G, adapter);
+    say("dlssg: frame generation support on the selected Vulkan adapter: %s (%d)", sl::getResultAsStr(r), (int)r);
 }
 
 // Streamline sets Reflex's mode on the swapchain it was told of last (VK_NV_low_latency2) and drops it while there is

@@ -10,7 +10,7 @@ VkResult vk_dlssg_create_instance(const VkInstanceCreateInfo *ci, VkInstance *ou
 VkResult vk_dlssg_enumerate(VkInstance inst, uint32_t *n, VkPhysicalDevice *pd);   // through the interposer too
 PFN_vkVoidFunction vk_dlssg_instance_proc(VkInstance inst, const char *name);   // the interposer's, or NULL
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
-void vk_dlssg_device_ready(VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
+void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev);   // after the device: checks DLSS-G and takes the swapchain hooks
 PFN_vkGetDeviceProcAddr vk_dlssg_dpa(void);   // Streamline's device entry points, or NULL when it is not in use
 int vk_dlssg_active(void);
 // gfx_present.c's swapchain calls while active
@@ -44,7 +44,7 @@ int vk_dlssg_multiplier_max(int *old_dll);
 // (the menu). frame_rate.c paces the game at the frame limit over it. Any thread.
 int vk_dlssg_multiplier(void);
 // Why DLSS-G runs or not: DLSSG_NOT_WANTED (NX2NAVI_FRAMEGEN was not dlss at start, or no DLSS or FSR 3.1 upscaling),
-// DLSSG_NO_FILES (nx2navi_dlssg.dll, Streamline or its swapchain hooks missing or failing), DLSSG_NO_GPU (Streamline
-// loaded, but DLSS-G does not run on this GPU or driver).
-enum { DLSSG_NOT_WANTED, DLSSG_RUNS, DLSSG_NO_FILES, DLSSG_NO_GPU };
+// DLSSG_NO_FILES (nx2navi_dlssg.dll, Streamline or its swapchain hooks missing or failing), DLSSG_UNAVAILABLE (Streamline
+// loaded but DLSS-G or a required plugin function was unavailable).
+enum { DLSSG_NOT_WANTED, DLSSG_RUNS, DLSSG_NO_FILES, DLSSG_UNAVAILABLE };
 int vk_dlssg_status(void);

@@ -480,7 +480,7 @@ static int create_device(void) {
     VkResult r = vk_dlssg_create_device(g_vk.instance, g_vk.phys, &di, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
-    vk_dlssg_device_ready(g_vk.device);
+    vk_dlssg_device_ready(g_vk.phys, g_vk.device);
     if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
         vk_dpa = vk_dlssg_dpa();
         rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");

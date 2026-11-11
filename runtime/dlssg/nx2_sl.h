@@ -44,6 +44,8 @@ typedef PFN_vkGetInstanceProcAddr (*PFN_nx2sl_instance_proc)(void);
 typedef PFN_vkGetDeviceProcAddr (*PFN_nx2sl_device_proc)(void);
 // 1 when DLSS-G loaded and supports this GPU (after the device exists)
 typedef int (*PFN_nx2sl_available)(void);
+// Optional: log Streamline's support result on the selected Vulkan device after availability failed.
+typedef void (*PFN_nx2sl_log_unavailable)(VkPhysicalDevice physical);
 // Reflex's low-latency mode, 0 off, 1 on, 2 on with boost: after the device, and after each swapchain the game creates
 // through the interposer (the mode is the swapchain's)
 typedef void (*PFN_nx2sl_reflex)(int mode);

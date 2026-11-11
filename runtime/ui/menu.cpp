@@ -1037,7 +1037,7 @@ static void row_framegen(void) {
     // NVIDIA's set since the start but not running: "in use: off" and why (vk_dlssg_status; the log has the details).
     // Through NGX that is NVIDIA's frame generation library missing beside the game, or a GPU it does not run on.
     const int st = cur != 2 || restart ? DLSSG_RUNS : ngx ? (vk_ngxfg_max() ? DLSSG_RUNS : DLSSG_NO_FILES) : vk_dlssg_status();
-    if (st == DLSSG_NO_GPU) note = UI_MENU_FRAMEGEN_OFF_GPU;
+    if (st == DLSSG_UNAVAILABLE) note = UI_MENU_FRAMEGEN_UNAVAILABLE;
     else if (st == DLSSG_NO_FILES) note = UI_MENU_FRAMEGEN_OFF_FILES;
     int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, at, 0, desc, menu_text(note));
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN", values[nv]);
