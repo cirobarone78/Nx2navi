@@ -695,7 +695,9 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
 // CPU side effects of its fence may still be to come. 1 when reached.
 int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
-    if (!vk_sync_wb_split()) return vk_sync_fence_wait(value, timeout_ns);
+    // A shadow pool reaches guest memory in a completion callback. Returning at the
+    // execution timeline can let the guest reuse the pool before an older writeback.
+    if (vk_mem_shadow_storage() || !vk_sync_wb_split()) return vk_sync_fence_wait(value, timeout_ns);
     if (__atomic_load_n(&done, __ATOMIC_ACQUIRE) >= value) return 1;
     uint64_t p0 = perf_begin();
     hold_release(value, 0, 0);   // a held submission the waiter needs goes to the queue now
