@@ -332,6 +332,9 @@ void vk_mem_lazy_handed(void);
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
 void vk_mem_shadow_sync(void);
+// Record time: a shader of the submission being recorded reads the device address table, so the next
+// vk_mem_shadow_sync brings the CPU's writes into every shadow the table names (once per guest submission).
+void vk_mem_shadow_table_read(void);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
 // The same for a GPU write into a VRAM mirror, which went back to guest memory with the submission: the texture checks

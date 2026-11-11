@@ -1367,6 +1367,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     // earlier in the frame, and Kokiri Forest's lit areas went black. A pool read only through the table is rarely a
     // mirrored one (mirrors are made for pools bound as buffers, which sync then).
     if (r->cbuf_slot == VK_GPA_CB_SLOT) {
+        vk_mem_shadow_table_read();   // shadow storage: the table's shadows are synced before this part is submitted
         VkDescriptorBufferInfo t = vk_gpa_info();
         return t.buffer ? t : (VkDescriptorBufferInfo){Z.zbuf, 0, VK_WHOLE_SIZE};
     }

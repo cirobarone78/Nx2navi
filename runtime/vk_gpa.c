@@ -36,6 +36,8 @@
 // NX2NAVI_GPA=0 turns the table off: the translator is told the host has no device addresses (those accesses read 0).
 // NX2NAVI_GPA_EMPTY=1 keeps it empty, so every access through it reads the zero buffer (diagnosis).
 // Mirrored pools are not synced for the table's readers (vk_exec_draw.c ssbo_info says why).
+// With shadow storage the records name the shadows, which vk_memory.c keeps up to date for the table's readers once per
+// guest submission (vk_mem_shadow_sync); the GPU's writes through the table stay in the shadow.
 #include <stdlib.h>
 #include <string.h>
 
