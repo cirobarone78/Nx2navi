@@ -4816,10 +4816,53 @@ static uint32_t *spirv_fog_keep_froxels(const uint32_t *w, uint64_t n) {
     return o;
 }
 
+// Successful cache-only warm requests. Input ids can differ while their final SPIR-V and pipeline layouts match.
+// Only preparation that destroys its pipeline may reuse these entries; a dispatch still needs its own live handle.
+// The code is hashed after overrides and fog changes. Subgroup requirements follow that code and the fixed device
+// capabilities. Layout handles and creation flags distinguish otherwise identical shader modules.
+typedef struct {
+    uint8_t code[32];
+    VkPipelineLayout layout;
+    uint64_t words;
+    VkPipelineCreateFlags flags;
+    VkPipelineShaderStageCreateFlags stage_flags;
+} ComputeWarmKey;
+typedef struct ComputeWarmEntry {
+    ComputeWarmKey key;
+    struct ComputeWarmEntry *next;
+} ComputeWarmEntry;
+#define COMPUTE_WARM_BUCKETS 1024
+static ComputeWarmEntry *compute_warm[COMPUTE_WARM_BUCKETS];
+static PlatMutex compute_warm_lock = PLAT_MUTEX_INIT;
+static uint64_t compute_warm_reused;
+
+// No in-flight entries: concurrent identical requests may both build, but a failed request never suppresses a retry.
+static int compute_warm_remember(const ComputeWarmKey *key, int completed) {
+    uint64_t h = fnv(FNV0, key, sizeof *key);
+    plat_mutex_lock(&compute_warm_lock);
+    ComputeWarmEntry **head = &compute_warm[h % COMPUTE_WARM_BUCKETS], *e = *head;
+    while (e && memcmp(&e->key, key, sizeof *key)) e = e->next;
+    int have = e != NULL;
+    if (!have && completed && (e = malloc(sizeof *e))) e->key = *key, e->next = *head, *head = e;
+    plat_mutex_unlock(&compute_warm_lock);
+    return have;
+}
+
+static void compute_warm_clear(void) {
+    for (size_t i = 0; i < COMPUTE_WARM_BUCKETS; i++) {
+        for (ComputeWarmEntry *e = compute_warm[i], *n; e; e = n) n = e->next, free(e);
+        compute_warm[i] = NULL;
+    }
+}
+
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
 // cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
 // neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
-static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only) {
+// already_warm is only supplied by callers that need cache coverage, not a live pipeline: 1 and VK_NULL_HANDLE mean
+// an identical request already succeeded in this process. NULL preserves normal creation and has no hashing cost.
+// NX2NAVI_COMPUTE_WARM_REUSE=0 disables this reuse for comparisons without changing the prepared inventory.
+static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only, int *already_warm) {
+    if (already_warm) *already_warm = 0;
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     uint64_t ow = 0;
@@ -4842,12 +4885,28 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     uint32_t lx = local_size_x(code, words);
     if (P.f_full_subgroups && vk_caps.sg_size && lx && lx % vk_caps.sg_size == 0 && uses_subgroup_ops(code, words))
         ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    ComputeWarmKey warm_key = {0};
+    const char *reuse = already_warm ? cfg_get("NX2NAVI_COMPUTE_WARM_REUSE") : NULL;
+    int remember = already_warm && (!reuse || strcmp(reuse, "0"));
+    if (remember) {
+        rt_sha256(code, (size_t)words * 4, warm_key.code);
+        warm_key.layout = l->layout, warm_key.words = words;
+        warm_key.flags = ci.flags, warm_key.stage_flags = ci.stage.flags;
+        if (compute_warm_remember(&warm_key, 0)) {
+            *already_warm = 1;
+            __atomic_fetch_add(&compute_warm_reused, 1, __ATOMIC_RELAXED);
+            vkDestroyShaderModule(P.device, m, NULL);
+            free(over);
+            return VK_NULL_HANDLE;
+        }
+    }
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipelineCreationFeedbackCreateInfo fci;
     VkPipelineCreationFeedback fb;
     ci.pNext = fb_chain(&fci, &fb, ci.pNext);
     crash_note("a compute pipeline", cs, NULL, NULL);
     if (pipe_create(2, &ci, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (pipe && remember) compute_warm_remember(&warm_key, 1);
     plat_crash_context(NULL);
     if (pipe) fb_note(FB_COMPUTE, &fb);
     cc_hit = !pipe ? -1 : pb_last ? 1
@@ -5390,7 +5449,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             plat_mutex_unlock(&P.lock);   // the compile runs without the lock
             uint64_t p0 = perf_begin();
             double c0 = now_ms();
-            pipe = compute_create(cs, l, 0);
+            pipe = compute_create(cs, l, 0, NULL);
             double cms = now_ms() - c0;
             int hit = cc_hit;
             perf_end(PERF_PIPE, p0);
@@ -5640,7 +5699,7 @@ static void bg_main(void *arg) {
         if (P.cache && vkCreatePipelineCache(P.device, &oci, NULL, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
         double t0 = now_ms();
         own_cache = own;   // without one the build goes into P.cache as before
-        VkPipeline pipe = compute_create(cs, l, 0);
+        VkPipeline pipe = compute_create(cs, l, 0, NULL);
         own_cache = VK_NULL_HANDLE;
         double ms = now_ms() - t0;
         if (held >= 0) gate_leave(held);
@@ -5684,7 +5743,7 @@ static void bg_start(void) {
 // keep 0: the pipeline is built for the pipeline cache only and destroyed at once, unless a dispatch came to wait for
 // it meanwhile; a shader over LB.big_words is then not built at all (comment at compute-used.bin). cs may be a copy
 // the caller releases afterwards when keep is 0: nothing here holds on to it then.
-static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
+static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep, int private_shader) {
     struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
@@ -5727,7 +5786,10 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     } else if (LB.idle) {
         plat_thread_priority(PLAT_PRIO_NORMAL);
     }
-    VkPipeline pipe = compute_create(cs, l, big);
+    int reused = 0;
+    // A private shader cannot have a dispatch waiting on its cs_flight slot. Shared/kept shaders always create their
+    // handle so a dispatch that arrives while the build is in flight still receives the pipeline it is waiting for.
+    VkPipeline pipe = compute_create(cs, l, big, !keep && private_shader ? &reused : NULL);
     double ms = now_ms() - t0;
     int compiled = pipe && cc_hit != 1, kept = 0;
     lb_lock();
@@ -5747,7 +5809,7 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     lb_unlock();
     if (!pipe && big && bg_on()) bg_queue(cs, iid, words);
     else if (!pipe && big) lb_defer(iid, words);
-    else lb_count(2, !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
+    else lb_count(2, reused ? 1 : !pipe ? 2 : have ? 1 : kept ? 0 : 3, ms);
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -5882,7 +5944,7 @@ static void lb_worker(void *arg) {
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh, LB.e[i].iid, keep);
+            lb_compute(sh, LB.e[i].iid, keep, owned);
         } else if (!owned && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
             if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);   // a kept library points at sh: never a copy
             else lb_skip_lib();
@@ -6206,9 +6268,10 @@ static void lb_warm_worker(void *arg) {
             Layout *l = compute_layout(sh, &B, &why);
             lb_unlock();
             double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
+            int reused = 0;
+            VkPipeline pipe = l ? compute_create(sh, l, 0, &reused) : VK_NULL_HANDLE;
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-            lb_count(2, pipe ? 3 : 2, now_ms() - t0);
+            lb_count(2, reused ? 1 : pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, st == GFX_STAGE_VS, 0);
             else lb_skip_lib();
@@ -6794,6 +6857,9 @@ static int cache_save(uint32_t wait_ms) {
 // Returns cache_save's answer.
 static int save_with(uint32_t wait_ms) {
     if (P.ready) keys_flush(), pb_flush(), cu_flush(), cf_log();
+    uint64_t reused = __atomic_load_n(&compute_warm_reused, __ATOMIC_RELAXED);
+    if (reused) rt_log("vk_pipeline: %llu duplicate compute warm requests reused a successful identical request",
+                       (unsigned long long)reused);
     if (P.ready && P.gpl) {
         rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers, %llu of those by the library workers for skipped draws; "
                "%llu of pipelines with a feedback loop; avg %.2f ms, "
@@ -6911,6 +6977,7 @@ void vk_pipeline_autosave(void) {
 void vk_pipeline_shutdown(void) {
     if (!P.ready) return;
     lb_stop();
+    compute_warm_clear();
     workers_drain();   // jobs point at layouts and Pipe entries freed below
     vk_pipeline_save();
     plat_mutex_lock(&P.lock);

@@ -1490,13 +1490,15 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control, uint8_t *options_hash) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
-    o += sprintf(o, "\",\"stage\":\"%s\",\"debug\":false,\"code\":\"", stage);
+    o += sprintf(o, "\",\"code\":\"");
     json_esc(&o, code_path);
-    o += sprintf(o, "\",\"c1\":\"");
+    o += sprintf(o, "\",");
+    const char *options = o;
+    o += sprintf(o, "\"stage\":\"%s\",\"debug\":false,\"c1\":\"", stage);
     for (uint32_t i = 0; i < c1_len; i++) o += sprintf(o, "%02x", c1[i]);
     o += sprintf(o, "\"");
     if (a) {
@@ -1570,6 +1572,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             if (end >= 8 * (ntex + nimg)) o += sprintf(o, ",\"nvn2_table\":[%d,%d,%d]", end - 8 * (ntex + nimg), ntex, nimg);
         }
     }
+    if (options_hash) rt_sha256(options, (size_t)(o - options), options_hash);
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
     o += sprintf(o, "\"}");
@@ -1902,8 +1905,90 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
 
 // ---- translation
 
+typedef struct PreparedJobs PreparedJobs;
+static _Thread_local PreparedJobs *preparing;
+
+// Only preparation workers share translator results. Logical shader and input IDs continue to include the full
+// guest program. The child sees the bytes of the code file and the serialized options in build_request.
+typedef struct PreparedJob {
+    struct PreparedJob *next;
+    uint8_t digest[32];
+    PlatCond done;
+    int busy, ready;
+    char cache_key[65], reflection_key[65];
+} PreparedJob;
+
+struct PreparedJobs {
+    PlatMutex lock;
+    PreparedJob *buckets[BUCKETS];
+    volatile int64_t reused;
+};
+
+// One worker owns a cold request. A failed owner leaves it available for the next worker to retry.
+static PreparedJob *prepared_enter(const uint8_t options_hash[32], const uint8_t *bytes, size_t n, PreparedJob **owner) {
+    uint8_t parts[3][32], digest[32];
+    memcpy(parts[0], xlate_id, 32);
+    rt_sha256(bytes, n, parts[1]);
+    memcpy(parts[2], options_hash, 32);
+    rt_sha256(parts, sizeof parts, digest);
+    uint32_t slot;
+    memcpy(&slot, digest, sizeof slot);
+    PreparedJob **bucket = &preparing->buckets[slot % BUCKETS];
+    plat_mutex_lock(&preparing->lock);
+    PreparedJob *j = *bucket;
+    while (j && memcmp(j->digest, digest, 32)) j = j->next;
+    if (!j && (j = calloc(1, sizeof *j))) {
+        memcpy(j->digest, digest, 32);
+        plat_cond_init(&j->done);
+        j->next = *bucket;
+        *bucket = j;
+    }
+    if (j) {
+        while (j->busy) plat_cond_wait(&j->done, &preparing->lock);
+        if (!j->ready) {
+            j->busy = 1;
+            *owner = j;
+        }
+    }
+    plat_mutex_unlock(&preparing->lock);
+    return *owner ? NULL : j;
+}
+
+static void prepared_finish(PreparedJob *owner, const GfxShader *s, const uint8_t request_key[32]) {
+    plat_mutex_lock(&preparing->lock);
+    if (s) {
+        key_hex(s->key, owner->cache_key);
+        key_hex(request_key, owner->reflection_key);
+        owner->ready = 1;
+    }
+    owner->busy = 0;
+    plat_cond_broadcast(&owner->done);
+    plat_mutex_unlock(&preparing->lock);
+}
+
+// Copy the unmodified disk SPIR-V. disk_load_from applies the per-install HDR substitution in memory.
+// The translator embeds its job key in reflection, so each logical job gets the key it would have emitted.
+static GfxShader *prepared_copy(const PreparedJob *j, const Req *r, const char *hex, const char *spv, const char *res) {
+    char path[PATH_CAP + 80];
+    uint64_t ns = 0, nr = 0;
+    snprintf(path, sizeof path, "%s/%s.res.json", cache_dir, j->cache_key);
+    uint8_t *reflection = read_file(path, &nr);
+    if (!reflection) return NULL;
+    const char *end = (char *)reflection + nr;
+    const char *id = json_key((char *)reflection, end, "key");
+    if (!id || end - id < 66 || *id != '"' || id[65] != '"' || memcmp(id + 1, j->reflection_key, 64))
+        return free(reflection), NULL;
+    memcpy((char *)id + 1, hex, 64);
+    snprintf(path, sizeof path, "%s/%s.spv", cache_dir, j->cache_key);
+    uint8_t *raw = read_file(path, &ns);
+    int ok = raw && plat_file_write_cached(spv, raw, (size_t)ns) && plat_file_write_cached(res, reflection, (size_t)nr);
+    free(raw);
+    free(reflection);
+    return ok ? disk_load_from(r->key, r->iid, 0, 1) : NULL;
+}
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                      const GfxShaderAnswers *a) {
+                                      const GfxShaderAnswers *a, PreparedJob **owner, int *published) {
     const uint8_t *key = r->key;
     GfxShader *s;
     UseMask m;
@@ -1921,39 +2006,47 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);
     snprintf(res_path, PATH_CAP + 80, "%s/%s.res.json", cache_dir, hex);
-    if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
-    size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+    size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
-    if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
-    int ok = svc_request(req, reply, sizeof reply);
+    if (!req) return fail("out of memory", hex);
     // NX2NAVI_XLATE_KEEP=1: a last-frame variant's job stays as <key>.job (one request line) with its code, to run the
     // translator on by hand (nx2navi_xlate --serve < <key>.job); 2 keeps every job translated in this run (delete a
     // key's .res.json and .spv from the cache to have it translated, and kept, again)
-    static int keep = -1;
-    if (keep < 0) {
-        const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
-        keep = k && *k ? atoi(k) : 0;
-    }
-    // A failed translation keeps its job and code too (rare; what a translator fix is tested on).
-    int failed = ok && strncmp(reply, "ok ", 3);
-    int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
-    if (kept) {
-        char job_path[PATH_CAP + 80];
-        snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
-        write_file(job_path, req, strlen(req));
-    }
-    free(req);
-    if (!kept) plat_file_delete(code_path);
-    if (!ok) return fail("translator unavailable", hex);
-    if (strncmp(reply, "ok ", 3)) {
-        plat_file_delete(spv_path), plat_file_delete(res_path);
-        if (r->sm86) plat_inc64(&n_sm86);
-        return fail(reply, hex);
+    const char *k = cfg_get("NX2NAVI_XLATE_KEEP");
+    int keep = k && *k ? atoi(k) : 0;
+    uint8_t options[32];
+    int share = preparing && !keep;
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control, share ? options : NULL);
+    size_t code_len = (size_t)(r->length - skip);
+    PreparedJob *prior = share ? prepared_enter(options, code + skip, code_len, owner) : NULL;
+    s = prior ? prepared_copy(prior, r, hex, spv_path, res_path) : NULL;
+    int reused = s != NULL;
+    if (s) {
+        free(req);
+    } else {
+        if (!write_file(code_path, code + skip, code_len)) return free(req), fail("cannot write the code file", hex);
+        int ok = svc_request(req, reply, sizeof reply);
+        // Keep a failed translation's job and code for diagnosis.
+        int failed = ok && strncmp(reply, "ok ", 3);
+        int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
+        if (kept) {
+            char job_path[PATH_CAP + 80];
+            snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
+            write_file(job_path, req, strlen(req));
+        }
+        free(req);
+        if (!kept) plat_file_delete(code_path);
+        if (!ok) return fail("translator unavailable", hex);
+        if (failed) {
+            plat_file_delete(spv_path), plat_file_delete(res_path);
+            if (r->sm86) plat_inc64(&n_sm86);
+            return fail(reply, hex);
+        }
+        if (!(s = disk_load_from(key, r->iid, 0, 1))) return fail("translator output missing or malformed", hex);
     }
     // Not flushed (see "Durability" at the top): the translator wrote them whole, and disk_load checks both.
     if (cache_flush()) plat_file_flush(spv_path), plat_file_flush(res_path);
-    if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
+    *published = 1;
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
         build_key(r->code_hash, a, &m, mk, miid);
@@ -1966,6 +2059,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         if (moved) {
             use_store(r->code_hash, &m);
         } else {                                           // keep the mask for this run only
+            *published = 0;
             plat_file_delete(spv_path), plat_file_delete(res_path), rt_log("gfx_shader: cannot rename %s", hex);
             plat_mutex_lock(&cache_lock);
             use_put(r->code_hash, 1, &m);
@@ -1974,7 +2068,8 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         memcpy(s->key, mk, 32), memcpy(s->iid, miid, 32);
     }
     in_store(s->iid, stage, control, code, r, a);
-    plat_inc64(&n_xlated);
+    if (reused) plat_inc64(&preparing->reused);
+    else plat_inc64(&n_xlated);
     s->fresh = 1;
     return mem_insert(s);
 }
@@ -1986,7 +2081,10 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
     int away = kern_core_away();
     const uint8_t *id = r->final ? r->key : r->code_hash;
     flight_enter(id);
-    const GfxShader *s = translate_one(r, stage, control, code, a);
+    PreparedJob *owner = NULL;
+    int published = 0;
+    const GfxShader *s = translate_one(r, stage, control, code, a, &owner, &published);
+    if (owner) prepared_finish(owner, published ? s : NULL, r->key);
     flight_leave(id);
     kern_core_back(&away);
     return s;
@@ -2441,7 +2539,7 @@ int gfx_shader_write_code(const GfxShader *s, const char *path) {
     char *req = st ? malloc(cap) : NULL, job[PATH_CAP + 80], hex[65];
     if (ok && req) {
         key_hex(s->key, hex);
-        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control);
+        build_request(req, hex, st, path, in.c1, in.c1_len, &in.a, in.control, NULL);
         snprintf(job, sizeof job, "%s.job", path);
         write_file(job, req, strlen(req));
     }
@@ -2721,6 +2819,7 @@ typedef struct {
     PrgList progs;
     const uint8_t *ans;
     size_t n_ans;
+    PreparedJobs jobs;
     uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
     volatile int64_t next, done, missing, failed, refined;
 } Prep;
@@ -2734,9 +2833,10 @@ static void prg_collect(const uint8_t *rec, void *ctx) {
 
 static void prep_worker(void *arg) {
     Prep *p = arg;
+    preparing = &p->jobs;
     for (;;) {
         size_t i = (size_t)plat_inc64(&p->next) - 1;
-        if (i >= p->n_ans) return;
+        if (i >= p->n_ans) break;
         const uint8_t *r = p->ans + i * ANS_REC;
         uint8_t key_rec[12 + 32];
         memcpy(key_rec + 12, r + 4, 32);
@@ -2758,6 +2858,7 @@ static void prep_worker(void *arg) {
         else if (p->iid) memcpy(p->iid[i], s->iid, 32);
         plat_inc64(&p->done);
     }
+    preparing = NULL;
 }
 
 // Translates every record of ans_path whose program is in prg_path on `threads` threads with up to `procs` translators.
@@ -2781,6 +2882,7 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
     plat_inc32(&C.suspended);   // a preparation translates everything under the current translator, carrying nothing
+    plat_mutex_init(&p.jobs.lock);
     uint64_t xl0 = (uint64_t)n_xlated;
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
     svc_set_limit(procs);
@@ -2807,6 +2909,15 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
            "cached; %lld default variants with refined answers; %.0f ms", p.n_ans, what, p.progs.n,
            (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed, (long long)p.missing, (long long)p.refined,
            (double)plat_now_ms() - t0);
+    rt_log("gfx_shader: prepare: %lld equivalent translator requests reused", (long long)p.jobs.reused);
+    for (int b = 0; b < BUCKETS; b++) {
+        PreparedJob *j = p.jobs.buckets[b];
+        while (j) {
+            PreparedJob *next = j->next;
+            free(j);
+            j = next;
+        }
+    }
     free(p.progs.idx), free(pb);
     if (ans_out) *ans_out = ab;
     else free(ab);
@@ -3074,7 +3185,7 @@ static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwh
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), snprintf(why, nwhy, "out of memory"), -1;
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control);
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control, NULL);
     int ok = carry_exchange(req, reply, sizeof reply), refused = ok && strncmp(reply, "ok ", 3);
     if (refused) {   // as translate_one: the job and its code stay, for a translator fix to be tested on
         char job_path[PATH_CAP + 80];
