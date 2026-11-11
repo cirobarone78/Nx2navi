@@ -9,18 +9,20 @@ typedef struct {
     int storage;     // created with VK_IMAGE_USAGE_STORAGE_BIT (FSR writes it)
 } VkFfxImage;
 
-int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
-// Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
-// whether the library file is there, asked once without loading it. 0 where the build has no FSR 3.1 to load.
+int vk_ffx_load(void);        // 1 when the library is there with its entry points (loaded once)
+int vk_ffx_load_fsr4(void);   // 1 when amd_fidelityfx_upscaler_vk.so (FSR 4) is loaded and descriptorBuffer is on
+// Whether FSR 3.1 / FSR 4 upscaling can run in this build, for the settings menu: after load ran, what it found; before,
+// whether the library file is there, asked once without loading it. 0 where the build has no FSR to load.
 int vk_ffx_available(void);
+int vk_ffx_fsr4_available(void);
 // The same for frame generation (vk_fg.cpp), which runs through the library's own API calls (vk_ffx_create and the
 // rest below), not only an upscaler.
 int vk_ffx_framegen_available(void);
-// Records FSR 3.1 into cb: color (the scene light, render size), depth (D32F), mv (R16G16F, render pixels, current to
-// previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took, render pixels. fov_y in
-// radians (0: unknown). 0 on failure (the caller falls back as it does when DLSS fails).
+// Records FSR 3.1 or FSR 4 (fsr4 != 0) into cb: color (the scene light, render size), depth (D32F), mv (R16G16F,
+// render pixels, current to previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took,
+// render pixels. fov_y in radians (0: unknown). 0 on failure (the caller falls back as it does when DLSS fails).
 int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
-                   const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y);
+                   const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y, int fsr4);
 void vk_ffx_release(void);   // before the device goes away
 
 #ifdef __cplusplus
