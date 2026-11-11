@@ -16,6 +16,7 @@
 #include "vk_dlaa.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
+#include "vk_xess.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
@@ -148,6 +149,9 @@ static int create_instance(void) {
     if (vk_hdr_armed() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
     vk_dlaa_instance_exts(ext, &n_ext, 12);
+    // Intel XeSS (vk_xess.cpp): what libxess.dll names, when the ini asked for XeSS at start. Into the same twelve slots
+    // DLSS's NGX extensions take, since a run has one temporal upscaler of the three.
+    vk_xess_instance_exts(ext, &n_ext, 12);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "NX2navi",
                              .pEngineName = "NX2navi", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -268,8 +272,21 @@ retry:
             g_vk.xfer_family = i;
             break;
         }
+    // Frame generation presents on a queue of its own: the graphics family has a single queue on Intel, so a second
+    // presentable family that can also run the interpolation's compute work is looked for.
+    g_vk.fg_family = g_vk.gfx_family;
+    for (uint32_t i = 0; i < nq; i++) {
+        int presentable = gfx_window_vk_presentable(g_vk.instance, g_vk.phys, i);
+        rt_log("vk: queue family %u: flags 0x%x, %u queues, presentable %d", i, qp[i].queueFlags, qp[i].queueCount,
+               presentable);
+        if (g_vk.fg_family == g_vk.gfx_family && i != g_vk.gfx_family && presentable && qp[i].queueCount >= 3 &&
+            (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT))   // compute carries transfer with it, the flag need not be set
+            g_vk.fg_family = i;
+    }
+    if (g_vk.fg_family != g_vk.gfx_family) rt_log("vk: frame generation runs on queue family %u", g_vk.fg_family);
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    vk_profile_init(&g_vk.props);   // before the memory mode: the profile picks its default
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -299,6 +316,8 @@ typedef struct {
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDevicePresentWaitFeaturesKHR pwait;
 } FeatureChain;
 
 static int create_device(void) {
@@ -363,6 +382,8 @@ static int create_device(void) {
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
     vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the eight below
+    // Intel XeSS (vk_xess.cpp): what libxess.dll names for the device, when the ini asked for XeSS at start
+    vk_xess_device_exts(g_vk.instance, g_vk.phys, ep, ne, ext, &n_ext, 48);
     // FSR 3.1 (vk_ffx.cpp): its Vulkan back end looks vkGetBufferMemoryRequirements2KHR up by that name, which resolves
     // only with the extension enabled (the core function has no suffix); without it the back end called address 0.
     // Always asked for: FSR 3.1 can be switched on in the menu during a run
@@ -395,6 +416,21 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // FSR 3.1 frame generation (vk_fg.cpp): AMD's swapchain paces the frames it generates by present id and waits on
+    // them (presentWait) to keep its own interpolation fed; without the two features VK_ERROR_INITIALIZATION_FAILED is
+    // all it says. Chained before the pipeline library, which drops the chain after it.
+    {
+        int pid_ok = has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        int pw_ok = has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+        rt_log("fg: present id %d, present wait %d", pid_ok, pw_ok);
+        if (pid_ok && pw_ok) {   // always asked for, like FSR 3.1 itself: the menu can switch it on during a run
+            g_vk.has_present_id = 1;
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+            CHAIN(pid, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+            CHAIN(pwait, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+        }
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -403,6 +439,10 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
+    // Intel XeSS (vk_xess.cpp): XeSS patches the chain it is handed, so its own structures go on the end. Held in
+    // xess_chain so that dropping the pipeline library below does not cut them off with it.
+    void *xess_chain = NULL;
+    if (tail && vk_xess_device_features(g_vk.instance, g_vk.phys, tail)) xess_chain = *tail;
     free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
@@ -415,7 +455,7 @@ static int create_device(void) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &gp};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-        if (!vk_caps_gpl(&c->gpl, &gp)) { *gpl_link = NULL; n_ext -= 2; }
+        if (!vk_caps_gpl(&c->gpl, &gp)) { *gpl_link = xess_chain; n_ext -= 2; }
     }
     const VkPhysicalDeviceFeatures *h = &c->f2.features;
     const char *miss = NULL;
@@ -463,17 +503,21 @@ static int create_device(void) {
                has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
     }
 
-    // Frame generation (vk_fg.cpp) presents on a second queue of the graphics family and acquires on a third
-    static const float prio[3] = {1.0f, 1.0f, 1.0f};
+    // Frame generation (vk_fg.cpp) presents on a queue of its own: a second family when the GPU has one that can
+    // present (Intel's graphics family has a single queue), else more queues of the graphics family.
+    static const float prio[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t nq_gfx = vk_fg_queue_count() < g_gfx_queues ? vk_fg_queue_count() : g_gfx_queues;
-    VkDeviceQueueCreateInfo qi[2] = {
+    VkDeviceQueueCreateInfo qi[3] = {
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.gfx_family, .queueCount = nq_gfx,
          .pQueuePriorities = prio}};
     uint32_t nqi = 1;
-    if (g_vk.xfer_family != g_vk.gfx_family) {
-        qi[1] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                          .queueFamilyIndex = g_vk.xfer_family, .queueCount = 1, .pQueuePriorities = prio};
-        nqi = 2;
+    if (g_vk.fg_family != g_vk.gfx_family) {
+        qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                              .queueFamilyIndex = g_vk.fg_family, .queueCount = 3, .pQueuePriorities = prio};
+    }
+    if (g_vk.xfer_family != g_vk.gfx_family && g_vk.xfer_family != g_vk.fg_family) {
+        qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                              .queueFamilyIndex = g_vk.xfer_family, .queueCount = 1, .pQueuePriorities = prio};
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
@@ -486,11 +530,24 @@ static int create_device(void) {
         rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");
     }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
-    if (nq_gfx >= 2) {
-        VkQueue present, acquire;
-        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 1, &present);
-        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, nq_gfx - 1, &acquire);
-        vk_fg_queues(present, acquire);
+    if (g_vk.fg_family != g_vk.gfx_family) {
+        VkFgQueue present = {VK_NULL_HANDLE, g_vk.fg_family}, acquire = present, compute = present;
+        vkGetDeviceQueue(g_vk.device, g_vk.fg_family, 0, &present.queue);
+        vkGetDeviceQueue(g_vk.device, g_vk.fg_family, 1, &acquire.queue);
+        vkGetDeviceQueue(g_vk.device, g_vk.fg_family, 2, &compute.queue);
+        vk_fg_queues(present, acquire, compute);
+        rt_log("vk: frame generation queues: family %u, present 0, acquire 1, async compute 2", g_vk.fg_family);
+    } else if (nq_gfx >= 3) {
+        VkFgQueue present = {VK_NULL_HANDLE, g_vk.gfx_family}, acquire = present, compute = present;
+        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 1, &present.queue);
+        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 2, &acquire.queue);
+        compute.queue = VK_NULL_HANDLE;
+        vk_fg_queues(present, acquire, compute);
+        rt_log("vk: frame generation queues: graphics family, present 1, acquire 2, no async compute queue");
+    } else {   // one queue of the graphics family: frame generation has no present queue of its own to run on
+        VkFgQueue game = {g_vk.gfx_queue, g_vk.gfx_family}, none = {VK_NULL_HANDLE, g_vk.gfx_family};
+        vk_fg_queues(game, game, none);
+        rt_log("vk: frame generation queues: the graphics queue alone (%u created)", nq_gfx);
     }
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
