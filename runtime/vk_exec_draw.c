@@ -167,6 +167,7 @@ static struct {
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
+    float jitter_x, jitter_y; // viewport offset of the last recorded draw
 } B;
 
 // Contents of B.ds_last: the set's packed descriptors (VkDescSlot), which with its layout determine every write. A draw
@@ -3465,13 +3466,16 @@ static VkViewport draw_viewport(VkExec *ex) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
-    vk_dlaa_viewport(ex, &v);   // the scene's draws move by the DLAA jitter
+    v.x += B.jitter_x, v.y += B.jitter_y;   // the scene's draws move by the DLAA jitter
     return v;
 }
 
-static void record_fixed(VkExec *ex) {
+static void record_fixed(VkExec *ex, int mesh) {
     VkCommandBuffer cb = ex->cb;
-    if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
+    float jx, jy;
+    vk_dlaa_draw_jitter(ex, mesh, &jx, &jy);
+    if ((ex->dirty & VK_EXEC_DIRTY_VIEWPORT) || jx != B.jitter_x || jy != B.jitter_y) {
+        B.jitter_x = jx, B.jitter_y = jy;
         VkViewport v = draw_viewport(ex);
         vkCmdSetViewportWithCount(cb, 1, &v);
         ex->recorded++;
@@ -4134,7 +4138,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         vk_mvsurvey_draw(ex);
         vk_mvprev_draw(ex);
     }
-    record_fixed(ex);
+    record_fixed(ex, mesh);
     repeat_stats(ex, info);
     {   // the replay's binding path is the CPU cost the frame profile needs to separate from recording
         uint64_t bt = bt_now();

@@ -65,9 +65,11 @@ int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
 // vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
-// the viewport of the scene's draws by the frame's jitter (vk_dlaa_viewport, when the viewport is recorded).
+// the viewport of eligible geometry by the frame's jitter; fullscreen composites and HUD draws stay unshifted.
 void vk_dlaa_draw(VkExec *ex);
-void vk_dlaa_viewport(VkExec *ex, VkViewport *v);
+void vk_dlaa_draw_jitter(const VkExec *ex, int mesh, float *x, float *y);
+// Propagate scene-depth identity through full-size depth copies used by later geometry.
+void vk_dlaa_depth_copy(VkImage src, VkImage dst, int whole);
 // vk_mvsurvey.c (NX2NAVI_MV_SURVEY): notes the uniform blocks of each scene draw, beside vk_dlaa_draw; each present
 // compares them with the previous frames' and logs a summary now and then.
 void vk_mvsurvey_draw(VkExec *ex);
