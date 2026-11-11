@@ -223,6 +223,9 @@
 # heap is under 20 GiB or the system reports less than 47 GiB of RAM (allowing for a nominal 48 GiB PC). If the RAM
 # size is unknown, only the GPU heap decides. Look for "NX2NAVI_ASTC_BC unset" in the game log to see the decision.
 # astc_bc = 1
+# With BC3 on: a texture none of whose texels is see-through is BC1, half the size of BC3 with the same texels (each
+# upload checks the blocks as it copies them). 0: every ASTC texture BC3.
+# astc_bc1 = 1
 # Game memory shared with the GPU: auto (mirror on a discrete GPU, import on an integrated one), import (host memory
 # imported into Vulkan), mirror (pools used as buffers get a copy in video memory) or verify (mirror plus a check of
 # every copy; slow). On a discrete GPU import can be far slower than mirror, not slightly slower: the GPU reads the
@@ -766,9 +769,6 @@
 # everything in it is freed, so smaller blocks hold less free space after area changes; larger ones need fewer
 # allocations while an area loads. Default: 64.
 # vma_block_mb = 64
-# 1: samples each new ASTC texture's blocks on the CPU and logs how many are opaque ("ASTC alpha probe" lines), which
-# could be stored at half the video memory. Slows area loads. Default: 0.
-# astc_bc_probe = 0
 # Flight recorder: keeps the last frames and saves them to a flight folder next to the folder of nx2navi.exe when a frame
 # takes longer than flight_spike_ms (0 to 60000).
 # flight = 0

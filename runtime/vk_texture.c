@@ -98,6 +98,7 @@ typedef struct Tex {
     uint8_t og_start;             // START_*: how its content started (start_at)
     uint8_t og_drop;              // DROP_*: the drop of this descriptor's last entry, when the ring still knew it
     uint8_t og_reimg;             // made with the image of a released entry (create_tex, reuse)
+    uint8_t bc1_try;              // ASTC as BC3 that its first upload makes BC1 when every block is opaque (upload)
     uint8_t said;                 // marks_check wrote its line for this entry
     uint8_t sfill;                // split fill: the CPU does not write it, and its image is the storage's bytes: 1 as a
                                   // CPU-written one's until the GPU writes it, 2 once (from_storage)
@@ -884,37 +885,32 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
     return d->width * (uint32_t)scale <= most ? scale : 1;
 }
 
-// NX2NAVI_ASTC_BC_PROBE=1 (astc_bc_probe in nx2navi.ini): measures, without changing any format, how much of the ASTC
-// set could be compressed if the alpha rule were data-driven instead of footprint-driven: the opaque part could be BC1,
-// half the size of the BC3 every decoded ASTC texture is now. Each texture's source blocks are decoded on the CPU with
-// tex_astc.c astc_decode_block (up to 512 spread over the level) and counted by whether any block has alpha below 250.
-#define ASTC_BC_PROBES 512
-static uint64_t n_probe_calls, n_probe_alpha, n_probe_opaque, n_probe_bytes_alpha, n_probe_bytes_opaque;
+// ---- ASTC as BC1 (NX2NAVI_ASTC_BC1, vk_astc.c)
+// A texture the CPU provides whose ASTC blocks all decode opaque is held as BC1, not BC3: the encoder then writes only
+// the colour half of the BC3 blocks it would have written (bc3_encode.comp), which BC1 decodes to the same texels, in
+// half the memory. Every ASTC texture is made BC3 (create_tex); its first upload checks its blocks inside the copy into
+// staging it makes anyway (astc_copy_opaque, tex_astc.c astc_blocks_opaque), and when all are opaque the entry gets a
+// BC1 image in place of the BC3 one before the decode (astc_reformat). A check of its own where the texture is made
+// cost 1.7 s of the render thread over a seven-minute teleport tour; the image made again costs a fraction of that.
+// The check covers every 16-byte block of the storage that is copied, the padding between levels and layers included
+// (zeros there decode as error blocks, opaque magenta; other bytes can only make it stricter). Each later upload into a
+// BC1 image checks again: the game may load other content into the same storage, and content with alpha gets a BC3
+// image back before it is decoded. Blocks of the endpoint modes with alpha are decoded to tell; past
+// ASTC_OPAQUE_DECODES of them in one texture it counts as not opaque, as the check would cost more than it saves.
+// Blocks the CPU untiles first (not astc_bl_regions) are checked in the storage before the copy (astc_opaque).
+#define ASTC_OPAQUE_DECODES 4096
+static uint64_t n_bc1_made, n_bc1_made_bytes, n_bc1_widened, n_bc1_checks, n_bc1_check_ns, n_bc1_check_bytes;
 
-static void astc_probe_alpha(const tex_t *t, const TexVkFormat *f) {
-    uintptr_t mem = (uintptr_t)t->mem;
-    // only a real host pointer can be read: 0 and the GPU address window are not readable from here
-    if (!mem || nvn_gpu_only(mem) || mem < 0x10000 || mem > 0x7ffffffeffffull || !f->astc_bw || !f->astc_bh) return;
-    uint32_t bw = f->astc_bw, bh = f->astc_bh;
-    uint64_t w = t->d.width ? t->d.width : 1, h = t->d.height ? t->d.height : 1;
-    uint64_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh, n = bx * by;
-    if (!n) return;
-    uint64_t probes = n < ASTC_BC_PROBES ? n : ASTC_BC_PROBES, bytes = n * 16u;
-    uint8_t rgba[16 * 16 * 4];   // a block decodes to bw x bh texels, up to 12 x 12 (astc_decode_block writes them all)
-    int opaque = 1;
-    for (uint64_t s = 0; s < probes && opaque; s++) {
-        uint64_t i = probes == n ? s : (s * n) / probes;
-        if (!astc_decode_block((const uint8_t *)mem + i * 16u, bw, bh, f->astc_srgb != 0, rgba)) continue;
-        for (int k = 0; k < (int)(bw * bh); k++)
-            if (rgba[k * 4 + 3] < 250) { opaque = 0; break; }
-    }
-    n_probe_calls++;
-    if (opaque) n_probe_opaque++, n_probe_bytes_opaque += bytes;
-    else n_probe_alpha++, n_probe_bytes_alpha += bytes;
-    if (n_probe_calls == 1 || n_probe_calls % 512 == 0)
-        rt_log("vk: ASTC alpha probe: %llu textures, %llu opaque (%.1f MiB) and %llu with alpha (%.1f MiB) so far",
-               (unsigned long long)n_probe_calls, (unsigned long long)n_probe_opaque, n_probe_bytes_opaque / 1048576.0,
-               (unsigned long long)n_probe_alpha, n_probe_bytes_alpha / 1048576.0);
+// 1 when every block of t's storage at addr decodes opaque; 0 when one does not or the storage is not mapped.
+static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
+    uint64_t t0 = kern_now_ns(), n = t->L.size / 16;
+    if (!t->mem || !n || !mem_read_hold(addr, t->L.size)) return 0;
+    uint32_t decoded = 0;
+    int ok = astc_blocks_opaque_mt((const uint8_t *)t->mem, n, f->astc_bw, f->astc_bh, f->astc_srgb != 0,
+                                   ASTC_OPAQUE_DECODES, &decoded, NULL);
+    mem_read_release();
+    n_bc1_checks++, n_bc1_check_ns += kern_now_ns() - t0, n_bc1_check_bytes += t->L.size;
+    return ok;
 }
 
 // ---- texture detail (NX2NAVI_TEXTURE_DETAIL = auto | full | reduced | low, texture_detail in nx2navi.ini; read at
@@ -1033,6 +1029,47 @@ static uint32_t detail_skip(const tex_t *t, const TexKey *k, const TexVkFormat *
     return most >= 2 && levels >= 4 && w >= DETAIL_LOW_MIN && h >= DETAIL_LOW_MIN ? 2 : 1;
 }
 
+// A texture whose content the CPU provides (tex_mirrored), up to SUBALLOC_MAX, takes memory from VMA's device blocks:
+// the driver prefers a dedicated allocation for most images, and vmaCreateImage follows that, so a scene load
+// (about 2700 new textures in one frame entering Kokiri Forest) made as many vkAllocateMemory calls, 43% of that
+// 680 ms frame. vmaAllocateMemory with the plain requirements sub-allocates instead, from the blocks the headroom
+// thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference (vma_image).
+// VK_NULL_HANDLE when the image does not take that memory.
+enum { SUBALLOC_MAX = 32 << 20 };
+static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc) {
+    VkImage img;
+    if (vkCreateImage(c->device, ci, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // an image the driver requires (not only prefers) dedicated memory for keeps it: vma_image
+    VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 mr2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dr};
+    VkImageMemoryRequirementsInfo2 ri = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = img};
+    vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
+    VkMemoryRequirements mr = mr2.memoryRequirements;
+    VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+    int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
+             vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
+    if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
+        vmaFreeMemory(c->vma, *alloc);
+        ok = 0;
+    }
+    if (!ok) {
+        vkDestroyImage(c->device, img, NULL);
+        img = VK_NULL_HANDLE, *alloc = NULL;
+    }
+    return img;
+}
+
+// An image made with vmaCreateImage. One of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's
+// 256 MiB blocks it left a hole the driver went on counting, with the rest of the block, against the budget and the
+// system's commit (0.5 to 1.8 GiB of such free space in a session at 5120x2160), until the block emptied; its own
+// memory goes back when it does.
+static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, ik);
+    if ((known ? known->size : image_size(ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    return vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
@@ -1048,10 +1085,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         log_limited(&n_unsupported, "texture format %#x: VkFormat %d lacks features %#x", d->format, (int)f.vk, (unsigned)f.need);
         return NULL;
     }
-    // NX2NAVI_ASTC_BC_PROBE (diagnostics only): measure what a data-driven alpha rule would compress
-    static int bc_probe = -1;   // read once: this runs for every texture created
-    if (bc_probe < 0) bc_probe = cfg_bool("NX2NAVI_ASTC_BC_PROBE");
-    if (f.astc_bw && bc_probe) astc_probe_alpha(t, &f);
+    // ASTC as BC1: a texture the CPU provides, not one that lies in pool memory, may turn BC1 at its first upload
+    int bc1_try = f.astc_bc == 1 && tex_mirrored(t) && !nvn_gpu_only(k->addr) && vk_astc_bc1();
     nvn_texlayout L;
     nvn_tex_layout(d, &L);
     uint32_t w = umax(d->width, 1), h = umax(d->height, 1), depth = 1, layers = 1;
@@ -1161,35 +1196,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                         (unsigned long long)k->addr, w, h, d->format);
         }
     }
-    // A texture whose content the CPU provides (tex_mirrored), up to SUBALLOC_MAX, takes memory from VMA's device blocks:
-    // the driver prefers a dedicated allocation for most images, and vmaCreateImage follows that, so a scene load
-    // (about 2700 new textures in one frame entering Kokiri Forest) made as many vkAllocateMemory calls, 43% of that
-    // 680 ms frame. vmaAllocateMemory with the plain requirements sub-allocates instead, from the blocks the headroom
-    // thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference.
-    enum { SUBALLOC_MAX = 32 << 20 };
-    if (!img && tex_mirrored(t) && samples == 1) {
-        if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS) {
-            // an image the driver requires (not only prefers) dedicated memory for keeps it: vmaCreateImage below
-            VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
-            VkMemoryRequirements2 mr2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dr};
-            VkImageMemoryRequirementsInfo2 ri = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = img};
-            vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
-            VkMemoryRequirements mr = mr2.memoryRequirements;
-            VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-            int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
-                     vmaAllocateMemory(c->vma, &mr, &ai, &e->alloc, NULL) == VK_SUCCESS;
-            if (ok && vmaBindImageMemory(c->vma, e->alloc, img) != VK_SUCCESS) {
-                vmaFreeMemory(c->vma, e->alloc);
-                ok = 0;
-            }
-            if (!ok) {
-                vkDestroyImage(c->device, img, NULL);
-                img = VK_NULL_HANDLE, e->alloc = NULL;
-            }
-        } else {
-            img = VK_NULL_HANDLE;
-        }
-    }
+    if (!img && tex_mirrored(t) && samples == 1) img = suballoc_image(c, &ci, &e->alloc);
     int gpu_only = !tex_mirrored(t);
     // an entry split fill is to fill gets a new image: start_at uploads into it in the upload batch (see "split fill")
     int to_fill = gpu_only && split_wants(t, &f) && L.size <= SPLIT_FILL_MAX;
@@ -1225,13 +1232,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     }
     if (!img) {
         if (gpu_only) n_reuse_new++;
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        // An image of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's 256 MiB blocks it left a hole
-        // the driver went on counting, with the rest of the block, against the budget and the system's commit (0.5 to 1.8
-        // GiB of such free space in a session at 5120x2160), until the block emptied; its own memory goes back when it does.
-        const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, &e->ik);
-        if ((known ? known->size : image_size(&ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+        VkResult r = vma_image(c, &ci, &e->ik, &img, &e->alloc);
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
@@ -1244,6 +1245,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         vmaGetAllocationInfo(c->vma, e->alloc, &own);
         e->bytes = own.size;
     }
+    e->bc1_try = (uint8_t)bc1_try;
     e->reusable = e->alloc && gpu_only;
     e->gw_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (e->reusable && nvn_gpu_only(k->addr)) gwin_add(e);
@@ -2785,6 +2787,75 @@ static int up_wait(const Tex *e) {
     return e->up_retry && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < e->up_retry;
 }
 
+// ASTC as BC1: e gets an image of the other format, made with the same parameters, in place of its own: BC1 (bc 2) for
+// the opaque content of its first upload, BC3 (bc 1) for content with alpha about to go into its BC1 image. The old
+// image and its views go once the GPU is past the submission being recorded, as a destroyed texture's do (destroy_tex),
+// so commands recorded with it keep it; the new one starts as a new image (init_image) in the upload batch, which runs
+// before the part being recorded (in cb, the batch upload has open, or its own), and the slots that resolve to e look
+// it up again (tex_gen_bump). 0 when no image could be made; e keeps its own.
+static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
+    static volatile int32_t n_failed;
+    VkCtx *c = vk_ctx();
+    const ImgKey *k = &e->ik;
+    int s = e->f.astc_srgb;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags,
+                            .imageType = (VkImageType)k->type,
+                            .format = bc == 2 ? (s ? VK_FORMAT_BC1_RGB_SRGB_BLOCK : VK_FORMAT_BC1_RGB_UNORM_BLOCK)
+                                              : (s ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK),
+                            .extent = {k->w, k->h, k->d}, .mipLevels = k->levels, .arrayLayers = k->layers,
+                            .samples = (VkSampleCountFlagBits)k->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = k->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    ImgKey nk;
+    img_key_of(&ci, &nk);
+    VmaAllocation a = NULL;
+    VkImage img = suballoc_image(c, &ci, &a);
+    if (!img && vma_image(c, &ci, &nk, &img, &a) != VK_SUCCESS) {
+        log_limited(&n_failed, "ASTC texture %#llx (%ux%u): no %s image could be made", (unsigned long long)e->pub.addr,
+                    e->t.d.width, e->t.d.height, bc == 2 ? "BC1" : "BC3");
+        return 0;
+    }
+    vk_exec_image_gone(e->pub.image);
+    vk_defer_image(e->pub.image, e->alloc);
+    vk_exec_image_gone(img);   // views cached under the handle of a destroyed image (create_tex)
+    int relink = e->ru_on;
+    if (relink) ru_unlink(e);
+    if (e->released) rel_bytes -= e->bytes;
+    if (e->retiring) retiring_bytes -= e->bytes;
+    VmaAllocationInfo own;
+    vmaGetAllocationInfo(c->vma, a, &own);
+    e->bytes = own.size;
+    if (e->released) rel_bytes += e->bytes;
+    if (e->retiring) retiring_bytes += e->bytes;
+    e->pub.image = img, e->alloc = a, e->reused = 0;
+    e->pub.format = e->f.vk = ci.format;
+    e->f.astc_bc = (uint8_t)bc;
+    e->ik = nk;
+    if (relink) ru_link(e);
+    if (cb) {
+        init_image(e, cb);
+    } else {
+        init_image(e, vk_upload_begin());
+        vk_upload_end();
+    }
+    tex_gen_bump(e->key.addr);
+    if (bc == 2) n_bc1_made++, n_bc1_made_bytes += e->bytes;
+    else n_bc1_widened++;
+    return 1;
+}
+
+// The upload's copy of size bytes of ASTC storage into staging, with the opaque check of its blocks: 1 when every block
+// is opaque and *decoded stays within ASTC_OPAQUE_DECODES. A large texture's copy and check run on the ASTC decode
+// workers (tex_astc_mt.c astc_blocks_opaque_mt), a small one's here.
+static uint64_t n_bc1_up_checks, n_bc1_up_bytes;
+static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint64_t size, uint32_t *decoded) {
+    uint64_t nb = size / 16;
+    int ok = astc_blocks_opaque_mt(src, nb, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb != 0, ASTC_OPAQUE_DECODES,
+                                   decoded, dst);
+    if (size % 16) memcpy(dst + 16 * nb, src + 16 * nb, size % 16);
+    n_bc1_up_checks++, n_bc1_up_bytes += size;
+    return ok;
+}
+
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
     int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
@@ -2842,6 +2913,26 @@ static void upload(Tex *e) {
     int checked = 0, parts = 1;
     // The GPU decoder reads the blocks in place (astc_bl_regions); the check mode compares against tight blocks.
     int gdsw = agpu && !acheck && !one_d && astc_bl_regions(e, levels, layers, bw, bh, ar);
+    // ASTC as BC1: a BC1 image takes opaque content only, and a BC3 one that may turn BC1 (bc1_try) does at its
+    // first upload when the content is opaque (astc_reformat). The blocks the GPU decoder takes as they lie (gdsw) are
+    // checked as they are copied; the others are checked here first. Without memory for a BC3 image the upload waits as
+    // one without memory for its decode does (no_mem); without memory for a BC1 one the texture stays BC3.
+    int bc1 = e->f.astc_bc == 2, try1 = e->bc1_try && e->f.astc_bc == 1 && !e->n_up, opq = 1;
+    uint32_t bc1_dec = 0;
+    e->bc1_try = 0;
+    if ((bc1 || try1) && !gdsw) {
+        opq = astc_opaque(t, e->pub.addr, &e->f);
+        if (bc1 && !opq && !astc_reformat(e, VK_NULL_HANDLE, 1)) {
+            e->uploaded = 0;
+            e->up_retry = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + UP_RETRY_FRAMES;
+            __atomic_add_fetch(&n_up_retry, 1, __ATOMIC_RELAXED);
+            free(ar), free(rg);
+            return;
+        }
+        if (try1 && opq) astc_reformat(e, VK_NULL_HANDLE, 2);
+        bc1 = try1 = 0;
+    }
+    int check = bc1 || try1;
     // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
     // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
     // takes the raw blocks of every region from one buffer.
@@ -2884,13 +2975,15 @@ static void upload(Tex *e) {
             e->chash_ok = 0;
         }
         if (gdsw && !sk) {
-            if (held) memcpy(stg, t->mem, size);
+            if (held && check) opq = astc_copy_opaque(e, stg, t->mem, size, &bc1_dec);
+            else if (held) memcpy(stg, t->mem, size);
             else memset(stg, 0, size);
         } else if (gdsw) {
             VkDeviceSize at = 0;
             for (k = 0; k < n; k++) {   // astc_bl_regions checked that each lies inside the storage
                 VkDeviceSize nb = vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh);
-                if (held) memcpy(stg + at, t->mem + ar[k].src, nb);
+                if (held && check) opq &= astc_copy_opaque(e, stg + at, t->mem + ar[k].src, nb, &bc1_dec);
+                else if (held) memcpy(stg + at, t->mem + ar[k].src, nb);
                 else memset(stg + at, 0, nb);
                 ar[k].src = at, at += nb;
             }
@@ -2947,7 +3040,13 @@ static void upload(Tex *e) {
         if (agpu) {
             for (k = 0; k < n; k++) ar[k].src += soff;   // a range of the arena (astc_arena); 0 in a buffer of its own
             uint64_t a0 = perf_begin();
-            checked = vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
+            // content with alpha for a BC1 image: a BC3 one first, or no decode for now (-1); opaque content at a BC3
+            // image's first upload: a BC1 one (it stays BC3 when none can be made)
+            int widen_failed = 0;
+            if (bc1 && !opq) widen_failed = !astc_reformat(e, cb, 1);
+            else if (try1 && opq) astc_reformat(e, cb, 2);
+            checked = widen_failed ? -1
+                    : vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
                                      e->pub.image, e->pub.aspect, rbuf);
             perf_end(PERF_ASTC, a0);
             vk_texstat_time(VK_TS_ASTC, a0);
@@ -2998,6 +3097,7 @@ static void upload(Tex *e) {
     e->wt_n = 0;
     e->uploaded = 1;
     e->n_up++;
+
     // The decode had no memory (vk_astc_record: its scratch buffer failed while the video memory was used up), so the
     // image does not hold this content: a new image holds nothing, an older one what it held before. Counted as
     // uploaded, it stayed that way until the game next wrote the storage, which for most textures is never. It counts
@@ -3096,7 +3196,7 @@ static void make_fresh_snap(Tex *e) {
 // Bytes per block and block size of the image's VkFormat (ASTC decodes to RGBA8, RGB expands to RGBA); 0 when the
 // VkFormat substitutes another one of unknown size.
 static int img_block(const Tex *e, int *bw, int *bh) {
-    if (e->f.astc_bc) { *bw = *bh = 4; return 16; }
+    if (e->f.astc_bc) { *bw = *bh = 4; return e->f.astc_bc == 2 ? 8 : 16; }   // BC1 or BC3
     if (e->f.astc_bw) { *bw = *bh = 1; return 4; }
     int b = nvn_fmt_bpb(e->t.d.format, bw, bh);
     if (e->f.expand_rgb) { *bw = *bh = 1; return b / 3 * 4; }
@@ -4874,8 +4974,8 @@ void vk_texture_census(VkTexCensus *s) {
 // STALE_FRAMES presents (touch). Then the entries that share their storage address with another live entry (each
 // descriptor of the same storage gets an image of its own), the formats holding the most, and the largest entries.
 void vk_texture_census_log(uint64_t frame) {
-    enum { K_BC3, K_RGBA8, K_CPU, K_GPU, K_N };
-    static const char *const kn[K_N] = {"ASTC as BC3", "ASTC as RGBA8", "other CPU-written", "GPU-written"};
+    enum { K_BC1, K_BC3, K_RGBA8, K_CPU, K_GPU, K_N };
+    static const char *const kn[K_N] = {"ASTC as BC1", "ASTC as BC3", "ASTC as RGBA8", "other CPU-written", "GPU-written"};
     uint64_t n[K_N] = {0}, b[K_N] = {0}, in[K_N] = {0}, ib[K_N] = {0}, bound = 0, dup_n = 0, dup_b = 0;
     uint64_t sk_n[3] = {0}, sk_b[3] = {0};   // texture detail: entries made without 1 and 2 levels, and their memory
     struct { int fmt; uint64_t n, b; } fm[48];
@@ -4890,7 +4990,8 @@ void vk_texture_census_log(uint64_t frame) {
         const Tex *e = by_key.vals[i];
         if (!e || e->released) continue;
         if (!e->bytes) { bound += e->bound_to != NULL; continue; }
-        int k = !comes_back_intact(e) ? K_GPU : e->f.astc_bw ? (e->f.astc_bc ? K_BC3 : K_RGBA8) : K_CPU;
+        int k = !comes_back_intact(e) ? K_GPU
+              : e->f.astc_bw ? (e->f.astc_bc == 2 ? K_BC1 : e->f.astc_bc ? K_BC3 : K_RGBA8) : K_CPU;
         n[k]++, b[k] += e->bytes;
         if (e->pub.skip < 3) sk_n[e->pub.skip]++, sk_b[e->pub.skip] += e->bytes;
         if (idle(e, now)) in[k]++, ib[k] += e->bytes;
@@ -4946,6 +5047,12 @@ void vk_texture_census_log(uint64_t frame) {
                  "position or size)", (unsigned long long)sk_n[1], sk_b[1] / M, (unsigned long long)sk_n[2], sk_b[2] / M,
                  (unsigned long long)n_exact, gfx_shader_exact_seen());
     rt_log("%s", line);
+    if (vk_astc_bc1())
+        rt_log("mem: ASTC as BC1 so far: %llu textures made BC1 at their first upload (%.0f MiB, half of what BC3 takes), "
+               "%llu made BC3 again for content with alpha; checks in the uploads' copies %llu (%.0f MiB), of the storage "
+               "before an upload that untiles on the CPU %llu (%.0f MiB) in %.1f ms", (unsigned long long)n_bc1_made,
+               n_bc1_made_bytes / M, (unsigned long long)n_bc1_widened, (unsigned long long)n_bc1_up_checks,
+               n_bc1_up_bytes / M, (unsigned long long)n_bc1_checks, n_bc1_check_bytes / M, n_bc1_check_ns / 1e6);
     for (int x = 0; x < nfm; x++)   // by bytes, largest first
         for (int y = x + 1; y < nfm; y++)
             if (fm[y].b > fm[x].b) { typeof(fm[0]) t = fm[x]; fm[x] = fm[y], fm[y] = t; }

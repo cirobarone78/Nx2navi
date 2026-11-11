@@ -4,6 +4,9 @@
 // NX2NAVI_ASTC_BC = 1 (gpu mode only; unset: by the video memory and RAM, create_bc_pipeline): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
 // texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
+// NX2NAVI_ASTC_BC1 = 1 (default; with BC3 on): a texture whose every ASTC block decodes opaque (vk_texture.c "ASTC as
+// BC1") is BC1 instead, the colour half of the BC3 blocks the same pass would write: the same texels at 4 bits per
+// texel.
 //
 // NX2NAVI_ASTC = auto (default): native when the device reports textureCompressionASTC_LDR and the format's features,
 // else gpu. gpu: compute decode into RGBA8 (runtime/shaders/astc_decode.comp). native: like auto, but logs when the
@@ -109,7 +112,9 @@ static struct {
     VkPipelineLayout layout;
     VkPipeline pipe;
     VkPipeline bc_pipe;           // the BC3 encoder (NX2NAVI_ASTC_BC): the decoder's layout, bindings 0 and 1
+    VkPipeline bc1_pipe;          // the same shader writing BC1 blocks (NX2NAVI_ASTC_BC1)
     int bc;                       // 1: ASTC images are BC3 (vk_astc_bc)
+    int bc1;                      // 1: opaque ones are BC1 (vk_astc_bc1)
     PFN_vkCmdPushDescriptorSetKHR push;
     VkBuffer tab;                 // device-local copy of the tables
     VmaAllocation tab_alloc;
@@ -312,6 +317,28 @@ static int create_pipeline(VkCtx *c) {
 // So RGBA8 needs 48 GiB of RAM as well.
 #define BC_KEEP_RGBA8_VRAM (20ull << 30)
 #define BC_KEEP_RGBA8_RAM_MB (48.0f * 1024 - 1024)   // a 48 GiB PC reports a little under 48 GiB
+
+// The encoder's pipeline: BC3 blocks, or with bc1 BC1 blocks (bc3_encode.comp's specialization constant BC1).
+static VkResult bc_pipeline(VkCtx *c, int bc1, VkPipeline *out) {
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
+                                   .pCode = bc3_encode_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(c->device, &mi, NULL, &m);
+    if (r != VK_SUCCESS) return r;
+    VkBool32 on = (VkBool32)(bc1 != 0);
+    VkSpecializationMapEntry me = {.constantID = 0, .offset = 0, .size = sizeof on};
+    VkSpecializationInfo si = {.mapEntryCount = 1, .pMapEntries = &me, .dataSize = sizeof on, .pData = &on};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
+                                                .pSpecializationInfo = &si},
+                                      .layout = G.layout};
+    r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, out);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) *out = VK_NULL_HANDLE;
+    return r;
+}
+
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("NX2NAVI_ASTC_BC");
     VkDeviceSize vram = 0;
@@ -332,16 +359,7 @@ static int create_bc_pipeline(VkCtx *c) {
         rt_log("vk: NX2NAVI_ASTC_BC: the device does not sample BC3; ASTC stays RGBA8");
         return 0;
     }
-    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
-                                   .pCode = bc3_encode_spv};
-    VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) return 0;
-    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
-                                      .layout = G.layout};
-    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &G.bc_pipe);
-    vkDestroyShaderModule(c->device, m, NULL);
+    VkResult r = bc_pipeline(c, 0, &G.bc_pipe);
     if (r != VK_SUCCESS) {
         G.bc_pipe = VK_NULL_HANDLE;
         rt_log("vk: NX2NAVI_ASTC_BC: the BC3 encoder pipeline failed (%d); ASTC stays RGBA8", (int)r);
@@ -349,6 +367,23 @@ static int create_bc_pipeline(VkCtx *c) {
     }
     rt_log("vk: ASTC textures are encoded to BC3 after the decode (NX2NAVI_ASTC_BC)");
     return 1;
+}
+
+// NX2NAVI_ASTC_BC1 (with BC3 on): opaque ASTC textures as BC1, when the device samples and copies into both BC1
+// formats.
+static int bc1_on(VkCtx *c) {
+    int on = cfg_bool("NX2NAVI_ASTC_BC1");
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    for (int i = 0; i < 2 && on; i++) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(c->phys, i ? VK_FORMAT_BC1_RGB_SRGB_BLOCK : VK_FORMAT_BC1_RGB_UNORM_BLOCK, &p);
+        if ((p.optimalTilingFeatures & need) != need) on = 0, rt_log("vk: NX2NAVI_ASTC_BC1: the device lacks BC1 features");
+    }
+    VkResult r = on ? bc_pipeline(c, 1, &G.bc1_pipe) : VK_SUCCESS;
+    if (r != VK_SUCCESS) on = 0, rt_log("vk: NX2NAVI_ASTC_BC1: the BC1 encoder pipeline failed (%d)", (int)r);
+    rt_log("vk: opaque ASTC textures %s (NX2NAVI_ASTC_BC1)", on ? "are BC1, the others BC3" : "are BC3 like the others");
+    return on;
 }
 
 static int native_device(VkCtx *c) { return c->has_astc_ldr; }
@@ -383,6 +418,7 @@ int vk_astc_mode(void) {
         }
         if (G.failed && m != VK_ASTC_NATIVE) m = VK_ASTC_CPU;
         G.bc = m == VK_ASTC_GPU && G.pipe && create_bc_pipeline(c);
+        G.bc1 = G.bc && bc1_on(c);
         G.mode = m;
         rt_log("vk: ASTC textures: %s (textureCompressionASTC_LDR %d)", mode_name(m), native_device(c));
     }
@@ -416,6 +452,15 @@ int vk_astc_bc(void) {
     if (!c || vk_astc_mode() != VK_ASTC_GPU) return 0;
     plat_mutex_lock_shared(&g_lock);
     int on = G.dev == c->device && G.bc;
+    plat_mutex_unlock_shared(&g_lock);
+    return on;
+}
+
+int vk_astc_bc1(void) {
+    VkCtx *c = vk_ctx();
+    if (!vk_astc_bc()) return 0;
+    plat_mutex_lock_shared(&g_lock);
+    int on = G.dev == c->device && G.bc1;
     plat_mutex_unlock_shared(&g_lock);
     return on;
 }
@@ -533,10 +578,12 @@ static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
     uint64_t gh = 8ull << r->th, gd = 1ull << r->td;
     return (VkDeviceSize)((row_bytes + 63) / 64 * ((rows + gh - 1) / gh) * ((r->slices + gd - 1) / gd) * (512ull << r->th << r->td));
 }
-static VkDeviceSize region_bc(const VkAstcRegion *r) { return tight_in(r, 4, 4); }   // BC3: 16 bytes per 4x4 block
+// The encoded blocks of a region: 16 bytes per 4x4 block for BC3 (bc 1), 8 for BC1 (bc 2)
+static VkDeviceSize region_bc(const VkAstcRegion *r, int bc) { return tight_in(r, 4, 4) / (bc == 2 ? 2 : 1); }
 VkDeviceSize vk_astc_region_bytes(const VkAstcRegion *r, uint32_t bw, uint32_t bh) { return region_in(r, bw, bh); }
 
 typedef struct { uint32_t in_base, out_base, width, height, bx, bslice; } BcPush;   // bc3_encode.comp Params
+_Static_assert(sizeof(BcPush) <= sizeof(Push), "the encoder's push constants lie in the decoder's range");
 
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback) {
@@ -545,7 +592,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkCtx *c = vk_ctx();
     if (!c || !vk_astc_gpu() || bw < 4 || bh < 4 || bw > 12 || bh > 12) return 0;
     plat_mutex_lock_shared(&g_lock);
-    VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE, bc_pipe = G.dev == c->device ? G.bc_pipe : VK_NULL_HANDLE;
+    VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE;
+    VkPipeline bc_pipe = G.dev != c->device ? VK_NULL_HANDLE : bc == 2 ? G.bc1_pipe : G.bc_pipe;
     plat_mutex_unlock_shared(&g_lock);
     if (!pipe || (bc && !bc_pipe)) return 0;
     if (bc) {
@@ -563,7 +611,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     for (int i = 0; i < n; i++) {
         VkDeviceSize o = region_out(&rg[i]), b = region_in(&rg[i], bw, bh);
         if (co && co + o > CHUNK_OUT) ci = co = cb3 = 0;
-        ci += b, co += o, cb3 += region_bc(&rg[i]), out_total += o;
+        ci += b, co += o, cb3 += region_bc(&rg[i], bc), out_total += o;
         if (ci > cap_in) cap_in = ci;
         if (co > cap_out) cap_out = co;
         if (cb3 > cap_bc) cap_bc = cb3;
@@ -666,7 +714,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         }
         if (slot >= 0)
             vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot + 1);
-        if (bc) {   // the chunk's texels to BC3 blocks behind them; the image copy then takes the blocks
+        if (bc) {   // the chunk's texels to BC3 (or BC1) blocks behind them; the image copy then takes the blocks
             mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
             VkDescriptorBufferInfo bdi[2] = {{sb, cap_in, cap_out}, {sb, cap_in + cap_out, cap_bc}};
@@ -681,13 +729,14 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             for (int i = i0; i < i1; i++) {
                 const VkAstcRegion *r = &rg[i];
                 uint32_t bx4 = (r->w + 3) / 4, by4 = (r->h + 3) / 4;
-                BcPush pc = {.in_base = (uint32_t)(to / 4), .out_base = (uint32_t)(bo / 16), .width = r->w, .height = r->h,
+                uint32_t bb = bc == 2 ? 8 : 16;   // bytes per block
+                BcPush pc = {.in_base = (uint32_t)(to / 4), .out_base = (uint32_t)(bo / bb), .width = r->w, .height = r->h,
                              .bx = bx4, .bslice = bx4 * by4};
                 vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 vkCmdDispatch(cb, (bx4 + 7) / 8, (by4 + 7) / 8, r->slices);
                 VkBufferImageCopy *cp = &copies[i - i0];
                 cp->bufferOffset = cap_in + cap_out + bo, cp->bufferRowLength = bx4 * 4, cp->bufferImageHeight = by4 * 4;
-                to += region_out(r), bo += region_bc(r);
+                to += region_out(r), bo += region_bc(r, bc);
             }
         }
         mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

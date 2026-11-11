@@ -446,6 +446,7 @@ int vk_astc_mode(void);                 // decided once per device (logged); VK_
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
 int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (NX2NAVI_ASTC_BC=1)
+int vk_astc_bc1(void);                  // 1: and the ones whose blocks decode opaque BC1 (NX2NAVI_ASTC_BC1)
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
 // after the other), w x h texels and slices deep, written at offset of level / layer. bl: the blocks at src are the
 // level's block-linear storage as the game laid it out, block height 2^th and depth 2^td GOBs (tex_deswizzle.c
@@ -455,7 +456,8 @@ typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset
 // bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
 // into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
 // call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
-// bc: img is BC3 (TexVkFormat.astc_bc); the texels are encoded to BC3 blocks before the copy, and readback is ignored.
+// bc: img is BC3 (TexVkFormat.astc_bc 1) or BC1 (2); the texels are encoded to its blocks before the copy, and readback
+// is ignored.
 // 1 when recorded. 0 when the decoder is unavailable or cannot take these regions, and -1 when its scratch buffer
 // cannot be allocated: nothing is recorded in either case, and after -1 the same call can succeed once memory is free.
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
