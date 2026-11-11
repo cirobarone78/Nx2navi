@@ -37,7 +37,8 @@ rl.mr.PINS.update({
 })
 
 # The sysroot's header folders the runtime and the lifted code include, besides glibc's and the kernel's
-HEADER_DIRS = ['SDL3', 'opus', 'vpx', 'vulkan', 'vk_video', 'c++']
+# glibc's network headers (netdb.h includes netinet/in.h and rpc/netdb.h): the co-op client in runtime/platform/linux.c
+HEADER_DIRS = ['SDL3', 'opus', 'vpx', 'vulkan', 'vk_video', 'c++', 'netinet', 'arpa', 'net', 'rpc']
 # Libraries a link reads, by name prefix in usr/lib/x86_64-linux-gnu (and lib/x86_64-linux-gnu): glibc's and those of
 # make_game.py's LINK_LIBS that come from the sysroot
 LIB_NAMES = [*(f'lib{n}' for n in rl.GLIBC_LIBS), 'libSDL3.so', 'libopus.a', 'libvpx.a', 'libvulkan.so']

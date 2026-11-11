@@ -1137,7 +1137,9 @@ def preflight(msys, jobs, sources=None):
     with tempfile.TemporaryDirectory(prefix='nx2navi-check-') as tmp:
         probe = Path(tmp) / 'probe.c'
         probe.write_text('int main(void) { return 0; }\n', encoding='ascii')
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie']
+        # the kit's toolchain links against its sysroot, as step_compile does
+        ld = (TC_FLAGS[:2] + ['-fuse-ld=lld'] if KIT_TC else ['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + \
+             ['-no-pie']
         p = subprocess.run([str(clangxx), *ld, '-o', str(Path(tmp) / 'probe'), '-x', 'c', str(probe), '-x', 'none',
                             *LINK_LIBS], capture_output=True, text=True, env=env, errors='replace')
     if p.returncode:
