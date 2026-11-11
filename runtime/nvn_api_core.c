@@ -712,7 +712,11 @@ NVN_API(nvnQueueSubmitCommands) {
     // several guest threads submit at once (the pause menu's first frame on): a plain ++ lost counts, and with one the
     // frame's first submission went without its wait, or a later one waited
     int idx = __atomic_fetch_add(&nvn_submits_in_frame, 1, __ATOMIC_RELAXED);
-    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->exec_wait(f, UINT64_MAX);
+    if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) {
+        gfx_tl_note('W', 0, f, 0);
+        gfx_backend()->exec_wait(f, UINT64_MAX);
+        gfx_tl_note('w', 0, 0, 0);
+    }
     nvn_call_note(0, (uintptr_t)q, 0);
 }
 

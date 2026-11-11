@@ -56,6 +56,7 @@ typedef struct {
     uint32_t nops;                      // the ops it records (JUMPs not counted)
     uint32_t cond0, ncond;              // its render conditions' decisions in G.cond
     uint64_t oq;                        // the occlusion counting at its first op (vk_exec_xfer_chunk_state)
+    uint32_t slot0, nslots;             // its block of occlusion query slots (vk_exec_xfer_slots)
     int idx;                            // in its group: 0 runs the group's pass hooks
     VkCommandBuffer cb;
     int recorded;
@@ -1883,6 +1884,7 @@ static Chunk *chunk_open(const VkExec *ex, const op_hdr *h, int idx) {
     Chunk *c = &G.c[idx];
     memcpy(&c->ex, ex, sizeof *ex);
     c->h = h, c->nops = 0, c->cond0 = G.ncond, c->ncond = 0, c->idx = idx, c->oq = vk_exec_xfer_chunk_state();
+    c->nslots = 0;
     return c;
 }
 
@@ -1893,7 +1895,7 @@ static void chunk_record(Chunk *c, int pool) {
     VkExec *ex = &c->ex, *was = x_cur;
     if (pool < RW.n) ex->dc = RW.w[pool]->dc;   // the submitting thread records with its own (the state's)
     x_cur = ex, rw_chunk = c, rw_ordered = !c->idx;
-    vk_exec_xfer_worker(1, G.cond + c->cond0, c->ncond, c->oq);
+    vk_exec_xfer_worker(1, G.cond + c->cond0, c->ncond, c->oq, c->slot0, c->nslots);
     ex->cb = vk_sync_worker_begin(pool);
     // the replay's command buffer before the group ended behind a full barrier, with every image in GENERAL
     ex->recorded = 0, ex->barrier_at = 0, ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL;
@@ -1925,7 +1927,7 @@ static void chunk_record(Chunk *c, int pool) {
     free(ex->views);
     ex->views = NULL;
     c->cb = ex->cb, c->recorded = ex->recorded;
-    vk_exec_xfer_worker(0, NULL, 0, 0);
+    vk_exec_xfer_worker(0, NULL, 0, 0, 0, 0);
     x_cur = was, rw_chunk = NULL;
     __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
 }
@@ -1955,6 +1957,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         return h;
     }
     uint64_t t0 = kern_now_ns();
+    gfx_tl_note('g', 0, draws, (uint64_t)n);
     vk_exec_barrier(ex);         // the command buffer so far ends behind a full barrier, every image back in GENERAL
     vk_exec_draw_group_begin(ex);
     // the front pass
@@ -1972,6 +1975,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         if (cut) c = chunk_open(ex, o, nc++), cd = 0, cut = 0;
         switch (o->op) {
         case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+            if (vk_exec_xfer_counting() && !ex->render_disabled) c->nslots++;   // at most one query each
             if (++cd == per && nc < n) cut = 1;
             break;
         case OP_CLEAR_COLOR: case OP_CLEAR_DS: break;   // recorded by the chunk
@@ -1993,6 +1997,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         o = nvn_op_next(o);
     }
     vk_exec_xfer_group(0);   // the segments stay listed for the workers until the next group
+    for (int i = 0; i < nc; i++) G.c[i].slot0 = vk_exec_xfer_slots(G.c[i].nslots);   // in the order of the stream
     // handed out: the workers and this thread take the chunks in order
     for (int i = 0; i < nc; i++) G.c[i].done = 0;
     G.hooks = 0;
@@ -2010,6 +2015,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     int rec = 0;
     for (int i = 0; i < nc; i++) cbs[i] = G.c[i].cb, rec += G.c[i].recorded;
     ex->cb = vk_sync_append(cbs, nc);
+    gfx_tl_note('h', 0, 0, 0);
     ex->recorded += rec, ex->barrier_at = ex->recorded;   // the last chunk ended with a full barrier
     ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->fb_fs = NULL;
     vk_exec_draw_new_cb();
@@ -2100,6 +2106,7 @@ static void rec_claim(void) {
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     if (vk_device_is_lost()) return 0;   // the run is ending (vk_device.c vk_device_lost_check): nothing is recorded
     uint64_t in_ns = kern_now_ns();
+    gfx_tl_note('R', 0, (uint64_t)n, fence);
     perf_lock_timing_here();   // NX2NAVI_LOCK_TIME
     if (prof_replay_tid != plat_thread_id()) perf_replay_thread();   // the profiler follows the thread replaying now
     perf_rec_waits = rec_wait_totals;
@@ -2231,5 +2238,6 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     rec_spent_ns += kern_now_ns() - in_ns;
     if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();
+    gfx_tl_note('r', 0, (uint64_t)(ex->recorded - part_start), 0);
     return ex->recorded - part_start;   // what the last part holds
 }

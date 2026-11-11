@@ -405,6 +405,7 @@ static void ts_read_cb(void *arg);
 // idle time with work queued, 7-8 ms a frame over PCIe 3.0 in Kokiri Forest, and the frame as CPU-bound.
 static void ts_submitted(void) {
     uint64_t now = plat_now_ns();
+    gfx_tl_note('S', now, cur_fence, 0);
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < ts_n_unsent; i++) {
             TsRead *t = ts_unsent[i];
@@ -432,6 +433,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                     max64(&ts_max_gap_ns, gap);
                 }
                 if (sub && sn > sub) plat_add64(&ts_queued_ns, sn - sub);
+                gfx_tl_note('G', (uint64_t)sn, (uint64_t)en, (uint64_t)sub);
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
@@ -448,6 +450,82 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     } else plat_inc64(&ts_missed);
     __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
     free(t);
+}
+
+// ---- frame timeline
+// NX2NAVI_GPU_TIMELINE=<frame>: from that presented frame on, TL_FRAMES frames of what the CPU and the GPU did go to the
+// log once they are complete, in milliseconds from the first of those presents: each replay's begin and end and its
+// thread, each timed part's submit, GPU start and end (calibrated timestamps, so with NX2NAVI_TRACE=perf), the waits for
+// the GPU after a frame's first submission, the replay workers' groups and the presents. It tells whether the GPU waits
+// for the replay, for a wait, or for the CPU behind one. Off (and one load per note) without the setting.
+#define TL_CAP 16384
+#define TL_FRAMES 4
+typedef struct { uint64_t t, a, b; uint32_t tid; int kind; } TlEv;
+static TlEv *tl_ev;
+static volatile int32_t tl_n, tl_rec;
+static int tl_on = -1;
+static uint64_t tl_from, tl_frames;
+
+void gfx_tl_note(int kind, uint64_t t, uint64_t a, uint64_t b) {
+    if (!__atomic_load_n(&tl_rec, __ATOMIC_ACQUIRE)) return;
+    int32_t i = plat_inc32(&tl_n) - 1;
+    if (i < TL_CAP) tl_ev[i] = (TlEv){t ? t : plat_now_ns(), a, b, plat_thread_id(), kind};
+}
+
+static int tl_cmp(const void *x, const void *y) {
+    uint64_t a = ((const TlEv *)x)->t, b = ((const TlEv *)y)->t;
+    return a < b ? -1 : a > b;
+}
+
+static void tl_dump(void) {
+    int n = tl_n < TL_CAP ? tl_n : TL_CAP;
+    qsort(tl_ev, (size_t)n, sizeof *tl_ev, tl_cmp);
+    uint64_t t0 = 0, t1 = UINT64_MAX;
+    for (int i = 0; i < n; i++)
+        if (tl_ev[i].kind == 'P') {
+            if (tl_ev[i].a == tl_from) t0 = tl_ev[i].t;
+            if (tl_ev[i].a == tl_from + TL_FRAMES) t1 = tl_ev[i].t;
+        }
+    rt_log("vk: timeline of frames %llu-%llu (%d events), ms from the first present:", (unsigned long long)tl_from,
+           (unsigned long long)(tl_from + TL_FRAMES), n);
+    for (int i = 0; i < n; i++) {
+        const TlEv *e = &tl_ev[i];
+        if (e->t < t0 || e->t > t1) continue;
+        double at = (double)(int64_t)(e->t - t0) / 1e6;
+        switch (e->kind) {
+        case 'P': rt_log("vk: tl %8.3f t%-5u present, frame %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'R': rt_log("vk: tl %8.3f t%-5u replay begins: %llu handles, value %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'r': rt_log("vk: tl %8.3f t%-5u replay ends: %llu commands in the last part", at, e->tid,
+                         (unsigned long long)e->a); break;
+        case 'W': rt_log("vk: tl %8.3f t%-5u waits for the GPU to run value %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'w': rt_log("vk: tl %8.3f t%-5u wait ends", at, e->tid); break;
+        case 'g': rt_log("vk: tl %8.3f t%-5u group of %llu draws in %llu chunks", at, e->tid, (unsigned long long)e->a,
+                         (unsigned long long)e->b); break;
+        case 'h': rt_log("vk: tl %8.3f t%-5u group recorded", at, e->tid); break;
+        case 'S': rt_log("vk: tl %8.3f t%-5u part submitted, value %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'G': rt_log("vk: tl %8.3f gpu    part runs %.3f ms (submitted %.3f ms before)", at,
+                         (double)(e->a - e->t) / 1e6, (double)(int64_t)(e->t - e->b) / 1e6); break;
+        default: break;
+        }
+    }
+}
+
+void gfx_tl_present(void) {
+    if (tl_on < 0) {
+        const char *e = cfg_get("NX2NAVI_GPU_TIMELINE");
+        tl_from = e && *e ? strtoull(e, NULL, 0) : 0;
+        tl_on = tl_from && (tl_ev = calloc(TL_CAP, sizeof *tl_ev)) != NULL;
+    }
+    if (!tl_on) return;
+    uint64_t f = ++tl_frames;
+    if (f == tl_from) __atomic_store_n(&tl_rec, 1, __ATOMIC_RELEASE);
+    gfx_tl_note('P', 0, f, 0);
+    if (f == tl_from + TL_FRAMES + 3) {   // the parts of the last frame have been read back by now
+        __atomic_store_n(&tl_rec, 0, __ATOMIC_SEQ_CST);
+        tl_dump();
+        tl_on = 0;
+    }
 }
 
 // At the start of a command buffer (sub_lock held): the pair it times, -1 untimed.

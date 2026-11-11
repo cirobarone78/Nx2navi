@@ -18,6 +18,10 @@ const OvNvState *ov_nv_state(void);                        // ov_gfx.c
 
 // ---- window, vsync, focus (gfx_present.c and the window back end, gfx_wsys.h; vk_device.c). Host threads only; never run guest code.
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
+// NX2NAVI_GPU_TIMELINE=<frame> (vk_sync.c "frame timeline"): an event of the frames it records, at CPU time t (0: now)
+// with two values; gfx_tl_present counts the presented frames and writes the record to the log when it is complete.
+void gfx_tl_note(int kind, uint64_t t, uint64_t a, uint64_t b);
+void gfx_tl_present(void);
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
 uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time of a tick (pacing)

@@ -536,6 +536,7 @@ void gfx_exit_log(void) {
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
+    gfx_tl_present();
     vk_dlssg_game_present();
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);

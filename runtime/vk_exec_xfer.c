@@ -228,11 +228,16 @@ typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t 
 // the counting as the stream does from its chunk's first op (vk_exec_xfer_chunk_state): XW.counting and the segment its
 // closed queries belong to, the next one at or after its position in the stream (XW.seg; past the group's last, the
 // pending list oq_seg, which a later reset or report takes). It keeps the query open in its own pass (XW.open), takes
-// ring slots atomically and adds the slots it closes under oq_seg_lock. XW.cond: the decisions of its chunk's render
-// conditions, made by the front pass in the order of the stream.
+// ring slots from its chunk's block and adds the slots it closes under oq_seg_lock. XW.cond: the decisions of its chunk's
+// render conditions, made by the front pass in the order of the stream.
+// The blocks (vk_exec_xfer_slots): the front pass gives each chunk as many slots as it has draws that count samples and
+// render, one after the other, so the slots follow the stream as the replay's own do and the completion thread reads
+// and resets them in long runs (oq_take). Taken from the ring at once, the slots of a group's chunks interleaved: four
+// times the result calls and a reset per slot, 3.5 ms more of the wait after a frame's first submission (RX 7900 XT,
+// Hyrule Field, 3 workers). A chunk that needs more than its block takes them from the ring.
 static _Thread_local struct {
     int on, open, counting, reported, keep;
-    uint32_t seg;
+    uint32_t seg, qnext, qend;
     const uint8_t *cond;
     uint32_t ncond, i;
 } XW = {.open = -1};
@@ -244,12 +249,21 @@ void vk_exec_xfer_group(int on) {   // on: a new group's front pass begins; off:
     GS.on = on;
 }
 
+int vk_exec_xfer_counting(void) { return oq_counting; }
+
+uint32_t vk_exec_xfer_slots(uint32_t n) {
+    uint32_t first = oq_next;
+    oq_next += n;
+    return first;
+}
+
 uint64_t vk_exec_xfer_chunk_state(void) {
     return (uint64_t)GS.n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
 }
 
-void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state) {
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots) {
     XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0;
+    XW.qnext = slot0, XW.qend = slot0 + nslots;
     XW.counting = (int)(state & 1), XW.reported = (int)(state >> 1 & 1), XW.keep = (int)(state >> 2 & 1);
     XW.seg = (uint32_t)(state >> 8);
 }
@@ -319,8 +333,9 @@ static void oq_close(VkExec *ex) {
 void vk_exec_oq_draw(VkExec *ex) {
     int *open = XW.on ? &XW.open : &oq_open;
     if (!(XW.on ? XW.counting : oq_counting) || *open >= 0) return;
-    // a worker takes its slot at once (a busy one is lost, not tried again): the others take theirs meanwhile
-    uint32_t q = (XW.on ? __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED) : oq_next) % OQ_N;
+    // a worker takes the next slot of its chunk's block, past it one from the ring at once; a busy one is lost, not
+    // tried again
+    uint32_t q = (!XW.on ? oq_next : XW.qnext != XW.qend ? XW.qnext++ : __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED)) % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");
         if (XW.on && XW.seg < GS.n) __atomic_store_n(&GS.s[XW.seg]->lost, 1, __ATOMIC_RELAXED);
@@ -415,6 +430,13 @@ static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
     if (oq_batch_mode < 0) oq_batch_mode = cfg_bool("NX2NAVI_OQ_BATCH");
+    // a segment the replay workers filled lists its slots in the order the chunks closed them: in ring order, they are
+    // taken in runs (oq_take)
+    for (uint32_t i = 1; i < s->n; i++) {
+        uint32_t v = s->q[i], j = i;
+        for (; j && s->q[j - 1] > v; j--) s->q[j] = s->q[j - 1];
+        s->q[j] = v;
+    }
     uint64_t sum = 0;
     for (uint32_t i = 0; i < s->n; i++) {
         // The fence has passed, so a query that is still unavailable will not become available: waiting would block the
