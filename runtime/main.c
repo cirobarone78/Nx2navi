@@ -661,7 +661,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
-    if (!strcmp(mode, "--probe-movie")) return probe_movie();
+    if (!strcmp(mode, "--probe-movie")) {   // the AV1 decoder tells the graphics back end of each frame it writes: none here
+        cfg.gpu = "null";
+        return probe_movie();
+    }
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
     if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();
