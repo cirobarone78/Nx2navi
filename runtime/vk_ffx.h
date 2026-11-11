@@ -35,6 +35,9 @@ const char *vk_ffx4_name(void);   // "AMD FSR 4.1.2" once vk_ffx4_available foun
 int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
                     const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y);   // as vk_ffx_upscale
 void vk_ffx4_release(void);
+int vk_ffx4_device_wanted(void);  // Linux: amd_fidelityfx_upscaler_vk.so is beside the executable, so the device is made
+                                  // with what it needs (VK_EXT_descriptor_buffer; FP8 matrices where reported); else 0
+int vk_ffx4_device_ready(void);   // the device was made with VK_EXT_descriptor_buffer (vk_device.c)
 int vk_ffx_fsr4(void);            // the setting asks for FSR 4 and it runs here: what vk_ffx_upscale uses, for the menu
 
 #if defined(__cplusplus) && !defined(VK_FFX_NO_API)

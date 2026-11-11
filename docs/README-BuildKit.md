@@ -131,8 +131,18 @@ AMD FSR 3.1 on Linux loads `libamd_fidelityfx_vk.so` from beside `ocarina`. AMD 
 and its frame generation swapchain, for every Vulkan GPU (`tools/ffx_linux/README.md`). The AppImage made with `--ffx`
 carries it and the build copies it beside the game. Without it the menu offers neither FSR 3.1 upscaling nor FSR 3.1
 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the game's own scaling and swapchain as
-they are (the log says `ffx: ... not found`). AMD FSR 4 is in the Windows build
-alone, and `fsr4 = 1` does nothing on Linux.
+they are (the log says `ffx: ... not found`).
+
+AMD FSR 4 on Linux is optional and made on the player's PC, as nothing of AMD's may ship in the AppImage: the window's
+*AMD FSR 4* button (or `AppRun --get-fsr4 <game folder>`) asks to agree to AMD's licence, downloads AMD's FSR SDK 2.3.0
+release, checks it and its upscaler DLL by SHA-256, builds a Vulkan FSR 4 upscaler from source at a pinned commit with
+the model and shaders read from that DLL, and puts `amd_fidelityfx_upscaler_vk.so` beside `ocarina`
+(`tools/fsr4_linux.py`; it needs git and GCC, about 120 MB of download and 10 to 20 minutes). `runtime/vk_ffx4.cpp` loads it
+there, and the device is made with `VK_EXT_descriptor_buffer` while the file is there (`runtime/vk_device.c`). It
+runs its INT8 network on cards without FP8 matrices (checked on an RTX 3080: 3.1 ms a frame from 1280x720 to
+2560x1440) and its FP8 network where the device reports `VK_EXT_shader_float8` and `VK_KHR_cooperative_matrix`. The
+menu then offers *AMD FSR 4* under Screen, Upscaling (`fsr4 = 1`); deleting the file turns it off. FSR 4's frame
+generation stays with the Windows build.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside

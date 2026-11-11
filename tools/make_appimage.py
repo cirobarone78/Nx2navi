@@ -54,6 +54,8 @@ NX2navi $(cat "$KIT/VERSION") - build Ocarina of Time (Switch 2, game 1.1.1) nat
   $(basename "${APPIMAGE:-$0}") <your game.nup> [game folder]       build (default folder: ~/Games/Ocarina)
   $(basename "${APPIMAGE:-$0}") --check <your game.nup>             only check the dump's version
   $(basename "${APPIMAGE:-$0}") --make-game <make_game.py options>  run tools/make_game.py directly
+  $(basename "${APPIMAGE:-$0}") --get-fsr4 [game folder]            AMD FSR 4 for the game, made on this PC from AMD's
+                                                                    SDK DLL (asks to agree to AMD's licence first)
 
 The game folder then holds 'ocarina' and 'play.sh', which starts it. Nothing of the game is in this file:
 everything the build writes comes from your dump, so keep it to yourself.
@@ -71,6 +73,23 @@ case "$1" in ""|-h|--help) usage; exit 0 ;; esac
 EVENTS=()
 ev() { [ ${#EVENTS[@]} -gt 0 ] && printf '@@{"ev":"%s","step":"%s"%s}\n' "$1" "$2" "${3:+,$3}"; return 0; }
 if [ "$1" = --events ]; then EVENTS=(--events); shift; fi
+
+# --get-fsr4 [folder]: AMD FSR 4 beside a built game (tools/fsr4_linux.py); needs none of the checks below. The window
+# passes --accept-amd-license after its own question; the command line asks here.
+if [ "$1" = --get-fsr4 ]; then
+    FOLDER="${2:-$HOME/Games/Ocarina}"
+    ACCEPT=()
+    if [ "${3:-}" = --accept-amd-license ]; then
+        ACCEPT=(--accept-amd-license)
+    else
+        echo "AMD FSR 4 is made from AMD's FSR SDK 2.3.0 upscaler DLL, downloaded from AMD's GitHub release and read on this PC."
+        echo "Licence: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.3.0/docs/license.md"
+        read -r -p "Do you agree to AMD's licence for it? [y/N] " yn
+        case "$yn" in [yY]*) ACCEPT=(--accept-amd-license) ;; *) echo "Nothing done."; exit 1 ;; esac
+    fi
+    exec "$PY" -I "$KIT/tools/fsr4_linux.py" --out "$FOLDER" --kit "$KIT" --pydeps "$PYDEPS" "${ACCEPT[@]}" \
+        "${EVENTS[@]+"${EVENTS[@]}"}"
+fi
 ev step deps '"state":"start"'
 
 missing=()
