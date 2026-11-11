@@ -1770,20 +1770,46 @@ static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
 // the others is bounded by NX2NAVI_TEX_RELEASED_MB (drop_stale).
 // Each call looks at up to SWEEP_LOOK entries from where the last one stopped (sweep_at; rel_unlink moves it off an
 // entry that leaves): with thousands of entries that stay, a walk from the head at every release would cross them all.
+// RELEASED_MAX is the floor of that limit; released_max raises it by the card (NX2NAVI_TEX_RELEASED_MAX sets it).
 #define RELEASED_MAX 2048
+#define RELEASED_MAX_TOP 8192
 #define RELEASED_HARD 16384
 #define SWEEP_LOOK 64
 #define SWEEP_UNSAMPLED PRESENTS(120)
 
 static int comes_back_intact(const Tex *e);
 
+// The limit of released entries past which the sweep drops those that lose nothing: one per 2 MiB of the video memory
+// budget, from RELEASED_MAX to RELEASED_MAX_TOP. In Castle Town market on a 16 GB card (RTX 5060 Ti) with 2048 the
+// sweep dropped 412 entries in a session and a few textures blinked black for a moment; with 8192 (and
+// NX2NAVI_TEX_RELEASED_MB = 4096) it dropped none, 6,863 were kept and none blinked. Their memory stays bounded by
+// NX2NAVI_TEX_RELEASED_MB and the VRAM pressure. Read once the budget is known.
+static int released_max(void) {
+    static int max;
+    if (max) return max;
+    const char *s = cfg_get("NX2NAVI_TEX_RELEASED_MAX");
+    if (s && *s) {
+        long long n = atoll(s);
+        max = n < 1 ? 1 : n > RELEASED_HARD ? RELEASED_HARD : (int)n;
+    } else {
+        uint64_t vused = 0, vbudget = 0;
+        int exact = 0;
+        if (!vk_mem_vram(&vused, &vbudget, &exact) || !vbudget) return RELEASED_MAX;
+        long long n = (long long)(vbudget >> 21);
+        max = n < RELEASED_MAX ? RELEASED_MAX : n > RELEASED_MAX_TOP ? RELEASED_MAX_TOP : (int)n;
+    }
+    rt_log("vk: released textures: the sweep keeps up to %d entries (NX2NAVI_TEX_RELEASED_MAX)", max);
+    return max;
+}
+
 static void sweep_released(void) {
-    if (nreleased <= RELEASED_MAX) return;
+    int lim = released_max();
+    if (nreleased <= lim) return;
     {
         uint64_t now = frames_now();
         const uint64_t stale = PRESENTS(120);   // STALE_FRAMES, defined below
         Tex *e = sweep_at ? sweep_at : rel_head;
-        for (int n = 0; n < SWEEP_LOOK && nreleased > RELEASED_MAX; n++) {
+        for (int n = 0; n < SWEEP_LOOK && nreleased > lim; n++) {
             if (!e || now - e->rel_frame < stale) { e = rel_head; break; }   // the rest is younger: from the oldest again
             Tex *next = e->rel_next;
             if (comes_back_intact(e) || e->overwritten) drop_tex(e, DROP_MAX);
