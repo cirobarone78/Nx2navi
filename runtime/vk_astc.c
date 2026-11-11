@@ -483,13 +483,19 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
         VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkBuffer b;
         VmaAllocation a;
-        if (vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL) != VK_SUCCESS) {
+        VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bi.size > need) {
+            // The usual scratch leaves room for later textures. This upload can still fit without the spare bytes.
+            bi.size = need;
+            r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, NULL);
+        }
+        if (r != VK_SUCCESS) {
             plat_mutex_unlock(&g_lock);
             return VK_NULL_HANDLE;
         }
         // the old one may still be read by its command buffer: freed once the batches recorded so far completed
         if (S.buf && S.dev == c->device) vk_defer_buffer(S.buf, S.alloc);
-        S.buf = b, S.alloc = a, S.size = size, S.dev = c->device;
+        S.buf = b, S.alloc = a, S.size = bi.size, S.dev = c->device;
         n_scratch_new++;
         vk_texstat_time(VK_TS_SCRATCH, t0);
     } else {

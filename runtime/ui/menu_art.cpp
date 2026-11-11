@@ -134,6 +134,11 @@ static int upload_rgba(Art &a, const uint8_t *rgba, uint32_t w, uint32_t h, uint
     }
     memcpy(map, chain, (size_t)bytes);
     free(chain);
+    // The batch flushes its own staging buffers. This one is caller-owned and can be noncoherent.
+    if (vmaFlushAllocation(c->vma, sa, 0, bytes) != VK_SUCCESS) {
+        vmaDestroyBuffer(c->vma, sb, sa);
+        return art_free(a), 0;
+    }
     VkCommandBuffer cb = vk_upload_begin();
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;

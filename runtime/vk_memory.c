@@ -3600,6 +3600,12 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VkBuffer b;
     VmaAllocation a;
     VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && aci.pool) {
+        // The staging pool can grow only in 64 MiB blocks of its one memory type. A smaller allocation may
+        // still fit in a default block or another host-visible type. Keep the same mapping requirements.
+        aci.pool = NULL;
+        r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+    }
     if (r != VK_SUCCESS) rt_fatal("vk: staging buffer of %llu bytes failed (%d)", (unsigned long long)size, (int)r);
     vk_texstat_add(VK_TS_STG_NEW, 1, bi.size);
     *buf = b;
