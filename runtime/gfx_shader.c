@@ -2715,13 +2715,18 @@ void gfx_shader_record_flush(int force) {
 // answers are read again from its first translation (gfx_shader_guess.c) and the variant it resolves to is the
 // translation with those, when they differ.
 #define SEED_DEFAULT 0x80                                  // tools/prepare_shaders.py DEFAULT_FLAG
+enum { SEED_VARIANTS = 3 + GFX_PREP_ALTERNATIVES };
+typedef struct {
+    uint8_t id[SEED_VARIANTS][32];
+    uint8_t count;
+} SeedVariants;
 typedef struct { const uint8_t *rec; } PrgIdx;
 typedef struct { PrgIdx *idx; size_t n; } PrgList;
 typedef struct {
     PrgList progs;
     const uint8_t *ans;
     size_t n_ans;
-    uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
+    SeedVariants *ids;                                     // resolved variants per seed record
     volatile int64_t next, done, missing, failed, refined;
 } Prep;
 
@@ -2730,6 +2735,14 @@ static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx 
 static void prg_collect(const uint8_t *rec, void *ctx) {
     PrgList *l = ctx;
     l->idx[l->n++].rec = rec;
+}
+
+static void seed_variant_add(SeedVariants *v, const GfxShader *s) {
+    if (!s) return;
+    for (int i = 0; i < v->count; i++)
+        if (!memcmp(v->id[i], s->iid, 32)) return;
+    if (v->count == SEED_VARIANTS) rt_fatal("gfx_shader: preparation variant bound exceeded");
+    memcpy(v->id[v->count++], s->iid, 32);
 }
 
 static void prep_worker(void *arg) {
@@ -2748,23 +2761,53 @@ static void prep_worker(void *arg) {
         uint32_t st, len;
         memcpy(&st, e->rec, 4), memcpy(&len, e->rec + 4, 4);
         const uint8_t *control = e->rec + 44, *code = control + CONTROL_SIZE, *c1 = code + len;
-        GfxShaderAnswers a, b;
+        GfxShaderAnswers a, b, regular[3];
         unpack_answers(r + 68, &a);
-        const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a), *t;
+        const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a), *t, *base = s;
+        int nr = 1;
+        regular[0] = a;
         if (s && r[ANS_REC - 1] & SEED_DEFAULT && gfx_shader_guess_refine(s, (int)st, &a, &b) &&
-            (t = gfx_shader_get((int)st, control, code, len, c1, &b)))
-            s = t, plat_inc64(&p->refined);
+            (t = gfx_shader_get((int)st, control, code, len, c1, &b))) {
+            regular[0] = b;
+            // A bitcast can also unpack bits from a float attribute. Model draws use both layouts at
+            // locations 8 and 9, independently of integer indices elsewhere in the same shader.
+            if (p->ids && st == GFX_STAGE_VS && (b.attr_type[8] != a.attr_type[8] || b.attr_type[9] != a.attr_type[9])) {
+                b.attr_type[8] = a.attr_type[8];
+                b.attr_type[9] = a.attr_type[9];
+                regular[nr++] = b;
+            }
+            // Integer bitcasts also occur on float vertex inputs. Preserve the
+            // original float layout rather than discarding it after refinement.
+            if (st == GFX_STAGE_VS && memcmp(&regular[nr - 1], &a, sizeof a)) regular[nr++] = a;
+            s = t;
+            plat_inc64(&p->refined);
+        }
         if (!s) plat_inc64(&p->failed);
-        else if (p->iid) memcpy(p->iid[i], s->iid, 32);
+        else if (p->ids) {
+            const GfxShader *normal[3] = {s};
+            SeedVariants *v = &p->ids[i];
+            seed_variant_add(v, s);
+            for (int j = 1; j < nr; j++) {
+                normal[j] = !memcmp(&regular[j], &a, sizeof a) ? base :
+                    gfx_shader_get((int)st, control, code, len, c1, &regular[j]);
+                seed_variant_add(v, normal[j]);
+            }
+            for (int j = 0; j < nr; j++) {
+                GfxShaderAnswers alternatives[GFX_PREP_ALTERNATIVES];
+                int na = gfx_shader_guess_alternatives(normal[j], (int)st, &regular[j], alternatives);
+                for (int k = 0; k < na; k++)
+                    seed_variant_add(v, gfx_shader_get((int)st, control, code, len, c1, &alternatives[k]));
+            }
+        }
         plat_inc64(&p->done);
     }
 }
 
 // Translates every record of ans_path whose program is in prg_path on `threads` threads with up to `procs` translators.
-// *ans_out, *iid_out (optional; free them): the answers records and the input id each resolved to (zero: failed).
+// *ans_out, *ids_out (optional; free them): the answers records and their successfully translated variants.
 // Returns the record count, -1 without the files.
 static long long prepare_files(const char *ans_path, const char *prg_path, int threads, int procs, const char *what,
-                               uint8_t **ans_out, uint8_t (**iid_out)[32]) {
+                               uint8_t **ans_out, SeedVariants **ids_out) {
     paths();
     double t0 = (double)plat_now_ms();
     uint8_t *ab = NULL, *pb = NULL;
@@ -2776,8 +2819,8 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
         return -1;
     }
     Prep p = {.progs = {calloc(pn / PRG_HEAD + 1, sizeof(PrgIdx)), 0}, .ans = ab, .n_ans = an / ANS_REC};
-    if (iid_out) p.iid = calloc(p.n_ans + 1, 32);
-    if (!p.progs.idx || (iid_out && !p.iid)) return free(p.progs.idx), free(p.iid), free(ab), free(pb), -1;
+    if (ids_out) p.ids = calloc(p.n_ans + 1, sizeof *p.ids);
+    if (!p.progs.idx || (ids_out && !p.ids)) return free(p.progs.idx), free(p.ids), free(ab), free(pb), -1;
     prg_walk(pb, pn, prg_collect, &p.progs);
     qsort(p.progs.idx, p.progs.n, sizeof *p.progs.idx, prg_cmp);
     plat_inc32(&C.suspended);   // a preparation translates everything under the current translator, carrying nothing
@@ -2810,7 +2853,7 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     free(p.progs.idx), free(pb);
     if (ans_out) *ans_out = ab;
     else free(ab);
-    if (iid_out) *iid_out = p.iid;
+    if (ids_out) *ids_out = p.ids;
     return (long long)p.n_ans;
 }
 
@@ -2865,7 +2908,8 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     snprintf(out, sizeof out, "%s/shader-prepared.bin", dir);
     double t0 = (double)plat_now_ms();
     uint64_t fail0 = (uint64_t)n_failures;
-    uint8_t *ab = NULL, (*iid)[32] = NULL;
+    uint8_t *ab = NULL;
+    SeedVariants *ids = NULL;
     // What this list is prepared from goes into its head (prp_file.h): the seed as it is on the disk now, and the
     // translator before the host options are mixed in, which is what nx2navi_xlate.id holds. The list there before
     // is replaced whole at the end; the log says whether it came from this seed.
@@ -2886,20 +2930,21 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     // For the whole run: the variants built into the driver's cache after it (vk_pipeline.c lb_warm_prepared) are the
     // current translator's, as before carrying existed.
     plat_inc32(&C.suspended);
-    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &iid);
+    long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &ids);
     if (n < 0) return 1;
-    uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
-    static const uint8_t zero[32];
+    uint8_t *recs = calloc((size_t)n * SEED_VARIANTS + 1, PRP_REC);
     size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
-    for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
-        if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;
-        uint8_t *r = recs + u * PRP_REC;
+    for (long long i = 0; recs && i < n; i++) {   // priority order: the first occurrence wins
         const uint8_t *a = ab + (size_t)i * ANS_REC;
         uint8_t prio = a[ANS_REC - 1] & ~SEED_DEFAULT;
-        r[0] = a[0] < 6 ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
-        memcpy(r + 4, iid[i], 32);
-        by[r[1]]++, stages[r[0]]++, u++;
+        for (unsigned j = 0; j < ids[i].count; j++) {
+            if (!set_add(&seen, hash8(ids[i].id[j]))) continue;
+            uint8_t *r = recs + u * PRP_REC;
+            r[0] = a[0] < 6 ? a[0] : 0, r[1] = prio > 2 ? 2 : prio;
+            memcpy(r + 4, ids[i].id[j], 32);
+            by[r[1]]++, stages[r[0]]++, u++;
+        }
     }
     free(seen.v);
     uint8_t *file = recs ? malloc(PRP_HEAD + PRP_FROM_SIZE + u * PRP_REC + 1) : NULL;
@@ -2920,7 +2965,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
-    free(file), free(recs), free(iid), free(ab);
+    free(file), free(recs), free(ids), free(ab);
     return ok ? 0 : 1;
 }
 
