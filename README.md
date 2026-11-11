@@ -55,6 +55,8 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - Your Discord status shows "Playing NX2navi" with the play time (on by default; the Game tab of the menu or the
   launcher's Settings turns it off)
 - Docked or handheld console mode
+- The game's text and its voices in different languages: the Game tab's Game language row sets the text, its Voice
+  language row is the game's own Voice Language option (nine voiced languages), shown and changed while the game runs
 - The game's textures stay compressed (BC3, about half the video memory at the same speed) unless the PC has 20 GiB of
   video memory and 48 GiB of RAM, as Windows counts video memory against the system's commit limit
 

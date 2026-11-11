@@ -26,6 +26,7 @@
 #include "platform/platform.h"
 #include "romfs_path.h"
 #include "save_share.h"
+#include "voice_lang.h"
 
 #define NX2NAVI_APPLICATION_ID 0x0400486024dec000ull   // the game's title id, as svc.c PROGRAM_ID tells it
 #define FILE_BASE 0x200000000ull
@@ -1088,6 +1089,7 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (romfs_owns(path)) return romfs_open(out, path, mode);
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
+    if (path && !strcmp(path, "save:/option.sav")) voice_lang_options_opened();   // voice_lang.c: the options are read
     if (!out || !(mode & (FS_OPEN_READ | FS_OPEN_WRITE)) || (mode & ~7)) return FS_R_INVALID_ARGUMENT;
     char p[PATH_CAP];
     int kind = M_FREE;

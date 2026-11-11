@@ -4,7 +4,9 @@
 // host. Stub rule: queries and initialisation succeed with neutral values, data paths stop with a named fatal.
 //
 // Environment:
-//   NX2NAVI_LANG=<Switch language code>   the game's language as given ("ja", "en-GB", "zh-Hant", ...)
+//   NX2NAVI_LANG=<Switch language code>   the game's language as given ("ja", "en-GB", "zh-Hant", ...): its text; the
+//                                      voices follow the game's own Voice Language option (voice_lang.c), which the
+//                                      game takes from this language only while it has no option.sav (a first start)
 //   NX2NAVI_LOCALE=<BCP 47 tag>           else the language for this locale ("pt-BR"), else the Windows user locale;
 //                                      a language the game does not ship becomes en-US
 //   NX2NAVI_OPERATION_MODE=docked|handheld   operation and performance mode reported to the game (default docked)

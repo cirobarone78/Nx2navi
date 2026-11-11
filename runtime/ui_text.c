@@ -195,8 +195,19 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CLOTH_REALTIME_DESC] = "Steps cloth and hair by real time as well.",
     [UI_MENU_HIGHFPS_FIX] = "High frame rate fixes",
     [UI_MENU_HIGHFPS_FIX_DESC] = "Corrects physics that misbehave above 30 frames per second, and objects that stay see-through or invisible above 60.",
-    [UI_MENU_GAME_LANG] = "Game language", [UI_MENU_GAME_LANG_DESC] = "Language of the game's text and voices.",
+    [UI_MENU_GAME_LANG] = "Game language",
+    [UI_MENU_GAME_LANG_DESC] = "Language of the game's text: menus, dialogue and subtitles. The voices have an option of "
+                               "their own in the game, Voice language below; the game takes them from this language only "
+                               "while it has no options file yet (a first start).",
     [UI_MENU_GAME_LANG_AUTO] = "Automatic",
+    [UI_MENU_VOICE_LANG] = "Voice language",
+    [UI_MENU_VOICE_LANG_DESC] = "Language of the spoken lines. This is the game's own Voice Language option, also on its "
+                                "options screen (Options on the title screen): a change here shows there, and one made "
+                                "there shows here. Lines spoken after a change use the new language, and the change is "
+                                "saved in the game's options file right away.",
+    [UI_MENU_VOICE_LANG_WAIT] = "Once the game has loaded its options",
+    [UI_MENU_VOICE_LANG_NONE] = "Not available for this game version",
+    [UI_MENU_VOICE_LANG_NOFILES] = "The game files have no voices",
     [UI_MENU_OPERATION_MODE] = "Console mode",
     [UI_MENU_OPERATION_MODE_DESC] = "Runs the game as docked or handheld.",
     [UI_MENU_MODE_DOCKED] = "Docked", [UI_MENU_MODE_HANDHELD] = "Handheld",
@@ -758,8 +769,19 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_CLOTH_REALTIME_DESC] = "Ткань и волосы тоже идут по реальному времени.",
     [UI_MENU_HIGHFPS_FIX] = "Исправления для высокого FPS",
     [UI_MENU_HIGHFPS_FIX_DESC] = "Исправляет физику, которая ломается при частоте выше 30 кадров в секунду, и объекты, которые выше 60 остаются полупрозрачными или невидимыми.",
-    [UI_MENU_GAME_LANG] = "Язык игры", [UI_MENU_GAME_LANG_DESC] = "Язык текста и озвучки игры.",
+    [UI_MENU_GAME_LANG] = "Язык игры",
+    [UI_MENU_GAME_LANG_DESC] = "Язык текста игры: меню, диалогов и субтитров. У озвучки в игре своя настройка, «Язык "
+                               "озвучки» ниже; игра берёт её из этого языка, только пока у неё ещё нет файла настроек "
+                               "(первый запуск).",
     [UI_MENU_GAME_LANG_AUTO] = "Автоматически",
+    [UI_MENU_VOICE_LANG] = "Язык озвучки",
+    [UI_MENU_VOICE_LANG_DESC] = "Язык произносимых реплик. Это собственная настройка игры «Язык озвучки», она есть и на "
+                                "экране настроек игры («Настройки» на титульном экране): изменение здесь видно там, а "
+                                "сделанное там видно здесь. Реплики после изменения звучат на новом языке, и изменение "
+                                "сразу сохраняется в файле настроек игры.",
+    [UI_MENU_VOICE_LANG_WAIT] = "Когда игра загрузит свои настройки",
+    [UI_MENU_VOICE_LANG_NONE] = "Недоступно в этой версии игры",
+    [UI_MENU_VOICE_LANG_NOFILES] = "В файлах игры нет озвучки",
     [UI_MENU_OPERATION_MODE] = "Режим консоли",
     [UI_MENU_OPERATION_MODE_DESC] = "Запускает игру как в док-станции или в портативном режиме.",
     [UI_MENU_MODE_DOCKED] = "В док-станции", [UI_MENU_MODE_HANDHELD] = "Портативный",
@@ -1218,8 +1240,19 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_CLOTH_REALTIME_DESC] = "Avança tecidos e cabelos pelo tempo real também.",
     [UI_MENU_HIGHFPS_FIX] = "Correções para alta taxa de quadros",
     [UI_MENU_HIGHFPS_FIX_DESC] = "Corrige a física que se comporta mal acima de 30 quadros por segundo e objetos que ficam transparentes ou invisíveis acima de 60.",
-    [UI_MENU_GAME_LANG] = "Idioma do jogo", [UI_MENU_GAME_LANG_DESC] = "Idioma dos textos e das vozes do jogo.",
+    [UI_MENU_GAME_LANG] = "Idioma do jogo",
+    [UI_MENU_GAME_LANG_DESC] = "Idioma dos textos do jogo: menus, diálogos e legendas. As vozes têm uma opção própria no "
+                               "jogo, Idioma das vozes, abaixo; o jogo só as tira deste idioma enquanto ainda não tem "
+                               "arquivo de opções (a primeira vez que é iniciado).",
     [UI_MENU_GAME_LANG_AUTO] = "Automático",
+    [UI_MENU_VOICE_LANG] = "Idioma das vozes",
+    [UI_MENU_VOICE_LANG_DESC] = "Idioma das falas. É a própria opção Idioma das vozes do jogo, que também está na tela de "
+                                "opções dele (Opções na tela de título): o que muda aqui aparece lá, e o que muda lá "
+                                "aparece aqui. As falas depois de uma mudança usam o novo idioma, e a mudança é salva na "
+                                "hora no arquivo de opções do jogo.",
+    [UI_MENU_VOICE_LANG_WAIT] = "Quando o jogo tiver carregado suas opções",
+    [UI_MENU_VOICE_LANG_NONE] = "Não disponível nesta versão do jogo",
+    [UI_MENU_VOICE_LANG_NOFILES] = "Os arquivos do jogo não têm vozes",
     [UI_MENU_OPERATION_MODE] = "Modo do console",
     [UI_MENU_OPERATION_MODE_DESC] = "Roda o jogo como na base ou no modo portátil.",
     [UI_MENU_MODE_DOCKED] = "Modo TV", [UI_MENU_MODE_HANDHELD] = "Modo portátil",
@@ -1803,8 +1836,16 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_HIGHFPS_FIX_DESC] = "修正帧率高于 30 时出现异常的物理效果，"
                                  "以及帧率高于 60 时一直半透明或不可见的物体。",
     [UI_MENU_GAME_LANG] = "游戏语言",
-    [UI_MENU_GAME_LANG_DESC] = "游戏文本和语音的语言。",
+    [UI_MENU_GAME_LANG_DESC] = "游戏文本（菜单、对话和字幕）的语言。语音在游戏中有自己的选项，即下方的“语音语言”；"
+                               "只有在游戏还没有设置文件时（首次启动），才按此语言设定语音。",
     [UI_MENU_GAME_LANG_AUTO] = "自动",
+    [UI_MENU_VOICE_LANG] = "语音语言",
+    [UI_MENU_VOICE_LANG_DESC] = "角色说话的语言。这是游戏自身的“语音语言”选项，游戏的设置画面（标题画面的“设置”）"
+                                "里也有：在这里更改会显示在那里，在那里更改也会显示在这里。更改后说出的台词使用新语言，"
+                                "并且更改会立即保存到游戏的设置文件中。",
+    [UI_MENU_VOICE_LANG_WAIT] = "游戏载入其设置后可用",
+    [UI_MENU_VOICE_LANG_NONE] = "此游戏版本不可用",
+    [UI_MENU_VOICE_LANG_NOFILES] = "游戏文件中没有语音",
     [UI_MENU_OPERATION_MODE] = "主机模式",
     [UI_MENU_OPERATION_MODE_DESC] = "以底座或掌机模式运行游戏。",
     [UI_MENU_MODE_DOCKED] = "底座模式",

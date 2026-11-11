@@ -469,6 +469,9 @@
 
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.
+# It is the language of the game's text. The voices follow the game's own Voice Language option (on the game's options
+# screen, and the Voice language row on the settings menu's Game tab), which the game takes from this language only
+# while it has no options file yet (a first start).
 # locale = en-US
 # lang = en-US
 # System mode reported to the game: docked or handheld.

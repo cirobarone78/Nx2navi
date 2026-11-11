@@ -55,6 +55,7 @@ extern "C" {
 #include "ui/menu.h"
 #include "ui_text.h"
 #include "vk_dlssg.h"
+#include "voice_lang.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -511,7 +512,8 @@ extern "C" void menu_vk_release(void) {
 // optional) at that presented frame; changes live settings with no input, menu open or not. nx2navi.ini is written only by
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note). FOCUS=<key> (the
 // NX2NAVI_ prefix optional) puts the cursor on that setting's row and scrolls it into view when the row is next drawn
-// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs.
+// (opt_focus_key), so a page's shot shows a row below the first screenful; it does not switch tabs. VOICE_LANG=<Switch
+// language code> is the Voice language row's change (row_voice_lang): the game's own option, no setting.
 enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_COUNT };   // Ocarina of Time: the options this port has
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
@@ -570,6 +572,10 @@ static void test_apply_sets(uint64_t frame) {
             char row[80];
             snprintf(row, sizeof row, "%s%s", strncmp(t.value, "NX2NAVI_", strlen("NX2NAVI_")) ? "NX2NAVI_" : "", t.value);
             opt_focus_key(row);
+        } else if (!strcmp(t.key, "NX2NAVI_VOICE_LANG")) {
+            int i = voice_lang_index(t.value);
+            if (i < 0) rt_log("menu: test hook: VOICE_LANG=%s is none of the nine voiced languages' codes", t.value);
+            voice_lang_request(i);
         } else {
             cfg_set(t.key, t.value);
         }
@@ -754,6 +760,31 @@ static void row_game_lang(void) {
     for (int i = 1; i <= n && *now && cur < 0; i++)
         if (!strcmp(ui_text_lang(now), ui_text_lang(vals[i]))) cur = i;
     opt_choice_list("NX2NAVI_LANG", UI_MENU_GAME_LANG, vals, names, n + 1, UI_MENU_GAME_LANG_DESC, cur);
+}
+
+// The voices: the game's own Voice Language option (voice_lang.c), shown as the game holds it and changed through the
+// game, so this row and the game's options screen are one setting and nothing goes to nx2navi.ini. It steps through the
+// languages whose voice files the game ships (and shows the option's value when its files are missing), and is greyed
+// until the game has read its options (the first seconds of a start), when the game files have no voices, or on a game
+// build whose option is not known.
+static void row_voice_lang(void) {
+    int cur = -1, want = voice_lang_pending();
+    unsigned offered = 0;
+    bool ready = voice_lang_state(&cur, &offered) != 0;
+    if (want >= 0) cur = want;
+    const char *names[VOICE_LANGS];
+    int choice[VOICE_LANGS], n = 0, at = -1;
+    for (int i = 0; i < VOICE_LANGS; i++)
+        if (offered & 1u << i || i == cur) {
+            if (i == cur) at = n;
+            choice[n] = i;
+            names[n++] = menu_text((UiTextId)voice_lang_name(i));
+        }
+    if (!ready) opt_disable_next(voice_lang_supported() ? UI_MENU_VOICE_LANG_WAIT : UI_MENU_VOICE_LANG_NONE);
+    else if (!offered) opt_disable_next(UI_MENU_VOICE_LANG_NOFILES);
+    // def -2: the option's default is the game's, so no entry carries the "default" mark (-1 would mark an empty value)
+    int nv = opt_choice_index("##voice_lang", UI_MENU_VOICE_LANG, names, n, at, -2, UI_MENU_VOICE_LANG_DESC);
+    if (ready && offered && nv >= 0) voice_lang_request(choice[nv]);
 }
 
 // The frame limit (frame_rate.c): unset, the older fps60 = 0 still means 30, and frame generation in use means the
@@ -1190,6 +1221,7 @@ static void tab_game(float scale) {
     opt_begin("##game", scale);
     row_fps_limit();   // frame_rate.c: Ocarina steps by the clock, so the pacer alone sets its rate
     row_game_lang();
+    row_voice_lang();
     static const UiTextId mode[] = {UI_MENU_MODE_DOCKED, UI_MENU_MODE_HANDHELD};
     opt_choice("NX2NAVI_OPERATION_MODE", UI_MENU_OPERATION_MODE, mode, 2, UI_MENU_OPERATION_MODE_DESC);
     opt_toggle("NX2NAVI_ASSUME_FOCUS", UI_MENU_ASSUME_FOCUS, UI_MENU_ASSUME_FOCUS_DESC);
