@@ -47,6 +47,12 @@ void vk_caps_driver(VkPhysicalDevice p) {
     vk_caps.amd_llpc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !vk_caps.amd_sc;
     vk_caps.mesa = drv.driverID == VK_DRIVER_ID_MESA_RADV || drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
                    drv.driverID == VK_DRIVER_ID_MESA_NVK;
+#ifdef __linux__
+    // i915 (under ANV) and amdgpu (under RADV) pin an imported host range when a submission names it, and again after
+    // any change to its pages; NVIDIA's driver pins it once, when it is imported. Any other driver counts as pinning:
+    // what the hold costs where it is not needed is memory given back a little later.
+    vk_caps.pins_imports = drv.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+#endif
 }
 
 // NX2NAVI_GPL=0 turns graphics pipeline libraries off; they are on wherever the driver has fast linking. AMD's RDNA 1/2

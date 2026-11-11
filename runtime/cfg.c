@@ -46,7 +46,7 @@ static const char *const known[] = {
     "FULLSCREEN", "FXAA", "GAME_ASPECT", "GAME_RES", "GPA", "GPA_EMPTY", "GPA_TWIN", "GPA_TWIN_MAX_KB", "GPL", "GPL_DRAW_BUILD", "GPL_FEEDBACK", "PIPE_AHEAD", "PIPE_FAST_WORKERS", "PIPE_LINK_DRAW_MS", "PROG_LEAD", "GPU", "GPU_INDEX", "GPU_PASSES", "GPU_NAME", "HDR", "HDR_BLOWOUT", "HDR_CONTRAST",
     "HDR_EXPOSURE", "HDR_FLARE", "HDR_GAMMA", "HDR_GAME_NITS", "HDR_GRADE", "HDR_HIGHLIGHT_SAT", "HDR_HIGHLIGHTS", "HDR_HUE",
     "HDR_LIVE",
-    "HDR_PEAK_NITS", "HDR_SATURATION", "HDR_SHADOWS", "HDR_TONEMAP", "HDR_UI_NITS", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
+    "HDR_PEAK_NITS", "HDR_SATURATION", "HDR_SHADOWS", "HDR_TONEMAP", "HDR_UI_NITS", "HIGHFPS_FIX", "IMPORT_HOLD", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
     "BIG_BUILD_FREE_MB", "BIG_BUILD_MAX_MB", "LIB_PREBUILD_BIG", "LIB_PREBUILD_BIG_BG", "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LIB_WARM", "PIPE_LINK_MS", "FRAME_HOLD_MS", "PACE_SMOOTH", "OQ_BATCH", "GATE_WAIT_MS", "LOCALE", "LOD_GUARD", "LSTICK_DEADZONE", "MEMORY", "MEM_CENSUS", "MENU_LANG", "MENU_SOUND_VOLUME", "MENU_TEST",
     "MENU_CURSOR", "MENU_CURSOR_LOG", "MENU_TEST_CLICK", "MENU_TEST_DIR", "MENU_TEST_SET", "MINIMAL_LAYOUT", "MICROPHONE", "MIRROR_GAP", "MODS_DIR", "MODS_DISABLED", "MODS_ORDER", "MODS_REBUILD", "MONITOR", "MOTION", "MOUSE_MODE", "MOUSE_DIRECT_PATCH", "MOUSE_SENS", "MOVIE_HOST", "MOVIE_PACE",
     "MVOBJ_ALL", "MVOBJ_BANKS", "MVOBJ_EQUAL", "MVOBJ_EXACT", "MVOBJ_EXEC", "MVOBJ_NOC4", "MVOBJ_ONLY", "MVOBJ_TIMES", "MVPREV_CHECK", "MVPREV_GROW", "MVPREV_SKIP", "MVPREV_TRUST", "MV_CHECK",
@@ -117,7 +117,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"CACHE_DIE", "performance"}, {"ONE_PER_CORE", "performance"},
     {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"LIB_WARM", "performance"}, {"PIPE_LINK_MS", "performance"}, {"PIPE_LINK_DRAW_MS", "performance"}, {"PIPE_AHEAD", "performance"}, {"PIPE_FAST_WORKERS", "performance"}, {"GPL_FEEDBACK", "performance"}, {"FRAME_HOLD_MS", "performance"}, {"PACE_SMOOTH", "performance"}, {"OQ_BATCH", "performance"}, {"GATE_WAIT_MS", "performance"}, {"PIPE_PREBUILD", "performance"},
     {"COMPUTE_KEEP", "performance"},
-    {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
+    {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"}, {"IMPORT_HOLD", "performance"},
     {"TEX_ALIAS", "performance"}, {"TEX_DISUSE", "performance"}, {"TEX_GEN_UNDO", "performance"}, {"TEX_REUSE", "performance"}, {"TEX_VRAM_PRESSURE", "performance"}, {"TEX_PROC_COMMIT_MB", "performance"}, {"ASTC_BC", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
     {"BIND_SKIP", "performance"}, {"SHADER_CACHE_FLUSH", "performance"}, {"SHADER_CARRY", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
     {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_IDLE", "performance"}, {"SPLIT_IN_PASS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
@@ -247,6 +247,7 @@ static const CfgMeta metas[] = {
     {"SHADER_CARRY", "1", "0|1", RESTART},   // gfx_shader.c "Carry": a previous translator's translations until translated again
     // textures and memory
     {"ASTC", "auto", "auto|gpu|native|cpu", RESTART}, {"MEMORY", "auto", "auto|import|mirror|verify", RESTART},
+    {"IMPORT_HOLD", "", "0|1", RESTART},   // vk_memory.c vk_mem_hold_init; unset: imports on every Linux driver but NVIDIA's
     {"TEX_ALIAS", "1", "0|1", RESTART}, {"TEX_DISUSE", "1", "0|1|2", RESTART}, {"TEX_GEN_UNDO", "1", "0|1", RESTART}, {"TEX_REUSE", "1", "0|1", RESTART}, {"TEX_VRAM_PRESSURE", "80", "0..100", RESTART}, {"ASTC_BC", "", "0|1", RESTART}, {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
     {"STG_ARENA", "1", "0|1", RESTART}, {"ASTC_GPU_DESWIZZLE", "1", "0|1", RESTART},
     {"ASTC_SCRATCH_KEEP", "0", "0|1", RESTART}, {"ASTC_ARENA", "0", "0|1", RESTART},   // vk_astc.c scratch_get, vk_texture.c astc_arena

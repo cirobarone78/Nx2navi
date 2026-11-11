@@ -184,6 +184,14 @@ int mem_frozen(uint64_t a);                                // the 2 MiB region o
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
+// The import hold (memory.c, vk_memory.c "import hold"). Once on (before the first import, with the device's queue
+// lock), a decommit leaves the pages a registered import covers committed until mem_import_release, and frozen
+// regions leave them out. mem_import_add: the import's id, 0 while off. mem_import_release: after the import's memory
+// object is freed; wait 0 only tries the locks and returns 0 when one is held (call again later), else 1.
+void mem_import_hold_on(void (*lock)(void), int (*trylock)(void), void (*unlock)(void));
+uint32_t mem_import_add(uint64_t lo, uint64_t hi);
+int mem_import_release(uint32_t id, int wait);
+void mem_import_hold_report(uint64_t frame);               // NX2NAVI_TRACE=perf: one line when the hold is on
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
 // NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.

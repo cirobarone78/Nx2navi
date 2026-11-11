@@ -189,6 +189,13 @@
 # title screen, bound: gpu, every line of the perf window waiting on a fence). The log names the mode in use: "mem:
 # mode import" or "mem: mode mirror".
 # memory = auto
+# Where the game's memory is imported (NX2NAVI_SHADOW=0 on Linux), memory the game gives back while an import still
+# covers it stays committed until the import is freed, and imported memory is never made read-only to skip it in the
+# checks for written pages. Every Linux driver but NVIDIA's pins imported memory again at each submission, and one
+# inaccessible page fails the submission: Intel's (Mesa) lost the device after the title movie without this. 1 = on,
+# 0 = off. Leave it commented for the automatic choice: on with imports on Linux on every driver but NVIDIA's. The log
+# says which: "mem: import hold on" or "mem: import hold off".
+# import_hold = 1
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
 # Small texture uploads stage in ranges of a few kept buffers instead of a new buffer each (0 = a buffer each).

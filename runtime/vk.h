@@ -63,9 +63,12 @@ typedef struct {
     int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
     int amd_llpc;                      // AMD's own driver for RDNA 3 and newer (its driverInfo names LLPC)
     int mesa;                          // a Mesa driver the game runs on: RADV, ANV or NVK
+    int pins_imports;                  // the kernel driver pins imported host memory again at every submission that
+                                       // names it (Linux, every driver but NVIDIA's): vk_memory.c "import hold"
 } VkCaps;
 extern VkCaps vk_caps;
-void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, amd_llpc, mesa
+void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc, amd_llpc, mesa,
+                                                     // pins_imports
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (NX2NAVI_VK_NO_FLOAT64 clears shaderFloat64)
 // Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
 // 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
@@ -350,6 +353,7 @@ uint64_t vk_mem_mirror_uploaded(void);   // --probe-vkexec: bytes copied into mi
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
+void vk_mem_hold_init(void);   // after vk_caps_init: the import hold (vk_memory.c "import hold") on or off, logged
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
                                                   // with NX2NAVI_TRACE=perf, every 1800 frames

@@ -252,6 +252,17 @@ Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-ba
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
 
+With `NX2NAVI_SHADOW=0` the pools are imported on Linux too. i915 and amdgpu pin an imported range when a submission
+names it, and again after any change to its pages; on Mesa's Intel driver every submission names every import. A page
+of one that is inaccessible or read-only at that moment fails the whole submission with `EFAULT`, and the device is
+lost. The game gives a finalized pool's memory back at once, while the import's memory object is freed only after the
+next submission completes, so `runtime/memory.c` keeps the pages a registered import covers committed until the import
+is freed and the queue lock has been passed once (the import hold, `runtime/import_hold.c`), and leaves imported pages
+out of the read-only freeze. The guest's own accounting changes at once, as before. `NX2NAVI_IMPORT_HOLD` switches it;
+unset, it is on with imports on every Linux driver but NVIDIA's, which pins an import once, when it is made. The log
+says `mem: import hold on` or `mem: import hold off`, and with `NX2NAVI_TRACE=perf` how much memory waited and for how
+long.
+
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
 the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, and its prologue brings
@@ -321,6 +332,16 @@ files); a change to the settings passes `nx2navi.exe --probe-cfg`.
 A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
 `runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
 the added text by GPU vendor and by why the cache was cold. No game files.
+
+A change to the import hold (`runtime/import_hold.c`; its callers in `runtime/memory.c` and `runtime/vk_memory.c`)
+passes `python tests\import_hold_check.py`, which builds `import_hold.c` with the platform layer and a model of guest
+memory: a decommit runs at once where no import lies and waits where one does, also at an import's ends, under
+overlapping imports and under a long one; a release runs exactly the waiting parts no other import covers, and only
+while it holds the queue lock; pages the game commits again while they wait come off the queue and read zero; and with
+a submitting, a game and a completion thread no page of an import a submission names is given back while that
+submission is in the driver, and at the end nothing is left waiting. On Linux,
+`python3 tests/import_hold_check.py thread` and `python3 tests/import_hold_check.py address,undefined` run it under
+clang's thread and address sanitizers. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:

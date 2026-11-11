@@ -46,6 +46,7 @@ typedef struct PoolRec {
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
+    uint32_t hold;                     // POOL_IMPORT with mem, the import hold on: its id in memory.c (mem_import_add)
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
@@ -258,11 +259,59 @@ static PoolRec *phys_find(const pool_t *key) {
     return NULL;
 }
 
-static void destroy_rec(VkCtx *c, PoolRec *r) {
+// ---- import hold
+// i915 (under ANV) and amdgpu (under RADV) pin the pages of an imported host range when a submission names it, and
+// again after any change to those pages; on ANV every submission names every import (a failed one named 2,816). A
+// page that is inaccessible or read-only at that moment fails the whole submission with EFAULT, and the device is
+// lost. NVIDIA's driver pins an import once, when it is made. The game finalizes a pool and gives its memory back
+// (UnmapPhysicalMemory) right away, but an unused pool's import is freed only once the next submission completes
+// (gpa_retire) and a mirrored one's at its mirror's retirement (mirror_retire), and a submission already in the driver
+// names the import until it returns. memory.c's decommit made the pages inaccessible in between: on an Intel UHD 770
+// under imports (NX2NAVI_SHADOW=0) 3 of 6 starts lost the device at the first submission after the title movie, and
+// traced, that submission returned EFAULT while a game thread decommitted 28.8 MiB around an import it named.
+// With the hold on, each import's range is registered with memory.c (vk_pool_init), which keeps the pages a
+// registered import covers committed when the guest gives them back and lets them go once the import's memory object
+// is freed and the queue lock has been passed (destroy_rec, hold_release); frozen regions leave imported pages out.
+// NX2NAVI_IMPORT_HOLD: 1 on wherever imports are made, 0 off; unset, on with imports where the driver pins them at
+// every submission (vk_caps.pins_imports: on Linux, every driver but NVIDIA's).
+static int hold_on;
+
+void vk_mem_hold_init(void) {
+    const char *e = cfg_get("NX2NAVI_IMPORT_HOLD");   // no fixed default: it depends on the driver, see above
+    int set = e && *e, want = set ? strcmp(e, "0") != 0 : vk_caps.pins_imports;
+    hold_on = want && !shadow_on;
+    if (hold_on) {
+        mem_import_hold_on(vk_queue_lock_raw, vk_queue_trylock_raw, vk_queue_unlock);
+        rt_log("mem: import hold on (%s): guest memory under an import is given back once the import is freed, and is "
+               "never made read-only", set ? "NX2NAVI_IMPORT_HOLD=1" : "the driver pins imports at every submission");
+        return;
+    }
+#ifdef __linux__
+    const char *drv = "NVIDIA's driver pins an import once, when it is made";
+#else
+    const char *drv = "imports are pinned once on this system";
+#endif
+    rt_log("mem: import hold off (%s%s%s)", want ? "" : set ? "NX2NAVI_IMPORT_HOLD=0" : drv,
+           !want && shadow_on ? "; " : "", shadow_on ? "shadow storage: no imports" : "");
+}
+
+static void hold_retry(void *arg);
+
+// After the import's memory object is freed. The completion thread only tries the locks (wait 0): a holder of the
+// queue lock may wait for it. When one is held it tries again after the next submission.
+static void hold_release(uint32_t id, int wait) {
+    if (!mem_import_release(id, wait)) vk_completion_add(vk_sync_issued() + 1, hold_retry, (void *)(uintptr_t)id);
+}
+
+static void hold_retry(void *arg) { hold_release((uint32_t)(uintptr_t)arg, 0); }
+
+// wait 0 on the completion thread (hold_release).
+static void destroy_rec(VkCtx *c, PoolRec *r, int wait) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->hold) hold_release(r->hold, wait);   // after the free: no submission made from now on names the import
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb);
@@ -301,6 +350,7 @@ int vk_pool_init(pool_t *p) {
         r->kind = POOL_IMPORT;
         mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
         ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        if (ok && r->mem && hold_on) r->hold = mem_import_add(r->import_lo, r->import_hi);
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
             long n = plat_inc32(&n_import_failures);
@@ -343,7 +393,7 @@ static uint32_t gpa_cover(uint64_t a) {
     return rec;
 }
 
-static void gpa_retire(void *arg) { destroy_rec(vk_ctx(), arg); }
+static void gpa_retire(void *arg) { destroy_rec(vk_ctx(), arg, 0); }
 
 void vk_pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
@@ -392,7 +442,7 @@ void vk_pool_fini(pool_t *p) {
     // an unused physical pool may still be read through the virtual pages that mapped it (device addresses, which do not
     // mark it used): its buffer outlives the submission being recorded too
     else if (r->kind == POOL_PHYS && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);
-    else destroy_rec(c, r);
+    else destroy_rec(c, r, 1);
 }
 
 // pool_lock held: the device address table follows a MapVirtual request on [lo, hi) of virtual pool v. Ranges it
@@ -601,7 +651,10 @@ static volatile uint64_t mirror_frame;   // the frame vk_mem_census last saw, fo
 void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
     static uint64_t window_start;
-    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
+    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) {
+        vram_log(frame), mirror_pool_log(frame);
+        if (hold_on) mem_import_hold_report(frame);
+    }
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
@@ -1955,7 +2008,7 @@ static void mirror_retire(void *arg) {
     for (int i = 0; i < nretiring; i++)
         if (retiring[i] == arg) { retiring[i] = retiring[--nretiring]; break; }
     plat_mutex_unlock(&retire_lock);
-    destroy_rec(vk_ctx(), arg);
+    destroy_rec(vk_ctx(), arg, 0);
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
@@ -3811,7 +3864,7 @@ void vk_mem_shutdown(void) {
     stg_pool_tried = 0;
     plat_rmutex_unlock(&cmd_lock);
     plat_mutex_lock(&pool_lock);
-    for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
+    for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf, 1);
     pool_index.n = 0;
     nm = npend = nwbl = nsnl = snl_copied = nswl = 0;   // mirrors went with their pools
     swl_marks = -1;
@@ -3823,7 +3876,7 @@ void vk_mem_shutdown(void) {
     nstouch = 0, s_sb_pages = 0;   // shadows too (their base copies went with their records)
     s_live_n = s_live_bytes = 0;
     plat_mutex_unlock(&shadow_lock);
-    for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i]);   // finalized ones whose callback never ran
+    for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i], 1);   // finalized ones whose callback never ran
     nretiring = 0;
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;

@@ -13,6 +13,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "import_hold.h"
 #include "layout.h"
 #include "platform/platform.h"
 
@@ -74,6 +75,18 @@ static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCo
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+
+// The import hold (vk_memory.c "import hold", on where the driver pins imported memory at every submission): a
+// decommit leaves the pages a registered import covers committed and queues them (import_hold.c), and they leave once
+// the import's memory object is freed and the device's queue lock has been passed, so that no submission in the
+// driver still names the import. The guest's accounting changes at once, as before. A commit of queued pages takes
+// them off the queue and gives them back and commits them again under the queue lock: they read zero, as committed
+// pages do. Frozen regions leave imported pages out. The registry and the queue are guarded by frz_lock; the queue
+// lock is taken inside it, the order the lazy write-back's fetch takes them in too.
+static int hold_on;                       // frz_lock; set once, before the first import
+static volatile int32_t hold_lines;       // log lines about single holds so far (HOLD_LINES are written)
+#define HOLD_LINES 256
+typedef struct { int ok; uint64_t parts, bytes, lo, hi, wait_max; } HoldRun;
 
 // Probed regions (NX2NAVI_WB_PROBE=1, a diagnosis). The back end copies what the GPU wrote into a mirrored pool back
 // into guest memory after every submission, in case the CPU or a host path reads it; whether anything does is what
@@ -418,9 +431,12 @@ void mem_thaw(uint64_t a, uint64_t n) {
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
-// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again. Not with
+// the import hold over a registered import: the driver pins its pages for writing at the next submission, and a
+// read-only page fails that as an inaccessible one does.
 static int freeze_locked(uint64_t r) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
+    if (hold_on && ih_overlaps(a, end)) return 0;
     int n = 0;
     for (uint64_t x = a, y; x < end; x = y) {
         int st = plat_mem_state(x, end, &y);
@@ -574,21 +590,54 @@ static int thaw_fault(uint64_t a) {
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) == PLAT_PROT_RW;
 }
 
+static int hold_line(void) { return plat_inc32(&hold_lines) <= HOLD_LINES; }
+
+// frz_lock held: guest memory [lo, hi) leaves now, or after waiting under an import since queued.
+static void hold_decommit(uint64_t lo, uint64_t hi, uint64_t queued, void *ctx) {
+    HoldRun *h = ctx;
+    thaw_range_locked(lo, hi - lo, 3);
+    if (!plat_mem_decommit(lo, hi - lo)) h->ok = 0;
+    if (!queued) return;
+    uint64_t w = plat_now_ns() - queued;
+    if (!h->parts++) h->lo = lo, h->hi = hi;
+    h->bytes += hi - lo;
+    if (w > h->wait_max) h->wait_max = w;
+}
+
+// frz_lock and the queue lock held: queued pages the guest commits again read zero, as committed pages do.
+static void hold_zero(uint64_t lo, uint64_t hi, uint64_t queued, void *ctx) {
+    HoldRun *h = ctx;
+    (void)queued;
+    if (!plat_mem_decommit(lo, hi - lo) || !plat_mem_commit(lo, hi - lo)) h->ok = 0;
+    if (!h->parts++) h->lo = lo, h->hi = hi;
+    h->bytes += hi - lo;
+}
+
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
     thaw_range_locked(a, n, 3);
-    int ok = !n || plat_mem_commit(a, n);
+    HoldRun h = {.ok = 1};
+    int ok = !n || (hold_on ? ih_commit(a, a + n, hold_zero, &h) && h.ok && plat_mem_commit(a, n) : plat_mem_commit(a, n));
     plat_mutex_unlock(&frz_lock);
     if (!ok) rt_fatal("memory: commit %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
+    if (h.parts && hold_line())
+        rt_log("mem: import hold: %s %#llx+%#llx committed again: %.2f MiB of it were still waiting for an import and "
+               "were given back and committed again", what, (unsigned long long)a, (unsigned long long)n,
+               h.bytes / 1048576.0);
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
     thaw_range_locked(a, n, 3);
-    int ok = !n || plat_mem_decommit(a, n);
+    HoldRun h = {.ok = 1};
+    uint64_t kept = 0;
+    int ok = !n || (hold_on ? ih_decommit(a, a + n, hold_decommit, &h, &kept) && h.ok : plat_mem_decommit(a, n));
     plat_mutex_unlock(&frz_lock);
     if (!ok) rt_fatal("memory: decommit %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
+    if (kept && hold_line())
+        rt_log("mem: import hold: %s %#llx+%#llx given back by the guest: %.2f MiB of it stay committed until the "
+               "imports over them are freed", what, (unsigned long long)a, (unsigned long long)n, kept / 1048576.0);
 }
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
@@ -597,6 +646,58 @@ static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
     int ok = !n || plat_mem_protect(a, n, prot);
     plat_mutex_unlock(&frz_lock);
     if (!ok) rt_fatal("memory: protect %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
+}
+
+void mem_import_hold_on(void (*lock)(void), int (*trylock)(void), void (*unlock)(void)) {
+    IhQueue q = {lock, trylock, unlock};
+    plat_mutex_lock(&frz_lock);
+    ih_set_queue(&q);
+    hold_on = 1;
+    plat_mutex_unlock(&frz_lock);
+}
+
+uint32_t mem_import_add(uint64_t lo, uint64_t hi) {
+    plat_mutex_lock(&frz_lock);
+    int want = hold_on && lo < hi;
+    uint32_t id = want ? ih_add(lo, hi) : 0;
+    plat_mutex_unlock(&frz_lock);
+    if (want && !id) rt_fatal("memory: out of memory for the import hold");
+    return id;
+}
+
+int mem_import_release(uint32_t id, int wait) {
+    if (!id) return 1;
+    if (wait) plat_mutex_lock(&frz_lock);
+    else if (!plat_mutex_trylock(&frz_lock)) return 0;
+    HoldRun h = {.ok = 1};
+    int r = ih_release(id, wait, hold_decommit, &h);
+    plat_mutex_unlock(&frz_lock);
+    if (r < 0) rt_fatal("memory: out of memory for the import hold");
+    if (!h.ok) rt_fatal("memory: decommit of memory an import kept failed (first part %#llx+%#llx)",
+                        (unsigned long long)h.lo, (unsigned long long)(h.hi - h.lo));
+    if (h.parts && hold_line())
+        rt_log("mem: import hold: %.2f MiB in %llu part%s (first %#llx+%#llx) given back %.1f ms after the guest gave "
+               "them up: the import over them was freed", h.bytes / 1048576.0, (unsigned long long)h.parts,
+               h.parts == 1 ? "" : "s", (unsigned long long)h.lo, (unsigned long long)(h.hi - h.lo), h.wait_max / 1e6);
+    return r;
+}
+
+void mem_import_hold_report(uint64_t frame) {
+    static IhStats last;
+    IhStats s;
+    plat_mutex_lock(&frz_lock);
+    int on = hold_on;
+    if (on) ih_stats(&s);
+    plat_mutex_unlock(&frz_lock);
+    if (!on) return;
+    rt_log("mem: import hold at frame %llu: %llu imports over %.1f MiB; %.2f MiB the guest gave up kept now in %llu "
+           "parts, %.2f MiB at most; since the last line %.2f MiB queued, %.2f MiB given back after waiting (longest "
+           "wait so far %.1f ms), %.2f MiB committed again before their turn", (unsigned long long)frame,
+           (unsigned long long)s.ranges, s.range_bytes / 1048576.0, s.part_bytes / 1048576.0,
+           (unsigned long long)s.parts, s.part_bytes_max / 1048576.0, (s.queued_bytes - last.queued_bytes) / 1048576.0,
+           (s.waited_bytes - last.waited_bytes) / 1048576.0, s.wait_max_ns / 1e6,
+           (s.cancelled_bytes - last.cancelled_bytes) / 1048576.0);
+    last = s;
 }
 
 // The process is re-run when a region is taken: Windows places DLLs, heaps and thread stacks at random addresses,
