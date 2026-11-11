@@ -3424,13 +3424,12 @@ static int pipe_memo_on(void) {
 // the draws issued and skipped since the last line (only when something was skipped). A black screen with draws
 // skipped for "shader failed" or "pipeline failed" points at the translator or the pipeline; draws issued and still
 // nothing on screen point at the shaders' results (NX2NAVI_DUMP).
-enum { SK_DISABLED, SK_SCISSOR, SK_NO_PROGRAM, SK_NO_VERTEX_STAGE, SK_SHADER_PENDING, SK_SHADER_FAILED, SK_DLAA,
-       SK_PIPE_PENDING, SK_PIPE_FAILED, SK_POOL_OFF, SK_COUNT };
-static const char *const sk_names[SK_COUNT] = {
-    "rendering disabled (render condition)", "empty scissor", "no program bound",
+const char *const vk_draw_skip_names[SK_COUNT] = {
+    "rendering disabled", "empty scissor", "no program bound",
     "no vertex (or mesh) stage in the program", "shader still translating",
     "shader failed to translate (see gfx_shader: translation failed)", "replaced by the upscaler",
-    "pipeline still building", "pipeline could not be created", "uses the texture pools (NX2NAVI_POOL=0)"};
+    "pipeline still building", "pipeline could not be created", "uses the texture pools (NX2NAVI_POOL=0)",
+    "excluded by NX2NAVI_SKIP_PROG", "excluded by NX2NAVI_SKIP_SHADERS"};
 #define DRAW_STATS_FRAMES 600
 static struct { uint64_t issued[2], skipped[2][SK_COUNT], frame; uint32_t first[2]; } DRS;
 
@@ -3446,7 +3445,7 @@ static void draw_stats_tick(void) {
         int o = snprintf(line, sizeof line, "vk: %s draws over %llu frames: %llu issued, skipped:", m ? "mesh" : "vertex",
                          (unsigned long long)(f - DRS.frame), (unsigned long long)DRS.issued[m]);
         for (int k = 0; k < SK_COUNT && o < (int)sizeof line - 60; k++)
-            if (DRS.skipped[m][k]) o += snprintf(line + o, sizeof line - o, " %s %llu;", sk_names[k], (unsigned long long)DRS.skipped[m][k]);
+            if (DRS.skipped[m][k]) o += snprintf(line + o, sizeof line - o, " %s %llu;", vk_draw_skip_names[k], (unsigned long long)DRS.skipped[m][k]);
         rt_log("%s", line);
     }
     memset(&DRS, 0, sizeof DRS.issued + sizeof DRS.skipped);
@@ -3465,11 +3464,12 @@ uint32_t vk_exec_pending_draws_take(void) {
 
 static int draw_skipped(const VkExec *ex, int mesh, int why) {
     DRS.skipped[mesh][why]++;
+    if (vk_dump_armed) vk_dump_draw_skipped(ex, mesh, why);
     if (why == SK_SHADER_PENDING || why == SK_PIPE_PENDING) pending_draws++;
     if (why == SK_PIPE_PENDING) perf_count(PERF_CNT_PIPE_SKIP);   // skipped draws only: a lookup that then waited is none
     if (!(DRS.first[mesh] >> why & 1)) {
         DRS.first[mesh] |= 1u << why;
-        rt_log("vk: first %s draw skipped because: %s (program %llu)", mesh ? "mesh" : "vertex", sk_names[why],
+        rt_log("vk: first %s draw skipped because: %s (program %llu)", mesh ? "mesh" : "vertex", vk_draw_skip_names[why],
                ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
     }
     draw_stats_tick();
@@ -3551,7 +3551,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     if (!sc.extent.width || !sc.extent.height) return draw_skipped(ex, mesh, SK_SCISSOR);
     if (!ex->prog) return draw_skipped(ex, mesh, SK_NO_PROGRAM);
     if (prog_lead_on()) prog_lead(ex->prog, mesh);
-    if (n_skip_prog && skip_prog_wanted(ex->prog->serial)) return draw_skipped(ex, mesh, SK_DISABLED);   // -1 until read
+    if (n_skip_prog && skip_prog_wanted(ex->prog->serial)) return draw_skipped(ex, mesh, SK_PROG_FILTER);   // -1 until read
     int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = mesh ? 0 : shader_memo_on();
     int has_ts = 0, ts_wait = 0, vst = mesh ? NVN_STAGE_MESH : NVN_STAGE_VS;
     const GfxShader *vs, *fs, *ts = NULL;
@@ -3587,7 +3587,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
     if (!vs || (has_fs && !fs) || (has_ts && !ts)) return draw_skipped(ex, mesh, SK_SHADER_FAILED);
-    if (shader_skipped(vs) || shader_skipped(fs)) return draw_skipped(ex, mesh, SK_POOL_OFF);   // NX2NAVI_SKIP_SHADERS
+    if (shader_skipped(vs) || shader_skipped(fs)) return draw_skipped(ex, mesh, SK_SHADER_FILTER);
     if (vk_dlaa_skip_draw(ex, fs)) return draw_skipped(ex, mesh, SK_DLAA);   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;

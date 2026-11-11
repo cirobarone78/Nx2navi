@@ -209,6 +209,10 @@ void vk_dump_init(void);                 // reads the environment; vk_exec_recor
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
 // after a draw's binds; mesh: a mesh draw (s->vs is its mesh stage, s->ts its task stage or NULL)
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int mesh);
+enum { SK_DISABLED, SK_SCISSOR, SK_NO_PROGRAM, SK_NO_VERTEX_STAGE, SK_SHADER_PENDING, SK_SHADER_FAILED, SK_DLAA,
+       SK_PIPE_PENDING, SK_PIPE_FAILED, SK_POOL_OFF, SK_PROG_FILTER, SK_SHADER_FILTER, SK_COUNT };
+extern const char *const vk_draw_skip_names[SK_COUNT];
+void vk_dump_draw_skipped(const VkExec *ex, int mesh, int why);
 // Around a mesh draw of the dumped frame (after vk_dump_draw): a primitives-generated query, listed in mesh_prims.txt.
 // begin returns the query, or -1 when none was begun; end takes that value.
 int vk_dump_mesh_begin(VkExec *ex);

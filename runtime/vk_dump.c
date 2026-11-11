@@ -8,7 +8,7 @@
 //   ..._tm.png                                       float formats: x/(1+x) of the same image (the plain one clamps);
 //                                                    in both, a pixel with a NaN channel is magenta
 //   passes.txt   per pass or dispatch: targets, draws, each distinct pipeline + texture set with its shaders' SPIR-V
-//                hashes (sh_<hash>.spv written once) and the bound textures with their samplers
+//                hashes (sh_<hash>.spv written once) and the bound textures with their samplers; draw preparation rejections by reason while the capture ran
 //   images.txt   per image: channel min/max, distinct texel values over the image and over its top quarter
 // Sampled 8-bit 2D textures up to TEX2D_CAP texels are copied once each as pass_<seq>_tex<id>_... at the end of the pass
 // that samples them; texture lines carry the storage address, mirror state, upload count and the image's and slot's
@@ -473,6 +473,32 @@ static int active(void) {   // passes_f is NULL before a dump that opens its fil
     return !finished && passes_f && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
+
+// A draw can be rejected before it opens a render pass. Count it against the captured frame as a whole.
+static struct { uint64_t count, first_prog; } skipped[2][SK_COUNT];
+
+void vk_dump_draw_skipped(const VkExec *ex, int mesh, int why) {
+    plat_mutex_lock(&rec_lock);
+    if (!finished && passes_f && frame_now() == dump_frame) {
+        if (!skipped[mesh][why].count) skipped[mesh][why].first_prog = ex->prog ? ex->prog->serial : 0;
+        skipped[mesh][why].count++;
+    }
+    plat_mutex_unlock(&rec_lock);
+}
+
+static void write_skipped(uint64_t frame) {
+    uint64_t total = 0;
+    for (int m = 0; m < 2; m++) for (int k = 0; k < SK_COUNT; k++) {
+        uint64_t n = skipped[m][k].count;
+        if (!n) continue;
+        fprintf(passes_f, "  skipped %s: %llu (%s, first program %llu)\n", m ? "mesh" : "vertex",
+                (unsigned long long)n, vk_draw_skip_names[k], (unsigned long long)skipped[m][k].first_prog);
+        total += n;
+    }
+    fprintf(passes_f, "frame %llu: %llu draws rejected during draw preparation while capture was active\n",
+            (unsigned long long)frame, (unsigned long long)total);
+    memset(skipped, 0, sizeof skipped);
+}
 
 typedef struct { char *s; size_t n, cap; } Str;
 
@@ -1226,6 +1252,15 @@ static int thumb_white(uint64_t f) {
     return bright * 100 > n * 97;
 }
 
+// Publish the selected frame and its output files together to the recording hooks.
+static void open_frame(uint64_t frame) {
+    plat_mutex_lock(&rec_lock);
+    snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)frame);
+    open_files();
+    dump_frame = frame;
+    plat_mutex_unlock(&rec_lock);
+}
+
 static void white_check(uint64_t frame) {
     static int run;   // consecutive white thumbnails: white runs are mostly 1-2 frames, too short for a dump 4 frames on
     if (frame < 1800) return;
@@ -1234,9 +1269,7 @@ static void white_check(uint64_t frame) {
     run = w ? run + 1 : 0;
     if (run >= 3) {   // frames frame-5..frame-3 white: the run is likely still on 4 frames later
         run = 0;
-        dump_frame = frame + 1;
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)dump_frame);
-        open_files();
+        open_frame(frame + 1);
         rt_log("vk_dump: frames %llu-%llu were white; frame %llu goes to %s", (unsigned long long)(frame - 5),
                (unsigned long long)(frame - 3), (unsigned long long)dump_frame, dir);
     }
@@ -1251,18 +1284,14 @@ void vk_dump_present(uint64_t frame) {
     }
     if (dump_white && !white_caught && !white_last && dump_frame == UINT64_MAX) white_check(frame);
     if (movie_k && dump_frame == UINT64_MAX && __atomic_exchange_n(&movie_req, 0, __ATOMIC_ACQ_REL)) {
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-        open_files();   // before the frame is named: its passes write to them
-        dump_frame = frame + 1;
+        open_frame(frame + 1);
         rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
     }
     if (key_mode && dump_frame == UINT64_MAX) {   // NX2NAVI_DUMP=key: a new press of Insert names the next frame
         static int held;
         int now = input_dump_key();
         if (now && !held) {
-            snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-            open_files();   // before the frame is named: its passes write to them
-            dump_frame = frame + 1;
+            open_frame(frame + 1);
             rt_log("vk_dump: Insert: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
         }
         held = now;
@@ -1274,14 +1303,13 @@ void vk_dump_present(uint64_t frame) {
         free(txt);
         file_more = n > 8 ? 7 : n > 1 ? n - 1 : 0;
         plat_file_delete(dump_file);
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-        open_files();   // before the frame is named: its passes write to them
-        dump_frame = frame + 1;
+        open_frame(frame + 1);
         rt_log("vk_dump: %s found: frame %llu goes to %s", dump_file, (unsigned long long)dump_frame, dir);
     }
     if (frame != dump_frame) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
+    write_skipped(frame);
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
     mq_write();
@@ -1305,9 +1333,7 @@ void vk_dump_present(uint64_t frame) {
     }
     if (file_more > 0) {   // NX2NAVI_DUMP_FILE with a count: the next frame too
         file_more--;
-        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
-        open_files();
-        dump_frame = frame + 1;
+        open_frame(frame + 1);
         rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
     }
 }
