@@ -103,6 +103,10 @@ typedef struct VkExec {
     void *views;                         // image views created for this command buffer (freed at its fence)
     int nviews, cap_views;
     int barrier_at;                      // recorded right after the last full barrier (-1: none yet)
+    // NX2NAVI_BARRIER_GAME (vk_exec.c barrier_to_why): the last full barrier was one the replay itself needed (a copy,
+    // clear or fill of its own follows it), so the next pass or dispatch gets a full one too; passes and dispatches
+    // begun since the last full barrier
+    int bar_dirty, bar_passes, bar_dispatches;
 
     // Feedback loops (vk.h VkCtx.feedback, vk_exec_draw.c feedback_prepare). Learned targets are attached in
     // ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; they stay in it across consecutive passes and go back to GENERAL at the next
@@ -128,6 +132,11 @@ void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
 // it. Skipped when nothing was recorded since the last one.
 void vk_exec_barrier(VkExec *ex);
+// The barrier before a game dispatch: a full one, or with NX2NAVI_BARRIER_GAME none unless the replay's own commands
+// came since the last full barrier (vk_exec.c barrier_to_why). Ends the open pass.
+void vk_exec_barrier_dispatch(VkExec *ex);
+// NX2NAVI_TRACE=perf, every 600 frames: the barriers per frame by kind.
+void vk_exec_barrier_log(uint64_t frame);
 // vk_texture.c (NX2NAVI_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
