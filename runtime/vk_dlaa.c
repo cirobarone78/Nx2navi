@@ -1456,10 +1456,11 @@ static int scene_color(VkFormat f);
 static void dlaa_draw_locked(VkExec *ex);
 void vk_dlaa_draw(VkExec *ex) {
     if (!dl_active() || D.ended) return;
-    static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once
-    plat_mutex_lock(&lock);
+    static PlatMutex lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws count at once (vk_exec.c chunks)
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&lock);
     dlaa_draw_locked(ex);
-    plat_mutex_unlock(&lock);
+    if (lk) plat_mutex_unlock(&lock);
 }
 
 static void dlaa_draw_locked(VkExec *ex) {

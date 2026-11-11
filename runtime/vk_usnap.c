@@ -435,13 +435,14 @@ static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders w
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
-    plat_mutex_lock(&drop_lock);
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
     if (U.on)
         for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
             if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
-    plat_mutex_unlock(&drop_lock);
+    if (lk) plat_mutex_unlock(&drop_lock);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

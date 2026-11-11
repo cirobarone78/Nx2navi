@@ -156,13 +156,14 @@ void vk_exec_draw_ctx_use(void *ctx);
 // vk_exec_draw.c, before the chunks of a parallel group are recorded (submitting thread): the stand-ins are made and the
 // texture pool set this submission took is brought up to date, which the chunks then only bind.
 void vk_exec_draw_group_begin(VkExec *ex);
-// vk_exec_xfer.c, parallel groups: vk_exec_xfer_serial says an op stays on the submitting thread (a samples-passed reset
-// or report); vk_exec_xfer_front is the front pass's CPU side of a counter report, render enable or render condition
-// (returns the condition's decision, 1 renders); vk_exec_xfer_worker turns the worker side on for the calling thread with
-// its chunk's decisions, or off.
-int vk_exec_xfer_serial(uint32_t op, const void *payload);
+// vk_exec_xfer.c, parallel groups: vk_exec_xfer_group turns the front pass on (it lists the group's occlusion segments)
+// or off; vk_exec_xfer_front replays a counter report or reset, render enable or render condition in the front pass
+// (returns the condition's decision, 1 renders); vk_exec_xfer_chunk_state is the occlusion counting at a chunk's first
+// op, which vk_exec_xfer_worker hands to the worker side with the chunk's decisions (on), or turns it off.
+void vk_exec_xfer_group(int on);
 int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload);
-void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond);
+uint64_t vk_exec_xfer_chunk_state(void);
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);

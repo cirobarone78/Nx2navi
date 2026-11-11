@@ -138,9 +138,10 @@ static PlatMutex draw_lock = PLAT_MUTEX_INIT;   // the replay workers' scene dra
 static void mvprev_draw_(VkExec *ex) {
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
-    plat_mutex_lock(&draw_lock);
+    int lk = vk_exec_in_chunk();   // only the chunks of a parallel group (vk_exec.c) note at once
+    if (lk) plat_mutex_lock(&draw_lock);
     mvprev_draw_locked(ex);
-    plat_mutex_unlock(&draw_lock);
+    if (lk) plat_mutex_unlock(&draw_lock);
 }
 
 static void mvprev_draw_locked(VkExec *ex) {

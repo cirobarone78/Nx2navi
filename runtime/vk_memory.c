@@ -2541,8 +2541,9 @@ void vk_mem_shadow_sync(uint64_t fence) {
     plat_mutex_unlock(&shadow_lock);
 }
 
-// The replay workers (vk_exec.c) bind and write from several threads at once: a mirror's first use in a submission
-// (creation, sync) and the notes of GPU writes go under use_lock. A use the submission already synced takes no lock.
+// The replay workers (vk_exec.c) bind and write from several threads at once: while a chunk records, a mirror's first
+// use in a submission (creation, sync) and the notes of GPU writes go under use_lock. A use the submission already
+// synced takes no lock, nor does the replay outside a parallel group (it alone records then).
 static PlatMutex use_lock = PLAT_MUTEX_INIT;
 
 static void mem_use_locked(VkMemSpan *sp);
@@ -2553,9 +2554,12 @@ void vk_mem_use(VkMemSpan *sp) {
         sp->buffer = r->mbuf;
         return;
     }
-    plat_mutex_lock(&use_lock);
+    // a refused pool not due for another try stays imported: nearly every pool in the field (two have mirrors)
+    if (r->mstate == MS_REFUSED && !(r->retry_sub && (int32_t)(msub - r->retry_sub) >= 0)) return;
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&use_lock);
     mem_use_locked(sp);
-    plat_mutex_unlock(&use_lock);
+    if (lk) plat_mutex_unlock(&use_lock);
 }
 
 static void mem_use_locked(VkMemSpan *sp) {
@@ -2577,9 +2581,10 @@ void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) {
-        plat_mutex_lock(&use_lock);
+        int lk = vk_exec_in_chunk();
+        if (lk) plat_mutex_lock(&use_lock);
         if (r->acc_sub != msub) mirror_sync(r);
-        plat_mutex_unlock(&use_lock);
+        if (lk) plat_mutex_unlock(&use_lock);
     }
     sp->buffer = r->mbuf;
 }
@@ -3168,14 +3173,16 @@ static void gpu_wrote_range(const VkMemSpan *sp, uint64_t size, int shader) {
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset + o, size - o);   // what found no snapshot room
 }
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
-    plat_mutex_lock(&use_lock);
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&use_lock);
     gpu_wrote(sp, size, 0);
-    plat_mutex_unlock(&use_lock);
+    if (lk) plat_mutex_unlock(&use_lock);
 }
 void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size) {
-    plat_mutex_lock(&use_lock);
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&use_lock);
     gpu_wrote(sp, size, 1);
-    plat_mutex_unlock(&use_lock);
+    if (lk) plat_mutex_unlock(&use_lock);
 }
 
 // Adds [a, b) to l, n sorted ranges that do not touch; returns the new count. Above cap ranges (l holds cap + 1) the two

@@ -220,18 +220,58 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr, seq; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
+typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
 
-// The replay workers (vk_exec.c "parallel groups") record draws of one group at once. A samples-passed reset or report
-// never falls inside such a group (vk_exec_xfer_serial), so counting does not change while the workers record: each
-// keeps the query open in its own pass (XW.open), takes ring slots atomically and adds the slots it closes to the
-// segment the next report takes, under oq_seg_lock. XW.cond: the decisions of its chunk's render conditions, made by the
-// front pass in the order of the stream (vk_exec_xfer_front).
-static _Thread_local struct { int on, open; const uint8_t *cond; uint32_t ncond, i; } XW = {.open = -1};
+// The replay workers (vk_exec.c "parallel groups") record the draws of one group at once. The front pass replays a
+// group's samples-passed resets and reports in the order of the stream before the workers record (vk_exec_xfer_front):
+// each makes its segment, queued for the completion thread in that order, and they are listed in GS. A worker follows
+// the counting as the stream does from its chunk's first op (vk_exec_xfer_chunk_state): XW.counting and the segment its
+// closed queries belong to, the next one at or after its position in the stream (XW.seg; past the group's last, the
+// pending list oq_seg, which a later reset or report takes). It keeps the query open in its own pass (XW.open), takes
+// ring slots atomically and adds the slots it closes under oq_seg_lock. XW.cond: the decisions of its chunk's render
+// conditions, made by the front pass in the order of the stream.
+static _Thread_local struct {
+    int on, open, counting, reported, keep;
+    uint32_t seg;
+    const uint8_t *cond;
+    uint32_t ncond, i;
+} XW = {.open = -1};
 static PlatMutex oq_seg_lock = PLAT_MUTEX_INIT;
+static struct { int on; OqSegment **s; uint32_t n, cap; } GS;   // the front pass's segments of the group
 
-void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond) {
+void vk_exec_xfer_group(int on) {   // on: a new group's front pass begins; off: it ended, the list stays
+    if (on) GS.n = 0;
+    GS.on = on;
+}
+
+uint64_t vk_exec_xfer_chunk_state(void) {
+    return (uint64_t)GS.n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
+}
+
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state) {
     XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0;
+    XW.counting = (int)(state & 1), XW.reported = (int)(state >> 1 & 1), XW.keep = (int)(state >> 2 & 1);
+    XW.seg = (uint32_t)(state >> 8);
+}
+
+// Adds closed slot q to the segment a worker's queries belong to now, or the pending list.
+static void seg_add(uint32_t q) {
+    plat_mutex_lock(&oq_seg_lock);
+    if (XW.seg < GS.n) {
+        OqSegment *s = GS.s[XW.seg];
+        if (s->n == s->cap) {
+            s->cap = s->cap ? s->cap * 2 : 16;
+            if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
+        }
+        s->q[s->n++] = q;
+    } else {
+        if (oq_nseg == oq_capseg) {
+            oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
+            if (!(oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg))) rt_fatal("vk: out of memory");
+        }
+        oq_seg[oq_nseg++] = q;
+    }
+    plat_mutex_unlock(&oq_seg_lock);
 }
 
 static int oq_ready(void) {
@@ -264,25 +304,27 @@ static void oq_close(VkExec *ex) {
     if (*open < 0) return;
     vkCmdEndQuery(ex->cb, oq_pool, (uint32_t)*open);
     ex->recorded++;
-    if (XW.on) plat_mutex_lock(&oq_seg_lock);
-    if (oq_nseg == oq_capseg) {
-        oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
-        oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg);
-        if (!oq_seg) rt_fatal("vk: out of memory");
+    if (XW.on) seg_add((uint32_t)*open);
+    else {
+        if (oq_nseg == oq_capseg) {
+            oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
+            oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg);
+            if (!oq_seg) rt_fatal("vk: out of memory");
+        }
+        oq_seg[oq_nseg++] = (uint32_t)*open;
     }
-    oq_seg[oq_nseg++] = (uint32_t)*open;
-    if (XW.on) plat_mutex_unlock(&oq_seg_lock);
     *open = -1;
 }
 
 void vk_exec_oq_draw(VkExec *ex) {
     int *open = XW.on ? &XW.open : &oq_open;
-    if (!oq_counting || *open >= 0) return;
+    if (!(XW.on ? XW.counting : oq_counting) || *open >= 0) return;
     // a worker takes its slot at once (a busy one is lost, not tried again): the others take theirs meanwhile
     uint32_t q = (XW.on ? __atomic_fetch_add(&oq_next, 1, __ATOMIC_RELAXED) : oq_next) % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");
-        __atomic_store_n(&oq_lost, 1, __ATOMIC_RELAXED);
+        if (XW.on && XW.seg < GS.n) __atomic_store_n(&GS.s[XW.seg]->lost, 1, __ATOMIC_RELAXED);
+        else __atomic_store_n(&oq_lost, 1, __ATOMIC_RELAXED);
         return;
     }
     __atomic_store_n(&oq_busy[q], 1, __ATOMIC_RELAXED);
@@ -402,16 +444,24 @@ static void oq_cb(void *arg) {
             write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
         }
     }
-    free(s);
+    free(s->q), free(s);
 }
 
 // Hands the segment to the completion thread with a report (addr; 0: no CPU-visible memory) or a reset.
 static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     oq_close(ex);
-    OqSegment *s = malloc(sizeof *s + sizeof *s->q * oq_nseg);
-    if (!s) rt_fatal("vk: out of memory");
+    OqSegment *s = calloc(1, sizeof *s);
+    if (!s || (oq_nseg && !(s->q = malloc(sizeof *s->q * oq_nseg)))) rt_fatal("vk: out of memory");
+    s->cap = oq_nseg;
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
-    memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
+    if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
+    if (GS.on) {   // the front pass: the workers add the queries of the group's ops before it
+        if (GS.n == GS.cap) {
+            GS.cap = GS.cap ? GS.cap * 2 : 64;
+            if (!(GS.s = realloc(GS.s, sizeof *GS.s * GS.cap))) rt_fatal("vk: out of memory");
+        }
+        GS.s[GS.n++] = s;
+    }
     oq_nseg = 0, oq_lost = 0;
     vk_completion_add_result(ex->fence, oq_cb, s);
 }
@@ -1005,23 +1055,13 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
 
 // ---- parallel groups (vk_exec.c): the CPU side in the front pass, the rest in the workers
 
-// 1 when the op has to be replayed on the submitting thread in the order of the stream: a samples-passed reset or report
-// ends a segment of occlusion counts, which the workers' queries are added to.
-int vk_exec_xfer_serial(uint32_t op, const void *payload) {
-    int type;
-    if (op == OP_REPORT_COUNTER) type = (int)((const p_report_counter *)payload)->type;
-    else if (op == OP_RESET_COUNTER) type = (int)((const p_reset_counter *)payload)->type;
-    else return 0;
-    return type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_ready();
-}
-
-// The front pass, in the order of the stream, before the workers record: a counter report other than samples passed
-// (its completion callback and pending entry, which later conditions read), a render enable and a render condition
-// (decided here, on the reports replayed so far). Returns the condition's decision: 1 renders.
+// The front pass, in the order of the stream, before the workers record (vk_exec_xfer_group on): a counter report or
+// reset (completion callbacks, pending entries, the occlusion segments and counting), a render enable and a render
+// condition (decided here, on the reports replayed so far). Returns the condition's decision: 1 renders.
 int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload) {
     switch (op) {
-    case OP_REPORT_COUNTER: report_counter(fx, payload); return 1;   // not samples passed (vk_exec_xfer_serial)
-    case OP_RESET_COUNTER: return 1;                                  // other counters have nothing to reset
+    case OP_REPORT_COUNTER: report_counter(fx, payload); return 1;
+    case OP_RESET_COUNTER: reset_counter(fx, payload); return 1;
     case OP_RENDER_ENABLE: fx->render_disabled = !((const p_flag *)payload)->value; return 1;
     case OP_RENDER_COND:
         fx->render_cond = *(const p_render_cond *)payload;
@@ -1038,7 +1078,20 @@ int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload) {
 static void xfer_worker(VkExec *ex, uint32_t op, const void *payload) {
     if (op != OP_RENDER_ENABLE && vk_contact_pending()) vk_exec_turn(), vk_contact_flush(ex);
     switch (op) {
-    case OP_REPORT_COUNTER: case OP_RESET_COUNTER: break;
+    case OP_REPORT_COUNTER: case OP_RESET_COUNTER: {
+        int type = op == OP_REPORT_COUNTER ? (int)((const p_report_counter *)payload)->type
+                                           : (int)((const p_reset_counter *)payload)->type;
+        if (type != NVN_COUNTER_TYPE_SAMPLES_PASSED || !oq_ready()) break;
+        oq_close(ex);   // into the segment this op ends; the next queries go to the next one
+        XW.seg++;
+        if (op == OP_RESET_COUNTER) XW.counting = 1, XW.reported = 0;
+        else {
+            if (XW.reported) XW.keep = 1;   // as oq_report
+            XW.reported = 1;
+            if (!XW.keep) XW.counting = 0;
+        }
+        break;
+    }
     case OP_RENDER_ENABLE: ex->render_disabled = !((const p_flag *)payload)->value; break;
     case OP_RENDER_COND:
         ex->render_cond = *(const p_render_cond *)payload;

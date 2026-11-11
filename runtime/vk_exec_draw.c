@@ -292,9 +292,11 @@ void *vk_exec_draw_ctx_new(void) {
 
 void vk_exec_draw_ctx_use(void *c) { dc = c ? c : &dc_main; }
 
-static PlatMutex shader_lock = PLAT_MUTEX_INIT;   // shader_tab: the replay workers look shaders up at once
+// Tables the chunks of a parallel group (vk_exec.c "replay workers") share, locked only while a chunk records: outside
+// groups the submitting thread alone replays, and these lookups run per draw.
+static PlatMutex shader_lock = PLAT_MUTEX_INIT;   // shader_tab
 static PlatMutex rs_lock = PLAT_MUTEX_INIT;       // rs_lists
-static PlatMutex pool_mt = PLAT_MUTEX_INIT;       // pool_sync from a chunk of a parallel group
+static PlatMutex pool_mt = PLAT_MUTEX_INIT;       // pool_sync from a chunk
 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
@@ -1051,7 +1053,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
         set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
-        plat_mutex_lock(&shader_lock);
+        int lk = vk_exec_in_chunk();   // only the chunks of a parallel group look up at once
+        if (lk) plat_mutex_lock(&shader_lock);
         for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
             ShaderEnt *e = &set[w];
             if (e->serial != serial || e->stage != st || memcmp(&e->a, &a, sizeof a)) continue;
@@ -1061,10 +1064,10 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                 set[0] = hit;
             }
             const GfxShader *found = set[0].s;
-            plat_mutex_unlock(&shader_lock);
+            if (lk) plat_mutex_unlock(&shader_lock);
             return found;
         }
-        plat_mutex_unlock(&shader_lock);
+        if (lk) plat_mutex_unlock(&shader_lock);
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : st == NVN_STAGE_TASK ? GFX_STAGE_TS
            : st == NVN_STAGE_MESH ? GFX_STAGE_MS : GFX_STAGE_CS;
@@ -1078,10 +1081,11 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
     else if (set) {   // in front, the least recently used way drops out
-        plat_mutex_lock(&shader_lock);
+        int lk = vk_exec_in_chunk();
+        if (lk) plat_mutex_lock(&shader_lock);
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
-        plat_mutex_unlock(&shader_lock);
+        if (lk) plat_mutex_unlock(&shader_lock);
     }
     return s;
 }
@@ -3070,7 +3074,8 @@ static void rs_add(RsRange *r, uint32_t *n, const VkExec *ex, const void *at, si
 static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     DrawCtx *const cx = ex->dc;
     if (info == cx->rs_last) return cx->rs_last_l;
-    plat_mutex_lock(&rs_lock);
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&rs_lock);
     if (!rs_lists.klen) nvn_hm_init(&rs_lists, sizeof info);
     RsList *l = nvn_hm_get(&rs_lists, &info);
     if (!l) {
@@ -3120,7 +3125,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         memcpy(l->r, tmp, sizeof *tmp * n);
         nvn_hm_put(&rs_lists, &info, l);
     }
-    plat_mutex_unlock(&rs_lock);
+    if (lk) plat_mutex_unlock(&rs_lock);
     cx->rs_last = info, cx->rs_last_l = l;
     return l;
 }
@@ -4602,14 +4607,21 @@ static void mo_emit(VkCommandBuffer cb) {
 }
 
 static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0);
+// The chunks of a parallel group (vk_exec.c) add to the frame's list at once: its memos, statistics and list go under
+// mo_lock there. The order of the list does not change the picture: its draws write motion without blending, tested
+// against the scene depth they do not write.
+static PlatMutex mo_lock = PLAT_MUTEX_INIT;
+
 static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off) {
     if (MO.failed || !vk_mvprev_on() || !ex->dc->B.st_valid) return;
     static int timed = -1;
     if (timed < 0) timed = rt_knob("MVOBJ_TIMES", "0");   // NX2NAVI_MVOBJ_TIMES=1: the summary's times (the clock reads cost)
-    if (!timed) return mvobj_draw_(ex, d, ib, ib_off, 0);
-    uint64_t t0 = kern_now_ns();
+    int lk = vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&mo_lock);
+    uint64_t t0 = timed ? kern_now_ns() : 0;
     mvobj_draw_(ex, d, ib, ib_off, t0);
-    MO.ns_check += kern_now_ns() - t0;
+    if (t0) MO.ns_check += kern_now_ns() - t0;
+    if (lk) plat_mutex_unlock(&mo_lock);
 }
 
 // NX2NAVI_MVOBJ_BANKS=1 (test): for scene draws, the words of each other uniform bank (c3, c6, c8-c16) that changed
@@ -4749,7 +4761,6 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     int nu = gfx_shader_resources(cx->B.st.vs, GFX_RES_UBO, &ur), reads = 0;
     for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
     if (!reads) return;
-    vk_exec_turn();   // a replay worker's chunk: the motion list follows the stream
     MO.cand++;
     uint64_t tp = t0 ? kern_now_ns() : 0;
     if (t0) MO.ns_part[0] += tp - t0, MO.n_part[0]++;

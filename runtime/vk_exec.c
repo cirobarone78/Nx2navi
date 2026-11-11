@@ -55,6 +55,7 @@ typedef struct {
     const op_hdr *h;                    // its first op
     uint32_t nops;                      // the ops it records (JUMPs not counted)
     uint32_t cond0, ncond;              // its render conditions' decisions in G.cond
+    uint64_t oq;                        // the occlusion counting at its first op (vk_exec_xfer_chunk_state)
     int idx;                            // in its group: 0 runs the group's pass hooks
     VkCommandBuffer cb;
     int recorded;
@@ -1774,6 +1775,7 @@ static struct {
     RwWorker *w[RW_MAX];
     const op_hdr *skip_to[CALL_DEPTH + 1];   // per call depth: the walk read ahead to this op, a group too small
     uint64_t groups, group_draws, chunks, serial_draws, wait_ns;   // since the last perf line
+    uint64_t end_draws[5];              // draws of groups by what ended them (group_peek's GE_*), since the last perf line
     volatile uint64_t turns, turn_ns, redos;
 } RW = {.n = -1};
 
@@ -1844,24 +1846,29 @@ static void views_release(VkExec *ex, uint64_t fence) {
     ex->nviews = 0;
 }
 
-// The draws of the group that starts at h (it ends at *end), reading at most GROUP_PEEK ops. *serial: it holds a
-// mesh draw (those are replayed on the submitting thread).
-static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end) {
+// What ended a group (RW.end_draws): the end of the run, a render target change, an inline uniform update, a mesh
+// draw, the read-ahead limit.
+enum { GE_RUN, GE_TARGET, GE_UB, GE_MESH, GE_LIMIT, GE_N };
+static const char *const ge_name[GE_N] = {"run end", "target change", "uniform update", "mesh draw", "read limit"};
+
+// The draws of the group that starts at h (it ends at *end, for the reason *why), reading at most GROUP_PEEK ops.
+static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end, int *why) {
     uint32_t draws = 0;
     int begun = 0;
     const p_set_rt *rt = &ex->rt;
+    *why = GE_LIMIT;
     for (uint32_t ops = 0; ops < GROUP_PEEK; ops++) {
-        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) break;   // the walk reports it
+        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) { *why = GE_RUN; break; }   // the walk reports it
         const void *a = nvn_op_payload(h);
         if (h->op == OP_JUMP) {
             h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target;
             continue;
         }
-        if (!run_op(h->op) || h->op == OP_UPDATE_UB || h->op == OP_DRAW_MESH || h->op == OP_DRAW_MESH_IND ||
-            vk_exec_xfer_serial(h->op, a))
-            break;
+        if (!run_op(h->op)) { *why = GE_RUN; break; }
+        if (h->op == OP_UPDATE_UB) { *why = GE_UB; break; }
+        if (h->op == OP_DRAW_MESH || h->op == OP_DRAW_MESH_IND) { *why = GE_MESH; break; }
         if (h->op == OP_SET_RT && memcmp(rt, a, sizeof *rt)) {
-            if (begun) break;   // another pass: the next group
+            if (begun) { *why = GE_TARGET; break; }   // another pass: the next group
             rt = a;
         }
         if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) draws++, begun = 1;
@@ -1875,7 +1882,7 @@ static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end
 static Chunk *chunk_open(const VkExec *ex, const op_hdr *h, int idx) {
     Chunk *c = &G.c[idx];
     memcpy(&c->ex, ex, sizeof *ex);
-    c->h = h, c->nops = 0, c->cond0 = G.ncond, c->ncond = 0, c->idx = idx;
+    c->h = h, c->nops = 0, c->cond0 = G.ncond, c->ncond = 0, c->idx = idx, c->oq = vk_exec_xfer_chunk_state();
     return c;
 }
 
@@ -1886,7 +1893,7 @@ static void chunk_record(Chunk *c, int pool) {
     VkExec *ex = &c->ex, *was = x_cur;
     if (pool < RW.n) ex->dc = RW.w[pool]->dc;   // the submitting thread records with its own (the state's)
     x_cur = ex, rw_chunk = c, rw_ordered = !c->idx;
-    vk_exec_xfer_worker(1, G.cond + c->cond0, c->ncond);
+    vk_exec_xfer_worker(1, G.cond + c->cond0, c->ncond, c->oq);
     ex->cb = vk_sync_worker_begin(pool);
     // the replay's command buffer before the group ended behind a full barrier, with every image in GENERAL
     ex->recorded = 0, ex->barrier_at = 0, ex->in_pass = 0, ex->nfbl = 0, ex->mark = NULL;
@@ -1918,7 +1925,7 @@ static void chunk_record(Chunk *c, int pool) {
     free(ex->views);
     ex->views = NULL;
     c->cb = ex->cb, c->recorded = ex->recorded;
-    vk_exec_xfer_worker(0, NULL, 0);
+    vk_exec_xfer_worker(0, NULL, 0, 0);
     x_cur = was, rw_chunk = NULL;
     __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
 }
@@ -1936,8 +1943,10 @@ static void group_take(int pool) {
 // replays the group itself, without reading ahead again before its end).
 static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     const op_hdr *end;
-    uint32_t draws = group_peek(ex, h, &end);
+    int why;
+    uint32_t draws = group_peek(ex, h, &end, &why);
     if (end == h) return h;   // an op the submitting thread replays itself
+    RW.end_draws[why] += draws;
     int n = (int)(draws / CHUNK_DRAWS);
     if (n > RW.n + 1) n = RW.n + 1;
     if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
@@ -1952,6 +1961,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;
     int nc = 1, cut = 0;
     G.ncond = 0;
+    vk_exec_xfer_group(1);
     Chunk *c = chunk_open(ex, h, 0);
     for (const op_hdr *o = h; o != end;) {
         const void *a = nvn_op_payload(o);
@@ -1982,6 +1992,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
         c->nops++;
         o = nvn_op_next(o);
     }
+    vk_exec_xfer_group(0);   // the segments stay listed for the workers until the next group
     // handed out: the workers and this thread take the chunks in order
     for (int i = 0; i < nc; i++) G.c[i].done = 0;
     G.hooks = 0;
@@ -2206,6 +2217,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
                    RW.groups ? (double)RW.chunks / (double)RW.groups : 0.0,
                    RW.groups ? (double)RW.wait_ns / 1e6 / (double)RW.groups : 0.0, (double)RW.serial_draws / (double)n_subs,
                    (double)turns / (double)n_subs, (double)turn_ns / 1e6 / (double)n_subs, (double)redos / (double)n_subs);
+            char e[256];
+            int o = 0;
+            for (int k = 0; k < GE_N; k++)
+                o += snprintf(e + o, sizeof e - (size_t)o, "%s %s %.0f", k ? "," : "", ge_name[k],
+                              (double)RW.end_draws[k] / (double)n_subs);
+            rt_log("perf: replay workers: draws per submission by what ended their group:%s", e);
+            memset(RW.end_draws, 0, sizeof RW.end_draws);
         }
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
