@@ -544,13 +544,19 @@ def copy_if_changed(src, dst):
             return False
     except FileNotFoundError:
         pass
+    # Some SMB servers reject TemporaryDirectory's mode-0700 directories while allowing ordinary files beside dst.
+    replacement = None
     try:
-        with tempfile.TemporaryDirectory(dir=dst.parent, prefix='.nx2navi-copy-') as tmp:
-            replacement = Path(tmp) / dst.name
-            shutil.copy2(src, replacement)
-            os.replace(replacement, dst)
+        fd, name = tempfile.mkstemp(dir=dst.parent, prefix='.nx2navi-copy-')
+        os.close(fd)
+        replacement = Path(name)
+        shutil.copy2(src, replacement)
+        os.replace(replacement, dst)
     except PermissionError:
         fail(f'cannot replace {dst}: close the game and check output-directory permissions')
+    finally:
+        if replacement is not None:
+            replacement.unlink(missing_ok=True)
     return True
 
 
@@ -854,7 +860,19 @@ def compile_all(srcs, cmd_for, cache, jobs, env, progress=None, salt='', stop=No
     reused = len(srcs) - len(todo)
     if adopted:
         say(f'  {adopted} objects an earlier version compiled are kept: the same compile of the same sources')
-    todo.sort(key=lambda job: job[0].stat().st_size, reverse=True)
+    def src_size(job):
+        # The sources sit where the player keeps the game, often a network share, which can answer 'not there' for a
+        # moment after a hiccup: give the share a minute to recover before reporting the file gone.
+        for attempt in range(30):
+            try:
+                return job[0].stat().st_size
+            except OSError:
+                if attempt == 29:
+                    fail(f'cannot read {job[0]}: the drive or network share holding the build cache seems to have '
+                         'dropped out; check it and run the build again (a source file that is really gone wants the '
+                         'build cache\'s lift folder deleted, so the build regenerates it)')
+                time.sleep(2)
+    todo.sort(key=src_size, reverse=True)
 
     def cc(job):
         src, dst = job
@@ -1808,7 +1826,9 @@ def main():
         ap.error('give --nup, both --exefs and --romfs, or --rebuild')
     if a.rebuild and not a.out:
         ap.error('--rebuild needs --out')
-    out = Path(a.out).resolve() if a.out else None
+    # Keep a mapped drive letter on Windows: resolve() turns it into a UNC path, and some network shares drop that
+    # separate connection under compiler load while the mapped connection stays up.
+    out = (Path(os.path.abspath(a.out)) if WIN else Path(a.out).resolve()) if a.out else None
     cache = out / 'build-cache' if out else None
     state_path = cache / 'state.json' if cache else None
     state = load_state(state_path) if state_path else {}
