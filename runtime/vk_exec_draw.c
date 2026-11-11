@@ -5607,27 +5607,85 @@ static VkImage fallback_scratch(VkExec *ex, uint32_t w, uint32_t h, VkFormat f) 
     return img;
 }
 
-// 1 when the bound compute program uses tensor-core instructions (HMMA 0x23c, IMMA 0x237, LDSM 0x83b): the game's
-// upscalers (the movie's and the 3D scene's), which the translator cannot run and the fallback blit stands in for.
-// Other untranslated programs (bindless texturing, indirect branches) bind the output image too, and a blit for them
-// pasted G-buffer normals and intermediates over the picture. Kept per program serial.
-static int uses_tensor_ops(const VkExec *ex) {
-    static struct { uint64_t serial; int8_t v; } memo[256];
+typedef struct {
+    uint64_t serial;
+    uint64_t tex_mask[2];   // texture slots (0..127) the program samples or fetches from
+    uint32_t img_mask;      // image slots (0..31) the program writes
+    uint8_t tensor;         // 1 when the program uses HMMA, IMMA or LDSM
+    uint8_t ntex, nimg;     // NVN2 compute binding table counts in c0 (ctl +0xb3, +0xb6)
+} TensorInfo;
+
+// Whether the bound compute program uses tensor-core instructions (HMMA 0x23c, IMMA 0x237, LDSM 0x83b) — the game's
+// upscalers (the movie's and the 3D scene's), which the translator cannot run and the fallback blit stands in for —
+// and which compute texture and image slots its SM86 instructions read and write. Other untranslated programs
+// (bindless texturing, indirect branches) bind the output image too, and a blit for them pasted G-buffer normals and
+// intermediates over the picture.
+//
+// NVN compute texture and image slots stay bound on the queue across dispatches and submissions until another bind
+// overwrites them. A multi-pass network's internal passes declare no images (or read-only ones), and its output pass
+// rebinds only the slots in its NVN2 c0 binding table (gfx_shader.c build_request, ctl +0xb3/+0xb6/+0xba;
+// tools/xlate/AmpereLowering.cs Handle): higher slots keep whatever an earlier pass left there, such as the 3D scene
+// upscaler's larger images during a movie. Kept per program serial.
+static TensorInfo tensor_info(const VkExec *ex) {
+    static TensorInfo memo[256];
+    TensorInfo z = {0};
     const uint8_t *ctl, *code;
     uint32_t len;
-    if (!ex->prog || !find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
+    if (!ex->prog || !find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return z;
     uint64_t sr = ex->prog->serial;
-    typeof(memo[0]) *m = &memo[(sr * 0x9E3779B97F4A7C15ull) >> 56];
-    if (sr && m->serial == sr) return m->v;
-    int v = 0;
-    if (ctl_nvn2(ctl))
-        for (uint32_t o = 0; o + 16 <= len && !v; o += 16) {
-            uint32_t op = (uint32_t)(code[o] | code[o + 1] << 8) & 0xfff;
-            v = op == 0x23c || op == 0x237 || op == 0x83b;
+    TensorInfo *m = &memo[(sr * 0x9E3779B97F4A7C15ull) >> 56];
+    if (sr && m->serial == sr) return *m;
+    TensorInfo r = {.serial = sr};
+    if (ctl_nvn2(ctl)) {
+        uint32_t clen;
+        uint16_t end;
+        memcpy(&clen, ctl + 0x38, 4);   // code bytes before any trailing c1 jump tables (ctl_stage_len)
+        if (clen > len) clen = len;
+        memcpy(&end, ctl + 0xba, 2);
+        int ntex = ctl[0xb3], nimg = ctl[0xb6];
+        int has_tab = end >= 8 * (ntex + nimg);
+        int start = has_tab ? (int)end - 8 * (ntex + nimg) : 0;
+        uint64_t tex_r[2] = {0, 0};
+        uint32_t img_w = 0, img_r = 0;
+        for (uint32_t o = 0; o + 16 <= clen; o += 16) {
+            uint64_t lo;
+            memcpy(&lo, code + o, 8);
+            uint32_t op = (uint32_t)lo & 0xfff;
+            if (op == 0x23c || op == 0x237 || op == 0x83b) r.tensor = 1;
+            int is_tex = op == 0xb60 || op == 0xb63 || op == 0xb66 || op == 0xb6c;   // TEX, TLD4, TLD, TXD (not TXQ/TMML)
+            int is_iw  = op == 0xb9b || op == 0x59f || op == 0x593;                 // SUST.P, SURED, SUATOM
+            int is_ir  = op == 0xb97 || op == 0x593;                                // SULD.P, SUATOM
+            if ((!is_tex && !is_iw && !is_ir) || ((lo >> 59) & 1) || !has_tab) continue;
+            uint32_t bank = (uint32_t)(lo >> 54) & 0x1f;
+            int byte_off = (int)((lo >> 40) & 0x3fff) * 4;
+            if (bank != 0 || byte_off < start || (byte_off - start) % 8 != 0) continue;
+            int entry = (byte_off - start) / 8;
+            if (is_tex && entry < ntex && entry < 128)
+                tex_r[entry >> 6] |= 1ull << (entry & 63);
+            if (entry >= ntex && entry < ntex + nimg && entry - ntex < 32) {
+                if (is_iw) img_w |= 1u << (entry - ntex);
+                if (is_ir) img_r |= 1u << (entry - ntex);
+            }
         }
-    m->serial = sr, m->v = (int8_t)v;
-    return v;
+        r.ntex = (uint8_t)ntex, r.nimg = (uint8_t)nimg;
+        if (has_tab) {
+            if (img_w) r.img_mask = img_w;
+            else if (!img_r && nimg > 0) r.img_mask = nimg < 32 ? (1u << nimg) - 1u : ~0u;
+            if (tex_r[0] || tex_r[1]) {
+                r.tex_mask[0] = tex_r[0], r.tex_mask[1] = tex_r[1];
+            } else {
+                for (int i = 0; i < ntex && i < 128; i++) r.tex_mask[i >> 6] |= 1ull << (i & 63);
+            }
+        } else {
+            r.img_mask = ~0u;
+            r.tex_mask[0] = r.tex_mask[1] = ~0ull;
+        }
+    }
+    *m = r;
+    return r;
 }
+
+static int uses_tensor_ops(const VkExec *ex) { return tensor_info(ex).tensor; }
 
 // NX2NAVI_NATIVE_TENSOR=1: tensor-core programs run their translation (HMMA, LDSM and MOVM lowered to warp shuffles in
 // tools/xlate/AmpereLowering.cs Hmma, Ldsm, Movm). Off by default: the lowered networks do not match the hardware yet
@@ -5640,9 +5698,12 @@ static int native_tensor(const VkExec *ex) {
 
 // Everything an untranslated program binds (NX2NAVI_LOG_CS_BINDS): what a stand-in could use instead. Texture lock held.
 static void log_cs_bindings_locked(const VkExec *ex) {
+    TensorInfo ti = tensor_info(ex);
     char line[1600];
     int o = 0;
     line[0] = 0;
+    if (ti.tensor)
+        o += snprintf(line + o, sizeof line - o, " table=(tex:%u,img:%u,w:%#x)", ti.ntex, ti.nimg, ti.img_mask);
     for (int i = 0; i < 160 && o < (int)sizeof line - 80; i++) {
         int im = i >= 128;
         uint64_t h = im ? ex->img[NVN_STAGE_CS][i - 128 < 32 ? i - 128 : 0] : ex->tex[NVN_STAGE_CS][i];
@@ -5690,37 +5751,10 @@ static int fallback_9e5_scene(VkFormat src, VkFormat dst) {
     return src == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && dst == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 }
 
-static void untranslated_dispatch_fallback(VkExec *ex) {
-    static int on = -1;
-    if (on < 0) on = rt_knob("CS_FALLBACK", "1");
-    if (!on) return;
-    if (!uses_tensor_ops(ex)) {   // its translation failed, and no stand-in exists for programs without tensor ops
-        if (knob_log_cs_binds()) {
-            vk_texture_lock();
-            log_fallback_skip_locked(ex, NULL, -1);
-            vk_texture_unlock();
-        }
-        return;
-    }
-    const VkTexImage *dst = NULL, *src = NULL, *out;
-    int in_place = 0;
-    vk_texture_lock();
-    for (int i = 0; i < 32; i++) {
-        uint64_t h = ex->img[NVN_STAGE_CS][i];
-        view_t v; int hv = 0;
-        const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
-        if (t && t->aspect == VK_IMAGE_ASPECT_COLOR_BIT && t->type == VK_IMAGE_TYPE_2D && t->samples == 1 &&
-            (!dst || (uint64_t)t->width * t->height > (uint64_t)dst->width * dst->height))
-            dst = t;
-    }
-    out = dst;
-    for (int i = 0; dst && i < 128; i++) {   // an in-place pass (its output also sampled) is left alone
-        uint64_t h = ex->tex[NVN_STAGE_CS][i];
-        view_t v; int hv = 0;
-        const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
-        if (t && t->image == dst->image) { dst = NULL; in_place = 1; break; }
-    }
-    for (int i = 0; dst && i < 128; i++) {
+static const VkTexImage *pick_fallback_src_locked(const VkExec *ex, const VkTexImage *dst, const uint64_t mask[2]) {
+    const VkTexImage *src = NULL;
+    for (int i = 0; i < 128; i++) {
+        if (!((mask[i >> 6] >> (i & 63)) & 1)) continue;
         uint64_t h = ex->tex[NVN_STAGE_CS][i];
         view_t v; int hv = 0;
         const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
@@ -5735,6 +5769,57 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             t->samples == 1 && t->width <= dst->width && t->height <= dst->height && t->width >= 16 && t->height >= 16 &&
             (!src || (uint64_t)t->width * t->height > (uint64_t)src->width * src->height))
             src = t;
+    }
+    return src;
+}
+
+static void untranslated_dispatch_fallback(VkExec *ex) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("CS_FALLBACK", "1");
+    if (!on) return;
+    TensorInfo ti = tensor_info(ex);
+    if (!ti.tensor) {   // its translation failed, and no stand-in exists for programs without tensor ops
+        if (knob_log_cs_binds()) {
+            vk_texture_lock();
+            log_fallback_skip_locked(ex, NULL, -1);
+            vk_texture_unlock();
+        }
+        return;
+    }
+    const VkTexImage *dst = NULL, *src = NULL, *out;
+    int in_place = 0;
+    vk_texture_lock();
+    for (int i = 0; i < 32; i++) {
+        if (!((ti.img_mask >> i) & 1)) continue;
+        uint64_t h = ex->img[NVN_STAGE_CS][i];
+        view_t v; int hv = 0;
+        const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        if (t && t->aspect == VK_IMAGE_ASPECT_COLOR_BIT && t->type == VK_IMAGE_TYPE_2D && t->samples == 1 &&
+            (!dst || (uint64_t)t->width * t->height > (uint64_t)dst->width * dst->height))
+            dst = t;
+    }
+    out = dst;
+    for (int i = 0; dst && i < 128; i++) {   // an in-place pass (its output also sampled) is left alone
+        if (!((ti.tex_mask[i >> 6] >> (i & 63)) & 1)) continue;
+        uint64_t h = ex->tex[NVN_STAGE_CS][i];
+        view_t v; int hv = 0;
+        const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        if (t && t->image == dst->image) { dst = NULL; in_place = 1; break; }
+    }
+    if (dst) {
+        // First try textures this pass itself samples; when a multi-pass network's output pass samples only an earlier
+        // pass's 10-bit intermediate, fall back to the program's c0 texture table and then the queue's bound slots,
+        // where the network's input pass left the RGBA8 source frame.
+        src = pick_fallback_src_locked(ex, dst, ti.tex_mask);
+        if (!src && ti.ntex) {
+            uint64_t tab[2] = {0, 0};
+            for (int i = 0; i < ti.ntex && i < 128; i++) tab[i >> 6] |= 1ull << (i & 63);
+            src = pick_fallback_src_locked(ex, dst, tab);
+        }
+        if (!src) {
+            const uint64_t all[2] = {~0ull, ~0ull};
+            src = pick_fallback_src_locked(ex, dst, all);
+        }
     }
     if (dst && src) vk_texture_storage_bound_locked(dst);
     else if (knob_log_cs_binds()) log_fallback_skip_locked(ex, out, in_place);
