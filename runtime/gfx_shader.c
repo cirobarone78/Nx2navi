@@ -197,7 +197,7 @@ static int carry_on(void) {
 #define write_file plat_file_write
 
 // ---- cache pack (<cache>/shader-cache.pack, written by tools/pack_shader_cache.py)
-// Little-endian: "TKSPACK1", u32 count, u32 0, then count entries sorted by (kind, name), then the data. name is the
+// Little-endian: "TKSPACK1", u32 count and flags, then count entries sorted by (kind, name), then the data. name is the
 // 32 bytes the loose file's 64 hex digits spell. The index is read once (48 bytes a file: ~5.6 MB after an install);
 // the data is read per lookup with positioned reads on one handle, safe from every thread. A pack that fails a check is
 // ignored as a whole and the loose files are used.
@@ -206,7 +206,7 @@ typedef struct { uint8_t name[32]; uint32_t kind, size; uint64_t offset; } PackE
 _Static_assert(sizeof(PackEnt) == 48, "shader-cache.pack entry layout");
 static PlatFile *pack_file;
 static PackEnt *pack_ix;
-static uint32_t pack_n;
+static uint32_t pack_n, pack_flags;
 
 static int pack_cmp(const PackEnt *a, uint32_t kind, const uint8_t name[32]) {
     if (a->kind != kind) return a->kind < kind ? -1 : 1;
@@ -238,7 +238,8 @@ static void pack_open(void) {
         else if (!pack_read_at(sizeof head, ix, n * (uint32_t)sizeof *ix)) why = "index read";
     }
     for (uint32_t i = 0; !why && i < n; i++) {
-        if (ix[i].offset + ix[i].size > id.size) why = "entry out of bounds";
+        if (ix[i].offset < sizeof head + (uint64_t)n * sizeof *ix || ix[i].offset > id.size ||
+            ix[i].size > id.size - ix[i].offset) why = "entry out of bounds";
         else if (i && pack_cmp(&ix[i - 1], ix[i].kind, ix[i].name) >= 0) why = "index order";
     }
     if (why) {
@@ -249,6 +250,7 @@ static void pack_open(void) {
         return;
     }
     pack_ix = ix, pack_n = n;
+    memcpy(&pack_flags, head + 12, sizeof pack_flags);
     rt_log("gfx_shader: cache pack %s: %u files", p, n);
 }
 
@@ -3185,6 +3187,14 @@ static size_t carry_prune_one(const CarryItem *it, size_t m, int j, Drops *d) {
     return kept + (d->left - left0);
 }
 
+typedef struct { uint64_t offset; uint32_t size, entry; } PackSpan;
+
+static int pack_span_order(const void *a, const void *b) {
+    const PackSpan *x = a, *y = b;
+    if (x->offset != y->offset) return x->offset < y->offset ? -1 : 1;
+    return (x->size > y->size) - (x->size < y->size);
+}
+
 // Writes shader-cache.pack.pruned: the open pack without the dropped files, with a trailer naming the pack it was copied
 // from (pack_swap_pruned puts it in place at the next start; the open pack cannot be replaced while this process reads
 // it). Written under another name, flushed, then renamed, so a copy that exists is whole. 1 when it was written.
@@ -3192,7 +3202,8 @@ static int carry_repack(Drops *d) {
     char tmp[PATH_CAP + 48], out[PATH_CAP + 48];
     qsort(d->v, d->n, sizeof *d->v, drop_cmp);
     PackEnt *nix = malloc(((size_t)pack_n + 1) * sizeof *nix);
-    uint64_t *src = malloc(((size_t)pack_n + 1) * sizeof *src), at;
+    PackSpan *src = malloc(((size_t)pack_n + 1) * sizeof *src);
+    uint64_t at;
     uint32_t k = 0;
     PlatFileId id;
     uint64_t have = 0;
@@ -3207,10 +3218,23 @@ static int carry_repack(Drops *d) {
         PackDrop key = {pack_ix[i].kind, {0}};
         memcpy(key.name, pack_ix[i].name, 32);
         if (bsearch(&key, d->v, d->n, sizeof *d->v, drop_cmp)) continue;
-        src[k] = pack_ix[i].offset, nix[k] = pack_ix[i], k++;
+        src[k] = (PackSpan){pack_ix[i].offset, pack_ix[i].size, k};
+        nix[k++] = pack_ix[i];
     }
     at = 16 + (uint64_t)k * sizeof *nix;
-    for (uint32_t i = 0; i < k; i++) nix[i].offset = at, at += nix[i].size;
+    // Copy each physical span once. Several retained logical shader keys can name the same bytes.
+    qsort(src, k, sizeof *src, pack_span_order);
+    uint32_t unique = 0;
+    uint64_t dest = at;
+    for (uint32_t i = 0; i < k; i++) {
+        PackSpan span = src[i];
+        if (!unique || pack_span_order(&span, &src[unique - 1])) {
+            src[unique++] = span;
+            dest = at;
+            at += span.size;
+        }
+        nix[span.entry].offset = dest;
+    }
     snprintf(tmp, sizeof tmp, "%s/shader-cache.pack.pruned.tmp", cache_dir);
     snprintf(out, sizeof out, "%s/shader-cache.pack.pruned", cache_dir);
     plat_file_delete(tmp);
@@ -3218,27 +3242,28 @@ static int carry_repack(Drops *d) {
     PlatFile *f = plat_fs_create(tmp, &err);
     uint8_t head[16] = "TKSPACK1", trailer[PACK_TRAILER] = PACK_SRC_MAGIC;
     memcpy(head + 8, &k, 4);
+    memcpy(head + 12, &pack_flags, sizeof pack_flags);
     file_id_put(trailer + 8, &id);
     size_t cap = 4u << 20, fill = 0;
     uint8_t *buf = malloc(cap);
     at = 16 + (uint64_t)k * sizeof *nix;   // where buf's first byte goes
     int ok = f && buf && plat_file_pwrite(f, head, 16, 0) == 16 &&
              plat_file_pwrite(f, nix, k * (uint32_t)sizeof *nix, 16) == (int64_t)k * (int64_t)sizeof *nix;
-    for (uint32_t i = 0; ok && i <= k; i++) {
-        uint32_t size = i < k ? nix[i].size : 0;
-        if (i == k || fill + size > cap) {   // the buffer out; between writes on-demand translation goes first
+    for (uint32_t i = 0; ok && i <= unique; i++) {
+        uint32_t size = i < unique ? src[i].size : 0;
+        if (i == unique || fill + size > cap) {   // the buffer out; between writes on-demand translation goes first
             ok = !fill || plat_file_pwrite(f, buf, (uint32_t)fill, at) == (int64_t)fill;
             at += fill, fill = 0;
             carry_wait();
         }
-        if (i == k || !ok) continue;
+        if (i == unique || !ok) continue;
         if (size > cap) {
             uint8_t *big = malloc(size);
-            ok = big && pack_read_at(src[i], big, size) && plat_file_pwrite(f, big, size, at) == (int64_t)size;
+            ok = big && pack_read_at(src[i].offset, big, size) && plat_file_pwrite(f, big, size, at) == (int64_t)size;
             at += size;
             free(big);
         } else {
-            ok = pack_read_at(src[i], buf + fill, size);
+            ok = pack_read_at(src[i].offset, buf + fill, size);
             fill += size;
         }
     }
