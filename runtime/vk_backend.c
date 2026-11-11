@@ -301,8 +301,12 @@ int vk_replay_async(void) {
 }
 
 // With the replay on its own thread a submission's value covers its replay too, and the wait stays the fence's.
+// The lists of NX2NAVI_MERGE_CPU are stored by then as the GPU's merges are (vk_mem_merge_cpu_wait).
 static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
-    return vk_replay_async() ? vk_sync_fence_wait(value, timeout_ns) : vk_sync_exec_wait(value, timeout_ns);
+    if (vk_replay_async()) return vk_sync_fence_wait(value, timeout_ns);
+    int ok = vk_sync_exec_wait(value, timeout_ns);
+    if (ok) vk_mem_merge_cpu_wait(value);
+    return ok;
 }
 
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
