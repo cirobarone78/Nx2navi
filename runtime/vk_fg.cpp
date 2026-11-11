@@ -35,6 +35,7 @@ namespace {
 
 struct {
     VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
+    uint32_t present_family = 0, acquire_family = 0;
     ffxContext sc = nullptr;   // the swapchain context
     ffxContext fg = nullptr;   // the frame generation context
     VkExtent2D fg_ext = {0, 0};
@@ -99,7 +100,10 @@ extern "C" int vk_fg_wanted(void) {
 // Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.
 extern "C" uint32_t vk_fg_queue_count(void) { return 3; }
 
-extern "C" void vk_fg_queues(VkQueue present, VkQueue acquire) { F.present = present, F.acquire = acquire; }
+extern "C" void vk_fg_queues(VkQueue present, uint32_t present_family, VkQueue acquire, uint32_t acquire_family) {
+    F.present = present, F.present_family = present_family;
+    F.acquire = acquire, F.acquire_family = acquire_family;
+}
 
 // AMD's swapchain is in place: the window's swapchain handle is AMD's object, and every swapchain call has to go
 // through AMD's functions. That holds after a failure too, until the present code has replaced the swapchain
@@ -122,8 +126,8 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
     d.createInfo.oldSwapchain = VK_NULL_HANDLE;
     d.gameQueue = {c->gfx_queue, c->gfx_family, submit_game};
     d.asyncComputeQueue = {VK_NULL_HANDLE, c->gfx_family, nullptr};
-    d.presentQueue = {F.present, c->gfx_family, nullptr};
-    d.imageAcquireQueue = {F.acquire, c->gfx_family, nullptr};
+    d.presentQueue = {F.present, F.present_family, nullptr};
+    d.imageAcquireQueue = {F.acquire, F.acquire_family, nullptr};
     ffxReturnCode_t r = vk_ffx_create(&F.sc, &d.header);
     if (r != FFX_API_RETURN_OK) {
         F.sc = nullptr;
@@ -271,9 +275,11 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     p.motionVectors = image(&mv);
     r = vk_ffx_dispatch(&F.fg, &p.header);
     if (r != FFX_API_RETURN_OK) return fail("frame generation preparation", r);
-    if (F.frame == 2 || F.frame % 3600 == 0)
-        rt_log("fg: %llu frames presented, %llu generated (%llu with the HUD kept out); paused %llu (menu), %llu without depth "
-               "and motion", (unsigned long long)F.frame, (unsigned long long)F.generated, (unsigned long long)F.hudless,
+    static uint64_t active_frames;
+    active_frames++;
+    if (active_frames == 10 || active_frames == 150 || active_frames % 600 == 0)
+        rt_log("fg: %llu active / %llu total frames presented, %llu generated (%llu with the HUD kept out); paused %llu (menu), %llu without depth "
+               "and motion", (unsigned long long)active_frames, (unsigned long long)F.frame, (unsigned long long)F.generated, (unsigned long long)F.hudless,
                (unsigned long long)F.paused, (unsigned long long)F.no_inputs);
 }
 
