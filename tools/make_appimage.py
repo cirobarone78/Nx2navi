@@ -91,7 +91,7 @@ EOF
     exit 1
 fi
 
-if ! PYTHONPATH="$PYDEPS" "$PY" -c 'import zbic' 2>/dev/null; then
+if ! "$PY" -I -c 'import sys; sys.path[:0] = [sys.argv[1]]; import zbic' "$PYDEPS" 2>/dev/null; then
     echo "Installing zbic (GPL-2.0, unpacks the game's program files) into $PYDEPS ..."
     "$PY" -m pip install --quiet --disable-pip-version-check --target "$PYDEPS" zbic || {
         echo "error: pip could not install zbic (it needs the internet once)" >&2
