@@ -948,6 +948,22 @@ static void probe_menu_text(void) {
     CHECK(menu_text(UI_MENU_CONTINUE) == ui_text_in(auto_lang, UI_MENU_CONTINUE), "menu_text auto ignores the system language");
 }
 
+int probe_ui_text(void) {
+    probe_menu_text();
+    static const char *const languages[] = {"en", "ru", "pt-BR", "zh-Hans"};
+    for (unsigned i = 0; i < sizeof languages / sizeof *languages; i++) {
+        cfg_set("NX2NAVI_MENU_LANG", languages[i]);
+        for (int id = UI_MENU_CHEATS_LINK; id <= UI_MENU_LAST_ID; id++)
+            CHECK(ui_text_defined(languages[i], (UiTextId)id) && menu_text((UiTextId)id) == ui_text_in(languages[i], (UiTextId)id),
+                  "cheat text %d does not follow %s", id, languages[i]);
+        const char *label = menu_text(UI_MENU_BOTTLE_LABEL), *format = strchr(label, '%');
+        CHECK(format && format[1] == 'd' && !strchr(format + 2, '%'), "bottle label format in %s", languages[i]);
+    }
+    cfg_set("NX2NAVI_MENU_LANG", "");
+    printf("probe-ui-text: %s (%d checks, %d failures)\n", failures ? "FAILED" : "passed", checks, failures);
+    return failures != 0;
+}
+
 static void probe_main(Cpu *c) {
     gc = c;
     probe_oe();

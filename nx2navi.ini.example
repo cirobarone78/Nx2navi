@@ -767,6 +767,10 @@
 # shared_fonts =
 
 [cheats]
+# Built-in policies for game 1.1.1 are switched individually in Settings > Cheats (docs/cheats.md).
+# Sprint speed while using the native sprint action: normal, 2, 3.5 or 5. Extra jumps require another jump press.
+# sprint_speed = normal
+# air_jumps = 0
 # One line per cheat of the mods' cheat files, mods\<mod>\cheats\<build id>.txt (docs/cheats.md); the Cheats tab of
 # the menu writes them. cheat_<hash> = 1 switches a cheat on, the hash being FNV-1a 32 of "<mod folder>/<cheat name>".
 # Default: every cheat off.
