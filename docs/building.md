@@ -24,7 +24,7 @@ Versions are the ones the build was verified with; newer patch releases are fine
 MSYS2 packages, after `pacman -Syuu` (run it twice; the first pass updates the core and exits):
 
 ```sh
-pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-{clang,lld,ninja,gcc,make,pkgconf,sdl3,opus,libvpx,zstd,vulkan-devel,\
+pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-{clang,lld,ninja,gcc,make,pkgconf,sdl3,opus,libvpx,dav1d,zstd,vulkan-devel,\
 vulkan-memory-allocator,vulkan-validation-layers,shaderc,spirv-tools} base-devel git unzip
 ```
 
@@ -213,7 +213,7 @@ Requirements:
 - Packages on Arch:
 
   ```sh
-  pacman -S --needed clang lld ninja make sdl3 opus libvpx zstd vulkan-headers vulkan-icd-loader \
+  pacman -S --needed clang lld ninja make sdl3 opus libvpx dav1d zstd vulkan-headers vulkan-icd-loader \
       vulkan-validation-layers shaderc spirv-tools dotnet-sdk uv git
   ```
 
