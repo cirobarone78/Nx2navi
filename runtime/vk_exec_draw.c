@@ -31,6 +31,7 @@
 #include "vk_gpa.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_stereo.h"
 
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
@@ -757,6 +758,7 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
 
 int vk_exec_image_gone(VkImage image) {
     vk_exec_bc_gone(image);
+    vk_stereo_image_gone(image);
     vk_hdr_image_gone(image);
     if (!views_by_image.klen) return 0;
     int purged = 0;
@@ -3729,6 +3731,12 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     if (!mesh) bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info, mesh);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
+    if (!mesh) vk_stereo_draw(ex, info);
+    else if (vk_stereo_enabled()) {
+        for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; ++i) vk_stereo_forget(ex->color[i].image);
+        if (ex->pipe.ds.dw) vk_stereo_forget(ex->depth.image);
+        vk_stereo_images(ex, info);
+    }
     vk_exec_oq_draw(ex);
     DRS.issued[mesh]++;
     draw_stats_tick();
@@ -5051,6 +5059,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         const VkTexImage *twin = raw_9e5_twin(src);
         si = twin ? twin->image : VK_NULL_HANDLE, sf = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     }
+    VkImage stereo_src = si;
     VkImageView dst_view = VK_NULL_HANDLE;   // for the tonemap pass, while the lock keeps the image
     if (src && dst && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && raw_9e5(si, sf) &&
         dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && knob_tm_dispatch() != 2) {
@@ -5143,8 +5152,20 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
                           .extent = {dw, dh, 1}};
         vkCmdCopyImage(ex->cb, scratch, VK_IMAGE_LAYOUT_GENERAL, di, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     }
+    vk_stereo_copy(stereo_src, di);
     ex->recorded++;
     vk_exec_barrier(ex);
+}
+
+// A translated dispatch may write any bound storage image. Forget even stale
+// bindings rather than carry an unproven identity through an unknown write.
+static void stereo_dispatch_forget(VkExec *ex) {
+    if (!vk_stereo_enabled()) return;
+    for (int i = 0; i < 32; ++i) {
+        uint64_t h = ex->img[NVN_STAGE_CS][i];
+        const VkTexImage *img = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), NULL, NULL) : NULL;
+        if (img) vk_stereo_forget(img->image);
+    }
 }
 
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
@@ -5195,6 +5216,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 0;
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    stereo_dispatch_forget(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
@@ -5244,6 +5266,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     }
     VkPassMark *m = dispatch_mark(ex, cs, 0, 0, 0);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
+    stereo_dispatch_forget(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));

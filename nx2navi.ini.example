@@ -343,6 +343,15 @@
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr
 # sharpness = 80
+
+# Experimental depth-reprojected stereo: off, sbs (half side-by-side), tab (half top-and-bottom), or anaglyph (red/cyan).
+# Hidden geometry cannot be revealed; edges can artifact and the game HUD inherits depth. Missing depth produces a flat
+# packed image. HDR and frame generation are unsupported and remain mono. The settings overlay remains mono; close it
+# with F1 to see 3D. Convergence is in view-space units, not metres.
+# stereo = off
+# stereo_separation = 20
+# stereo_convergence = 100
+# stereo_swap = 0
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at

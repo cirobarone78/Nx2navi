@@ -1,0 +1,69 @@
+#version 450
+// Two approximate eye views from one colour/depth picture, not two geometry renders.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D colour;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2, rgba16f) uniform writeonly image2D output_image;
+layout(push_constant) uniform Params {
+    ivec4 crop;        // source x, y, width, height
+    ivec4 output_info; // output width, height, mode (SBS/TAB/anaglyph), eye swap
+    vec4 projection;   // P22, P23, P32, P33, from the scene's perspective projection
+    vec4 options;      // per-eye UV separation, convergence distance, has depth, reserved
+} pc;
+
+bool finite1(float x) { return (floatBitsToUint(x) & 0x7fffffffu) < 0x7f800000u; }
+
+float disparity(vec2 uv) {
+    if (pc.options.z < 0.5 || !finite1(pc.options.x) || !finite1(pc.options.y) ||
+        pc.options.x <= 0.0 || pc.options.y <= 0.0) return 0.0;
+    ivec2 size = textureSize(depth_tex, 0);
+    vec2 source_uv = (vec2(pc.crop.xy) + uv * vec2(pc.crop.zw)) / vec2(textureSize(colour, 0));
+    ivec2 pixel = clamp(ivec2(source_uv * vec2(size)), ivec2(0), size - 1);
+    float d = texelFetch(depth_tex, pixel, 0).r;
+    // Reversed-Z sky and invalid depth have no reliable parallax.
+    if (!finite1(d) || d <= 0.0 || d >= 1.0) return 0.0;
+    float ndc = 2.0 * d - 1.0;
+    float den = pc.projection.z * ndc - pc.projection.x;
+    if (!finite1(den) || abs(den) < 1e-12) return 0.0;
+    float distance = -(pc.projection.y - pc.projection.w * ndc) / den;
+    if (!finite1(distance) || distance <= 1e-6) return 0.0;
+    float shift = pc.options.x * (pc.options.y / distance - 1.0);
+    return finite1(shift) ? clamp(shift, -0.03, 0.03) : 0.0;
+}
+
+vec4 eye(vec2 uv, float sign) {
+    if (pc.output_info.w != 0) sign = -sign;
+    vec2 sample_uv = uv;
+    // Inverse reprojection avoids unwritten holes. It cannot recover disoccluded surfaces:
+    // four fixed-point updates and border clamping can smear silhouettes, rather than invent geometry.
+    for (int i = 0; i < 4; i++)
+        sample_uv.x = clamp(uv.x - sign * disparity(sample_uv), 0.0, 1.0);
+    ivec2 pixel = pc.crop.xy + clamp(ivec2(sample_uv * vec2(pc.crop.zw)), ivec2(0), pc.crop.zw - 1);
+    // Match the normal Vulkan blit: an sRGB view decodes on fetch, while UNORM values stay as stored.
+    return texelFetch(colour, pixel, 0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = pc.output_info.xy;
+    if (any(greaterThanEqual(p, imageSize(output_image))) || any(greaterThanEqual(p, size))) return;
+    if (any(lessThanEqual(size, ivec2(0))) || any(lessThanEqual(pc.crop.zw, ivec2(0)))) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    vec4 result;
+    if (pc.output_info.z == 1 && size.x >= 2) {
+        int split = size.x / 2;
+        bool left = p.x < split;
+        uv.x = (float(left ? p.x : p.x - split) + 0.5) / float(left ? split : size.x - split);
+        result = eye(uv, left ? 1.0 : -1.0);
+    } else if (pc.output_info.z == 2 && size.y >= 2) {
+        int split = size.y / 2;
+        bool left = p.y < split;
+        uv.y = (float(left ? p.y : p.y - split) + 0.5) / float(left ? split : size.y - split);
+        result = eye(uv, left ? 1.0 : -1.0);
+    } else if (pc.output_info.z == 3) {
+        vec4 left = eye(uv, 1.0), right = eye(uv, -1.0);
+        result = vec4(left.r, right.gb, left.a);
+    } else {
+        result = eye(uv, 0.0);
+    }
+    imageStore(output_image, p, result);
+}

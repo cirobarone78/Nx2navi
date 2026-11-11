@@ -28,6 +28,7 @@
 #include "vk.h"
 #include "vk_fg.h"
 #include "vk_dlaa.h"
+#include "vk_stereo_present.h"
 #include "vk_dlssg.h"
 
 #define FRAMES 2
@@ -820,6 +821,14 @@ static int movie_overlay(VkCommandBuffer cb, int slot, VkImage dst) {
 static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int w, int h, const int rect[4], VkImage dst,
                        const int to[4], int general) {
     int cw = rect[2], ch = rect[3];
+    const int stereo_rect[4] = {0, 0, to[2], to[3]};
+    // Only the real SDR picture: never transform frame generation's HUD-less comparison image.
+    VkImage stereo = general && !g_sc_hdr && slot < FRAMES
+        ? vk_stereo_record(cb, slot, src, fmt, w, h, rect, to[2], to[3]) : VK_NULL_HANDLE;
+    if (stereo) {
+        src = stereo, fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+        w = cw = to[2], h = ch = to[3], rect = stereo_rect;
+    }
     // Colour adjustment (NX2NAVI_COLOR_*, vk_color.c), or on an HDR10 swapchain the PQ encode (vk_hdr.c; the adjustment is
     // for SDR): a copy of the crop takes the game image's place below
     VkImage graded = !general ? VK_NULL_HANDLE : g_sc_hdr ? vk_hdr_encode(cb, slot, src, fmt, rect)
@@ -830,7 +839,8 @@ static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     const int *prect = graded ? grect : rect;
     // FSR (NX2NAVI_UPSCALER): EASU when the picture's rectangle is larger than the crop, the shrink and RCAS when it is
     // smaller; else the bilinear blit
-    int fsr = general ? vk_fsr_record(cb, slot, psrc, pfmt, graded ? cw : w, graded ? ch : h, prect, dst, to) : 0;
+    // The compute pass already sized each eye for this output. An unfiltered 1:1 copy keeps the eye boundary intact.
+    int fsr = general && !stereo ? vk_fsr_record(cb, slot, psrc, pfmt, graded ? cw : w, graded ? ch : h, prect, dst, to) : 0;
     if (!fsr && src) {
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
             sync_barrier(cb, psrc, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -840,7 +850,7 @@ static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
             .srcOffsets = {{prect[0], prect[1], 0}, {prect[0] + cw, prect[1] + ch, 1}},
             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
         vkCmdBlitImage(cb, psrc, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, stereo ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
         if (general)   // later submissions that write the source wait for the blit's read
             sync_barrier(cb, psrc, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
@@ -1615,6 +1625,7 @@ void gfx_window_release_vk(void) {
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();
+        vk_stereo_release();
         vk_hdr_release();
         vk_contact_release();
         free_capture();

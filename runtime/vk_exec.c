@@ -27,6 +27,7 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_dlaa.h"
+#include "vk_stereo.h"
 
 #define WEAK __attribute__((weak))
 #define CALL_DEPTH 8
@@ -769,6 +770,8 @@ static void clear_attachment(VkExec *ex, const VkClearAttachment *a) {
     uint32_t bit = a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? 1u << a->colorAttachment : 0x100u;
     vk_exec_feedback_war(ex, bit);   // a draw of this pass sampled it: its reads finish before the clear writes
     vkCmdClearAttachments(ex->cb, 1, a, 1, &cr);
+    if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) vk_stereo_forget(ex->color[a->colorAttachment].image);
+    else if (a->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) vk_stereo_forget(ex->depth.image);
     ex->recorded++;
     ex->fb_dirty |= bit;
 }
@@ -817,6 +820,7 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
         vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
+        vk_stereo_forget(t->image);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
         return;
@@ -848,6 +852,7 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
         vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+        if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) vk_stereo_forget(t->image);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
         return;

@@ -287,6 +287,18 @@ With `--romfs <extracted RomFS folder>` it draws the game's interface textures a
 both decode the game's files, so they run with `.venv-py314\Scripts\python` (`compression.zstd` and numpy). What they
 write is decoded game data: keep it under `build/`.
 
+Stereoscopic output has standalone game-free checks: `python tests/stereo_menu_check.py --cc <clang++>` checks the
+actual Screen rows and configuration, including save/reload in a fresh process. `python tests/stereo_runtime_check.py`
+checks scene selection and frame handoff; `python tests/stereo_present_check.py` checks the actual compositor with
+recording Vulkan stubs. `python tests/stereo_shader_check.py` compiles and validates the optimized shader and its
+descriptor/push-constant ABI. `python tests/stereo_put_picture_check.py --cc <clang>` checks the actual presentation
+body's final-size, unfiltered copy and ordinary-rendering fallback. `python tests/stereo_gpu.py` dispatches the shader
+on small synthetic colour/depth images and reads them back, including comparison with a native Vulkan sRGB blit.
+The shader checks need `glslc` and `spirv-val` (PATH or `GLSLC`/`SPIRV_VAL`); GPU checks
+also need the test-only Python `vulkan` package. These standalone checks do not run through `*_test.py` discovery.
+They do not launch the game or establish gameplay appearance, display compatibility or performance. See
+[Stereoscopic output](stereoscopic-output.md) for the supported layouts and experimental rendering boundary.
+
 A change to the shared save (`runtime/save_zip.c`, `runtime/save_share.c`, the save import in `runtime/fs_host.c`)
 passes `python tests\save_zip_check.py` and `python tests\save_share_check.py`. The first builds `save_zip.c` alone
 and checks its deflate, inflate, zip writer and reader against Python's zlib and zipfile both ways, and that the

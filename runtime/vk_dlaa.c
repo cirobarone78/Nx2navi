@@ -29,6 +29,7 @@
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_exec.h"
+#include "vk_stereo.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
 #include "dlaa_mv_spv.h"
@@ -1747,6 +1748,10 @@ evaluated:
     VkImage shown = mvdebug ? e->mv : maskdebug && mk ? mk->mask : maskdebug && masked ? e->mask : e->out;
     if (shown != e->out) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
     vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    if (shown == e->out && !dst->level && !dst->base_layer && dst->layers == 1 && !dst->is3d &&
+        dst->width == ow && dst->height == oh)
+        vk_stereo_temporal(t->image, z->image, dst->image);
+    else vk_stereo_forget(dst->image);
     full_barrier(cb);
     if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
     if (vk_dlaa_hudless_wanted) hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames

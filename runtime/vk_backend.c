@@ -33,10 +33,11 @@
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
+#include "vk_stereo_present.h"
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; StereoFrame stereo; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -85,7 +86,9 @@ static void present_main(void *arg) {
         plat_mutex_unlock(&pl);
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
+        vk_stereo_present_frame(j.stereo);
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        vk_stereo_present_frame((StereoFrame){0});
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
@@ -228,6 +231,10 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
+    VkImage present = img && (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? img->image : VK_NULL_HANDLE;
+    VkFormat present_format = img ? img->format : VK_FORMAT_UNDEFINED;
+    if (present) vk_hdr_present_source(img, &present, &present_format);
+    StereoFrame stereo = vk_stereo_frame(present);
     int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
     if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         if (!held && plat_inc32(&n_skipped) <= 8)
@@ -239,9 +246,8 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         }
         return;
     }
-    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value};
-    vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
+    PresentJob j = {.image = present, .format = present_format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
+                    .at = at_ns, .queued = queued, .value = value, .stereo = stereo};
     if (crop) {
         j.has_crop = 1;
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];

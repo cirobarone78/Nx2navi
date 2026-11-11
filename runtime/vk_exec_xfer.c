@@ -42,6 +42,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_stereo.h"
 
 enum { W_FORMAT, W_REGION, W_BUFFER, W_OVERLAP, W_COPY, W_CLEAR, W_QUERY, W_COUNT };
 
@@ -787,7 +788,7 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
-    if (to_image) vk_texture_gpu_written(p->tex);
+    if (to_image) vk_stereo_forget(s.img->image), vk_texture_gpu_written(p->tex);
     else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
@@ -827,6 +828,12 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
         vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
+    if (s.aspect == VK_IMAGE_ASPECT_COLOR_BIT && s.img->type == VK_IMAGE_TYPE_2D && d.img->type == VK_IMAGE_TYPE_2D &&
+        !s.level && !d.level && !s.layer0 && !d.layer0 && !s.z && !d.z && s.nz == 1 && d.nz == 1 &&
+        !s.x && !s.y && !d.x && !d.y && s.w == s.img->width && s.h == s.img->height &&
+        d.w == d.img->width && d.h == d.img->height)
+        vk_stereo_copy(s.img->image, d.img->image);
+    else vk_stereo_forget(d.img->image);
     ex->recorded++;
     vk_texture_gpu_written(p->dst);
     static int lg = -1;
@@ -966,6 +973,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         vk_exec_barrier(ex);
         vkCmdClearDepthStencilImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &rng);
     }
+    vk_stereo_forget(img->image);
     ex->recorded++;
     vk_texture_gpu_written(t);
 }

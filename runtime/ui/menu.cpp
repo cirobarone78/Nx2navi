@@ -1093,6 +1093,18 @@ static void row_game_res(void) {
     opt_choice_list("NX2NAVI_GAME_RES", UI_MENU_GAME_RES, values, names, 6, UI_MENU_GAME_RES_DESC);
 }
 
+static void row_stereo(void) {
+    static const char *const values[] = {"off", "sbs", "tab", "anaglyph"};
+    const char *names[] = {menu_text(UI_MENU_STEREO_OFF), menu_text(UI_MENU_STEREO_SBS),
+                           menu_text(UI_MENU_STEREO_TAB), menu_text(UI_MENU_STEREO_ANAGLYPH)};
+    opt_choice_list("NX2NAVI_STEREO", UI_MENU_STEREO, values, names, 4, UI_MENU_STEREO_DESC);
+    if (strcmp(cfg_value("NX2NAVI_STEREO"), "off")) {
+        opt_slider("NX2NAVI_STEREO_SEPARATION", UI_MENU_STEREO_SEPARATION, 0, 100, UI_MENU_STEREO_SEPARATION_DESC, 1);
+        opt_slider("NX2NAVI_STEREO_CONVERGENCE", UI_MENU_STEREO_CONVERGENCE, 1, 1000, UI_MENU_STEREO_CONVERGENCE_DESC, 1);
+        opt_toggle("NX2NAVI_STEREO_SWAP", UI_MENU_STEREO_SWAP, UI_MENU_STEREO_SWAP_DESC);
+    }
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
     opt_toggle("NX2NAVI_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -1113,6 +1125,7 @@ static void tab_screen(float scale) {
     if (wide_available()) opt_choice("NX2NAVI_GAME_ASPECT", UI_MENU_GAME_ASPECT, wide, 4, UI_MENU_GAME_ASPECT_DESC);
     if (wide_available()) row_game_res();
     row_upscaling();
+    row_stereo();
     row_framegen();
     row_hdr();
     // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS) and FSR 3.1 (vk_ffx.cpp, its own RCAS); with
