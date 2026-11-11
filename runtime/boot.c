@@ -327,7 +327,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();
     vk_pipeline_prewarm_marker_clear();   // an orderly end, not a driver crash in the boot's builds (vk_pipeline.c pm_skipped)
-    vk_pipeline_save();   // no-op without the Vulkan back end
+    vk_pipeline_save_exit();   // no-op without the Vulkan back end
     prof_write();
     rtss_limit_restore();
     fflush(stderr);

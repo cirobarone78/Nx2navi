@@ -247,7 +247,7 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         coop_shutdown();   // LEAVE and BYE to the room, before the process ends
         fs_save_flush();
         vk_pipeline_prewarm_marker_clear();   // as the window's close (gfx_present.c gfx_window_closed)
-        vk_pipeline_save();
+        vk_pipeline_save_exit();
         prof_write();
         rtss_limit_restore();
         fflush(NULL);

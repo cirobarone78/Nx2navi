@@ -86,7 +86,7 @@ void gfx_window_closed(void) {
     // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
     // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
     vk_pipeline_prewarm_marker_clear();
-    vk_pipeline_save();
+    vk_pipeline_save_exit();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
     coop_shutdown();   // LEAVE and BYE to the room, before the process ends
