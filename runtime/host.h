@@ -22,6 +22,8 @@ void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[
 void rt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rt_vlogf(const char *fmt, va_list ap);
 void rt_log_raw(const char *p, size_t n);
+// Mirror this thread's crash report to the run's crash log. Returns the previous setting.
+int rt_log_crash(int active);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,

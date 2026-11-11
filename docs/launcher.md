@@ -75,12 +75,12 @@ Navi (`art.NAVI`, 22 x 21 pixels, drawn in whole pixels at every size) is also t
 identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi rather than Python.
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
-Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
-Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
+Update Channel, Export Diagnostics, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
+last lines and Cancel, and after a failure Try Again, Copy Report and Export Diagnostics; home (Play, Updates, Game Folder,
+Saves, Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
 Dimming and Remove Background, Animations, Sounds, Add to Steam on Windows, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
-Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
+Build Cache, Update Channel, the folders, Export Diagnostics, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
 
 Controls: the mouse (hover moves the cursor, a click selects); the keyboard (arrows, Enter or Space, Esc, F5 checks
@@ -253,6 +253,16 @@ When the new version fails to start (exit code 86 from `start.pyw`, or any error
 `current.txt` back to `previous.txt`'s version and starts it with `--rolled-back`. The game is never rebuilt while it
 runs. Keep Build Cache off deletes the lifted C and the objects (about 5 GB) after each build but keeps
 `build-cache/state.json`, so updates still rebuild without the dump (compiling everything).
+
+## Exporting diagnostics
+
+Choose **Export Diagnostics** on the first installation screen, in **Settings**, or on a failed install, update or
+rebuild. The launcher writes a zip to Downloads (falling back to Desktop or home) and opens its folder. This works before choosing a game folder or
+making the first save.
+
+In the zip, `launcher/` contains the available launcher logs. In `game/`, `nx2navi.log` is the latest game run.
+The four previous runs are numbered 1 through 4, so after one restart look in `nx2navi.1.log`. Look for a
+matching `.crash.log` for fatal details if the regular log reached its 64 MiB limit.
 
 ## Sharing a save
 

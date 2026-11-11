@@ -61,11 +61,18 @@ unsigned rt_trace;
 #define LOG_CAP (64ull << 20)
 enum { LOG_EARLY, LOG_FILE, LOG_OFF };
 static int g_log_state;
-static PlatAppend *g_log_file;
+static PlatAppend *g_log_file, *g_crash_file;
+static __thread int g_reporting_crash;
 static char g_log_path[PLAT_PATH_MAX * 3];
 static char g_log_early[32768];
 static size_t g_log_early_n;
 static uint64_t g_log_bytes;
+
+int rt_log_crash(int active) {
+    int old = g_reporting_crash;
+    g_reporting_crash = active;
+    return old;
+}
 
 // The log's destinations. logq.c calls it: from the log thread in a game run, else from the thread that logs.
 static void log_sink(const char *p, size_t n) {
@@ -75,7 +82,8 @@ static void log_sink(const char *p, size_t n) {
     if (at + n <= LOG_CAP) {
         plat_append_write(g_log_file, p, n);
     } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
-        static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
+        static const char cut[] = "[host] log: the file reached 64 MiB. Further traces go to stderr. "
+                                  "Crash reports also use nx2navi.crash.log.\n";
         plat_append_write(g_log_file, cut, sizeof cut - 1);
     }
 }
@@ -83,10 +91,18 @@ static void log_sink(const char *p, size_t n) {
 void rt_log_sync(void) { logq_sync(); }
 
 void rt_log_raw(const char *p, size_t n) {
-    if (__atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE) == LOG_EARLY) {
+    int state = __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE);
+    if (state == LOG_EARLY) {
         fwrite(p, 1, n, stderr);
         size_t at = __atomic_fetch_add(&g_log_early_n, n, __ATOMIC_RELAXED);
         if (at + n <= sizeof g_log_early) memcpy(g_log_early + at, p, n);
+        return;
+    }
+    // A queued batch can contain lines from several threads. Mirror only this thread's report before queuing it.
+    if (state == LOG_FILE && g_reporting_crash && !(g_crash_file && plat_append_write(g_crash_file, p, n))) {
+        // Preserve the report in the main file even past the cap if the companion could not be written.
+        plat_append_write(g_log_file, p, n);
+        fwrite(p, 1, n, stderr);
         return;
     }
     logq_write(p, n);
@@ -125,7 +141,7 @@ const char *rt_log_path(void) {
 // the main thread before the boot starts other threads.
 static void log_open(int game) {
     logq_init(log_sink);
-    char dir[PLAT_PATH_MAX * 3], from[PLAT_PATH_MAX * 3 + 16], to[PLAT_PATH_MAX * 3 + 16];
+    char dir[PLAT_PATH_MAX * 3], from[PLAT_PATH_MAX * 3 + 32], to[PLAT_PATH_MAX * 3 + 32];
     char *cut = NULL;
     if (game && !plat_stderr_path(dir, sizeof dir) && plat_exe_path(dir, sizeof dir)) {
         cut = plat_last_sep(dir);
@@ -139,10 +155,19 @@ static void log_open(int game) {
             if (i > 1) snprintf(from, sizeof from, "%s/nx2navi.%d.log", dir, i - 1);
             else snprintf(from, sizeof from, "%s/nx2navi.log", dir);
             snprintf(to, sizeof to, "%s/nx2navi.%d.log", dir, i);
-            if (plat_file_exists(from)) plat_file_replace(from, to, 1);
+            if (!plat_file_exists(from) || !plat_file_replace(from, to, 1)) continue;
+            if (i > 1) snprintf(from, sizeof from, "%s/nx2navi.%d.crash.log", dir, i - 1);
+            else snprintf(from, sizeof from, "%s/nx2navi.crash.log", dir);
+            snprintf(to, sizeof to, "%s/nx2navi.%d.crash.log", dir, i);
+            // Older runs have no companion. Never keep one belonging to a previous occupant of this slot.
+            if (!plat_file_replace(from, to, 1)) plat_file_delete(to);
         }
         snprintf(g_log_path, sizeof g_log_path, "%s/nx2navi.log", dir);
         g_log_file = plat_append_open(g_log_path);
+        if (g_log_file) {
+            snprintf(to, sizeof to, "%s/nx2navi.crash.log", dir);
+            g_crash_file = plat_append_open(to);
+        }
     }
     if (!g_log_file) {
         __atomic_store_n(&g_log_state, LOG_OFF, __ATOMIC_RELEASE);
@@ -195,6 +220,7 @@ void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
 }
 
 void rt_udf(Cpu *c, uint64_t pc) {
+    rt_log_crash(1);
     char at[128], lr[128], d[128];
     rt_logf("udf at %s (lr %s)\n", ldr_describe(pc, at, sizeof at), ldr_describe(c->x[30], lr, sizeof lr));
     for (int i = 0; i < 31; i++) rt_logf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
@@ -260,6 +286,7 @@ static void crash_handler(const PlatCrash *x) {
     static volatile int32_t busy;
     if (plat_xchg32(&busy, 1)) plat_exit(71);
     rt_log_sync();   // the lines before the crash, then the report, each written as it is made
+    rt_log_crash(1);
     char d[160];
     uintptr_t rip = x->rip;
     rt_logf("FATAL: %s (%#x) at host %p (", x->what, x->code, (void *)rip);

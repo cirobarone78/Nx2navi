@@ -586,6 +586,7 @@ void vk_device_fault_report(VkResult r) {
     plat_mutex_lock(&lock);
     if (done) { plat_mutex_unlock(&lock); return; }
     done = 1;
+    int previous = rt_log_crash(1);
     vk_crumbs_report();
     vk_pass_marks_report();
     VkCtx *c = vk_ctx();
@@ -595,6 +596,7 @@ void vk_device_fault_report(VkResult r) {
     if (!get) {
         rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"
                                                                                                     : "not enabled");
+        rt_log_crash(previous);
         plat_mutex_unlock(&lock);
         return;
     }
@@ -621,6 +623,7 @@ void vk_device_fault_report(VkResult r) {
     }
     free(ai);
     free(vi);
+    rt_log_crash(previous);
     plat_mutex_unlock(&lock);
 }
 

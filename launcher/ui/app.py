@@ -12,7 +12,7 @@ flat cells and the orange choices are canvas items. Screens:
     customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
-                and Copy Report
+                and Copy Report, plus Export Diagnostics
     settings    the launcher's choices, the folders, the logs and Uninstall
     uninstall   what to remove, then Uninstall or Cancel
 
@@ -32,10 +32,11 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
+from .. import NAME, build, diagnostics, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
 from ..context import Context
 from . import art, picture, sound
 
@@ -170,6 +171,9 @@ class App:
         self.look_message = ''   # why the last background picture was not taken, in Customize Launcher's descriptions
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
         self.export_message = ''   # the last Export Save result, shown in its description
+        self.diagnostics_pool = ThreadPoolExecutor(max_workers=1)
+        self.diagnostics_export = None
+        self.diagnostics_message = ''
         self.steam_message = ''   # the last Add to Steam result, shown in its description
         self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
         self.dumps = None
@@ -744,6 +748,7 @@ class App:
                         'open. A new version downloads in the background and installs when you are not playing; '
                         'Settings can make it wait until you choose Updates.'),
             self.channel_row(),
+            self.diagnostics_row(),
             Row('divider'),
             Row('action', 'Begin Installation', on=self.begin_install, desc=begin_desc, enabled=True),
         ]
@@ -1284,8 +1289,9 @@ class App:
         try:
             self.game_proc = winsys.start_game(exe)
         except OSError as e:
-            self.message = f'The game could not start: {e}'
-            self.render()
+            self.ctx.log(f'could not start {exe}: {e}')
+            self.message = f'The game could not start: {e}. Use Settings → Export Diagnostics to save the logs.'
+            self.show('home', self.focus)
             return
         self.ctx.log(f'play: {exe}')
         self.sounds.play('select')
@@ -1306,7 +1312,7 @@ class App:
         if code not in (0, None):
             text = exit_code_text(code)
             self.ctx.log(f'the game ended with code {text}')
-            self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
+            self.message = f'The game ended with code {text}. Use Settings → Export Diagnostics to save the logs.'
             note_exit_in_log(self.game_dir(), text)
         if self.install_staged('the game exited'):
             return
@@ -1382,6 +1388,34 @@ class App:
 
     # ---- settings
 
+    def diagnostics_row(self):
+        busy = self.diagnostics_export is not None
+        return Row('value', 'Export Diagnostics', 'Exporting…' if busy else '', 'arrow',
+                   on=self.export_diagnostics, enabled=not busy,
+                   desc=(self.diagnostics_message, 'Save the launcher log and recent game and crash logs in a zip. '
+                         'The folder opens with the zip selected.'))
+
+    def export_diagnostics(self):
+        if self.diagnostics_export is None:
+            self.diagnostics_export = self.diagnostics_pool.submit(diagnostics.export_diagnostics,
+                                                                  self.settings.get('game_dir'), self.layout.logs)
+            self.diagnostics_message = 'Writing the diagnostics zip…'
+            self.show(self.screen, self.focus)
+
+    def diagnostics_finished(self):
+        try:
+            path = self.diagnostics_export.result()
+        except Exception as e:
+            self.diagnostics_message = f'Could not export diagnostics: {e}'
+        else:
+            self.diagnostics_message = f'Diagnostics saved to {path}.'
+            try:
+                winsys.reveal(path)
+            except OSError:
+                pass
+        self.diagnostics_export = None
+        self.show(self.screen, self.focus)
+
     def rows_settings(self):
         gd = self.settings.get('game_dir')
         dump = self.settings.get('dump')
@@ -1408,6 +1442,7 @@ class App:
                 desc=(f'The dump the game was built from: {dump}.' if dump else 'No dump chosen yet.',
                       'Select this row to choose another .nup file.')),
             Row('divider'),
+            self.diagnostics_row(),
             Row('value', 'Open Logs Folder', '', 'arrow', on=lambda: self.open(self.layout.logs),
                 desc=('The launcher\'s logs. Attach launcher.log when you report a problem with installing or '
                       'updating; never send game files.',)),
@@ -1472,6 +1507,8 @@ class App:
             rows.append(Row('pair', actions=[('Try Again', self.retry_job), ('Copy Report', self.copy_report)]))
         for r in rows:
             r.desc = self.job_desc
+        if j.result == 'failed':
+            rows.append(self.diagnostics_row())
         return rows
 
     def job_focus(self):
@@ -1492,8 +1529,8 @@ class App:
                     else 'The Update Stopped',
                     'text': [self.friendly(j.error), 'Nothing in your game folder was changed.' if cur.id not in
                              ('download', 'verify', 'tools', 'tools_update') else ''],
-                    'log': lines, 'note': 'Try again first. If it stops again, use Copy Report and send it with your '
-                                          'issue. Never send game files.'}
+                    'log': lines, 'note': 'Copy Report gives a short summary. Export Diagnostics saves the logs '
+                                          'for a bug report.'}
         if j.result == 'cancelled':
             return {'title': 'Cancelled', 'text': ['Nothing was changed that a new start cannot finish.']}
         if j.result == 'ok':
@@ -1612,10 +1649,13 @@ class App:
 
     def tick(self):
         try:
+            if self.diagnostics_export is not None and self.diagnostics_export.done():
+                self.diagnostics_finished()
             if self.check and self.check.result is not None and not getattr(self.check, 'seen', False):
                 self.check.seen = True
                 self.check_done()
-            ev = self.bg.poll(self.release, busy=bool(self.job and self.job.result is None))
+            busy = self.diagnostics_export is not None or bool(self.job and self.job.result is None)
+            ev = self.bg.poll(self.release, busy=busy)
             if ev:
                 self.background_event(ev)
             if self.screen == 'job' and self.job:

@@ -2913,6 +2913,51 @@ class WhilePlayingTest(Tmp):
         a.root.deiconify.assert_called_once()
 
 
+class DiagnosticsActionTest(Tmp):
+    def test_export_from_first_run_settings_and_failed_job(self):
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            import tkinter
+            import numpy
+        except ImportError:
+            self.skipTest('the launcher UI requires tkinter and numpy')
+        from launcher.ui.app import App
+
+        app = App.__new__(App)
+        app.settings, app.layout, app.dumps = {}, self.layout, []
+        app.ctx = mock.Mock(layout=self.layout)
+        app.job = jobs.InstallJob(app.ctx, '', self.tmp / 'game')
+        app.job.result = 'failed'
+        app.focus, app.show = 0, mock.Mock()
+        app.diagnostics_export, app.diagnostics_message = None, ''
+        archive = self.tmp / 'report.zip'
+        with ThreadPoolExecutor(max_workers=1) as app.diagnostics_pool, \
+                mock.patch('launcher.ui.app.diagnostics.export_diagnostics', return_value=archive) as export, \
+                mock.patch('launcher.ui.app.winsys.reveal') as reveal:
+            for screen in ('first_run', 'settings', 'job'):
+                app.screen = screen
+                rows = getattr(app, 'rows_' + screen)()
+                row = next(r for r in rows if r.label == 'Export Diagnostics')
+                self.assertTrue(row.enabled)
+                row.on()
+                app.export_diagnostics()   # a repeated activation shares the running export
+                self.assertFalse(app.diagnostics_row().enabled)
+                self.assertEqual(app.diagnostics_export.result(timeout=5), archive)
+                app.diagnostics_finished()
+                export.assert_called_once_with(None, self.layout.logs)
+                reveal.assert_called_once_with(archive)
+                self.assertIn(str(archive), app.diagnostics_row().desc[0])
+                export.reset_mock()
+                reveal.reset_mock()
+
+            export.side_effect = OSError('disk full')
+            app.export_diagnostics()
+            app.diagnostics_finished()
+            self.assertTrue(app.diagnostics_row().enabled)
+            self.assertIn('disk full', app.diagnostics_message)
+            reveal.assert_not_called()
+
+
 class WindowTest(Tmp):
     def test_selftest(self):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],

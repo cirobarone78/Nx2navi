@@ -54,12 +54,14 @@ body:
       value: |
         ### The log
 
-        The log of the run that crashed is `logs\nx2navi.log` in the game's folder. Copy it before you start the game again: the next start renames it to `nx2navi.1.log`, and after five starts it is gone. Attach the whole file without editing it.
+        If your launcher has **Settings → Export Diagnostics**, attach the ZIP it creates. It includes recent game runs, crash details and launcher logs, even before the first save.
+
+        On earlier releases, the log of the run that crashed is `logs\nx2navi.log` in the game's folder. Copy it before you start the game again: the next start renames it to `nx2navi.1.log`, and after five starts it is gone. Attach the whole file without editing it.
   - type: textarea
     id: log
     attributes:
       label: Log
-      description: Drag nx2navi.log into this field.
+      description: Drag the diagnostics ZIP or the game log into this field.
     validations:
       required: true
   - type: textarea
