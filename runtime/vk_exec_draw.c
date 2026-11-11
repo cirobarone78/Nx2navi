@@ -1540,7 +1540,7 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
     int memo = td_mode(), locked = 0;
     for (int r = 0; r < n; r++) {
-        // Only bound slots (0..127) are looked at. The texture and sampler pool arrays (res.pool: 32768 and 4096
+        // Only bound slots (0..127) are looked at. The texture and sampler pool arrays (res.pool: VK_POOL_TEX and 4096
         // descriptors, bindless handles) have slot -1: walking them ran up to about 100,000 empty iterations per scan,
         // about 3.6 ms of replay per frame in Kokiri Forest, and read tex[FS][0..127] for them by mistake.
         if (res[r].pool || res[r].slot < 0) continue;
