@@ -73,13 +73,14 @@
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
 # The thread that records the GPU work (the first to spend half a second doing it, not the one that submits first) keeps
-# the highest scheduling priority (recorder_prio), and a core of its own that the process's other threads stay off
-# (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never). That is a fast core, with both of its
-# logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the performance
-# core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when fewer than
-# four cores are that fast. The log names the thread and its logical processors.
+# the highest scheduling priority (recorder_prio), and can get a core of its own that the process's other threads stay
+# off (recorder_core: 0 = never, the default; auto = with 12 or more logical processors; 1 always). That is a fast core,
+# with both of its logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the
+# performance core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when
+# fewer than four cores are that fast. The log names the thread and its logical processors. Default 0: on an
+# i9-14900KF the reserved core left the woken replay thread unscheduled for about 200 ms roughly once a second.
 # recorder_prio = 1
-# recorder_core = auto
+# recorder_core = 0
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).
 # submit_batch = 4
 # Occlusion query results are read back from the video card in batches, 0 or 1. Default: on. 0 reads each query with a

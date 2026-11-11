@@ -1636,8 +1636,13 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
 // scheduler prefers it over the guest's other cores (NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone) and
 // gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's cores, the audio, the
 // shader and pipeline workers, is kept off it, so nothing of this process preempts the recording. That core is then
-// lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only with 12 or more logical processors;
-// 1 always, 0 never. Linux reserves none with fewer than four fast cores.
+// lost to the rest, so NX2NAVI_RECORDER_CORE=auto reserves it only with 12 or more logical processors; 1 always, 0
+// never. Linux reserves none with fewer than four fast cores.
+// 0 is the default: on an i9-14900KF (8 performance and 16 efficiency cores, 32 logical processors) with the replay on
+// its own thread, the reserved core (logical processors 14 and 15) left the woken replay thread unscheduled for about
+// 200 ms roughly once a second while the game stood in Kakariko: its queue held 40 to 50 items, its lock was free, the
+// wakes had been sent and it used no CPU time, while the game waited on a fence of the work in that queue (27 frames a
+// minute with a 150 ms or longer frame). With no core reserved the same minute had none.
 // The recording thread is not the first to call vk_exec_record: the game's main thread submits first and goes on
 // submitting a little at a time, while another guest thread does the work (Kokiri Forest: that thread spent 21.9 of
 // the 22.5 s the replay took in a minute and a half, the first one 0.5 s). The first thread to have spent
@@ -1665,6 +1670,8 @@ static void rec_claim(void) {
                       "NX2NAVI_RECORDER_CORE=0 turns it off)", n > 1 ? "s" : "", which, n, ncpu);
         else rt_log("vk: no core was reserved for the recording thread (too few fast cores, or the system refused it; "
                     "NX2NAVI_RECORDER_CORE=0 stops the attempt)");
+    } else {
+        rt_log("vk: the recording thread runs on any core (NX2NAVI_RECORDER_CORE=auto or 1 reserves one)");
     }
 }
 
