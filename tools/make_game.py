@@ -985,20 +985,28 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
-def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None):
+def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, native_cpu=False, native_lto=False):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot."""
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
-        # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
-        # aliasing: the lifted code reaches guest memory through casts of one address to several types
-        # (tools/build_game.py's flags). The lifted code is built for this PC's level (cpu_level); the runtime
-        # stays generic, so the prebuilt one serves every PC (its vectors are 16 bytes, passed alike at every level).
+        # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2 by default; neither may assume
+        # strict aliasing: the lifted code reaches guest memory through casts of one address to several types
+        # (tools/build_game.py's flags). The lifted code is built for this PC's level (cpu_level); the runtime stays
+        # generic unless NX2NAVI_NATIVE_CPU=1 opts into host tuning (-march=native -O3, plus ThinLTO with lld).
         guest = dst.name.startswith(('main_', 'sdk_', 'subsdk0_'))
-        march = [f'-march=x86-64-v{level}'] if guest and level else []
+        if guest:
+            march = [f'-march=x86-64-v{level}'] if level else []
+            opt = ['-O1']
+        elif native_cpu and not WIN:
+            march = ['-march=native', '-mtune=native']
+            opt = ['-O3', '-flto=thin'] if native_lto else ['-O3']
+        else:
+            march = []
+            opt = ['-O2']
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', *opt,
                 *march, '-fno-strict-aliasing', '-w', *declspec, *inc, '-o', str(dst), str(src)]
     return cmd_for
 
@@ -1260,10 +1268,13 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     fast = fast_clang(msys, clang, env)
     if fast:
         say(f'  the lifted code compiles with {fast}')
-    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys)
+    has_lld = bool(shutil.which('ld.lld'))
+    native_cpu = not WIN and os.environ.get('NX2NAVI_NATIVE_CPU') == '1'
+    native_lto = native_cpu and not prebuilt and has_lld
+    cmd_for = runtime_cmd(clang, clangxx, inc, level, fast, msys, native_cpu, native_lto)
     # The keys earlier versions gave the same compiles (compile_all alts): 0.6.0's, with the compiler's file time and,
     # with the fast compiler, its id and --sysroot; 0.5.0's and earlier's, with their kit's folder in the paths.
-    plain = runtime_cmd(clang, clangxx, inc, level, None, msys)
+    plain = runtime_cmd(clang, clangxx, inc, level, None, msys, native_cpu, native_lto)
     fast_old = (cid_old + compiler_ids(fast, env)[1]) if fast else None
     kits = earlier_kits()
 
@@ -1323,7 +1334,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     if WIN:
         ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
-        ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
+        ld = (['-fuse-ld=lld'] if has_lld else []) + (['-flto=thin', '-Wl,--lto-O3', '-Wl,--icf=safe'] if native_lto else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one
     ld.append('-Wl,--Map=' + (cache_dir / 'ocarina.map').as_posix())
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
