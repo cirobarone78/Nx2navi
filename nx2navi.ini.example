@@ -191,6 +191,9 @@
 # memory = auto
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
+# A new depth or stencil texture made in memory a live texture uses is not cleared, as a colour one is not: the clear
+# erased that texture, and in Hyrule Castle Town the sunlight went out of a frame every few seconds (0 = cleared).
+# depth_keep = 1
 # Small texture uploads stage in ranges of a few kept buffers instead of a new buffer each (0 = a buffer each).
 # stg_arena = 1
 # With astc = gpu: the compute shader reads the blocks in the game's tiled layout, so the CPU only copies the
