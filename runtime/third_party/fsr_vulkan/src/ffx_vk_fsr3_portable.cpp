@@ -13,7 +13,9 @@
 #endif
 
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#if defined(FFX_VK_PORTABLE_HAS_FRAME_GENERATION)   // NX2navi build: frame generation compiles only when asked for
 #include <FidelityFX/host/ffx_frameinterpolation.h>
+#endif
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
 
@@ -134,6 +136,7 @@ static uint32_t toFfxContextFlags(uint32_t flags)
     return result;
 }
 
+#if defined(FFX_VK_PORTABLE_HAS_FRAME_GENERATION)
 static uint32_t toFrameInterpolationContextFlags(uint32_t flags)
 {
     uint32_t result = 0;
@@ -151,6 +154,8 @@ static uint32_t toFrameInterpolationContextFlags(uint32_t flags)
         result |= FFX_FRAMEINTERPOLATION_ENABLE_DEBUG_CHECKING;
     return result;
 }
+
+#endif   // FFX_VK_PORTABLE_HAS_FRAME_GENERATION
 
 static FfxBackbufferTransferFunction toFfxTransferFunction(
     FfxVkPortableTransferFunction transferFunction)
@@ -642,6 +647,7 @@ extern "C" FfxVkPortableResult ffxVkPortableUpscaleContextDestroy(
     return fromFfxResult(ffxResult);
 }
 
+#if defined(FFX_VK_PORTABLE_HAS_FRAME_GENERATION)
 struct FfxVkPortableFrameGenerationContext {
     uint64_t magic = kFrameGenerationContextMagic;
     FfxVkPortableDeviceInfo deviceInfo{};
@@ -1019,3 +1025,4 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextDestroy(
     delete context;
     return fromFfxResult(ffxResult);
 }
+#endif   // FFX_VK_PORTABLE_HAS_FRAME_GENERATION

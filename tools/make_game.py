@@ -1274,8 +1274,7 @@ def fsr_inc(rt):
             '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'backends' / 'shared'),
             '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'sdk' / 'src' / 'backends' / 'shared' / 'blob_accessors'),
             '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'generated' / 'ffx-1.1.4' / 'vk' / 'fsr3upscaler'),
-            '-I', str(rt / 'third_party' / 'fsr_vulkan' / 'generated' / 'ffx-1.1.4' / 'vk' / 'fsr3framegeneration'),
-            '-DFFX_VK_PORTABLE_HAS_FSR3_UPSCALER=1', '-DFFX_FSR3UPSCALER', '-DFFX_FI', '-DFFX_OF']
+            '-DFFX_VK_PORTABLE_HAS_FSR3_UPSCALER=1', '-DFFX_FSR3UPSCALER', '-DFFX_OF']
 
 
 def per_install_names(generated=GENERATED_HEADERS):
