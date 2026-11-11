@@ -522,11 +522,25 @@ static void pb_log(const char *when) {
 typedef struct { VkStructureType sType; const void *pNext; VkPipelineCreateFlags flags; } PipeCiHead;
 
 // Builds into P.cache against reads of its data. Every create with P.cache holds this shared (pipe_create_in); the
-// copy of the data in cache_save holds it exclusively and only takes it when no build is running. The Vulkan rules
+// normal autosave holds it exclusively and only takes it when no build is running. The NVIDIA exit snapshot uses
+// shared access too, so an unfinished compile cannot prevent saving completed data; merges still take exclusive
+// access. The Vulkan rules
 // allow reading a cache created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT while pipelines are
 // built into it, but Intel's Windows driver (101.8991 on an Arc 140V) crashed inside vkGetPipelineCacheData during the
 // copy, reading through a null entry, with compute and library builds running beside the autosave.
 static PlatMutex cache_rw = PLAT_MUTEX_INIT;
+static volatile int32_t cache_saving_at_exit;
+
+// Normal autosaves never hold new builds back. At process exit, let existing
+// driver calls finish without admitting more until the cache has been copied.
+static void cache_build_enter(void) {
+    for (;;) {
+        while (__atomic_load_n(&cache_saving_at_exit, __ATOMIC_ACQUIRE)) plat_sleep_ms(1);
+        plat_mutex_lock_shared(&cache_rw);
+        if (!__atomic_load_n(&cache_saving_at_exit, __ATOMIC_ACQUIRE)) return;
+        plat_mutex_unlock_shared(&cache_rw);
+    }
+}
 
 // A pipeline cache of this thread's own that its creates build into in place of P.cache; VK_NULL_HANDLE (every thread
 // but the background builder of large compute shaders) for P.cache itself. A create into it does not hold cache_rw, so
@@ -571,7 +585,7 @@ static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineC
     int shared = cache && !own_cache;
     if (cache && own_cache) cache = own_cache;
     uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: the create on any thread, its wait for cache_rw included
-    if (shared) plat_mutex_lock_shared(&cache_rw);
+    if (shared) cache_build_enter();
     VkResult r;
     if (shared && P.play) {
         PipeCiHead *hd = ci;
@@ -626,7 +640,7 @@ VkResult vk_pipeline_create_foreign(VkDevice dev, int compute, uint32_t n, const
         return r;
     }
     VkResult r = VK_SUCCESS;
-    plat_mutex_lock_shared(&cache_rw);
+    cache_build_enter();
     if (!P.play) {   // one cache: whether it held them is not known here; its save looks at the data's size
         r = foreign_one(dev, compute, cache, n, infos, alloc, out);
         if (r == VK_SUCCESS) __atomic_fetch_add(&FP.made, n, __ATOMIC_RELAXED), __atomic_fetch_add(&cache_merges, n, __ATOMIC_RELAXED);
@@ -6292,7 +6306,7 @@ static void lb_warm_prepared(const char *dir) {
 // A driver whose compiler crashes on one of these would crash at every preparation: seed-pipelines-running.txt marks
 // the step, and a run that finds the marker of a run that died skips the step for good on this folder (the pipelines
 // are then built at their first draw, as without a list) until the marker is deleted.
-static int cache_save(uint32_t wait_ms);
+static int cache_save(uint32_t wait_ms, int exiting);
 
 static int seed_pipelines(const char *dir) {
     const char *mode = cfg_value("NX2NAVI_PREPARE_PIPELINES");
@@ -6406,7 +6420,7 @@ static int seed_pipelines(const char *dir) {
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // those a pool worker took
     uint32_t built = K.built - built0, failed = K.failed - failed0;
     plat_mutex_unlock(&P.lock);
-    int saved = cache_save(5000) > 0;   // as a save at exit: it waits that long for a moment with no build running
+    int saved = cache_save(5000, 0) > 0;   // explicit preparation waits for a moment with no build running
     plat_file_delete(mark);
     char msg[640];
     snprintf(msg, sizeof msg, "prepare-pipelines: %zu listed pipelines: %u built (%u mesh), %u failed, %u the same as one "
@@ -6721,26 +6735,53 @@ static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shu
 // every save copied and wrote the whole cache whenever a pipeline had been created since the last one, also when the
 // cache had held it: three saves of 358.1 MB in one run that added 0.3 MB (2026-11-11).
 // The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
-// (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
+// (a shared request queues behind it), so a pending autosave could stall the replay. Only the final process-exit
+// snapshot uses shared access on NVIDIA; other drivers retain the admission gate and exclusive snapshot, including
+// the reported Intel concurrent-read failure above. wait_ms: how long to keep trying
 // while builds run (0: one try). Returns 0 when no build-free moment came, -1 when the data could not be copied or
 // its file not written (the log says which), 1 otherwise (saved, or nothing to save).
-static int cache_save_one(int which, uint32_t wait_ms) {
+static int cache_save_one(int which, uint32_t wait_ms, int exiting) {
     VkPipelineCache cache = which ? P.play : P.cache;
     const char *path = which ? P.play_path : P.cache_path;
     if (!cache) return 1;
+    VkCtx *ctx = vk_ctx();
+    int concurrent = exiting && ctx && ctx->props.vendorID == 0x10de;
+    int gated = exiting && !concurrent;
     uint64_t until = plat_now_ms() + wait_ms;
-    while (!plat_mutex_trylock(&cache_rw)) {
-        if (plat_now_ms() >= until) return 0;
+    if (gated) __atomic_store_n(&cache_saving_at_exit, 1, __ATOMIC_RELEASE);
+    while (!(concurrent ? plat_mutex_trylock_shared(&cache_rw) : plat_mutex_trylock(&cache_rw))) {
+        if (plat_now_ms() >= until) {
+            if (gated) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
+            return 0;
+        }
         plat_sleep_ms(2);
     }
     size_t size = 0;
     void *data = NULL;
     int sized = vkGetPipelineCacheData(P.device, cache, &size, NULL) == VK_SUCCESS && size;
     int same = sized && size == P.saved[which];
-    int got = sized && !same && (data = malloc(size)) && vkGetPipelineCacheData(P.device, cache, &size, data) == VK_SUCCESS;
-    plat_mutex_unlock(&cache_rw);
+    int got = 0;
+    for (int attempt = 0; sized && !same && attempt < (concurrent ? 3 : 1); attempt++) {
+        // The cache may grow between the size query and read. A little spare capacity absorbs small additions; an
+        // incomplete read is retried from a fresh size query. Never replace the last saved cache with a partial one.
+        size_t spare = concurrent ? 65536 : 0;
+        if (size > SIZE_MAX - spare) break;
+        size_t capacity = size + spare;
+        if (!(data = malloc(capacity))) break;
+        size = capacity;
+        VkResult r = vkGetPipelineCacheData(P.device, cache, &size, data);
+        if (r == VK_SUCCESS && size && size <= capacity) { got = 1; break; }
+        free(data), data = NULL;
+        if (!concurrent || r != VK_INCOMPLETE) break;
+        sized = vkGetPipelineCacheData(P.device, cache, &size, NULL) == VK_SUCCESS && size;
+    }
+    if (concurrent) plat_mutex_unlock_shared(&cache_rw);
+    else plat_mutex_unlock(&cache_rw);
+    // Release admission before logging, file IO or taking any other lock. A
+    // paused builder may still own its caller's pipeline or library lock.
+    if (gated) __atomic_store_n(&cache_saving_at_exit, 0, __ATOMIC_RELEASE);
     static uint64_t skipped[2];
-    int failed = sized && !same && !got;
+    int failed = !sized || (!same && !got);
     if (same) skipped[which]++;
     if (failed) rt_log("vk_pipeline: %s not saved: no copy of its %.1f MB", path, size / 1048576.0);
     if (got) {
@@ -6772,7 +6813,7 @@ static int cache_save_one(int which, uint32_t wait_ms) {
 }
 
 // Both caches' saves (cache_save_one): 1 when each is done, 0 when one found no build-free moment, -1 when one failed.
-static int cache_save(uint32_t wait_ms) {
+static int cache_save(uint32_t wait_ms, int exiting) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
     // Not under P.lock: holding P.lock through the copy and the file write (about 60 ms on the 1.4.3 fight) stopped
     // every pipeline lookup of the replay, a freeze at each 20 s autosave.
@@ -6782,8 +6823,8 @@ static int cache_save(uint32_t wait_ms) {
         return 1;
     }
     int ok = 1, r;
-    if (!P.play || P.fold) ok = cache_save_one(0, wait_ms);
-    if (P.play && (r = cache_save_one(1, wait_ms)) < ok) ok = r;   // the worse of the two
+    if (!P.play || P.fold) ok = cache_save_one(0, wait_ms, exiting);
+    if (P.play && (r = cache_save_one(1, wait_ms, exiting)) < ok) ok = r;   // the worse of the two
     plat_mutex_unlock(&save_lock);
     return ok;
 }
@@ -6792,7 +6833,7 @@ static int cache_save(uint32_t wait_ms) {
 #define SAVE_WAIT_MS 5000
 
 // Returns cache_save's answer.
-static int save_with(uint32_t wait_ms) {
+static int save_with(uint32_t wait_ms, int exiting) {
     if (P.ready) keys_flush(), pb_flush(), cu_flush(), cf_log();
     if (P.ready && P.gpl) {
         rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers, %llu of those by the library workers for skipped draws; "
@@ -6847,7 +6888,7 @@ static int save_with(uint32_t wait_ms) {
     }
     gfx_shader_record_flush(1);
     if (P.ready && !P.cache) pb_log("at a save");   // with P.cache the line comes with its own save below
-    int saved = cache_save(wait_ms);
+    int saved = cache_save(wait_ms, exiting);
     if (!saved && wait_ms)
         rt_log("vk_pipeline: %s not saved: pipeline builds kept running for %u ms", P.play ? P.play_path : P.cache_path,
                (unsigned)wait_ms);
@@ -6856,7 +6897,11 @@ static int save_with(uint32_t wait_ms) {
 
 // The save at exit and after the shader preparation: it waits up to SAVE_WAIT_MS for a moment with no build running.
 void vk_pipeline_save(void) {
-    save_with(SAVE_WAIT_MS);
+    save_with(SAVE_WAIT_MS, 0);
+}
+
+void vk_pipeline_save_exit(void) {
+    save_with(SAVE_WAIT_MS, 1);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
@@ -6885,7 +6930,7 @@ static void autosave_once(void) {
         if (!plat_mutex_trylock(&cache_rw)) return;
         plat_mutex_unlock(&cache_rw);
     }
-    if (save_tried(&sr, n, now, save_with(0) > 0))
+    if (save_tried(&sr, n, now, save_with(0, 0) > 0))
         rt_log("vk_pipeline: the pipeline cache was not saved in %d tries in a row; the next try is made when a new "
                "pipeline is built, or at exit", SAVE_RETRIES + 1);
 }
