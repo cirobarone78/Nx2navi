@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Hookshot → Intel Arc B390（Xe3）移植线</title>
+<style>
+  :root{--bg:#0f1115;--panel:#161a21;--panel2:#1c2129;--line:#2a313c;--ink:#e8edf4;--dim:#9aa7b8;
+    --accent:#4cc2ff;--accent2:#7ee787;--warn:#f2b95e;--bad:#ff7b72;--ok:#3fb950}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:48px 28px 90px}
+  header.top{border-bottom:1px solid var(--line);padding-bottom:26px;margin-bottom:30px}
+  .kicker{color:var(--accent);font-size:12.5px;letter-spacing:.18em;text-transform:uppercase}
+  h1{font-size:29px;line-height:1.35;margin:12px 0 8px;font-weight:650}
+  h1 small{display:block;font-size:15px;font-weight:400;color:var(--dim);margin-top:8px}
+  .meta{display:flex;flex-wrap:wrap;gap:16px;color:var(--dim);font-size:13px;margin-top:14px}
+  .meta b{color:var(--ink);font-weight:600}
+  h2{font-size:20px;margin:42px 0 12px;padding-left:12px;border-left:3px solid var(--accent)}
+  h3{font-size:15.5px;margin:24px 0 8px;color:#cfe0f2}
+  p{margin:9px 0}
+  code{background:#11151b;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font:12.5px/1.5 "Cascadia Mono",Consolas,monospace;color:#a9d1ff}
+  pre{background:#11151b;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;
+    font:12.5px/1.6 "Cascadia Mono",Consolas,monospace;color:#bcd4f0}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin:20px 0 4px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card .k{font-size:12px;color:var(--dim)}.card .v{font-size:23px;font-weight:650;margin-top:6px}
+  .card .v.g{color:var(--accent2)}.card .v.w{color:var(--warn)}
+  .card .n{font-size:12.5px;color:var(--dim);margin-top:4px}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--panel2);color:#cbd8e8;font-weight:600;font-size:12.5px}
+  tr:hover td{background:#141920}
+  .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;font-weight:600;white-space:nowrap}
+  .p0{background:#3d1517;color:#ff9d95;border:1px solid #6b2226}
+  .p1{background:#3a2a12;color:#f2b95e;border:1px solid #6a4a1c}
+  .p2{background:#152b3a;color:#7fc8ef;border:1px solid #1d4a63}
+  .p3{background:#1b2a1e;color:#8fd99a;border:1px solid #2b4a31}
+  .note{border-left:3px solid var(--warn);background:#1d1a12;padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+  footer{margin-top:56px;border-top:1px solid var(--line);padding-top:16px;color:var(--dim);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="kicker">Line B · Mirror · Port · Plan</div>
+  <h1>Hookshot 移植到 Intel Arc B390（Xe3 核显）— 第二条线
+    <small>源码/发布包镜像 · 上游 Intel 适配盘点 · 构建与风险路线</small></h1>
+  <div class="meta">
+    <span>上游 <b>NotRexed/Hookshot</b>（GPL-3.0）</span>
+    <span>源码 <b>main 0d8e7557 / 2026-11-10</b></span>
+    <span>发布 <b>v2.0.14</b></span>
+    <span>目标 <b>Arc B390 · 32 GB UMA · Vulkan 1.4.359</b></span>
+  </div>
+</header>
+
+<p>与 NX2navi 线并行：那条是模拟器内核移植，这条是把《时之笛》Switch 2 版<b>静态重编译</b>成原生程序，自带 Vulkan 后端 <code>gpu/vk</code>。两线不共享代码，只共享 Intel 适配经验（外部内存导入、UMA 预算、管线串行编译）。</p>
+
+<div class="cards">
+  <div class="card"><div class="k">源码镜像</div><div class="v g">23 MB</div><div class="n">bare git，含 tag 与发布分支</div></div>
+  <div class="card"><div class="k">发布包镜像</div><div class="v g">462 MB</div><div class="n">v2.0.14 八个分片，逐个 sha256</div></div>
+  <div class="card"><div class="k">硬性 Vulkan 能力</div><div class="v g">9 / 9</div><div class="n">本机实测全部就位</div></div>
+  <div class="card"><div class="k">上游已带 B390 专属修补</div><div class="v w">3 处</div><div class="n">EQ 偏置 / CAS 死循环 / retired imports</div></div>
+</div>
+
+<h2>1. 镜像与包</h2>
+<p>沿用 NX2navi 的目录约定。GitHub 直连不通，fetch 走 <code>ghfast.top</code>，失败回落 <code>gh-proxy.com</code>。</p>
+<table>
+  <tr><th>路径</th><th>内容</th><th>体积</th><th>说明</th></tr>
+  <tr><td><code>_mirror/Hookshot.git</code></td><td>裸镜像（全 tag）</td><td>23 MB</td><td>离线可查全部历史</td></tr>
+  <tr><td><code>Hookshot/</code></td><td>工作副本 main</td><td>53 MB</td><td><code>mirror</code> / <code>upstream</code> / <code>origin</code>(待 fork)</td></tr>
+  <tr><td><code>_mirror/hookshot-builder/</code></td><td>v2.0.14 builder 分片</td><td>462 MB</td><td>与 <code>hookshot-setup-v2.0.14.txt</code> 对应</td></tr>
+  <tr><td><code>hookshot-builder/HookshotBuilder/tools/</code></td><td>工具链 + 源码快照 + <code>work\</code></td><td>≈1.4 GB</td><td>自洽、可离线构建</td></tr>
+</table>
+<table>
+  <tr><th>脚本</th><th>作用</th></tr>
+  <tr><td><code>_mirror/sync-hookshot.ps1</code></td><td>拉裸镜像 → 快进工作副本 → 可选 <code>-Push origin</code></td></tr>
+  <tr><td><code>_mirror/fetch-hookshot-parts.ps1</code></td><td>按 setup.txt 下 8 个分片并校验 sha256</td></tr>
+  <tr><td><code>_mirror/fork-hookshot.ps1</code></td><td>调 API 建 fork 并挂 <code>origin</code>（需 PAT）</td></tr>
+</table>
+<p class="dim">坑：<code>ghfast.top</code> 对带 Range 的请求会先回 200 再永久挂住，所以下载脚本一律整文件重下，不用 <code>curl -C -</code>。</p>
+
+<h2>2. B390 环境核验（vulkaninfo 实测）</h2>
+<p>后端只有三条硬要求（<code>gpu/vk/VULKAN.md:24-26</code>）：Vulkan 1.3、<code>VK_EXT_mesh_shader</code>（NVN2 task/mesh，每帧约 60 draw）、<code>VK_EXT_external_memory_host</code>（游戏内存池原地当 buffer）。本机逐项：</p>
+<table>
+  <tr><th>能力</th><th>结果</th><th>用途</th></tr>
+  <tr><td>Vulkan 版本</td><td><span class="tag p3">1.4.359</span></td><td>驱动 32.0.101.9150</td></tr>
+  <tr><td>VK_EXT_external_memory_host</td><td><span class="tag p3">支持</span></td><td>整条渲染路径的地基</td></tr>
+  <tr><td>VK_EXT_mesh_shader</td><td><span class="tag p3">支持</span></td><td>否则只能退回 WebGPU（掉 LOD）</td></tr>
+  <tr><td>VK_KHR_cooperative_matrix</td><td><span class="tag p3">支持</span></td><td>矩阵乘：电影升频、神经路径</td></tr>
+  <tr><td>push_descriptor / descriptor_indexing / timeline_semaphore / robustness2 / memory_budget / float16_int8</td><td><span class="tag p3">全支持</span></td><td>绑定、同步、预算、半精度</td></tr>
+  <tr><td>内存模型</td><td><span class="tag p1">UMA 32 GB</span></td><td>走代码里的 integrated 分支</td></tr>
+</table>
+<p><b>没有硬性缺项</b>，可直接进入构建。</p>
+
+<h2>3. 上游已有的 Intel / iGPU 处理</h2>
+<p>这不是零适配代码：上游已有人拿 Arc 与核显跑过，坑都留在代码里，是本线能快速落地的依仗。</p>
+<table>
+  <tr><th>位置</th><th>做法</th><th>对 B390 的意义</th></tr>
+  <tr><td><code>gpu/vk/vk_draw.cpp:3528-3536</code></td><td>Intel（0x8086）EQUAL 深度加 64 单位偏置并降为 LEQUAL</td><td>Intel 顶点位置末位不一致会导致地面穿孔；<code>RX_VK_EQ_BIAS</code> 可覆盖</td></tr>
+  <tr><td><code>gpu/vk/vk_draw.cpp:5213-5217, 7191-7193</code></td><td>Intel 上 compute / fallback 管线串行编译（issue 496）</td><td>规避驱动并发建管线崩溃；<code>RX_VK_COMPUTE_SERIAL</code> 可反选</td></tr>
+  <tr><td><code>gpu/vk/vk_memory.cpp:2689-2696</code></td><td>Windows 上默认不归还 retired imports（<code>RX_VK_KEEP_RETIRED</code>）</td><td><b>B390 专用</b>：归还时「每次」丢设备、不归还「5 次 1 次」丢（issue 17，报告者 fuxau）</td></tr>
+  <tr><td><code>gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp:396-401</code></td><td>CAS 循环加了 1024 次上限</td><td><b>B390 专用</b>：robust buffer access 下越界 atomic 可能永不返回，表现为过完片头后画面卡死且无设备丢失</td></tr>
+  <tr><td><code>gpu/vk/vk_texture.cpp:3429-3436</code></td><td>核显纹理预算压到 2560 MB</td><td>UMA 上纹理与游戏约 10 GB 抢内存；<code>RX_VK_VRAM_MB</code> 覆盖</td></tr>
+  <tr><td><code>gpu/vk/vk_memory.cpp:3083-3084</code></td><td>核显 write-back 影子区上限 512 MB</td><td>影子落系统内存，不设限会吃满 RAM</td></tr>
+  <tr><td><code>gpu/vk/vk_memory.cpp:1979-1983</code></td><td>VRAM 镜像默认只在独显开</td><td>UMA 上镜像无收益</td></tr>
+  <tr><td><code>gpu/vk/vk_shader.cpp:1031-1035</code></td><td>管线缓存按 GPU 打标记</td><td>避免独显缓存拿到核显用</td></tr>
+  <tr><td>提交 <code>0d8e7557</code></td><td>write-back 差分对核显也开启</td><td>基线已含</td></tr>
+</table>
+
+<h2>4. 风险与对策</h2>
+<table>
+  <tr><th>级别</th><th>风险</th><th>证据</th><th>对策</th></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>进 Kokiri 丢设备（残留 1/5 概率）</td><td><code>vk_memory.cpp:2690-2696</code>：B390 上归还 retired imports 必丢，不归还仍 5 次 1 次丢（issue 17）</td><td>先按默认（不归还）跑；丢设备时用 <code>RX_VK_KEEP_RETIRED</code>/<code>RX_VK_WB_DIFF</code>/<code>RX_VK_MIRROR</code>/<code>RX_VK_VRAM_MB</code> 做开关矩阵定位</td></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>UMA 内存耗尽</td><td>纹理 2560 + 影子 512 + 游戏约 10 GB，32 GB 余量不宽</td><td>先原样跑，OOM 再压 2048/256，看 <code>system_heap_usage</code> 日志</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>首帧卡顿</td><td>Intel 管线串行编译</td><td>构建期预编译 shader（不给 <code>--no-prepare-shaders</code>）</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>EQ 偏置 64 是否适合 Xe3</td><td>该值未在 B390 单独验证</td><td>视觉验收地面/水/雾，扫 <code>RX_VK_EQ_BIAS=0/32/64/128</code></td></tr>
+  <tr><td><span class="tag p2">P2</span></td><td>DLSS 不可用（NGX 只认 NVIDIA，FSR 4 需 AMD DLL）</td><td>—</td><td>先用内置 FSR 3.1；把本项目的 Intel NR 接进 DLSS 槽位是后续独立里程碑</td></tr>
+</table>
+
+<h2>5. 构建命令与资源账</h2>
+<pre>$env:HOOKSHOT_TOOLS = "d:\game\switch2\hookshot-builder\HookshotBuilder\tools"
+$env:HOOKSHOT_MINGW = "$env:HOOKSHOT_TOOLS\llvm-mingw"
+$env:RX_CPM         = "$env:HOOKSHOT_TOOLS\cpm"
+$env:WGPU_NATIVE    = "$env:HOOKSHOT_TOOLS\wgpu-native"
+
+python -I nx2\make_game.py --nup "&lt;...v131072&gt;.nup" --out "d:\game\HookshotGame" `
+  --language en-US --jobs 10 --log "d:\game\switch2\hookshot-build.log"</pre>
+<table>
+  <tr><th>项</th><th>数值</th><th>说明</th></tr>
+  <tr><td>输入 dump</td><td>23.9 GiB，<code>0400486024DEC000</code>，update <code>v131072</code></td><td>工作区现成那份</td></tr>
+  <tr><td>磁盘峰值</td><td>约 60 GB</td><td>D: 剩 81.6 GB</td></tr>
+  <tr><td>内存 / 线程</td><td>32 GB / 14 线程</td><td>并发受内存门控</td></tr>
+  <tr><td>耗时</td><td>10–45 分钟</td><td>受 <code>HOOKSHOT_KEEP_BUILD_FILES</code> 影响</td></tr>
+</table>
+
+<h2>6. B390 实机首跑（2026-11-11）</h2>
+<table>
+  <tr><th>项</th><th>实测</th><th>说明</th></tr>
+  <tr><td>设备</td><td><code>Intel(R) Arc(TM) B390 GPU, Vulkan 1.4, driver 0x1963be, type 1</code></td><td>mesh shaders / host memory import / pipeline libraries 全部 yes</td></tr>
+  <tr><td>着色器转译</td><td>38,809 个程序 81.7 s，46,370 新增，90 失败</td><td>仅转译（<code>RX_VK_NO_WARM=1</code>），程序缓存 6.3 GB</td></tr>
+  <tr><td>帧率</td><td>60.0 fps 稳定，GPU 时间 0.6 ms/帧</td><td>8,760 帧无一次 device lost</td></tr>
+  <tr><td>矩阵乘法</td><td>软件标量（无 cooperative_matrix 16x8x16 f16）</td><td>重负载场景的主要风险</td></tr>
+  <tr><td>驱动编译</td><td><b>极慢</b>：预热 9 分钟仅 0.3%；11,121 条状态管线预估 69–129 分钟</td><td>B390 上必须避开预热与状态表预编译</td></tr>
+  <tr><td>运行时缺片</td><td>10 个 compute 程序翻译失败（<code>native op 0xb66</code>，native texel fetch / descriptor binding），每帧 12 个 dispatch 被跳过</td><td>属转译器能力问题，非 Intel 专属；后续需补 lower 规则</td></tr>
+</table>
+<div class="note">B390 上可用的启动姿势：<code>RX_VK_NO_WARM=1</code>（跳过驱动预编译）、<code>RX_VK_PRECOMPILE_COMPUTES=none</code> 并删除 <code>hookshot_pipelines.bin</code>（跳过状态表预编译）、<code>RX_VK_PRECOMPILE_STALL_S=10</code>（卡住的管线不阻塞开局）。着色器转译结果落在 <code>hookshot_prepared.bin</code>，第二次启动直接跳过。</div>
+
+<h2>6.1 花屏与驱动崩溃（2026-11-11 晚，已复现）</h2>
+<table>
+  <tr><th>现象</th><th>证据</th><th>性质</th></tr>
+  <tr><td>花屏 / 忽黑忽白</td><td>内置 <code>RX_VK_SHOTS</code> 读回真实呈现图：第 300 帧全黑、600 帧只有一块 UI 面板、900 帧全黑、1200 帧纯白（luma 246）。同一时刻每帧 612 次 draw、118 个 pass、11800 条 barrier，帧率 12.9 fps，<b>最慢一帧 4174 ms</b>，<code>680.3 draws left out (not ready)</code></td><td>管线按需编译把每帧拖到秒级，呈现缓冲反复落在未画完的帧上</td></tr>
+  <tr><td>卡退</td><td><code>CRASH: exception 0xc0000005 (read 0x190, guest 0xfffff00000000190) at igvk64.dll+0x79ddf3</code>，回溯 <code>igvk64.dll×5 → hookshot_vk.dll+0x1f8933 → ucrtbase → KERNEL32</code>，发生在构建管线的后台线程里</td><td><b>Intel 驱动内部空指针</b>，不是模拟器代码崩，属上游 known issue（Intel 卡 "black screen or crash"）</td></tr>
+  <tr><td>前一次（无 NOOPT）</td><td><code>submit 77254 failed (-4)</code> → <code>the GPU device was lost</code>，丢失前一批 11 个 compute dispatch 连续提交；此前 <code>slow submit: 15-18 ms</code> 持续累积</td><td>Windows TDR（默认 2 s）先把 GPU 判死</td></tr>
+  <tr><td>转译缺口</td><td>10 个 compute 程序 <code>native op 0xb66</code> 无法 lower（<code>040a7b66 30800809 …</code> / <code>10127b66 30800813 …</code>，word1 bit28=0，与现有 lower 规则要求的 <code>Bits(60,1)</code>=1 不符），每帧 12 个 dispatch 被跳过；另有 <code>a network left out on this card</code> 使一批程序不转译</td><td>需在 <code>lower_to_maxwell.h</code> 补 TLD 变体</td></tr>
+</table>
+<div class="note">已固化的启动参数（写在游戏目录 <code>hookshot_env.txt</code>）：<code>RX_VK_NO_WARM=1</code>、<code>RX_VK_PRECOMPILE_COMPUTES=none</code>、<code>RX_VK_PRECOMPILE_STALL_S=10</code>、<code>RX_VK_MESH_NOCULL=2c56dc1006942f74</code>（readme 里针对 "剔除 pass 跑数秒导致卡死" 的官方绕过）。注意：实际启动时仍以命令行环境变量为准，直接双击可能重新触发 12,389 条管线预编译（约 100 分钟）。</div>
+
+<h2>6.2 卡死定位与绕过（2026-11-11 02:1x）</h2>
+<p>后端自带 <code>RX_VK_CHECKPOINTS</code> 的 GPU 标记环，设备丢失时会把标记序列打出来。实测丢设备瞬间的转储是：</p>
+<pre><code>vk:   stage 0x2000: marker 65209 (dispatch of program ab7699ee7f536755, frame 778)
+vk:     before: dispatch of program 48590e0b8589d6ca   ×5（都没等到 after）
+vk: FATAL: the GPU device was lost (VK_ERROR_DEVICE_LOST)</code></pre>
+<p>即 frame 778 进入林区那一串 compute 里，<code>ab7699ee7f536755</code> 的 dispatch 之后 GPU 再没有前进。查源码 <code>vk_draw.cpp:5503</code> 有同一现象的记录：issue 817，Kokiri 林区/德库树里一批 task/mesh 程序共享 task shader <code>2c56dc1006942f74</code>，在里面跑一个几秒级的剔除循环，直到内核判死 GPU；<code>RX_VK_SKIP_CODE=2c56dc1006942f74</code> 是项目自己的绕法（代价是这批程序画的模型也一起没了）。</p>
+<p>另外把 Windows TDR 从默认 2 s 放宽到 60 s（<code>HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers</code> 的 <code>TdrDelay</code>/<code>TdrDdiDelay</code>=60，重启生效），用来看清这类"几秒级 pass"到底是被 TDR 误杀还是真的死循环。</p>
+<div class="note">判断画面好坏别靠抓窗口（会被 IDE 遮挡），用后端自己的 <code>RX_VK_SHOTS=&lt;dir&gt;</code> + <code>RX_VK_SHOT_EVERY</code> 读回真实呈现图。本机实测：菜单帧结构正常（neighbour difference 2.5-2.8，saturation 0.54-0.60），进入场景前后会出现整帧纯黑与整帧纯白（luma 226）——纯白那张是横向渐变，属过场淡入淡出，不是花屏；真正的花屏要看进场景之后的帧。</div>
+
+<h2>7. 里程碑</h2>
+<table>
+  <tr><th>阶段</th><th>目标</th><th>完成判据</th></tr>
+  <tr><td>M0 建线</td><td>镜像、分片、脚本、本文档</td><td><span class="ok">已完成</span></td></tr>
+  <tr><td>M1 构建</td><td>用本机 dump 出可执行目录</td><td><span class="ok">已完成</span>（628 个 C 文件、编译 14:09、总计 27:34；<code>hookshot.exe</code> 448 MB + <code>hookshot_vk.dll</code> 9 MB；romfs 186,583 文件 / 24.4 GB）</td></tr>
+  <tr><td>M2 首跑</td><td>拿到 Intel 上的首个 <code>hookshot_log.txt</code></td><td><span class="ok">已完成</span>（B390 设备创建成功、60.0 fps、0 次 device lost；见下节）</td></tr>
+  <tr><td>M3 稳定</td><td>消除 device lost</td><td>连续 10 次进 Kokiri 不丢</td></tr>
+  <tr><td>M4 验收</td><td>画面与帧率</td><td>视觉无穿孔/闪烁，帧率可玩</td></tr>
+  <tr><td>M5 升频器</td><td>FSR 3.1 / Intel NR</td><td>独立排期</td></tr>
+</table>
+
+<footer>Line B · 数据来源：本机 vulkaninfo、上游源码行号、v2.0.14 分片清单 sha256、B390 首跑 <code>hookshot_log.txt</code>。</footer>
+</div>
+</body>
+</html>
