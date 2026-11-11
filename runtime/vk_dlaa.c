@@ -470,7 +470,7 @@ static struct {
         uint32_t w, h, ow, oh;   // render size, output size
         VkImage out, mv;
         VmaAllocation out_mem, mv_mem;
-        VkImageView out_view, mv_view;
+        VkImageView out_view, grade_view, mv_view;
         VkImage mask, chars[2];  // the bias mask DLSS reads, the character class mask of this and last frame (R8)
         VmaAllocation mask_mem, chars_mem[2];
         VkImageView mask_view, chars_view[2];
@@ -485,6 +485,7 @@ static struct {
     VkImage last_color;          // the target DLAA ran on last frame: another one means a new history
     NgxParam *params;
     int failed, reset;
+    int pre_tonemap;
     uint64_t evals, frames_missed;
     int share_off;   // frames left that pick the output pass without the mode's share (vk_dlaa_pass, vk_dlaa_frame)
     // jitter (vk_dlaa_viewport)
@@ -666,6 +667,7 @@ static int idle_free(void) {
 static void destroy_size(struct Size *e) {
     const VkCtx *c = vk_ctx();
     if (e->out_view) vkDestroyImageView(c->device, e->out_view, NULL);
+    if (e->grade_view) vkDestroyImageView(c->device, e->grade_view, NULL);
     if (e->mv_view) vkDestroyImageView(c->device, e->mv_view, NULL);
     if (e->out) vmaDestroyImage(c->vma, e->out, e->out_mem);
     if (e->mv) vmaDestroyImage(c->vma, e->mv, e->mv_mem);
@@ -1597,7 +1599,7 @@ static void window_line(void) {
 }
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
-static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h);
+static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h);
 
 // Another light target than last frame's. The game draws its scene into one of a few pooled targets of the same size
 // and moves to another whenever its pass list changes, in the middle of play with the camera and the scene carrying
@@ -1670,7 +1672,13 @@ static void release_kept(const struct Size *making, int all) {
 // Set when the scene the upscaler runs on has another size than the last one; vk_dlaa_resized_take reads it.
 static volatile int32_t size_changed;
 
-static void evaluate(VkExec *ex, const VkExecTarget *dst) {
+typedef struct {
+    VkImage image;
+    VkImageView view, grade_target;
+} SceneInput;
+
+static void evaluate(VkExec *ex, const VkExecTarget *dst, const SceneInput *scene) {
+    VkImageView grade_target = scene ? scene->grade_target : VK_NULL_HANDLE;
     const VkExecTarget *t = &D.color, *z = &D.depth;
     if (!dst) dst = t;
     uint32_t w = t->width, h = t->height, ow = dst->width, oh = dst->height;
@@ -1684,6 +1692,15 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     }
     struct Size *e = size_for(cb, w, h, ow, oh);
     if (!e) return dl_fail("work image creation", 0);
+    if (grade_target && !e->grade_view) {
+        // The original packed RGB input supplies one in the alpha channel.
+        VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e->out,
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .components = {.a = VK_COMPONENT_SWIZZLE_ONE}, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &e->grade_view) != VK_SUCCESS) grade_target = VK_NULL_HANDLE;
+    }
+    if (!!grade_target != D.pre_tonemap) D.reset = 1, D.pre_tonemap = !!grade_target;
+
     if (e != D.last) {   // another size's history is from another moment
         D.reset = 1, D.why[0]++, e->chars_ok = 0;
         __atomic_store_n(&size_changed, 1, __ATOMIC_RELEASE);
@@ -1723,7 +1740,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         uint64_t now = plat_now_ns();
         double dt = D.last_eval_ns ? (now - D.last_eval_ns) / 1e6 : 0;
         D.last_eval_ns = now;
-        VkFfxImage fc = {t->image, t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
+        VkFfxImage fc = {scene ? scene->image : t->image, scene ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
                    fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
         if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, 0))
             return dl_fail("FSR 3.1", 0);
@@ -1768,6 +1785,11 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     }
     if (D.last_color != t->image) target_changed(t, mv == 1);
     NgxResourceVK rc = res_image(cv, t->image, t->format, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    if (scene) {
+        VkImage image = grade_target ? vk_scene_grade.raw : scene->image;
+        VkImageView view = grade_target ? vk_scene_grade.scene.imageView : scene->view;
+        rc = res_image(view, image, VK_FORMAT_B10G11R11_UFLOAT_PACK32, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+    }
     NgxResourceVK ro = res_image(e->out_view, e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, 1);
     NgxResourceVK rz = res_image(zv, z->image, z->format, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
     NgxResourceVK rm = res_image(e->mv_view, e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
@@ -1825,10 +1847,19 @@ evaluated:
     // (NX2NAVI_DLAA_MASKDEBUG=1 shows whichever bias mask DLSS got: the reactive one, or the characters')
     VkImage shown = mvdebug ? e->mv : maskdebug && mk ? mk->mask : maskdebug && masked ? e->mask : e->out;
     if (shown != e->out) b.srcOffsets[1] = (VkOffset3D){(int32_t)w, (int32_t)h, 1};
-    vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    if (grade_target && shown == e->out) {
+        vk_scene_grade_record(cb, &vk_scene_grade, e->grade_view, grade_target, ow, oh);
+        static int told;
+        if (!told) {
+            rt_log("dlaa: reconstructing pre-tonemap HDR; guest tonemap and bloom at %ux%u", ow, oh);
+            told = 1;
+        }
+    } else {
+        vkCmdBlitImage(cb, shown, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    }
     full_barrier(cb);
-    if (dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
-    if (vk_dlaa_hudless_wanted) hudless(cb, e, ow, oh);   // frame generation keeps the HUD out of its generated frames
+    if (!scene && dst != t) vk_dlaa_swap_img = t->img, vk_dlaa_swap_view = e->out_view;   // the scaling draw reads DLSS's picture
+    if (vk_dlaa_hudless_wanted) hudless(cb, grade_target ? dst->image : e->out, ow, oh);   // frame generation keeps the HUD out of its generated frames
     ex->recorded += 4;
     vk_exec_draw_new_cb();   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image;
@@ -1859,7 +1890,7 @@ evaluated:
 // (vk_hdr_encode): DLSS's output is kept as RGBA16F for the same encode. The game's own HDR (native) encodes inside the
 // game, which this cannot follow: no HUD-less picture there.
 int vk_dlaa_hudless_wanted;
-static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) {
+static void hudless(VkCommandBuffer cb, VkImage source, uint32_t w, uint32_t h) {
     const VkCtx *c = vk_ctx();
     int hdr = vk_hdr_wanted() && !vk_hdr_native();
     if (vk_hdr_native()) return;
@@ -1899,7 +1930,7 @@ static void hudless(VkCommandBuffer cb, struct Size *e, uint32_t w, uint32_t h) 
     }
     VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
-    vkCmdBlitImage(cb, e->out, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+    vkCmdBlitImage(cb, source, VK_IMAGE_LAYOUT_GENERAL, hdr ? D.hl : D.hl_srgb, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                    VK_FILTER_NEAREST);
     full_barrier(cb);
     if (hdr) {
@@ -1939,6 +1970,52 @@ static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FO
 static int output_target(VkFormat f) { return srgb8(f) || vk_hdr_native_picture(f); }
 
 double wide_dlss_share(void);   // widescreen.c: the DLSS mode's share of the picture (1 DLAA), 0 off
+
+int vk_dlaa_scene_wanted(void) {
+    return rt_game_version == 111 && dl_active() && (N.ngx_up || use_fsr()) && D.armed && !D.done && D.cam_size == OCAM_BLOCK;
+}
+
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination) {
+    if (!vk_dlaa_scene_wanted()) return 0;
+    view_t sv, dv;
+    int hs = 0, hd = 0;
+    vk_texture_lock();
+    const VkTexImage *src = vk_texture_by_id_locked(NVN_HANDLE_TEX(source), &sv, &hs);
+    const VkTexImage *dst = vk_texture_by_id_locked(NVN_HANDLE_TEX(destination), &dv, &hd);
+    int valid = src && dst && src->layers == 1 && src->levels == 1 && dst->layers == 1 && dst->levels == 1 &&
+                !(hs && sv.set_format && sv.format != NVN_FORMAT_R11G11B10F) &&
+                !(hd && dv.set_format && dv.format != NVN_FORMAT_R11G11B10F) && src->image != dst->image && src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                dst->format == src->format &&
+                (src->width == D.color.width && src->height == D.color.height) &&
+                src->samples == 1 && dst->samples == 1 && src->type == VK_IMAGE_TYPE_2D && dst->type == VK_IMAGE_TYPE_2D &&
+                dst->width >= src->width && dst->height >= src->height && (dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkExecTarget output = {0};
+    VkImage input = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE, grade_target = VK_NULL_HANDLE;
+    if (valid) {
+        output = (VkExecTarget){.image = dst->image, .width = dst->width, .height = dst->height};
+        input = src->image;
+        view = vk_exec_target_view(src, src->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+        if (!use_fsr() && vk_scene_grade.fence == ex->fence && vk_scene_grade.graded == src->image &&
+            vk_scene_grade.frame == __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) &&
+            vk_scene_grade.raw != dst->image && (dst->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            grade_target = vk_exec_target_view(dst, dst->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+        vk_texture_storage_bound_locked(dst);
+    }
+    vk_texture_unlock();
+    if (!view) return 0;
+    uint64_t previous = D.evals;
+    evaluate(ex, &output, &(SceneInput){input, view, grade_target});
+    vk_scene_grade.graded = VK_NULL_HANDLE;
+    if (D.evals == previous) return 0;
+    D.ended = D.done = 1;
+    static int told;
+    if (!told) {
+        rt_log("dlaa: scene resolve bypasses the complete SMAA sequence");
+        told = 1;
+    }
+    return 1;
+}
 
 void vk_dlaa_pass(VkExec *ex) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
@@ -1990,6 +2067,10 @@ void vk_dlaa_pass(VkExec *ex) {
         return;
     }
     if (!D.armed) return;
+    if (rt_game_version == 111 && !deferred && !D.ended && D.cam_size == OCAM_BLOCK) {
+        // This frame resolves at the recognized compute scaler. Keep the final output pass as a fallback.
+        if (ex->pass_ncolor != 1 || !c->image || z->image || !output_target(c->format)) return;
+    }
     if (!deferred) {   // Ocarina's shape: the output pass ends the scene and runs DLSS
         int one = ex->pass_ncolor == 1 && c->image && !z->image && c->image != D.color.image && c->samples <= 1 &&
                   !c->is3d;
@@ -2005,7 +2086,7 @@ void vk_dlaa_pass(VkExec *ex) {
         int same = c->width == D.color.width && c->height == D.color.height;
         if (one && big && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
-            evaluate(ex, c);
+            evaluate(ex, c, NULL);
         } else if (one && same && native && scene_color(c->format)) {
             // DLAA in gameplay: the pass the HUD is drawn into is also at the scene's size, in the light format, and
             // the game's upscaler (its stand-in here) has just written the picture there. Waiting for the 8-bit output
@@ -2018,24 +2099,24 @@ void vk_dlaa_pass(VkExec *ex) {
                 rt_log("dlaa: the pass the HUD is drawn into is at the scene's size (%ux%u, format %d): DLSS writes there",
                        c->width, c->height, (int)c->format);
             D.ended = D.done = D.up = 1;
-            evaluate(ex, c);
+            evaluate(ex, c, NULL);
         } else if (one && same && output_target(c->format)) {
             D.ended = D.done = 1;
-            evaluate(ex, NULL);
+            evaluate(ex, NULL, NULL);
         }
         return;
     }
     if (!D.ended) {
         if (!ex->pass_w || ex->pass_w * 4 > D.color.width) return;
         D.ended = 1;
-        if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL);   // DLAA in place; else wait for the scaling pass
+        if (D.color.width >= o[0]) D.done = 1, evaluate(ex, NULL, NULL);   // DLAA in place; else wait for the scaling pass
         return;
     }
     // the game's scaling pass: one colour target of the output size, no depth
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
         D.done = D.up = 1;
-        evaluate(ex, c);
+        evaluate(ex, c, NULL);
     }
 }
 

@@ -59,6 +59,9 @@ int64_t vk_dlaa_vram(void);
 typedef struct VkExec VkExec;
 void vk_dlaa_pass(VkExec *ex);
 void vk_dlaa_frame(void);
+// vk_exec.c: replace the complete recognized scene AA/scaler sequence only after a successful temporal resolve.
+int vk_dlaa_scene_wanted(void);
+int vk_dlaa_scene_resolve(VkExec *ex, uint64_t source, uint64_t destination);
 // 1 once, at the present of the first frame whose scene has a new size after a setting changed (vk_dlaa.c).
 int vk_dlaa_resized_take(void);
 // vk_exec_draw.c, each draw before its fixed state is recorded: notes the scene camera block (vk_dlaa_draw), and moves
