@@ -526,10 +526,30 @@ static __thread VkPipelineCache own_cache;
 // New content in P.cache that P.stats does not count, for autosave_once to save: bg_merge's merges, and the compiles
 // of pipelines built for the cache only (lb_compute keep 0).
 static volatile uint32_t cache_merges;
+// A save is waiting for cache_rw (cache_save, autosave_once): while it is above 0, the builds no draw waits for hold
+// back their next create into P.cache (pipe_create_in), so the builds running drain and the copy finds its moment.
+// Without it the background queue (the pipelines the boot left, the optimised builds after each fast link, the boot's
+// library prebuild, the library warm) kept a build running at every try: a 25-minute 0.7.1 session on an RTX 5080 never wrote
+// pipeline-cache.bin, not at an autosave nor at exit, and the next start compiled the same pipelines again. Draws, the
+// replay thread and the jobs a draw waits for never wait here.
+static volatile int32_t save_gate;
+// Set while this thread's build is one no draw waits for: the low flag of the job pipe_worker runs (promote clears it
+// when a draw comes to wait, and the create then goes ahead), or yields_always on a boot library prebuild thread
+// (lb_worker) and a library warm thread (lw_worker). Its creates into P.cache wait while save_gate is up.
+static __thread const volatile uint8_t *build_yields;
+static const uint8_t yields_always = 1;
+// How long a background create holds back for a save at most: the save lowers the gate when it is done or gives up, so
+// this only bounds a save that hangs.
+#define SAVE_GATE_MAX_MS 10000
 
 static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
     int shared = cache && !own_cache;
     if (cache && own_cache) cache = own_cache;
+    if (shared && build_yields && *build_yields && __atomic_load_n(&save_gate, __ATOMIC_ACQUIRE) > 0) {
+        uint64_t until = plat_now_ms() + SAVE_GATE_MAX_MS;
+        while (*build_yields && __atomic_load_n(&save_gate, __ATOMIC_ACQUIRE) > 0 && plat_now_ms() < until)
+            plat_sleep_ms(2);
+    }
     if (shared) plat_mutex_lock_shared(&cache_rw);
     VkResult r = kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
                            : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
@@ -3543,7 +3563,9 @@ static void pipe_worker(void *arg) {
             }
         }
         plat_mutex_unlock(&P.lock);
+        build_yields = &j->low;   // a low job steps aside for a save (save_gate) until a draw promotes it
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+        build_yields = NULL;
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         ready_note(j->p, 0);
@@ -5350,6 +5372,7 @@ static void lb_report(const char *how) {
 // cache) and kept libraries.
 static void lb_worker(void *arg) {
     lb_me = (int)(intptr_t)arg;        // its handle is LB.th[lb_me]
+    build_yields = &yields_always;     // the prebuild steps aside for a save (save_gate)
     plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
@@ -5464,6 +5487,7 @@ static double lw_build(const GfxWarmEnt *e) {
 
 static void lw_worker(void *arg) {
     (void)arg;
+    build_yields = &yields_always;   // the warm steps aside for a save (save_gate)
     plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
         size_t i = (size_t)plat_inc64(&LW.next) - 1;
@@ -6035,9 +6059,13 @@ static int cache_save(uint32_t wait_ms) {
         plat_mutex_unlock(&save_lock);
         return 1;
     }
+    // The background builds hold back from here to the end of the copy (save_gate), so the ones running end and none
+    // starts in their place; what a draw waits for still builds, and the lock is still only tried.
+    __atomic_add_fetch(&save_gate, 1, __ATOMIC_RELEASE);
     uint64_t until = plat_now_ms() + wait_ms;
     while (!plat_mutex_trylock(&cache_rw)) {
         if (plat_now_ms() >= until) {
+            __atomic_sub_fetch(&save_gate, 1, __ATOMIC_RELEASE);
             plat_mutex_unlock(&save_lock);
             return 0;
         }
@@ -6048,6 +6076,7 @@ static int cache_save(uint32_t wait_ms) {
     int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
               vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
     plat_mutex_unlock(&cache_rw);
+    __atomic_sub_fetch(&save_gate, 1, __ATOMIC_RELEASE);
     if (got) {
         if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
         else if (P.feedback) {
@@ -6122,6 +6151,10 @@ void vk_pipeline_save(void) {
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
 // runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
+// AUTOSAVE_WAIT_MS: how long a save waits for the builds running to end; AUTOSAVE_RETRY_MS: the pause after a wait that
+// found none ending, during which the background builds go on.
+#define AUTOSAVE_WAIT_MS 1500
+#define AUTOSAVE_RETRY_MS 3000
 static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
@@ -6138,14 +6171,29 @@ static void autosave_once(void) {
     vk_pipeline_stats(&s);
     uint64_t n = s.graphics + s.compute + cache_merges;   // a merge comes after its pipeline was counted (bg_main)
     if (n == last_n) return;
-    // Only at a moment with no build running (cache_save): while one runs the save waits for the next tick, 500 ms
-    // on, before it logs or flushes anything, so a busy stretch does not repeat the statistics lines every tick.
+    // Only at a moment with no build running (cache_save). The background builds hold back meanwhile (save_gate), so
+    // that moment comes once the ones running end (a cold fragment shader library takes up to about 0.5 s); while
+    // builds a draw waits for keep it busy longer, the save tries again AUTOSAVE_RETRY_MS later, before it logs or
+    // flushes anything, so a busy stretch neither repeats the statistics lines nor keeps the background queue held.
+    static uint64_t retry_at;
+    if (now < retry_at) return;
+    int gated = 0;
     if (P.cache && P.cache_path[0]) {
-        if (!plat_mutex_trylock(&cache_rw)) return;
+        __atomic_add_fetch(&save_gate, 1, __ATOMIC_RELEASE);
+        gated = 1;
+        uint64_t until = now + AUTOSAVE_WAIT_MS;
+        int idle;
+        while (!(idle = plat_mutex_trylock(&cache_rw)) && plat_now_ms() < until) plat_sleep_ms(2);
+        if (!idle) {
+            __atomic_sub_fetch(&save_gate, 1, __ATOMIC_RELEASE);
+            retry_at = plat_now_ms() + AUTOSAVE_RETRY_MS;
+            return;
+        }
         plat_mutex_unlock(&cache_rw);
     }
     last_n = n, last_ms = now;
     save_with(0);
+    if (gated) __atomic_sub_fetch(&save_gate, 1, __ATOMIC_RELEASE);
 }
 
 // On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to
