@@ -9,6 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,7 +68,7 @@ class PackTest(unittest.TestCase):
         self.assertEqual(got[(3, name('use3'))], USE)
         self.assertEqual(got[(4, name('in3'))], b'TKSI3')
         left = sorted(p.name for p in self.cache.iterdir())
-        self.assertEqual(left, sorted([psc.PACK, 'notes.txt', f'{keys[0]}.code']))   # in/ removed when empty
+        self.assertEqual(left, sorted([psc.PACK, '.pack.lock', 'notes.txt', f'{keys[0]}.code']))
 
     def test_second_run_merges_new_loose_files_and_loose_wins(self):
         a = self.shader('a')
@@ -100,11 +101,45 @@ class PackTest(unittest.TestCase):
         self.assertTrue((self.cache / f'{k}.spv').exists())
         self.assertEqual(len(read_pack(self.cache / psc.PACK)), 4)
 
-    def test_a_broken_pack_is_rebuilt_from_the_loose_files(self):
+    def test_a_broken_pack_is_preserved_for_recovery(self):
         self.shader('a')
         (self.cache / psc.PACK).write_bytes(b'garbage')
-        n, _, _, _ = psc.pack(self.cache)
-        self.assertEqual(n, 4)
+        with self.assertRaises(ValueError):
+            psc.pack(self.cache)
+        self.assertEqual((self.cache / psc.PACK).read_bytes(), b'garbage')
+
+    def test_identical_payloads_keep_every_key_and_share_storage(self):
+        data = b'compiled bytes' * 100
+        for i in range(4):
+            (self.cache / f'{name(str(i))}.spv').write_bytes(data)
+        n, _, _, size = psc.pack(self.cache)
+        self.assertEqual((n, size), (4, 16 + 48 * 4 + len(data)))
+        self.assertEqual(set(read_pack(self.cache / psc.PACK).values()), {data})
+        before = (self.cache / psc.PACK).stat().st_mtime_ns
+        psc.pack(self.cache)
+        self.assertEqual((self.cache / psc.PACK).stat().st_mtime_ns, before)
+
+    def test_hash_collision_does_not_merge_different_bytes(self):
+        values = [b'a' * 200, b'b' * 200, b'a' * 200]
+        for i, value in enumerate(values):
+            (self.cache / f'{name(str(i))}.spv').write_bytes(value)
+        with patch.object(psc.hashlib, 'sha256') as digest:
+            digest.return_value.digest.return_value = bytes(32)
+            n, _, _, size = psc.pack(self.cache)
+        self.assertEqual((n, size), (3, 16 + 48 * 3 + 400))
+        self.assertEqual(read_pack(self.cache / psc.PACK), {(1, name(str(i))): value for i, value in enumerate(values)})
+
+    def test_failed_repack_keeps_original_and_loose_files(self):
+        a = self.shader('a')
+        psc.pack(self.cache)
+        before = (self.cache / psc.PACK).read_bytes()
+        (self.cache / f'{a}.spv').write_bytes(b'new shader')
+        with patch.object(psc, 'store_payload', side_effect=OSError('write failed')):
+            with self.assertRaises(OSError):
+                psc.pack(self.cache)
+        self.assertEqual((self.cache / psc.PACK).read_bytes(), before)
+        self.assertTrue((self.cache / f'{a}.spv').exists())
+        self.assertFalse((self.cache / (psc.PACK + '.tmp')).exists())
 
 
 if __name__ == '__main__':
