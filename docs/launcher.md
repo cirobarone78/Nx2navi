@@ -363,6 +363,11 @@ weighs every chain as its own programs do and downloads a missing root from Wind
 stops the step with what each check said, the PC's clock against the server's (the Date of a plain-HTTP request to
 it), and what to check: the date, time and time zone, or security software that scans encrypted connections.
 
+Downloads go through a proxy when the PC names one: the launcher's opener (`launcher/net.py` `_open`) keeps Python's
+default proxy handling, which reads `HTTPS_PROXY` and `HTTP_PROXY` (and `NO_PROXY`) from the environment and, without
+them, the proxy set in Windows' Internet settings. Only HTTP proxies work; a SOCKS proxy does not. An address that needs
+a user name and password takes them in the variable, as in `HTTPS_PROXY=http://user:password@host:port`.
+
 ## Uninstalling
 
 Settings > Uninstall NX2navi, or Settings > Apps > NX2navi (which runs `NX2navi.exe --uninstall`): what the launcher
