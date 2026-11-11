@@ -240,7 +240,11 @@ int vk_exec_wait_event(const void *payload);
 int vk_exec_event_met(const void *payload);   // the same test without counting
 extern int vk_exec_signalled;                 // set by every replayed SignalEvent; vk_exec.c clears it
 // Events the CPU signals (vk_exec_xfer.c "events the CPU signals").
-void vk_exec_event_cpu(const void *event);    // any thread: nvnEventSignal is about to write the event's value
+void vk_exec_event_cpu(const void *event, uint32_t to);   // any thread: nvnEventSignal is about to write to into the event
+// Any thread: an event the CPU signals does not yet hold the wait the replay last tested on it (the game has not given
+// its signal for the frame yet).
+int vk_exec_event_cpu_pending(void);
+int vk_exec_waits(const uint64_t *handles, int n);   // any thread: these recordings hold a wait for an event
 void vk_exec_event_sync(int begin);           // vk_exec_record: its mirror sync and uniform copy are taken now / it ends
 int vk_exec_event_cpu_known(const void *event);     // the CPU has signalled this event before
 int vk_exec_event_holds_now(const void *payload);   // an OP_WAIT_EVENT's condition on the value in memory now
@@ -255,7 +259,9 @@ void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint6
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
 void vk_exec_evt(char what, const void *event, uint32_t value);
-void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged
+void vk_exec_evt_frame(uint64_t frame);   // a present (the replay thread's when it has its own): the frame's tokens are logged
+extern int vk_exec_flush_held;    // replay thread: set around the submission made before a present
+int vk_exec_event_order(void);    // NX2NAVI_EVENT_ORDER (and NX2NAVI_EVENT_ORDER_ASYNC with the replay on its own thread)
 int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
 int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
