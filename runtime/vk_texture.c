@@ -601,7 +601,13 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
                                 .image = e->pub.image, .subresourceRange = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
-    if (e->f.depth || e->f.stencil) {
+    // NX2NAVI_DEPTH_KEEP (1 default; 0 off, ab): a depth or stencil image bound into pool memory is not cleared either,
+    // as colour ones are not (below): the clear erased the live image another descriptor has at the same memory. In
+    // Hyrule Castle Town a 1920x1080 depth-stencil made over a live 960x540 target took the sunlight out of a frame every
+    // few seconds.
+    static int depth_keep = -1;
+    if (depth_keep < 0) depth_keep = rt_knob("DEPTH_KEEP", "1");
+    if ((e->f.depth || e->f.stencil) && !(e->bound_to && RT_KNOB_ON(depth_keep))) {
         VkClearDepthStencilValue zero = {0.0f, 0};
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
