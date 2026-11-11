@@ -4926,9 +4926,24 @@ static struct {
     volatile int32_t kept;                                // libraries entered in libs[] so far
     int32_t keep_n;
     int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
+    int tail_one;                                      // automatic boot policy: only worker 0 takes the warming tail
     PlatMutex stat;
 } LB = {.stat = PLAT_MUTEX_INIT};
 static __thread int lb_me = -1;        // on a boot prebuild thread (lb_worker): its index in LB.th
+
+// Claim a boot job without dropping one when the extra workers finish the recent-pipeline prefix. Recent pipelines
+// retain parallel creation; a single worker continues the complete tail. Explicit thread counts override this
+// policy, and installer preparation uses its own queue at full concurrency. The CAS makes the prefix boundary
+// exact even when two workers reach it together. No pipeline creation or dispatch waits on this queue lock.
+static size_t lb_next(int worker) {
+    int64_t next = __atomic_load_n(&LB.next, __ATOMIC_RELAXED);
+    for (;;) {
+        if (LB.stop || (size_t)next >= LB.n ||
+            (LB.idle && LB.tail_one && worker > 0 && (size_t)next >= LB.n_keep)) return LB.n;
+        if (__atomic_compare_exchange_n(&LB.next, &next, next + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return (size_t)next;
+    }
+}
 
 // ---- preparation that outlives a driver crash. A bug in the driver's shader compiler can kill the process inside
 // vkCreate*Pipelines: NVIDIA 615.78.08 on an RTX 5080 crashed on the same vertex library at the same point of every
@@ -5846,8 +5861,8 @@ static void lb_worker(void *arg) {
     lb_me = (int)(intptr_t)arg;        // its handle is LB.th[lb_me]
     plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
-        size_t i = (size_t)plat_inc64(&LB.next) - 1;
-        if (i >= LB.n || LB.stop) break;
+        size_t i = lb_next(lb_me);
+        if (i >= LB.n) break;
         if (skip_listed(LB.e[i].iid)) {
             skip_count();
             plat_mutex_lock(&LB.stat);
@@ -6146,12 +6161,12 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.n = n;
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
-    // Two threads by default, not half the CPUs. On a 32-thread CPU with NVIDIA's driver, 16 builders kept the driver's
-    // lock busy: 77% of the process's running time was a spin loop in nvoglv64.dll (about 8 cores), the prebuild had not
-    // finished after 34,000 frames, and lib_prebuild = 0 took it to 5% and the game to its frame limit (RTX 4080 SUPER,
-    // driver 617.14, 2026-11-08). With the driver's disk cache warm (--prepare-shaders, --warm-shaders) a build takes
-    // well under a millisecond, so two threads still finish the list quickly.
+    // Two threads for the recent-pipeline prefix by default, then one for the remaining cache-warming work. Lower
+    // tail concurrency leaves more CPU/driver capacity for rendering without removing any prepared variants. An
+    // explicit thread setting retains its requested concurrency throughout. A cold driver can spend far longer on
+    // a request than the idle-priority shader loader; fewer concurrent builds also reduce driver contention.
     int t = te && *te ? atoi(te) : (cpus < 4 ? 1 : 2);   // idle priority; a cold driver takes ~2 s per large compute shader
+    LB.tail_one = !(te && *te);
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();
@@ -6171,6 +6186,9 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
            "threads; library state clamp %u, polygon mode %u, depth -w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)",
            n_cs < n ? n_cs : n, LB.n_keep, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly, LB.minus_w,
            LB.samples, big);
+    if (LB.tail_one && started > 1)
+        rt_log("vk_pipeline: stage library prebuild: after the %zu recent compute pipelines, one worker continues the "
+               "remaining list; NX2NAVI_LIB_PREBUILD_THREADS overrides this background limit", LB.n_keep);
 }
 
 static void lb_stop(void) {
