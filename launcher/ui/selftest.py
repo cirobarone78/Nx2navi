@@ -141,6 +141,14 @@ def states(app):
     def settings():
         app.show('settings', 0)
 
+    def game_settings():
+        app.game_settings_return = ('home', 0)
+        app.saved_options = dict(fps_limit='120', perf_overlay='off', upscaling='dlss-quality', framegen='off',
+                                 game_res='1440', fullscreen='1', microphone='0')
+        app.game_options = app.saved_options.copy()
+        app.game_settings_error = ''
+        app.show('game_settings', 2)
+
     def failed():
         j = jobs.InstallJob(ctx, s['dump'], s['game_dir'])
         for sid, val in (('tools', 'Done · 0:48'), ('check', 'Version 1.1.1'), ('exefs', 'Done · 0:04'),
@@ -211,7 +219,8 @@ def states(app):
             ('4-update-ready', update_ready), ('5-updating', updating), ('6-settings', settings),
             ('7-build-failed', failed), ('8-uninstall', uninstall), ('9-import-saves', import_saves),
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
-            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-first-scheme', restore_scheme)]
+            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-first-scheme', restore_scheme),
+            ('16-game-settings', game_settings)]
 
 
 def run(app, shots):

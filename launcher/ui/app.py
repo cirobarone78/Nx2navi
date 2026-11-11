@@ -8,7 +8,8 @@ The window is one Tk canvas at 1000 x 640 logical pixels, scaled to the display.
 flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
-    home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
+    home        Play, Updates, Game Settings, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
+    game_settings  picture, frame rate and microphone choices for the next game start
     customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
@@ -50,7 +51,8 @@ DESC = (614, 336)               # x, width
 P = art.PALETTE                 # the colour scheme in use: art.set_theme changes it in place
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
-DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2}
+DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1,
+         'uninstall': 2, 'game_settings': 2}
 DIMS = (0, 20, 40, 60, 80)      # Background Dimming, in percent
 SOUND_LEVELS = (('off', 'Off'), ('low', 'Low'), ('medium', 'Medium'), ('high', 'High'))
 
@@ -521,7 +523,7 @@ class App:
             r.actions[getattr(r, 'pick', 0)][1]()
             return
         elif r.on:
-            self.sounds.play('back' if r.kind == 'action' and r.label == 'Back' else 'select')
+            self.sounds.play('back' if r.kind == 'action' and r.label in ('Back', 'Discard Changes') else 'select')
             r.on()
             return
         self.render()
@@ -531,10 +533,12 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'game_settings'):
             self.sounds.play('back')
         if self.screen == 'settings':
             self.show('home', self.home_row('Settings'))
+        elif self.screen == 'game_settings':
+            self.leave_game_settings()
         elif self.screen == 'uninstall':
             self.show('settings')
         elif self.screen == 'saves':
@@ -878,6 +882,7 @@ class App:
             Row('value', 'Play', play_value, big=True, icon='play', on=self.play, desc=play_desc),
             upd,
             Row('divider'),
+            self.game_settings_row(),
             Row('value', 'Game Folder', gd, on=lambda: self.open(gd),
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
                       'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
@@ -1380,6 +1385,99 @@ class App:
         gd = self.settings.get('game_dir')
         self.run_job(jobs.RebuildJob(self.ctx, gd, self.settings.get('dump')), 'home')
 
+    # ---- game settings
+
+    def game_settings_row(self):
+        return Row('value', 'Game Settings', '', 'arrow', on=self.open_game_settings,
+                   desc=('Adjust the picture, frame rate and microphone before starting the game.',))
+
+    def open_game_settings(self):
+        if self.screen != 'game_settings':
+            self.game_settings_return = (self.screen, self.focus)
+        self.game_settings_error = ''
+        gd = self.settings.get('game_dir')
+        try:
+            if not gd or not Path(gd).is_dir():
+                raise OSError('The game folder is unavailable.')
+            self.saved_options = gameini.read_options(gd)
+            self.game_options = self.saved_options.copy()
+        except OSError as e:
+            self.game_options = None
+            self.game_settings_error = str(e)
+        self.show('game_settings')
+
+    def rows_game_settings(self):
+        if self.game_options is None:
+            return [Row('action', 'Try Again', on=self.open_game_settings, desc=(self.game_settings_error,)),
+                    Row('action', 'Back', on=self.leave_game_settings, desc=('Return to the launcher.',))]
+
+        def choice(key, label, desc):
+            labels = gameini.CHOICES[key]
+            current = self.game_options[key]
+            can_generate = self.game_options['upscaling'].startswith(('dlss-', 'fsr3-'))
+            values = list(labels)
+            if key == 'framegen' and not can_generate:
+                values = ['default', 'off']
+                desc += ' Select DLSS or FSR 3.1 under Upscaling to enable frame generation.'
+
+            def step(direction):
+                i = values.index(current) if current in values else (-1 if direction > 0 else 0)
+                value = values[(i + direction) % len(values)]
+                self.game_options[key] = value
+                if key == 'upscaling' and not value.startswith(('dlss-', 'fsr3-')):
+                    if self.game_options['framegen'] not in ('default', 'off'):
+                        self.game_options['framegen'] = 'off'
+                self.game_settings_error = ''
+                self.show('game_settings', self.focus)
+
+            name = labels.get(current) or current.encode('utf-8', errors='replace').decode('utf-8')
+            return Row('enum', label, get=lambda: name, left=lambda: step(-1), right=lambda: step(1),
+                       desc={'title': name if len(name) > 16 else 'Game Settings', 'text': [desc],
+                             'note': 'Save and Back applies these choices the next time you start the game.'})
+
+        changes = self.game_options != self.saved_options
+        return [
+            choice('fps_limit', 'Frame Rate Limit', 'The maximum displayed frame rate, including generated frames.'),
+            choice('perf_overlay', 'Performance Overlay', 'Show the frame rate or the full performance panel in '
+                   'the top right of the picture. F10 cycles the overlay in game.'),
+            choice('upscaling', 'Upscaling', 'Choose how the 3D scene is scaled. DLSS and DLAA require a compatible '
+                   'NVIDIA RTX GPU and the DLSS runtime.'),
+            choice('framegen', 'Frame Generation', 'Generate frames between rendered frames. NVIDIA DLSS frame '
+                   'generation requires a supported RTX 40-series or newer GPU.'),
+            choice('game_res', 'Game Resolution', 'The height of the game picture before it is fitted to the window. '
+                   'Available resolutions depend on the game build.'),
+            choice('fullscreen', 'Fullscreen', 'Start in a borderless fullscreen window.'),
+            choice('microphone', 'Game Microphone', 'Allow the game to open the default recording device for '
+                   'microphone input.'),
+            Row('divider'),
+            Row('action', 'Save and Back', on=self.save_game_settings,
+                desc=(self.game_settings_error, 'Save these choices for the next start. Game defaults follow the '
+                      'runtime and device. Environment settings can override saved choices.')),
+            Row('action', 'Discard Changes' if changes else 'Back', on=self.leave_game_settings,
+                desc=('Return to the launcher without saving edits.',)),
+        ]
+
+    def leave_game_settings(self):
+        self.show(*self.game_settings_return)
+
+    def save_game_settings(self):
+        gd = self.settings.get('game_dir')
+        changes = {key: value for key, value in self.game_options.items() if value != self.saved_options[key]}
+        if changes:
+            if (self.game_proc and self.game_proc.poll() is None) or build.game_running(gd):
+                self.game_settings_error = 'Close the game before saving. Your edits are still here.'
+            else:
+                try:
+                    gameini.save_options(gd, changes, original=self.saved_options)
+                except (OSError, ValueError) as e:
+                    self.game_settings_error = f'Could not save game settings: {e}'
+                else:
+                    self.leave_game_settings()
+                    return
+            self.show('game_settings', self.focus)
+        else:
+            self.leave_game_settings()
+
     # ---- settings
 
     def rows_settings(self):
@@ -1399,7 +1497,7 @@ class App:
                         'Keep the translated code and compiled files (about 5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
             self.channel_row(),
-            *([self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
+            *([self.game_settings_row(), self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
             Row('divider'),
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
                 desc=('Open the game folder: saves in profile, the game\'s settings in nx2navi.ini, its logs in '
@@ -1849,7 +1947,10 @@ class App:
                 img = self.sprite(('chev', cw, ch, left, 'on'), lambda lf=left: art.chevron(cw, ch, P['on_text'], lf))
                 c.create_image(ix0 + X(9) if left else ix1 - X(9), cy, anchor='w' if left else 'e', image=img,
                                tags='dyn')
-            self.canvas.create_text(cx, cy, text=r.get(), font=vfont, fill=P['on_text'], tags='dyn')
+            value = r.get()
+            available = ix1 - ix0 - 2 * (X(14) + cw)
+            font = self.fit_font(vfont, value, available)
+            c.create_text(cx, cy, text=fit(font, value, available), font=font, fill=P['on_text'], tags='dyn')
         elif r.kind == 'progress':
             fw = int((ix1 - ix0) * max(0.0, min(1.0, r.fraction)))
             if fw > 2:

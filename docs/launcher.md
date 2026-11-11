@@ -88,6 +88,17 @@ for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window 
 
 `python -m launcher --selftest --shots DIR` draws every screen with made-up states and saves a PNG of each.
 
+## Game settings
+
+Open **Game Settings** on the home screen or in **Settings** to change the frame rate limit, performance overlay,
+upscaling, frame generation, game resolution, fullscreen and microphone. Use the arrows beside a value, the keyboard or the D-pad.
+Choose **Save and Back** to apply the changes on the next game start. **Discard Changes**, Esc or the controller's
+B button leaves the saved settings as they were.
+
+The launcher edits the built game's `nx2navi.ini`, the same file the in-game menu uses. **Game default** lets the
+game pick the value. A matching `NX2NAVI_*` environment variable takes precedence. DLSS requires a supported NVIDIA
+RTX GPU and the DLSS runtime. Select DLSS or FSR 3.1 before choosing frame generation.
+
 ## The launcher's folder
 
 ```

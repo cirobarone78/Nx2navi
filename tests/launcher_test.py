@@ -2914,11 +2914,52 @@ class WhilePlayingTest(Tmp):
 
 
 class WindowTest(Tmp):
+    def test_game_settings_save_discard_and_running_game(self):
+        try:
+            from launcher.ui.app import App, Row
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a = App.__new__(App)
+        a.screen, a.focus = 'settings', 1
+        a.settings = {'game_dir': str(self.tmp)}
+        a.sounds = mock.Mock()
+        a.render = mock.Mock()
+        a.rows_settings = lambda: [Row('divider'), a.game_settings_row()]
+        a.game_proc = None
+        a.game_settings_row().on()
+        self.assertEqual(a.screen, 'game_settings')
+        # Use the same row callbacks the keyboard, mouse and controller invoke.
+        rows = {r.label: r for r in a.rows}
+        rows['Game Microphone'].right()
+        staged = a.game_options['microphone']
+        rows['Performance Overlay'].right()
+        self.assertEqual(a.game_options['perf_overlay'], 'off')
+        ini = self.tmp / 'nx2navi.ini'
+        self.assertFalse(ini.exists())
+        a.back()
+        self.assertEqual((a.screen, a.focus), ('settings', 1))
+        a.sounds.play.assert_called_once_with('back')
+        a.screen, a.focus = 'home', 0
+        a.rows_home = lambda: [a.game_settings_row()]
+        a.game_settings_row().on()
+        self.assertEqual(a.game_options['microphone'], 'default')
+        next(r for r in a.rows if r.label == 'Game Microphone').right()
+        a.focus = next(i for i, r in enumerate(a.rows) if r.label == 'Save and Back')
+        with mock.patch('launcher.build.game_running', return_value=True):
+            a.activate()
+        self.assertIn('Close the game', a.game_settings_error)
+        self.assertFalse(ini.exists())
+        a.sounds.reset_mock()
+        a.activate()
+        self.assertEqual((a.screen, a.focus), ('home', 0))
+        a.sounds.play.assert_called_once_with('select')
+        self.assertEqual(gameini.read_options(self.tmp)['microphone'], staged)
+
     def test_selftest(self):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('15 screens drawn', r.stdout)
+        self.assertIn('16 screens drawn', r.stdout)
 
 
 if __name__ == '__main__':
