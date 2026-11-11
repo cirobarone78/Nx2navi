@@ -142,8 +142,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_FLARE_DESC] = "Lifts the darkest parts as a little stray light would; 0 keeps black black.",
     [UI_MENU_HDR_GRADE] = "Colour grading",
     [UI_MENU_HDR_GRADE_DESC] = "How much of the game's own colour grading the HDR picture keeps; 0 is the scene without it.",
-    [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
-    [UI_MENU_SHADOW_SCALE_DESC] = "Sharper shadows. Higher costs more GPU power.",
+    [UI_MENU_SHADOW_SCALE] = "Shadow resolution (experimental)",
+    [UI_MENU_SHADOW_SCALE_DESC] = "Scales supported shadow maps on each side, not the whole picture. 1x keeps their original size. "
+                                 "Higher values use more GPU memory and time. Some maps cannot be scaled. Takes effect after a restart; "
+                                 "visual correctness in this game version is not yet verified.",
     [UI_MENU_PCSS] = "Soft shadows",
     [UI_MENU_PCSS_DESC] = "Sun shadows sharp where an object meets the ground and softer the further the shadow falls "
                           "(PCSS). 0 keeps the game's filter. Takes effect at the next start.",
@@ -152,6 +154,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                      "Traced on the screen after lighting. Takes effect at the next start.",
     [UI_MENU_SHADOW_RANGE] = "Shadow cascade range",
     [UI_MENU_SHADOW_RANGE_DESC] = "Keeps shadows sharp further away.",
+    [UI_MENU_SHADOW_RANGE_UNAVAILABLE] = "This game build has no shadow cascade distance patch. The game's distance stays unchanged.",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS for the 3D scene (NVIDIA RTX GPUs; " DLSS_FILE " next to " EXE_FILE "): smoother "
                           "edges and less shimmer. The HUD is not touched. The mode below sets the resolution it works "
@@ -707,8 +710,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_FLARE_DESC] = "Приподнимает самые тёмные участки, как немного рассеянного света; 0 оставляет чёрное чёрным.",
     [UI_MENU_HDR_GRADE] = "Цветокоррекция игры",
     [UI_MENU_HDR_GRADE_DESC] = "Сколько собственной цветокоррекции игры сохраняет HDR-картинка; 0 — сцена без неё.",
-    [UI_MENU_SHADOW_SCALE] = "Разрешение теней",
-    [UI_MENU_SHADOW_SCALE_DESC] = "Более чёткие тени. Выше — больше нагрузка на видеокарту.",
+    [UI_MENU_SHADOW_SCALE] = "Разрешение теней (экспериментально)",
+    [UI_MENU_SHADOW_SCALE_DESC] = "Увеличивает поддерживаемые карты теней по каждой стороне, а не весь кадр. 1x сохраняет исходный размер. "
+                                 "Большие значения требуют больше видеопамяти и времени GPU. Некоторые карты не масштабируются. "
+                                 "Нужен перезапуск; правильность изображения в этой версии игры ещё не проверена.",
     [UI_MENU_PCSS] = "Мягкие тени",
     [UI_MENU_PCSS_DESC] = "Тени от солнца резкие там, где предмет касается земли, и мягче, чем дальше падает тень "
                           "(PCSS). 0 оставляет фильтр игры. Действует после перезапуска.",
@@ -717,6 +722,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                      "складках. Считаются по экрану после освещения. Действует после перезапуска.",
     [UI_MENU_SHADOW_RANGE] = "Дальность каскадов теней",
     [UI_MENU_SHADOW_RANGE_DESC] = "Сохраняет чёткие тени на большем расстоянии.",
+    [UI_MENU_SHADOW_RANGE_UNAVAILABLE] = "В этой сборке нет патча дальности каскадов теней. Дальность игры остаётся прежней.",
     [UI_MENU_DLAA] = "NVIDIA DLSS / DLAA",
     [UI_MENU_DLAA_DESC] = "NVIDIA DLSS для 3D-сцены (видеокарты NVIDIA RTX; " DLSS_FILE " рядом с " EXE_FILE "): ровнее "
                           "края и меньше мерцания. Интерфейс не затрагивается. Режим ниже задаёт разрешение, с которым он "
@@ -1567,10 +1573,13 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_FLARE_DESC] = "Ergue as partes mais escuras como um pouco de luz difusa faria; 0 mantém o preto preto.",
     [UI_MENU_HDR_GRADE] = "Gradação de cor",
     [UI_MENU_HDR_GRADE_DESC] = "Quanto da gradação de cor do próprio jogo a imagem HDR mantém; 0 é a cena sem ela.",
-    [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
-    [UI_MENU_SHADOW_SCALE_DESC] = "Sombras mais nítidas. Mais alto exige mais da placa de vídeo.",
+    [UI_MENU_SHADOW_SCALE] = "Resolução das sombras (experimental)",
+    [UI_MENU_SHADOW_SCALE_DESC] = "Amplia cada lado dos mapas de sombra compatíveis, não a imagem inteira. 1x mantém o tamanho original. "
+                                 "Valores maiores usam mais memória e tempo da GPU. Alguns mapas não podem ser ampliados. "
+                                 "Requer reinício; a correção visual nesta versão do jogo ainda não foi verificada.",
     [UI_MENU_SHADOW_RANGE] = "Alcance das cascatas de sombra",
     [UI_MENU_SHADOW_RANGE_DESC] = "Mantém as sombras nítidas a distâncias maiores.",
+    [UI_MENU_SHADOW_RANGE_UNAVAILABLE] = "Esta versão não tem um patch de distância das cascatas de sombra. A distância do jogo permanece inalterada.",
     [UI_MENU_CONTACT_SHADOWS] = "Sombras de contato",
     [UI_MENU_CONTACT_SHADOWS_DESC] = "Pequenas sombras do sol que os mapas de sombra não pegam: nos pés, sob pedras, "
                                      "na grama e em dobras. Traçadas na tela depois da iluminação. Vale no próximo "
@@ -2222,10 +2231,12 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_FLARE_DESC] = "像少量杂散光一样提亮最暗的部分；0 保持纯黑。",
     [UI_MENU_HDR_GRADE] = "调色",
     [UI_MENU_HDR_GRADE_DESC] = "HDR 画面保留游戏自身调色的程度；0 为不含调色的场景。",
-    [UI_MENU_SHADOW_SCALE] = "阴影分辨率",
-    [UI_MENU_SHADOW_SCALE_DESC] = "让阴影更清晰。越高越吃显卡。",
+    [UI_MENU_SHADOW_SCALE] = "阴影分辨率（实验性）",
+    [UI_MENU_SHADOW_SCALE_DESC] = "按边长缩放支持的阴影贴图，而非整个画面。1x 保持原始尺寸。较高数值消耗更多显存和 GPU 时间。"
+                                 "部分贴图无法缩放。重启后生效；尚未验证此游戏版本中的视觉正确性。",
     [UI_MENU_SHADOW_RANGE] = "阴影级联范围",
     [UI_MENU_SHADOW_RANGE_DESC] = "让远处的阴影保持清晰。",
+    [UI_MENU_SHADOW_RANGE_UNAVAILABLE] = "此构建没有阴影级联距离补丁，游戏的阴影距离保持不变。",
     [UI_MENU_CONTACT_SHADOWS] = "接触阴影",
     [UI_MENU_CONTACT_SHADOWS_DESC] = "阴影贴图遗漏的细小太阳阴影：脚下、石头下、草丛和褶皱中。在光照之后于屏幕空间追踪。下次启动时生效。",
     [UI_MENU_PCSS] = "柔和阴影",

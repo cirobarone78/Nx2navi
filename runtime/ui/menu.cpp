@@ -61,6 +61,7 @@ void vk_queue_lock(void);
 void vk_queue_unlock(void);
 void res_sizes(unsigned out[2], unsigned scene[2]);
 int res_adjustable(void);
+int rt_patch_set(const char *name);
 int wide_available(void);
 const char *const *vk_color_preset(const char *name);
 int vk_hdr_wanted(void);
@@ -688,7 +689,7 @@ static void row_texture_detail(void) {
 
 static void row_shadow_scale(void) {
     static const char *const vals[] = {"1", "2", "3", "4"};
-    static const char *const names[] = {"960 (1x)", "1920 (2x)", "2880 (3x)", "3840 (4x)"};
+    static const char *const names[] = {"1x", "2x", "3x", "4x"};
     opt_choice_list("NX2NAVI_SHADOW_SCALE", UI_MENU_SHADOW_SCALE, vals, names, 4, UI_MENU_SHADOW_SCALE_DESC);
 }
 
@@ -1084,6 +1085,11 @@ static void tab_screen(float scale) {
     const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
     opt_choice_list("NX2NAVI_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
     row_texture_detail();
+    // Scaling is a renderer option; fixed sizes and cascade distances need this build's guest patches.
+    row_shadow_scale();
+    if (res_adjustable() && rt_patch_set("shadow") >= 0) row_shadow_res();
+    if (rt_patch_set("cascade") < 0) opt_disable_next(UI_MENU_SHADOW_RANGE_UNAVAILABLE);
+    row_shadow_range();
     opt_end();
 }
 

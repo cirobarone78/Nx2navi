@@ -318,6 +318,12 @@ A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `nx2navi.exe --probe-cfg`.
 
+The Screen tab's shadow controls can be checked without starting the game or using a GPU:
+`python tests/shadow_menu_check.py --cc <path-to-clang++>`. It compiles the actual tab and shadow row bodies with
+recording option rows and stubbed unrelated controls. It checks the resolution multipliers and the availability
+gates for fixed size and cascade range. This is a menu wiring test, not a test of rendered shadows, GPU cost or saves.
+The renderer's shadow scale is experimental; 1.1.1 has no cascade range patch and keeps the game's distance.
+
 A change to what the library warm logs when the driver's cache of stage libraries is cold (`runtime/vk_warm_hint.h`,
 `runtime/vk_pipeline.c` `lw_main`) passes `python tests\warm_hint_check.py`, which builds the header alone and checks
 the added text by GPU vendor and by why the cache was cold. No game files.
