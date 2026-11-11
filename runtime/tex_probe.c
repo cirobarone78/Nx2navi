@@ -13,8 +13,6 @@
 #include "nvn_api.h"
 #include "tex.h"
 #include "vk.h"
-#include "vk_gpa.h"
-#include "gpa_read_spv.h"
 #include "platform/platform.h"
 
 static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
@@ -391,130 +389,6 @@ static int test_import(pool_t *pool) {
     return 0;
 }
 
-// test_gpa_read's shader (runtime/shaders/gpa_read.spvasm): one invocation follows the device address table from a
-// guest address (the push constant) to the buffer that holds it and stores the 32-bit word found there in the result
-// buffer. Storage bindings: 0 the table itself, 1 the result. The pool that holds the word is never a descriptor, a
-// transfer source or a resolved span of the submission.
-
-typedef struct {
-    VkPipeline pipe;
-    VkPipelineLayout layout;
-    VkDescriptorSet set;
-    uint64_t source;
-    int setup_mirror, mirrored;
-} GpaRead;
-
-static void gpa_read_record(VkCommandBuffer cb, void *arg) {
-    GpaRead *r = arg;
-    // Match vk_backend.c submit_now and vk_exec.c vk_exec_record, including epochs on descriptor reuse.
-    vk_texture_new_submit();
-    vk_mem_mirror_begin();
-    // The only explicit use of the source pool is making its mirror, before the first read: that submission takes its
-    // shadow touch and its first upload. After the CPU's write nothing resolves, uses or flushes the pool.
-    if (r->setup_mirror) r->mirrored = vk_mem_mirror_probe(r->source), r->setup_mirror = 0;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->layout, 0, 1, &r->set, 0, NULL);
-    vkCmdPushConstants(cb, r->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof r->source, &r->source);
-    vk_mem_gpa_use();   // the shader reads the table, in the second submission through the same descriptor set
-    vkCmdDispatch(cb, 1, 1, 1);
-    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                           .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
-    vk_mem_mirror_end(cb, vk_sync_issued() + 1);   // called under the submission lock, before the value is issued
-}
-
-static int test_gpa_read(uint8_t *guest) {
-    VkCtx *c = vk_ctx();
-    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = guest + 0xA00000, .size = 0x10000,
-                   .game_mem = guest + 0xA00000};
-    if (!vk_gpa_wanted()) {   // no buffer device addresses, or NX2NAVI_GPA=0: shaders read zeros through it by design
-        printf("probe-vkmem: no device address table: the read through it is skipped\n");
-        return 0;
-    }
-    volatile uint32_t *source = (volatile uint32_t *)pool.mem;
-    *source = 0x13579BDFu;   // before vk_pool_init: a shadow copy starts with the bytes an import would show
-    GCHECK(vk_gpa_on() && vk_pool_init(&pool), "the device address table and a CPU-visible pool for the read through it");
-    VkBuffer out = VK_NULL_HANDLE;
-    VmaAllocation alloc = NULL;
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-    VkDescriptorPool dp = VK_NULL_HANDLE;
-    // With shadow storage the pool also gets a VRAM mirror, which the table then names: the prologue of a part that
-    // uses the table keeps both up to date (vk_mem_gpa_sync). Without it the pool stays an import, guest memory itself:
-    // a mirror is not synced for the table's readers there (vk_exec_draw.c ssbo_info).
-    int want_mirror = vk_mirror_on && vk_mem_shadow_storage();
-    GpaRead r = {.source = (uintptr_t)pool.mem, .setup_mirror = want_mirror};
-    int bad = 1;
-#define GPA_CHECK(cond, what) do { if (!(cond)) { printf("probe-vkmem: FAIL GPA " what "\n"); goto done; } } while (0)
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
-    VmaAllocationCreateInfo ai = {.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT};
-    VmaAllocationInfo info;
-    GPA_CHECK(vmaCreateBuffer(c->vma, &bi, &ai, &out, &alloc, &info) == VK_SUCCESS && info.pMappedData, "result buffer");
-    VkDescriptorSetLayoutBinding bindings[2] = {
-        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
-        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}};
-    VkDescriptorSetLayoutCreateInfo dl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2,
-                                         .pBindings = bindings};
-    GPA_CHECK(vkCreateDescriptorSetLayout(c->device, &dl, NULL, &dsl) == VK_SUCCESS, "descriptor layout");
-    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof r.source};
-    VkPipelineLayoutCreateInfo pl = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                     .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
-    GPA_CHECK(vkCreatePipelineLayout(c->device, &pl, NULL, &r.layout) == VK_SUCCESS, "pipeline layout");
-    VkShaderModuleCreateInfo sm = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof gpa_read_spv,
-                                   .pCode = gpa_read_spv};
-    GPA_CHECK(vkCreateShaderModule(c->device, &sm, NULL, &module) == VK_SUCCESS, "shader module");
-    VkComputePipelineCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = r.layout,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = module, .pName = "main"}};
-    GPA_CHECK(vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &cp, NULL, &r.pipe) == VK_SUCCESS, "compute pipeline");
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
-    VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
-                                     .poolSizeCount = 1, .pPoolSizes = &ps};
-    GPA_CHECK(vkCreateDescriptorPool(c->device, &pi, NULL, &dp) == VK_SUCCESS, "descriptor pool");
-    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dp,
-                                     .descriptorSetCount = 1, .pSetLayouts = &dsl};
-    GPA_CHECK(vkAllocateDescriptorSets(c->device, &da, &r.set) == VK_SUCCESS, "descriptor set");
-    VkDescriptorBufferInfo buffers[2] = {vk_gpa_info(), {out, 0, 4}};
-    VkWriteDescriptorSet writes[2];
-    for (unsigned i = 0; i < 2; i++)
-        writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = r.set, .dstBinding = i,
-                                          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                          .pBufferInfo = &buffers[i]};
-    vkUpdateDescriptorSets(c->device, 2, writes, 0, NULL);
-    static const uint32_t want[2] = {0x13579BDFu, 0x2468ACE0u};
-    for (unsigned pass = 0; pass < 2; pass++) {
-        if (pass) *source = want[pass];   // a plain CPU write: no resolve, use, flush or shadow sync of the pool
-        uint64_t fence = vk_sync_probe_submit(gpa_read_record, &r);
-        GPA_CHECK(vk_sync_fence_wait(fence, 5000000000ull), "shader fence timed out");
-        GPA_CHECK(!want_mirror || r.mirrored, "source mirror setup");
-        vmaInvalidateAllocation(c->vma, alloc, 0, VK_WHOLE_SIZE);
-        uint32_t got = *(volatile uint32_t *)info.pMappedData;
-        if (got != want[pass]) {
-            printf("probe-vkmem: FAIL GPA/BDA %s read: got %#010x, expected %#010x (mirror %d)\n",
-                   pass ? "after CPU mutation" : "initial", got, want[pass], r.mirrored);
-            goto done;
-        }
-    }
-    g_gpu_checks += 2;
-    printf("probe-vkmem: GPA/BDA CPU write -> shader read: initial %#010x and mutation %#010x exact (mirror %d)\n",
-           want[0], want[1], r.mirrored);
-    bad = 0;
-done:
-    vk_sync_finish();   // after a timeout too: the objects below must outlive the shader
-    if (dp) vkDestroyDescriptorPool(c->device, dp, NULL);
-    if (r.pipe) vkDestroyPipeline(c->device, r.pipe, NULL);
-    if (module) vkDestroyShaderModule(c->device, module, NULL);
-    if (r.layout) vkDestroyPipelineLayout(c->device, r.layout, NULL);
-    if (dsl) vkDestroyDescriptorSetLayout(c->device, dsl, NULL);
-    if (out) vmaDestroyBuffer(c->vma, out, alloc);
-    vk_pool_fini(&pool);
-#undef GPA_CHECK
-    return bad;
-}
-
 // ReadFile into a watched page, buffered and unbuffered: timed, and whether write watch saw the kernel's write.
 static int test_readfile(uint8_t *dst) {
     char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 64];
@@ -798,16 +672,14 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     GCHECK(img && img->mirrored && img->levels == 3 && img->format == VK_FORMAT_R8G8B8A8_UNORM, "RGBA8 texture image");
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8")) return 1;
-    // CPU writes to the storage: write watch -> re-upload on the next use, and every mip the GPU sees has the new bytes
+    // CPU writes to the storage: write watch -> re-upload on the next use
     uint64_t up0, re0, re1;
     vk_texture_stats(NULL, &up0, &re0);
     if (fill_storage(&t, lin)) return 1;
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8 rewritten")) return 1;
     vk_texture_stats(NULL, NULL, &re1);
-#ifdef _WIN32   // elsewhere an import's pinning can mark pages written again without a CPU write: the count is not exact
     GCHECK(re1 == re0 + 1, "storage rewritten: %llu re-uploads (want 1)", (unsigned long long)(re1 - re0));
-#endif
     if (read_back(&t, 1, lin, 0, "RGBA8 ReadTexels from storage")) return 1;
 
     // BC1, 64x48: blocks uploaded as they are, read back from the image
@@ -912,7 +784,7 @@ static int test_gpu(void) {
     vk_mem_stats(&st);
     GCHECK(!st.imported_pools && !st.physical_pools && !st.virtual_pools, "pools left after fini");
     g_gpu_checks += 2;
-    return test_gpa_read(h);
+    return 0;
 }
 
 int probe_vkmem(void) {
