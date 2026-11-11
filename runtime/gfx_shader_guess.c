@@ -3,7 +3,8 @@
 // every texture a 2D one, float vertex inputs and colour outputs. Against the 3,093 (program, answers) pairs a play
 // session of Ocarina recorded, that guess matched 89.5%: vertex 77.3%, compute 88.1%, fragment 99.6%. With two readings
 // of the first translation, one more translation for the programs they change, --prepare-shaders matched 98.3% of them
-// (vertex 97.1%, compute 96.0%, fragment 99.6%; last-frame vertex variants, vk_mvprev.c, are not prepared):
+// (vertex 97.1%, compute 96.0%, fragment 99.6%). The bounded alternatives below additionally prepare previous-position
+// vertex and compute array-texture variants; those alternatives were not included in that measurement:
 //
 // - Vertex inputs. A vertex attribute without an answer is declared float, and a shader that reads it as an integer
 //   then bitcasts the loaded value to an integer type. Such inputs are answered uint: of the 313 integer inputs met
@@ -96,4 +97,51 @@ int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswer
             }
     }
     return memcmp(out, a, sizeof *a) != 0;
+}
+
+int gfx_shader_guess_alternatives(const GfxShader *s, int stage, const GfxShaderAnswers *a,
+                                  GfxShaderAnswers out[GFX_PREP_ALTERNATIVES]) {
+    if (!s) return 0;
+    const GfxShaderRes *r;
+    if (stage == GFX_STAGE_VS && !a->mvprev) {
+        // vk_exec_draw.c mvobj_draw_ requests the previous-position translation
+        // for vertex programs reading a user bank besides the camera bank c4.
+        // Match that prefilter, even if later position analysis rejects a draw.
+        int n = gfx_shader_resources(s, GFX_RES_UBO, &r);
+        for (int i = 0; i < n; i++)
+            if (r[i].slot >= 3 && r[i].slot <= 16 && r[i].slot != 4) {
+                out[0] = *a;
+                out[0].mvprev = 1;
+                return 1;
+            }
+    }
+    if (stage != GFX_STAGE_CS) return 0;
+    // A sampled 2D instruction can bind either a flat view or a layer of an
+    // array view. Prepare each declared 2D slot as an array, plus the all-array
+    // case, without the exponential product of unrelated resource dimensions.
+    // The current persisted use mask combines texture and image query slots.
+    // Consequently an image-only program also acquires another input ID when
+    // the texture bound at its image slot changes to an array. Include those
+    // lookup aliases without changing the image type or format itself.
+    // Bindless accesses, MSAA and non-2D instructions retain their original answers.
+    uint32_t slots = 0;
+    int count = 0;
+    for (int kind = 0; kind < 2; kind++) {
+        int n = gfx_shader_resources(s, kind ? GFX_RES_IMG : GFX_RES_TEX, &r);
+        for (int i = 0; i < n; i++) {
+            if (r[i].pool || (r[i].type & 0x2ff) != 3 || r[i].slot < 0 || r[i].slot >= 32) continue;
+            int length = r[i].count ? r[i].count : 1;
+            for (int j = r[i].slot; j < 32 && j - r[i].slot < length; j++)
+                if (a->tex_type[j] == GFX_TEX_2D) slots |= 1u << j;
+        }
+    }
+    GfxShaderAnswers all = *a;
+    for (int j = 0; j < 32; j++) {
+        if (!(slots >> j & 1)) continue;
+        out[count] = *a;
+        out[count++].tex_type[j] = GFX_TEX_2D_ARRAY;
+        all.tex_type[j] = GFX_TEX_2D_ARRAY;
+    }
+    if (count > 1) out[count++] = all;
+    return count;
 }

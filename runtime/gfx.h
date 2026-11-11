@@ -94,6 +94,10 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs);
 // shader reads as integers become uint, a compute shader's textures and images take the types its translation
 // declares. 1 when *out differs from *a (translate again with *out).
 int gfx_shader_guess_refine(const GfxShader *s, int stage, const GfxShaderAnswers *a, GfxShaderAnswers *out);
+// Additional plausible bind states from translated resources; returns the number written, without changing *a.
+enum { GFX_PREP_ALTERNATIVES = 33 };
+int gfx_shader_guess_alternatives(const GfxShader *s, int stage, const GfxShaderAnswers *a,
+                                  GfxShaderAnswers out[GFX_PREP_ALTERNATIVES]);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
 size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorded first, then prepared; needs recording on
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
