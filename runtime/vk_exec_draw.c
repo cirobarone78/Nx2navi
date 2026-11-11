@@ -351,15 +351,20 @@ static const struct { VkImageType t; VkImageViewType vt; uint32_t layers; VkSamp
     {VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, VK_SAMPLE_COUNT_4_BIT, 0},
     {VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, VK_SAMPLE_COUNT_4_BIT, 0}};
 
-// A 1x1 stand-in image of view type dinfo[i] in `fmt`, moved to GENERAL by the upload batch (which reaches the queue before
-// the submission that uses it). *sview is the view a storage descriptor takes (a cube becomes a 2D array).
-static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc, VkImageView *view, VkImageView *sview) {
+// A 1x1 stand-in image of view type dinfo[i] in `fmt`, moved to GENERAL and cleared to `clear` by the upload batch (which
+// reaches the queue before the submission that uses it). *sview is the view a storage descriptor takes (a cube becomes a
+// 2D array). Left uncleared its content was undefined, and a material that read its roughness map through one (a slot
+// with no texture yet) could see roughness near 0: on Kakariko's distant cliffs at night the specular term reached
+// 3392 in single pixels, which bloom and the temporal upscaler spread into bright white spots.
+static void make_dummy(int i, VkFormat fmt, const VkClearColorValue *clear, VkImage *image, VmaAllocation *alloc,
+                       VkImageView *view, VkImageView *sview) {
     VkCtx *c = vk_ctx();
     int ms = dinfo[i].s != VK_SAMPLE_COUNT_1_BIT;
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = dinfo[i].f, .imageType = dinfo[i].t,
                             .format = fmt, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = dinfo[i].layers,
                             .samples = dinfo[i].s, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ia = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ia, image, alloc, NULL) != VK_SUCCESS) rt_fatal("vk: stand-in image %d failed", i);
@@ -380,9 +385,22 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
                                  .image = *image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, dinfo[i].layers}};
     VkCommandBuffer cb = vk_upload_begin();
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, bar.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdClearColorImage(cb, *image, VK_IMAGE_LAYOUT_GENERAL, clear, 1, &bar.subresourceRange);
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    bar.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     vkCmdPipelineBarrier2(cb, &di);
     vk_upload_end();
 }
+
+// Sampled stand-ins read as mid grey, opaque: a missing roughness or metalness map gives a middling value, a missing
+// two-channel normal map a flat normal, a missing colour map grey. Storage stand-ins (any format, written by shaders that
+// have no image) start at zero.
+static const VkClearColorValue DUMMY_SAMPLED = {.float32 = {0.5f, 0.5f, 0.5f, 1.0f}};
+static const VkClearColorValue DUMMY_STORAGE = {.uint32 = {0, 0, 0, 0}};
 
 // Storage image stand-ins in the format a shader declares (GfxShaderRes.format: the translator's TextureFormat order); Vulkan wants
 // the view format to match the declaration. Created on first use.
@@ -404,7 +422,7 @@ static VkImageView storage_dummy(int di, int code) {
     for (int i = 0; i < 48; i++) {
         if (!SD[i].used) {
             SD[i].used = 1, SD[i].di = di, SD[i].fmt = fmt;
-            make_dummy(di, fmt, &SD[i].image, &SD[i].alloc, &SD[i].view, &SD[i].sview);
+            make_dummy(di, fmt, &DUMMY_STORAGE, &SD[i].image, &SD[i].alloc, &SD[i].view, &SD[i].sview);
             return SD[i].sview;
         }
         if (SD[i].di == di && SD[i].fmt == fmt) return SD[i].sview;
@@ -440,7 +458,7 @@ static void dummies_init(void) {
     Z.samp_shadow = vk_sampler_for(&sp);
 
     for (int i = 0; i < DV_COUNT; i++)
-        make_dummy(i, VK_FORMAT_R8G8B8A8_UNORM, &Z.img[i].image, &Z.img[i].alloc, &Z.img[i].view, &Z.img[i].sview);
+        make_dummy(i, VK_FORMAT_R8G8B8A8_UNORM, &DUMMY_SAMPLED, &Z.img[i].image, &Z.img[i].alloc, &Z.img[i].view, &Z.img[i].sview);
     Z.ready = 1;
 }
 
