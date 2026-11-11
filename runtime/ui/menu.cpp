@@ -70,6 +70,7 @@ int vk_dlaa_needs_restart(void);
 int vk_ngxfg_wanted(void);              // vk_dlaa.c: DLSS's frame generation through NGX itself can run in this run
 int vk_ngxfg_max(void);                 // ... and how many frames it may generate per rendered one (0: it cannot)
 int vk_ffx_available(void);             // vk_ffx.cpp: FSR 3.1 upscaling can run (asked without loading the library)
+int vk_ffx_fsr4_available(void);        // vk_ffx.cpp: FSR 4 upscaling can run (fsr4-vk + descriptorBuffer)
 int vk_ffx_framegen_available(void);    // ... and FSR 3.1 frame generation
 int vk_texture_detail_auto(void);       // vk_texture.c: the texture detail auto picks on this card, 0 full to 2 low
 double frame_step_limit_hz(void);
@@ -823,8 +824,9 @@ static void upscaling_name(char *out, size_t size) {
     static const char *const modes[] = {"dlaa", "quality", "balanced", "performance", "ultra_performance"};
     static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     static const UiTextId fsr3[] = {UI_MENU_FSR3_NATIVE, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
-    // FSR 3.1 set where it cannot load runs nothing (vk_dlaa.c vk_dlaa_fsr3): the game scales the picture as the rest says
-    if (!cfg_bool("NX2NAVI_DLAA") || (!strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") && !vk_ffx_available())) {
+    const char *taa = cfg_value("NX2NAVI_TAA");
+    const bool is_fsr3 = !strcmp(taa, "fsr3"), is_fsr4 = !strcmp(taa, "fsr4");
+    if (!cfg_bool("NX2NAVI_DLAA") || (is_fsr3 && !vk_ffx_available()) || (is_fsr4 && !vk_ffx_fsr4_available())) {
         if (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr")) snprintf(out, size, "%s", menu_text(UI_MENU_UPSCALER_BILINEAR));
         else snprintf(out, size, menu_text(UI_MENU_OV_FMT_FSR), cfg_int("NX2NAVI_SHARPNESS"));
         return;
@@ -832,7 +834,8 @@ static void upscaling_name(char *out, size_t size) {
     int mode = 0;
     for (int i = 0; i < 5; i++)
         if (!strcmp(cfg_value("NX2NAVI_DLSS"), modes[i])) mode = i;
-    if (!strcmp(cfg_value("NX2NAVI_TAA"), "fsr3")) snprintf(out, size, "AMD FSR 3.1 %s", menu_text(fsr3[mode]));
+    if (is_fsr4) snprintf(out, size, "AMD FSR 4 %s", menu_text(fsr3[mode]));
+    else if (is_fsr3) snprintf(out, size, "AMD FSR 3.1 %s", menu_text(fsr3[mode]));
     else snprintf(out, size, mode ? "DLSS %s" : "NVIDIA %s", menu_text(dlss[mode]));
 }
 
@@ -844,22 +847,23 @@ static void row_upscaling(void) {
     static const char *const modes[] = {"dlaa", "quality", "balanced", "performance", "ultra_performance"};
     static const UiTextId mode_names[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                           UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
-    // FSR 3.1's modes take the same render scales as DLSS's (Native AA is FSR's name for DLAA's full size)
+    // FSR 3.1 / FSR 4 modes take the same render scales as DLSS (Native AA is FSR's name for DLAA's full size)
     static const UiTextId fsr_names[] = {UI_MENU_FSR3_NATIVE, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                          UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
-    enum { BILINEAR, FSR1, DLSS, FSR3 };
+    enum { BILINEAR, FSR1, DLSS, FSR3, FSR4 };
     struct Entry { int kind, mode; };
-    static char text[10][96];
-    Entry list[12];
-    const char *names[12];
+    static char text[15][96];
+    Entry list[18];
+    const char *names[18];
     int n = 0;
     auto add = [&](int kind, int mode) {
         list[n] = {kind, mode};
         if (kind == BILINEAR) names[n] = menu_text(UI_MENU_UPSCALER_BILINEAR);
         else if (kind == FSR1) names[n] = menu_text(UI_MENU_UPSCALER_FSR);
         else {
-            char *t = text[(kind == FSR3 ? 5 : 0) + mode];
+            char *t = text[(kind == FSR4 ? 10 : kind == FSR3 ? 5 : 0) + mode];
             if (kind == DLSS) snprintf(t, sizeof text[0], mode ? "DLSS %s" : "NVIDIA %s", menu_text(mode_names[mode]));
+            else if (kind == FSR4) snprintf(t, sizeof text[0], "AMD FSR 4 %s", menu_text(fsr_names[mode]));
             else snprintf(t, sizeof text[0], "AMD FSR 3.1 %s", menu_text(fsr_names[mode]));
             names[n] = t;
         }
@@ -868,34 +872,36 @@ static void row_upscaling(void) {
     // what is set now
     Entry now = {strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") ? BILINEAR : FSR1, 0};
     if (cfg_bool("NX2NAVI_DLAA")) {
-        now = {strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? DLSS : FSR3, 0};
+        const char *taa = cfg_value("NX2NAVI_TAA");
+        now = {!strcmp(taa, "fsr4") ? FSR4 : !strcmp(taa, "fsr3") ? FSR3 : DLSS, 0};
         for (int i = 0; i < 5; i++)
             if (!strcmp(cfg_value("NX2NAVI_DLSS"), modes[i])) now.mode = i;
     }
-    const bool dlss = dlss_offered(), fsr = vk_ffx_available();
+    const bool dlss = dlss_offered(), fsr = vk_ffx_available(), fsr4 = vk_ffx_fsr4_available();
     add(BILINEAR, 0);
     add(FSR1, 0);
     for (int i = 0; dlss && i < 5; i++) add(DLSS, i);
     for (int i = 0; fsr && i < 5; i++) add(FSR3, i);
+    for (int i = 0; fsr4 && i < 5; i++) add(FSR4, i);
     if (!dlss && now.kind == DLSS) add(DLSS, now.mode);
     if (!fsr && now.kind == FSR3) add(FSR3, now.mode);
+    if (!fsr4 && now.kind == FSR4) add(FSR4, now.mode);
     int cur = 0;
     for (int i = 0; i < n; i++)
         if (list[i].kind == now.kind && list[i].mode == now.mode) cur = i;
-    // FSR 3.1 still set where it cannot load: nothing upscales, so the row says so under its value
     const char *note = nullptr;
-    if (!fsr && now.kind == FSR3) note = menu_text(UI_MENU_FSR3_OFF);
+    if ((!fsr && now.kind == FSR3) || (!fsr4 && now.kind == FSR4)) note = menu_text(UI_MENU_FSR3_OFF);
     else if (upscaling_restart()) note = menu_text(UI_MENU_AFTER_RESTART);
     int nv = opt_choice_index("NX2NAVI_UPSCALER", UI_MENU_UPSCALING, names, n, cur, 1,
-                              !fsr ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
+                              !fsr && !fsr4 ? UI_MENU_UPSCALING_DESC_NO_FSR : dlss ? UI_MENU_UPSCALING_DESC : UI_MENU_UPSCALING_DESC_FSR,
                               note);
     if (nv < 0 || nv >= n) return;
     const Entry e = list[nv];
     opt_apply("NX2NAVI_UPSCALER", e.kind == FSR1 ? "fsr" : "bilinear");
     opt_apply("NX2NAVI_DLAA", e.kind >= DLSS ? "1" : "0");
-    if (e.kind < DLSS) opt_apply("NX2NAVI_FRAMEGEN", "off");   // it needs DLSS's or FSR 3.1's motion vectors (row_framegen)
+    if (e.kind < DLSS) opt_apply("NX2NAVI_FRAMEGEN", "off");   // it needs DLSS's or FSR's motion vectors (row_framegen)
     if (e.kind >= DLSS) opt_apply("NX2NAVI_DLSS", modes[e.mode]);
-    if (e.kind >= DLSS) opt_apply("NX2NAVI_TAA", e.kind == FSR3 ? "fsr3" : "dlss");
+    if (e.kind >= DLSS) opt_apply("NX2NAVI_TAA", e.kind == FSR4 ? "fsr4" : e.kind == FSR3 ? "fsr3" : "dlss");
 }
 
 // Under the HDR value: "after restart" when what is set waits for one (the game's own HDR, to or from it:
@@ -1005,7 +1011,8 @@ static void row_framegen(void) {
     // the generated frames are made from DLSS's or FSR 3.1's motion vectors: without one of them it would do nothing,
     // and FSR 3.1 set where it cannot load (vk_ffx_available) is none
     const bool dlss = dlss_offered(), fsr = vk_ffx_framegen_available();
-    const bool upscaled = cfg_bool("NX2NAVI_DLAA") && (strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") || vk_ffx_available());
+    const char *taa = cfg_value("NX2NAVI_TAA");
+    const bool upscaled = cfg_bool("NX2NAVI_DLAA") && (!strcmp(taa, "fsr3") ? vk_ffx_available() : !strcmp(taa, "fsr4") ? vk_ffx_fsr4_available() : 1);
     const char *v = cfg_value("NX2NAVI_FRAMEGEN");
     int cur = !strcmp(v, "fsr3") ? 1 : !strcmp(v, "dlss") ? 2 : 0;
     // what the texts promise follows what runs here: DLSS's frame generation, AMD's, both or neither
@@ -1074,9 +1081,11 @@ static void tab_screen(float scale) {
     row_upscaling();
     row_framegen();
     row_hdr();
-    // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS) and FSR 3.1 (vk_ffx.cpp, its own RCAS); with
+    // The sharpening runs under FSR 1 (vk_fsr.c vk_fsr_record, RCAS), FSR 3.1, and FSR 4 (vk_ffx.cpp); with
     // bilinear or DLSS the slider would do nothing
-    int dl = cfg_bool("NX2NAVI_DLAA"), fsr3 = dl && !strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") && vk_ffx_available();
+    const char *taa = cfg_value("NX2NAVI_TAA");
+    int dl = cfg_bool("NX2NAVI_DLAA"),
+        fsr3 = dl && ((!strcmp(taa, "fsr3") && vk_ffx_available()) || (!strcmp(taa, "fsr4") && vk_ffx_fsr4_available()));
     if (!fsr3 && (strcmp(cfg_value("NX2NAVI_UPSCALER"), "fsr") || dl)) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
     opt_slider("NX2NAVI_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     // Anisotropic filtering of the surface textures that tile (vk_texture.c aniso_raised), at once (vk_sampler_aniso_live)
