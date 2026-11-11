@@ -50,6 +50,17 @@ site osolver main 38afd10 bd440d02 1e2a1002   # the same three words in the seco
 site osolver main 38afd1c 1f010800 1f218800
 site osolver main 38afd20 1e380001 1e280001
 
+# Movie-synchronised event timelines: the movie layer advances its counter at +760 on each draw of a ready
+# picture. main+0x3b3ec10 reads that counter for the event dispatcher, so rendering a picture twice also
+# advances voices and overlays twice. Both ready paths reach these sites only after main+0x3b5ce80 checks
+# the player and its video surface. Use the timestamp of the surface's current picture: main+0x3b61ea0 reads
+# it from the selected non-EOS VideoFrame when switching the image buffers, before marking the surface ready.
+# x8 = layer->controller->player->surface->timestamp in ns. Clamp negative timestamps to zero and convert to
+# the nearest 60 Hz timeline tick (WebM timestamps can be rounded to milliseconds). The original add of one
+# counts the first picture as frame one. x9 is scratch on both paths, and the replacement preserves flags.
+site ostep main 3b5c7c4 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d2800789 9b097d08 528ca009 72a3b9a9 8b090108 d37ff929 9ac90908
+site ostep main 3b5c908 b942fa88 f9400a88 f9400108 f940f508 f9406108 8aa8fd08 d2800789 9b097d08 528ca009 72a3b9a9 8b090108 d37ff929 9ac90908
+
 # Pick-up window count: the window that shows a pick-up above the character (its update is main+0xa67e50) moves the
 # number it shows (+0x360) to the new total (+0x35c) by trunc(frames per update * max(1, difference / 50)) a frame, and
 # closes only once the two are equal. Below one frame per update that is 0: above 60 fps, and at 60 while the step runs
