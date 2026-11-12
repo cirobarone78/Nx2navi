@@ -601,7 +601,7 @@ int vk_dlaa_fg_inputs(VkFfxImage *depth, VkFfxImage *mv, float *jx, float *jy, i
     if (!D.fg_fresh || D.failed) return 0;
     D.fg_fresh = 0;
     if (!fg_current(D.fg_at)) return 0;
-    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = 0;
+    *depth = D.fg_depth, *mv = D.fg_mv, *jx = D.fg_jx, *jy = D.fg_jy, *reset = D.fg_reset;
     return 1;
 }
 
@@ -1717,6 +1717,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     rec_drain();   // NGX records into the command buffer itself: the recorder thread must have made every call so far
     if (timed) T.cpu_drain += kern_now_ns() - c0;
     if (mv == 1) fcam_probe(cb, e, w, h);   // mv_pass's distances, behind its barrier
+    int reset;
     if (fsr) {   // FSR 3.1 (vk_ffx.cpp) in DLSS's place: the same images, then the same blit below
         if (t->level || t->base_layer || z->level || z->base_layer) return dl_fail("FSR 3.1 on a target that is not level 0, layer 0", 0);
         if (D.last_color != t->image) target_changed(t, mv == 1);
@@ -1725,7 +1726,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         D.last_eval_ns = now;
         VkFfxImage fc = {t->image, t->format, w, h, 0}, fz = {z->image, z->format, w, h, 0},
                    fm = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1}, fo = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, 1};
-        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, D.reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, 0))
+        reset = D.reset;
+        if (!vk_ffx_upscale(cb, &fc, &fz, &fm, &fo, jx, jy, reset, dt > 0 && dt < 100 ? (float)dt : 16.67f, 0))
             return dl_fail("FSR 3.1", 0);
         static int told;
         if (!told++) rt_log("dlaa: FSR 3.1 at %ux%u -> %ux%u (scene format %d, depth format %d)", w, h, ow, oh,
@@ -1778,7 +1780,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     p_setf(p, "Jitter.Offset.X", jx);
     p_setf(p, "Jitter.Offset.Y", jy);
     p_setf(p, "Sharpness", 0.0f);
-    p_seti(p, "Reset", D.reset);
+    reset = D.reset;
+    p_seti(p, "Reset", reset);
     // One bias mask: the reactive one (NX2NAVI_DLSS_REACTIVE, a test) where it ran, else the characters' (mv_pass), else
     // none. The parameter object is reused, so it is cleared explicitly.
     NgxResourceVK rk = mk ? res_image(mk->mask_view, mk->mask, VK_FORMAT_R8_UNORM, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0)
@@ -1836,6 +1839,7 @@ evaluated:
     D.fg_depth = (VkFfxImage){z->image, z->format, w, h, 0};
     D.fg_mv = (VkFfxImage){e->mv, VK_FORMAT_R16G16_SFLOAT, w, h, 1};
     D.fg_depth_view = zv, D.fg_mv_view = e->mv_view;
+    D.fg_reset = reset;
     D.fg_jx = jx, D.fg_jy = jy, D.fg_at = D.presents, D.fg_fresh = 1;
     next_jitter(w, ow);
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0)   // 300: one early line with the frames counted
