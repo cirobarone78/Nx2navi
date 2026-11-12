@@ -222,6 +222,7 @@ uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
+uint64_t mem_thaw_count(void);                           // thaws by a write fault or a mapping change so far
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;

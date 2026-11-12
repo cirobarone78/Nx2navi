@@ -861,6 +861,17 @@
 # at the start of buffers of several MiB about twice a second. 0: the whole buffer comes back and everything near it
 # is copied back every frame for up to 32 seconds, as before (a tenth fewer frames a second in a village).
 # wb_lazy_chunk = 0
+# While an area streams in, the game's loaders write into memory regions the renderer had made read-only (idle regions
+# are frozen so the per-frame write checks can skip them) and map and unmap hundreds of MiB a second. Each first write
+# thaws its region, and under that load each such change of protection or mapping took 8 to 17 ms while holding the
+# lock the next GPU submission needs, so frames stalled 50 to 180 ms near areas being preloaded. Off by default:
+# 1: a write thaws its region without holding that lock (the next write there waits for the thaw).
+# thaw_unlocked = 0
+# 1: mapping and unmapping guest memory runs without holding that lock (the regions are held thawed meanwhile).
+# map_unlocked = 0
+# No new freezes for this many milliseconds after a burst of thaws (8 within half a second), so streaming does not
+# freeze memory it is about to write again. 0: off. 5000 was measured.
+# freeze_storm_hold_ms = 0
 # Barriers between the game's draw passes and compute dispatches. 1: only where the game itself asks for one, or where
 # the work changes between drawing and compute; this takes about a tenth off the graphics card's time for a frame.
 # 0: a full barrier before every pass and every dispatch. Default: 1 on NVIDIA graphics cards, 0 on all others, where it

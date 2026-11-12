@@ -3235,12 +3235,44 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
 static uint64_t freeze_budget_ns = ~0ull;   // ~0: not read yet
 static uint64_t frz_hold_until, frz_backoff, frz_held_passes, frz_slow;   // gen_lock
 
+// NX2NAVI_FREEZE_STORM_HOLD_MS=<n> (default 0 = off): no freezes for n ms after a burst of thaws. While an area
+// streams in, the loaders write into regions frozen long before and into ones just frozen, some 150-250 thaws a
+// second, each a VirtualProtect that then takes 8-17 ms; freezing the regions they wrote a moment ago only adds more
+// of both. A burst is STORM_THAWS thaws by a write fault or a mapping change within STORM_SPAN_NS; each burst
+// extends the hold. Not freezing is always safe: the write-watch queries simply cover the region.
+#define STORM_THAWS 8
+#define STORM_SPAN_NS 500000000ull
+static uint64_t storm_hold_ns = ~0ull, storm_until, storm_t0, storm_n0, storm_holds;   // gen_lock
+
+static int storm_held(uint64_t now) {
+    if (storm_hold_ns == ~0ull) {
+        const char *e = cfg_get("NX2NAVI_FREEZE_STORM_HOLD_MS");
+        long long ms = e && *e ? atoll(e) : 0;
+        storm_hold_ns = ms > 0 ? (uint64_t)ms * 1000000ull : 0;
+        if (storm_hold_ns) rt_log("mem: no freezes for %lld ms after a burst of thaws (NX2NAVI_FREEZE_STORM_HOLD_MS)", ms);
+    }
+    if (!storm_hold_ns) return 0;
+    uint64_t n = mem_thaw_count(), t = plat_now_ns();
+    if (!storm_t0 || t - storm_t0 >= STORM_SPAN_NS) storm_t0 = t, storm_n0 = n;
+    else if (n - storm_n0 >= STORM_THAWS) {
+        if (now >= storm_until && ++storm_holds <= 40)
+            rt_log("mem: a burst of thaws (%llu in %.0f ms): no freezes for %llu ms", (unsigned long long)(n - storm_n0),
+                   (t - storm_t0) / 1e6, (unsigned long long)(storm_hold_ns / 1000000));
+        storm_until = now + storm_hold_ns, storm_t0 = t, storm_n0 = n;
+    }
+    return now < storm_until;
+}
+
 static void freeze_pass(void) {
     if (freeze_budget_ns == ~0ull) {
         long long us = cfg_int("NX2NAVI_FREEZE_BUDGET_US");
         freeze_budget_ns = us > 0 ? (uint64_t)us * 1000 : 0;
     }
     uint64_t start = qpc();
+    if (storm_held(plat_now_ns())) {
+        if (nfcand) frz_held_passes++;
+        return;
+    }
     if (freeze_budget_ns && start < frz_hold_until) {
         if (nfcand) frz_held_passes++;
         return;
