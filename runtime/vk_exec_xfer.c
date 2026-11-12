@@ -204,7 +204,10 @@ static Pending *pending_slot(uint64_t addr, int insert) {
 // report into guest memory. Slots come from one ring; the completion thread reads and host-resets them
 // (hostQueryReset, Vulkan 1.2), so the replay records no reset commands. A full ring (no slot read back yet) leaves the
 // draw uncounted and the segment's count at least 1, as does a query still unavailable after its fence. Without hostQueryReset the counts stay 0.
-#define OQ_N 4096
+// The ring holds about four frames of Hyrule Field's queries (about 3,500 a frame): the replay workers' chunks take
+// blocks of slots sized to their draws (vk_exec_xfer_slots), more than they use, and with 4096 the ring came round to
+// slots the completion thread had not reset yet, leaving draws uncounted.
+#define OQ_N 16384
 #define LOG_ONCE(...) do { static volatile char once_; if (!__atomic_exchange_n(&once_, 1, __ATOMIC_RELAXED)) rt_log(__VA_ARGS__); } while (0)
 static VkQueryPool oq_pool;
 static int oq_state;                     // 0 not set up, 1 counting available, -1 unavailable
@@ -228,21 +231,24 @@ typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t 
 // the counting as the stream does from its chunk's first op (vk_exec_xfer_chunk_state): XW.counting and the segment its
 // closed queries belong to, the next one at or after its position in the stream (XW.seg; past the group's last, the
 // pending list oq_seg, which a later reset or report takes). It keeps the query open in its own pass (XW.open), takes
-// ring slots from its chunk's block and adds the slots it closes under oq_seg_lock. XW.cond: the decisions of its chunk's
-// render conditions, made by the front pass in the order of the stream.
+// ring slots from its chunk's block and keeps the slots it closes with their segment in its chunk's list (CP), which
+// vk_exec_xfer_group_merge puts into the segments once the group is done, chunk after chunk: under a lock per slot, the
+// workers waited for each other at every query. XW.cond: the decisions of its chunk's render conditions, made by the
+// front pass in the order of the stream.
 // The blocks (vk_exec_xfer_slots): the front pass gives each chunk as many slots as it has draws that count samples and
 // render, one after the other, so the slots follow the stream as the replay's own do and the completion thread reads
 // and resets them in long runs (oq_take). Taken from the ring at once, the slots of a group's chunks interleaved: four
 // times the result calls and a reset per slot, 3.5 ms more of the wait after a frame's first submission (RX 7900 XT,
 // Hyrule Field, 3 workers). A chunk that needs more than its block takes them from the ring.
 static _Thread_local struct {
-    int on, open, counting, reported, keep;
+    int on, open, counting, reported, keep, chunk;
     uint32_t seg, qnext, qend;
     const uint8_t *cond;
     uint32_t ncond, i;
 } XW = {.open = -1};
-static PlatMutex oq_seg_lock = PLAT_MUTEX_INIT;
 static struct { int on; OqSegment **s; uint32_t n, cap; } GS;   // the front pass's segments of the group
+#define CP_CHUNKS 32
+static struct { uint32_t *seg, *q, n, cap; } CP[CP_CHUNKS];    // per chunk index: closed slots and their segment
 
 void vk_exec_xfer_group(int on) {   // on: a new group's front pass begins; off: it ended, the list stays
     if (on) GS.n = 0;
@@ -261,8 +267,10 @@ uint64_t vk_exec_xfer_chunk_state(void) {
     return (uint64_t)GS.n << 8 | (uint64_t)(oq_counting & 1) | (uint64_t)(oq_reported & 1) << 1 | (uint64_t)(oq_keep & 1) << 2;
 }
 
-void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots) {
-    XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0;
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
+                         int chunk) {
+    if (chunk < 0 || chunk >= CP_CHUNKS) rt_fatal("vk: replay worker chunk %d of at most %d", chunk, CP_CHUNKS);
+    XW.on = on, XW.open = -1, XW.cond = cond, XW.ncond = ncond, XW.i = 0, XW.chunk = chunk;
     XW.qnext = slot0, XW.qend = slot0 + nslots;
     XW.counting = (int)(state & 1), XW.reported = (int)(state >> 1 & 1), XW.keep = (int)(state >> 2 & 1);
     XW.seg = (uint32_t)(state >> 8);
@@ -270,22 +278,37 @@ void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t s
 
 // Adds closed slot q to the segment a worker's queries belong to now, or the pending list.
 static void seg_add(uint32_t q) {
-    plat_mutex_lock(&oq_seg_lock);
-    if (XW.seg < GS.n) {
-        OqSegment *s = GS.s[XW.seg];
-        if (s->n == s->cap) {
-            s->cap = s->cap ? s->cap * 2 : 16;
-            if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
-        }
-        s->q[s->n++] = q;
-    } else {
-        if (oq_nseg == oq_capseg) {
-            oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
-            if (!(oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg))) rt_fatal("vk: out of memory");
-        }
-        oq_seg[oq_nseg++] = q;
+    __typeof__(CP[0]) *l = &CP[XW.chunk];
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 256;
+        if (!(l->seg = realloc(l->seg, sizeof *l->seg * l->cap)) || !(l->q = realloc(l->q, sizeof *l->q * l->cap)))
+            rt_fatal("vk: out of memory");
     }
-    plat_mutex_unlock(&oq_seg_lock);
+    l->seg[l->n] = XW.seg, l->q[l->n++] = q;
+}
+
+void vk_exec_xfer_group_merge(int nchunks) {
+    for (int c = 0; c < nchunks && c < CP_CHUNKS; c++) {
+        __typeof__(CP[0]) *l = &CP[c];
+        for (uint32_t i = 0; i < l->n; i++) {
+            uint32_t q = l->q[i];
+            if (l->seg[i] < GS.n) {
+                OqSegment *s = GS.s[l->seg[i]];
+                if (s->n == s->cap) {
+                    s->cap = s->cap ? s->cap * 2 : 16;
+                    if (!(s->q = realloc(s->q, sizeof *s->q * s->cap))) rt_fatal("vk: out of memory");
+                }
+                s->q[s->n++] = q;
+            } else {
+                if (oq_nseg == oq_capseg) {
+                    oq_capseg = oq_capseg ? oq_capseg * 2 : 64;
+                    if (!(oq_seg = realloc(oq_seg, sizeof *oq_seg * oq_capseg))) rt_fatal("vk: out of memory");
+                }
+                oq_seg[oq_nseg++] = q;
+            }
+        }
+        l->n = 0;
+    }
 }
 
 static int oq_ready(void) {

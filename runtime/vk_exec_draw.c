@@ -276,6 +276,10 @@ typedef struct DrawCtx {
     struct { int valid, has_fs; MemoKey k; const GfxShader *vs, *fs; } SM;   // the shader memo (shader_memo_on)
     struct { int valid; VkPipeState s; const VkPipeInfo *info; } PM;          // the pipeline memo (pipe_memo_on)
     void *fm;                            // feedback_scan's memo per texture handle (FmEnt[FM_N]), made at first use
+    void *mo_vm;                         // mvobj_pick's memo of the motion variant per vertex shader, made at first use
+    struct { const void *d; uint64_t ind; VkDeviceSize at; } ma[64];   // mesh_ring_entry: entries filled ahead
+    int ma_n, ma_i;                      // ... how many, and the next one a draw takes
+    uint32_t ma_brk;                     // ... vk_exec_brk_now when they were filled
     VkWriteDescriptorSet bind_w[MAX_BINDINGS];   // bind_resources: write structs, packed descriptors, texel views
     VkDescSlot bind_d[MAX_DESC];
     VkBufferView bind_bv[MAX_DESC];
@@ -2450,8 +2454,11 @@ static void pool_sync_draw(VkExec *ex) {
     plat_mutex_unlock(&pool_mt);
 }
 
+static int mesh_ring_make(void);
+
 void vk_exec_draw_group_begin(VkExec *ex) {
     dummies_init();
+    if (vk_ctx()->has_mesh_shader && !vk_ctx()->mesh_fallback) mesh_ring_make();   // the chunks' indirect mesh draws
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     if (pool_on() && PL.cur_fence == ex->fence && !PL.sealed) pool_sync(ex);   // the set this submission took
 }
@@ -4606,21 +4613,28 @@ static void mo_emit(VkCommandBuffer cb) {
     }
 }
 
-static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0);
-// The chunks of a parallel group (vk_exec.c) add to the frame's list at once: its memos, statistics and list go under
-// mo_lock there. The order of the list does not change the picture: its draws write motion without blending, tested
-// against the scene depth they do not write.
+static int mvobj_pick(VkExec *ex, const GfxShader **vs_out, uint32_t *banks_out, uint64_t t0);
+static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0,
+                        const GfxShader *vs, uint32_t banks);
+// The chunks of a parallel group (vk_exec.c) add to the frame's list at once: whether a draw is listed at all is decided
+// by its own draw context (mvobj_pick, its memo per context), and only the frame's list, its memos and statistics go
+// under mo_lock there: under one lock for the whole check, the chunks' scene draws waited for each other. The order of
+// the list does not change the picture: its draws write motion without blending, tested against the scene depth they
+// do not write.
 static PlatMutex mo_lock = PLAT_MUTEX_INIT;
 
 static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off) {
     if (MO.failed || !vk_mvprev_on() || !ex->dc->B.st_valid) return;
     static int timed = -1;
     if (timed < 0) timed = rt_knob("MVOBJ_TIMES", "0");   // NX2NAVI_MVOBJ_TIMES=1: the summary's times (the clock reads cost)
-    int lk = vk_exec_in_chunk();
-    if (lk) plat_mutex_lock(&mo_lock);
     uint64_t t0 = timed ? kern_now_ns() : 0;
-    mvobj_draw_(ex, d, ib, ib_off, t0);
-    if (t0) MO.ns_check += kern_now_ns() - t0;
+    const GfxShader *vs;
+    uint32_t banks;
+    int listed = mvobj_pick(ex, &vs, &banks, t0);
+    int lk = listed && vk_exec_in_chunk();
+    if (lk) plat_mutex_lock(&mo_lock);
+    if (listed) mvobj_draw_(ex, d, ib, ib_off, t0, vs, banks);
+    if (t0) __atomic_add_fetch(&MO.ns_check, kern_now_ns() - t0, __ATOMIC_RELAXED);
     if (lk) plat_mutex_unlock(&mo_lock);
 }
 
@@ -4746,30 +4760,34 @@ static int mo_prev_cached(int index, const p_bind_buf *u, VkDescriptorBufferInfo
     return r;
 }
 
-static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0) {
+// Whether the draw goes on to the frame's list (mvobj_draw_), with its motion variant and the banks its position reads;
+// this draw context alone decides (no lock in a chunk): the draw's state, and the variant memo per context.
+static int mvobj_pick(VkExec *ex, const GfxShader **vs_out, uint32_t *banks_out, uint64_t t0) {
     DrawCtx *const cx = ex->dc;
-    mvobj_banks(ex);
+    if (!vk_exec_in_chunk()) mvobj_banks(ex);   // a test's log of every scene draw (its tables are not shared)
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT || cx->B.st.samples > 1 ||
         cx->B.st.raster_discard)
-        return;
+        return 0;
     // solid geometry only, which tests and writes the scene depth: effects, particles and screen quads write none, and
     // drawn again they would put their motion on the surfaces behind them (DLSS takes those from the surface)
-    if (!cx->B.st.ds.dt || !cx->B.st.ds.dw) return;
+    if (!cx->B.st.ds.dt || !cx->B.st.ds.dw) return 0;
     // a vertex shader that reads a user bank besides the camera's (c4) may move on its own
     const GfxShaderRes *ur;
     int nu = gfx_shader_resources(cx->B.st.vs, GFX_RES_UBO, &ur), reads = 0;
     for (int i = 0; i < nu; i++) reads |= ur[i].slot >= 3 && ur[i].slot <= 16 && ur[i].slot != 4;
-    if (!reads) return;
-    MO.cand++;
-    uint64_t tp = t0 ? kern_now_ns() : 0;
-    if (t0) MO.ns_part[0] += tp - t0, MO.n_part[0]++;
-    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    if (MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != z->format) mo_begin(ex, frame);
+    if (!reads) return 0;
+    __atomic_add_fetch(&MO.cand, 1, __ATOMIC_RELAXED);
+    if (t0) {
+        __atomic_add_fetch(&MO.ns_part[0], kern_now_ns() - t0, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&MO.n_part[0], 1, __ATOMIC_RELAXED);
+    }
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     // the variant: the translation of the same code and answers, kept per shader once found; it names the banks the
     // position depends on (0: none, the shader is skipped from then on)
-    static struct { const GfxShader *of, *vs; uint32_t banks; } vmemo[1024];
+    typedef struct { const GfxShader *of, *vs; uint32_t banks; } VMemo;
+    VMemo *vmemo = cx->mo_vm;
+    if (!vmemo && !(vmemo = cx->mo_vm = calloc(1024, sizeof *vmemo))) rt_fatal("vk: out of memory (motion memo)");
     uint32_t vi = (uint32_t)((uintptr_t)cx->B.st.vs * 0x9E3779B97F4A7C15ull >> 54);
     if (vmemo[vi].of != cx->B.st.vs) {
         int has, pending = 0;
@@ -4777,8 +4795,8 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
         const GfxShader *v = shader_for(ex, NVN_STAGE_VS, &has, &pending, 0);
         cx->sf_mvprev = 0;
         if (!v || pending) {
-            MO.building++;
-            return;
+            __atomic_add_fetch(&MO.building, 1, __ATOMIC_RELAXED);
+            return 0;
         }
         GfxShaderIo io[32];
         uint32_t extra = gfx_shader_outputs(v, io) & ~gfx_shader_outputs(cx->B.st.vs, io);
@@ -4789,8 +4807,8 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     const GfxShader *vs = vmemo[vi].vs;
     uint32_t banks = vmemo[vi].banks;
     if (!banks || !(banks & ~(1u << 4))) {
-        MO.no_out++;
-        return;
+        __atomic_add_fetch(&MO.no_out, 1, __ATOMIC_RELAXED);
+        return 0;
     }
     // a position without the scene camera (c4) has a view of its own (c8 c9 c10 [c13]: its c8 is at a new address every
     // frame, last frame's is never found): drawn again it would get this frame's view and no camera motion
@@ -4798,8 +4816,8 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     static int noc4 = -1;
     if (noc4 < 0) noc4 = rt_knob("MVOBJ_NOC4", "0");   // NX2NAVI_MVOBJ_NOC4=1 (test): drawn again all the same
     if (!(banks >> 4 & 1) && !noc4) {
-        MO.no_out++;
-        return;
+        __atomic_add_fetch(&MO.no_out, 1, __ATOMIC_RELAXED);
+        return 0;
     }
     // only positions that read an object's own blocks: bones (c5), place (c7) or c6. The rest (terrain and grass: c14
     // c15 c16, with or without c9) measured no better than the camera's motion (NX2NAVI_MV_CHECK, turning, those draws
@@ -4808,8 +4826,8 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     static int all = -1;
     if (all < 0) all = rt_knob("MVOBJ_ALL", "0");
     if (!all && !(banks & (1u << 5 | 1u << 6 | 1u << 7))) {
-        MO.no_out++;
-        return;
+        __atomic_add_fetch(&MO.no_out, 1, __ATOMIC_RELAXED);
+        return 0;
     }
     // NX2NAVI_MVOBJ_ONLY=<hex bank mask> (test): only draws whose position reads no bank outside the mask (bit n: cn)
     static long only = -2;
@@ -4817,13 +4835,26 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
         const char *e = cfg_get("NX2NAVI_MVOBJ_ONLY");
         only = e && *e ? strtol(e, NULL, 16) : -1;
     }
-    if (only >= 0 && banks & ~(uint32_t)only & ~(1u << 4)) return;
+    if (only >= 0 && banks & ~(uint32_t)only & ~(1u << 4)) return 0;
     static long exact = -2;   // NX2NAVI_MVOBJ_EXACT=<hex bank mask> (test): only draws with exactly these position banks
     if (exact == -2) {
         const char *e = cfg_get("NX2NAVI_MVOBJ_EXACT");
         exact = e && *e ? strtol(e, NULL, 16) : -1;
     }
-    if (exact >= 0 && banks != (uint32_t)exact) return;
+    if (exact >= 0 && banks != (uint32_t)exact) return 0;
+    *vs_out = vs, *banks_out = banks;
+    return 1;
+}
+
+// A draw mvobj_pick took, onto the frame's list (in a chunk under mo_lock): the list begins at the first such draw of
+// the frame's submission (mo_emit drops a list of another frame, submission or depth format).
+static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0,
+                        const GfxShader *vs, uint32_t banks) {
+    DrawCtx *const cx = ex->dc;
+    const VkExecTarget *z = &ex->depth;
+    uint64_t tp = t0 ? kern_now_ns() : 0;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != z->format) mo_begin(ex, frame);
     mo_mask_note(banks, cx->B.st.vs);
     // last frame's camera and blocks; held still when none of the position's blocks changed (most of the scenery)
     VkDescriptorBufferInfo cam, prevb[17];
@@ -5073,12 +5104,25 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
 
 // NVN2 mesh draws (DrawMeshTasks): count task workgroups, or mesh workgroups for a program without a task stage, through
 // VK_EXT_mesh_shader. The stages are the translator's TaskEXT / MeshEXT modules (tools/xlate/MeshSpirv.cs).
+// The lazy lookups below store the pointer before the flag that says it was looked up: the chunks of a parallel
+// group draw meshes at once, and one that saw the flag first went on with no pointer and skipped its draws.
 static PFN_vkCmdDrawMeshTasksEXT draw_mesh_fn(void) {
     static PFN_vkCmdDrawMeshTasksEXT fn;
     static int looked;
-    if (!looked) {
-        looked = 1;
+    if (!__atomic_load_n(&looked, __ATOMIC_ACQUIRE)) {
         if (vk_ctx()->has_mesh_shader) fn = (PFN_vkCmdDrawMeshTasksEXT)vk_dpa(vk_ctx()->device, "vkCmdDrawMeshTasksEXT");
+        __atomic_store_n(&looked, 1, __ATOMIC_RELEASE);
+    }
+    return fn;
+}
+
+static PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_ind_fn(void) {
+    static PFN_vkCmdDrawMeshTasksIndirectEXT fn;
+    static int looked;
+    if (!__atomic_load_n(&looked, __ATOMIC_ACQUIRE)) {
+        if (vk_ctx()->has_mesh_shader)
+            fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vk_dpa(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
+        __atomic_store_n(&looked, 1, __ATOMIC_RELEASE);
     }
     return fn;
 }
@@ -5090,12 +5134,12 @@ static PFN_vkCmdDrawMeshTasksEXT draw_mesh_fn(void) {
 static void mesh_shading_rate(VkExec *ex) {
     static PFN_vkCmdSetFragmentShadingRateKHR fn;
     static int looked, from;
-    if (!looked) {
-        looked = 1;
+    if (!__atomic_load_n(&looked, __ATOMIC_ACQUIRE)) {   // as draw_mesh_fn: the pointer before the flag
         const char *e = cfg_get("NX2NAVI_FOLIAGE_SHADOW_VRS");
         from = e && *e ? atoi(e) : 2;
         if (vk_ctx()->has_vrs)
             fn = (PFN_vkCmdSetFragmentShadingRateKHR)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdSetFragmentShadingRateKHR");
+        __atomic_store_n(&looked, 1, __ATOMIC_RELEASE);
     }
     if (!fn) return;
     rec_shading_rate(fn, ex->cb, !ex->color[0].image && ex->depth.image && (int)ex->depth.base_layer >= from ? 2 : 1);
@@ -5433,11 +5477,24 @@ static void mesh_count_note(VkExec *ex, const VkMemSpan *src) {
 // only by the draw it was filled for, at the same record address, while no other op was replayed since
 // (vk_exec_brk). In the village 42 of the 45 draws a frame are served that way: 3 gaps with these copies a frame
 // where there were 41 (0.04 ms of GPU time for 0.22), and about 40 passes fewer to begin and end.
+// The entries filled ahead are the draw context's (DrawCtx.ma): a chunk of a parallel group (vk_exec.c) fills them for
+// the draws that follow its own (vk_exec_mesh_run reads on from the op it records), and an entry it filled for a draw
+// another chunk records is left unused.
 enum { MESH_AHEAD = 64 };
-static struct { const p_draw_mesh_ind *d; uint64_t ind; VkDeviceSize at; } mesh_ahead[MESH_AHEAD];
-static int mesh_ahead_n, mesh_ahead_i;
-static uint32_t mesh_ahead_brk;
+_Static_assert(MESH_AHEAD == sizeof dc_main.ma / sizeof dc_main.ma[0], "DrawCtx.ma holds MESH_AHEAD entries");
 static uint64_t mesh_ahead_taken, mesh_ahead_own;   // since the start: draws served by an entry filled ahead; the others
+
+// The ring, made before the chunks of a group record (vk_exec_draw_group_begin) or at the first indirect mesh draw.
+static int mesh_ring_make(void) {
+    if (mesh_ring) return 1;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 12ull * MESH_RING,
+                             .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkBuffer b;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &b, &mesh_ring_alloc, NULL) != VK_SUCCESS) return 0;
+    __atomic_store_n(&mesh_ring, b, __ATOMIC_RELEASE);
+    return 1;
+}
 
 static int mesh_ahead_on(void) {
     static int mode = -1;
@@ -5446,6 +5503,7 @@ static int mesh_ahead_on(void) {
 }
 
 static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan *src, VkDeviceSize *at) {
+    DrawCtx *const cx = ex->dc;
     if ((rt_trace & RT_TRACE_PERF) && (mesh_ahead_taken + mesh_ahead_own) % 20000 == 19999) {
         char stops[160];
         vk_exec_mesh_run_stops(stops, sizeof stops);
@@ -5453,32 +5511,24 @@ static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan
                "their pass; the runs ended: %s", (unsigned long long)(mesh_ahead_taken + mesh_ahead_own + 1),
                (unsigned long long)mesh_ahead_taken, stops);
     }
-    if (mesh_ahead_i < mesh_ahead_n) {
-        if (mesh_ahead[mesh_ahead_i].d == d && mesh_ahead[mesh_ahead_i].ind == d->ind && mesh_ahead_brk == vk_exec_brk) {
-            *at = mesh_ahead[mesh_ahead_i++].at;
-            mesh_ahead_taken++;
+    if (cx->ma_i < cx->ma_n) {
+        if (cx->ma[cx->ma_i].d == d && cx->ma[cx->ma_i].ind == d->ind && cx->ma_brk == vk_exec_brk_now()) {
+            *at = cx->ma[cx->ma_i++].at;
+            __atomic_add_fetch(&mesh_ahead_taken, 1, __ATOMIC_RELAXED);
             return 1;
         }
-        mesh_ahead_n = mesh_ahead_i = 0;   // the walk went another way: the entries left are never drawn from
+        cx->ma_n = cx->ma_i = 0;   // the walk went another way: the entries left are never drawn from
     }
-    mesh_ahead_own++;
-    if (!mesh_ring) {
-        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 12ull * MESH_RING,
-                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &mesh_ring, &mesh_ring_alloc, NULL) != VK_SUCCESS) {
-            mesh_ring = VK_NULL_HANDLE;
-            return 0;
-        }
-    }
-    *at = 12ull * (mesh_ring_next++ % MESH_RING);
+    __atomic_add_fetch(&mesh_ahead_own, 1, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&mesh_ring, __ATOMIC_ACQUIRE) && (vk_exec_in_chunk() || !mesh_ring_make())) return 0;
+    *at = 12ull * (__atomic_fetch_add(&mesh_ring_next, 1, __ATOMIC_RELAXED) % MESH_RING);
     vk_exec_barrier(ex);   // ends the pass (the next draw opens it again) and orders the culling's writes before the copy
     vk_gpu_gap_note(VK_GAP_MESH_RING, 12);
     vkCmdFillBuffer(ex->cb, mesh_ring, *at + 4, 8, 1);
     VkBufferCopy cp = {src->offset, *at, 4};
     vkCmdCopyBuffer(ex->cb, src->buffer, mesh_ring, 1, &cp);
     mesh_count_note(ex, src);
-    mesh_ahead_n = mesh_ahead_i = 0;
+    cx->ma_n = cx->ma_i = 0;
     if (mesh_ahead_on()) {
         const void *run[MESH_AHEAD];
         int n = vk_exec_mesh_run(d, run, MESH_AHEAD);
@@ -5487,17 +5537,17 @@ static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan
             VkMemSpan ip;
             if (!vk_mem_resolve(f->ind, 12, &ip) || ip.offset % 4) break;   // that draw reports it when the walk gets there
             VK_MEM_USE(ip);
-            VkDeviceSize fa = 12ull * (mesh_ring_next++ % MESH_RING);
+            VkDeviceSize fa = 12ull * (__atomic_fetch_add(&mesh_ring_next, 1, __ATOMIC_RELAXED) % MESH_RING);
             vk_gpu_gap_note(VK_GAP_MESH_RING, 12);
             vkCmdFillBuffer(ex->cb, mesh_ring, fa + 4, 8, 1);
             VkBufferCopy fc = {ip.offset, fa, 4};
             vkCmdCopyBuffer(ex->cb, ip.buffer, mesh_ring, 1, &fc);
             mesh_count_note(ex, &ip);
             ex->recorded += 2;
-            mesh_ahead[mesh_ahead_n].d = f, mesh_ahead[mesh_ahead_n].ind = f->ind, mesh_ahead[mesh_ahead_n].at = fa;
-            mesh_ahead_n++;
+            cx->ma[cx->ma_n].d = f, cx->ma[cx->ma_n].ind = f->ind, cx->ma[cx->ma_n].at = fa;
+            cx->ma_n++;
         }
-        mesh_ahead_brk = vk_exec_brk;
+        cx->ma_brk = vk_exec_brk_now();
     }
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -5512,13 +5562,7 @@ static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan
 // DrawMeshTasksIndirect: one draw from its ring entry (mesh_ring_entry); x2-x4 of the call vary like leftovers, so they
 // are not read as a count or stride.
 static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
-    static PFN_vkCmdDrawMeshTasksIndirectEXT fn;
-    static int looked;
-    if (!looked) {
-        looked = 1;
-        if (vk_ctx()->has_mesh_shader)
-            fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vk_dpa(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
-    }
+    PFN_vkCmdDrawMeshTasksIndirectEXT fn = draw_mesh_ind_fn();
     int fallback = vk_ctx()->mesh_fallback;
     if (!fn && !fallback) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
     static int on = -1;

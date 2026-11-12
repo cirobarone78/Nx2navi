@@ -163,7 +163,11 @@ void vk_exec_draw_group_begin(VkExec *ex);
 void vk_exec_xfer_group(int on);
 int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload);
 uint64_t vk_exec_xfer_chunk_state(void);
-void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots);
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
+                         int chunk);
+// After every chunk of the group is done (submitting thread): the slots the chunks closed go into their segments, in
+// the order of the chunks.
+void vk_exec_xfer_group_merge(int nchunks);
 // The front pass: whether a draw here counts samples (a query slot), and n slots of the ring in the order of the stream
 // for one chunk (the first is returned; vk_exec_xfer_worker hands them to the chunk's worker).
 int vk_exec_xfer_counting(void);
@@ -289,6 +293,7 @@ uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after t
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
 extern uint32_t vk_exec_brk;          // replay thread: bumped by every op that is not state or a draw (vk_exec.c op_linear)
+uint32_t vk_exec_brk_now(void);       // vk_exec_brk, or in a parallel group's chunk the chunk's own count
 int vk_exec_mesh_run(const void *cur, const void **out, int max);
 void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.

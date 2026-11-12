@@ -81,7 +81,7 @@ int vk_mvprev_on(void) { return P.on > 0; }
 void vk_mvprev_want(uint32_t index_mask) {
     static int fixed = -1;
     if (fixed < 0) fixed = !rt_knob("MVPREV_GROW", "1");   // NX2NAVI_MVPREV_GROW=0: c5, c7 and c14 only (test)
-    if (!fixed) P.mask |= index_mask & ((1u << BANKS) - 1);
+    if (!fixed) __atomic_fetch_or(&P.mask, index_mask & ((1u << BANKS) - 1), __ATOMIC_RELAXED);   // chunks at once
 }
 
 uint64_t vk_mvprev_step(int stage, int index, uint64_t size) {
