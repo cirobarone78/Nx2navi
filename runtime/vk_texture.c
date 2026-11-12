@@ -494,6 +494,28 @@ static int same_but_swizzle(const TexKey *a, const TexKey *b) {
     return !memcmp(&x, &y, sizeof x);
 }
 
+// Whether a slot (key k) may follow entry p, another descriptor at the same storage, when the slot's own entry is
+// released (slot_resolve). Ocarina's per-frame render targets share storage, so the live entry at an address is often
+// a target of another size that the frame laid out there: an effect's 1130x86 strip over the 480x270 half-size
+// lighting term at a 1280x720 scene. Followed, the compute pass that writes the term and the full-screen pass that
+// reads it both got the strip's image, the term read back as zero over most of the screen and a jump attack's hit
+// effect drew the right 44% of the scene black. A slot follows only an entry of its own size; block-compressed
+// formats are left out of the test, as a GPU encoder renders their blocks through a smaller uncompressed view of the
+// same storage. Counted in n_follow_refused.
+static uint64_t n_follow_refused;
+static int follow_size_ok(const Tex *p, const TexKey *k) {
+    int bw1 = 1, bh1 = 1, bw2 = 1, bh2 = 1;
+    nvn_fmt_bpb(p->key.d.format, &bw1, &bh1);
+    nvn_fmt_bpb(k->d.format, &bw2, &bh2);
+    if (bw1 > 1 || bh1 > 1 || bw2 > 1 || bh2 > 1) return 1;
+    if (p->key.d.width == k->d.width && p->key.d.height == k->d.height && p->key.d.depth == k->d.depth) return 1;
+    if (n_follow_refused++ < 8)
+        rt_log("vk: a texture slot at %#llx (%ux%u format %#x) did not follow a %ux%u texture at the same storage: "
+               "its own image instead", (unsigned long long)k->addr, k->d.width, k->d.height, k->d.format,
+               p->key.d.width, p->key.d.height);
+    return 0;
+}
+
 // Textures whose content the CPU provides in pool memory. Display, compressible, zcull,
 // depth, multisample and GPU-only storage stays GPU-owned.
 // mirror_refused: NULL for such a texture, else the rule that leaves it out, in words for a log line.
@@ -3865,7 +3887,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
             // With the target kept they get the volume itself.
             if (p->key.d.target != k.d.target) continue;
             if (same_but_swizzle(&p->key, &k) && (!cpu_slot || !s->finalized || alias_has_gpu_content(p))) { e = p; break; }
-            if (!any && (!cpu_slot || alias_has_gpu_content(p))) any = p;
+            if (!any && (!cpu_slot || alias_has_gpu_content(p)) && follow_size_ok(p, &k)) any = p;
         }
         // A finalized CPU descriptor must not recreate its image from freed storage. The slot keeps this state even
         // after its released image was evicted; registering the descriptor again makes it current.
