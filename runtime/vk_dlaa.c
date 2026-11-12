@@ -487,6 +487,7 @@ static struct {
     int failed, reset;
     uint64_t evals, frames_missed;
     int share_off;   // frames left that pick the output pass without the mode's share (vk_dlaa_pass, vk_dlaa_frame)
+    int shape_logged;   // passes of another shape than the scene's turned down as the output pass (vk_dlaa_pass)
     // jitter (vk_dlaa_viewport)
     VkImage jdepth;              // the scene depth of the last frame DLAA ran on: passes drawing with it are jittered
     float jx, jy;                // the offset the next scene draws take, render pixels (window x right, y down)
@@ -2003,7 +2004,18 @@ void vk_dlaa_pass(VkExec *ex) {
         int native = share <= 0 || share >= 1;   // no upscaling share: the scene is as large as the picture
         int big = D.share_off || native || c->width >= 0.95 * D.color.width / share;
         int same = c->width == D.color.width && c->height == D.color.height;
-        if (one && big && c->width > D.color.width && c->height > D.color.height) {
+        // The output pass has the scene's shape: the game redraws its 2000x2000 area map into an RGBA8 target of its
+        // own on a room change and on the pause menu, one colour target and no depth, larger than the scene both ways.
+        // Taken for the output pass, DLSS wrote the game's picture into the map, and the minimap showed that picture
+        // behind its room shapes until the pause menu drew the map again. A pass whose width over height is more than
+        // 3% from the scene's (sizes round to multiples of 8) is not the output; the ultrawide sets widen the scene
+        // with the picture, so their output pass still matches.
+        int shape = (double)c->width * D.color.height <= 1.03 * (double)c->height * D.color.width &&
+                    (double)c->height * D.color.width <= 1.03 * (double)c->width * D.color.height;
+        if (one && !shape && big && c->width > D.color.width && c->height > D.color.height && D.shape_logged < 8)
+            D.shape_logged++, rt_log("dlaa: a %ux%u pass is not the output pass: its shape is not the scene's %ux%u",
+                                     c->width, c->height, D.color.width, D.color.height);
+        if (one && shape && big && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
         } else if (one && same && native && scene_color(c->format)) {
