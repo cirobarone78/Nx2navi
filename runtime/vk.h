@@ -527,6 +527,15 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
+// The replay workers (vk_exec.c "replay workers"): a chunk's lookup that would make or take back a texture entry
+// before the chunk's turn returns nothing and says so here; the chunk replays the op again in turn
+// (vk_texture_deferred_take clears it). vk_exec_turn_due: the calling thread records a chunk whose earlier chunks may not
+// be done yet; vk_exec_turn waits until they are (no-op elsewhere).
+int vk_texture_deferred(void);
+int vk_texture_deferred_take(void);
+int vk_exec_turn_due(void);
+int vk_exec_in_chunk(void);   // the calling thread records a chunk of a parallel group
+void vk_exec_turn(void);
 VkSampler vk_sampler_by_id_locked(int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler. VK_NULL_HANDLE
@@ -701,6 +710,15 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
 // batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
 // is signalled by its last part, whose signal covers every earlier part in submission order.
 VkCommandBuffer vk_sync_split(void);
+// Inside vk_exec_record, for the replay workers (vk_exec.c): vk_sync_append ends the command buffer recorded so far,
+// puts it and then cbs (recorded by the workers) into the part, in that order, and returns a new begun one for the rest
+// of the part; vk_sync_append_room says whether the part has room for n more. A worker claims and begins a command
+// buffer of its own pool for the submission being recorded with vk_sync_worker_begin(w) and ends it with
+// vk_sync_worker_end, on its own thread, while the submitting thread waits for it.
+int vk_sync_append_room(int n);
+VkCommandBuffer vk_sync_append(const VkCommandBuffer *cbs, int n);
+VkCommandBuffer vk_sync_worker_begin(int w);
+void vk_sync_worker_end(VkCommandBuffer cb);
 extern int vk_sub_in_frame;   // replay: the submission being recorded is the frame's n-th (0 the first; vk_backend.c)
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.

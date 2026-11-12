@@ -66,6 +66,10 @@
 # of latency, and can show a dark or flickering frame now and then: the other thread reads vertex and buffer memory
 # the game has sometimes rewritten by then.
 # replay_async = 0
+# EXPERIMENTAL, work in progress. Record the draws of a submission on replay worker threads, 0 to 16. Default: 0, the
+# replay records everything on one thread. With 1 a worker records each long run of draws while the submitting thread
+# waits for it: no faster yet, it checks that the pictures stay the same before several workers record at once.
+# replay_workers = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.

@@ -773,6 +773,7 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info) {
     for (int i = 0; i < 4; i++)   // unlocked first look: most draws go elsewhere (a stale slot only costs the lock below)
         known |= __atomic_load_n(&recs[i].win, __ATOMIC_RELAXED) == t->image;
     if (!known) return;
+    vk_exec_turn();   // a replay worker's chunk: the last such draw of the stream decides, as in the replay
     VkImage src = VK_NULL_HANDLE;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     int ntex = 0, slot = -1;

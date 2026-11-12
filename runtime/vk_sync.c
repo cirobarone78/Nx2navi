@@ -35,6 +35,11 @@ static CmdSlot *slots;
 static int nslots;
 static int cur_slot;          // the slot vk_sync_submit records into now (an index: take_slot may move slots)
 static uint64_t cur_fence;    // the value of the submission being recorded
+// The command buffers of the part being recorded that come before slots[cur_slot] (vk_sync_append): earlier pieces of
+// the replay's own and those the replay workers recorded, in queue order.
+#define PART_CBS 254
+static VkCommandBuffer part_cbs[PART_CBS];
+static int npart_cbs;
 
 // Shared with the completion thread (st_lock).
 static PlatMutex st_lock = PLAT_MUTEX_INIT;
@@ -69,7 +74,7 @@ static void results_run(uint64_t upto);
 static struct {
     int n;
     VkSubmitInfo2 si[HOLD_CAP];
-    VkCommandBufferSubmitInfo cbi[HOLD_CAP][2];
+    VkCommandBufferSubmitInfo cbi[HOLD_CAP][PART_CBS + 2];   // the prologue and the part's command buffers
     VkSemaphoreSubmitInfo sig[HOLD_CAP][2];
     uint64_t last;                    // the newest timeline value a held submission signals, 0 none
     uint64_t batches, subs;           // vkQueueSubmit2 calls and the submissions they carried
@@ -400,6 +405,7 @@ static void ts_read_cb(void *arg);
 // idle time with work queued, 7-8 ms a frame over PCIe 3.0 in Kokiri Forest, and the frame as CPU-bound.
 static void ts_submitted(void) {
     uint64_t now = plat_now_ns();
+    gfx_tl_note('S', now, cur_fence, 0);
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < ts_n_unsent; i++) {
             TsRead *t = ts_unsent[i];
@@ -427,6 +433,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                     max64(&ts_max_gap_ns, gap);
                 }
                 if (sub && sn > sub) plat_add64(&ts_queued_ns, sn - sub);
+                gfx_tl_note('G', (uint64_t)sn, (uint64_t)en, (uint64_t)sub);
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
@@ -443,6 +450,82 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     } else plat_inc64(&ts_missed);
     __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
     free(t);
+}
+
+// ---- frame timeline
+// NX2NAVI_GPU_TIMELINE=<frame>: from that presented frame on, TL_FRAMES frames of what the CPU and the GPU did go to the
+// log once they are complete, in milliseconds from the first of those presents: each replay's begin and end and its
+// thread, each timed part's submit, GPU start and end (calibrated timestamps, so with NX2NAVI_TRACE=perf), the waits for
+// the GPU after a frame's first submission, the replay workers' groups and the presents. It tells whether the GPU waits
+// for the replay, for a wait, or for the CPU behind one. Off (and one load per note) without the setting.
+#define TL_CAP 16384
+#define TL_FRAMES 4
+typedef struct { uint64_t t, a, b; uint32_t tid; int kind; } TlEv;
+static TlEv *tl_ev;
+static volatile int32_t tl_n, tl_rec;
+static int tl_on = -1;
+static uint64_t tl_from, tl_frames;
+
+void gfx_tl_note(int kind, uint64_t t, uint64_t a, uint64_t b) {
+    if (!__atomic_load_n(&tl_rec, __ATOMIC_ACQUIRE)) return;
+    int32_t i = plat_inc32(&tl_n) - 1;
+    if (i < TL_CAP) tl_ev[i] = (TlEv){t ? t : plat_now_ns(), a, b, plat_thread_id(), kind};
+}
+
+static int tl_cmp(const void *x, const void *y) {
+    uint64_t a = ((const TlEv *)x)->t, b = ((const TlEv *)y)->t;
+    return a < b ? -1 : a > b;
+}
+
+static void tl_dump(void) {
+    int n = tl_n < TL_CAP ? tl_n : TL_CAP;
+    qsort(tl_ev, (size_t)n, sizeof *tl_ev, tl_cmp);
+    uint64_t t0 = 0, t1 = UINT64_MAX;
+    for (int i = 0; i < n; i++)
+        if (tl_ev[i].kind == 'P') {
+            if (tl_ev[i].a == tl_from) t0 = tl_ev[i].t;
+            if (tl_ev[i].a == tl_from + TL_FRAMES) t1 = tl_ev[i].t;
+        }
+    rt_log("vk: timeline of frames %llu-%llu (%d events), ms from the first present:", (unsigned long long)tl_from,
+           (unsigned long long)(tl_from + TL_FRAMES), n);
+    for (int i = 0; i < n; i++) {
+        const TlEv *e = &tl_ev[i];
+        if (e->t < t0 || e->t > t1) continue;
+        double at = (double)(int64_t)(e->t - t0) / 1e6;
+        switch (e->kind) {
+        case 'P': rt_log("vk: tl %8.3f t%-5u present, frame %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'R': rt_log("vk: tl %8.3f t%-5u replay begins: %llu handles, value %llu", at, e->tid,
+                         (unsigned long long)e->a, (unsigned long long)e->b); break;
+        case 'r': rt_log("vk: tl %8.3f t%-5u replay ends: %llu commands in the last part", at, e->tid,
+                         (unsigned long long)e->a); break;
+        case 'W': rt_log("vk: tl %8.3f t%-5u waits for the GPU to run value %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'w': rt_log("vk: tl %8.3f t%-5u wait ends", at, e->tid); break;
+        case 'g': rt_log("vk: tl %8.3f t%-5u group of %llu draws in %llu chunks", at, e->tid, (unsigned long long)e->a,
+                         (unsigned long long)e->b); break;
+        case 'h': rt_log("vk: tl %8.3f t%-5u group recorded", at, e->tid); break;
+        case 'S': rt_log("vk: tl %8.3f t%-5u part submitted, value %llu", at, e->tid, (unsigned long long)e->a); break;
+        case 'G': rt_log("vk: tl %8.3f gpu    part runs %.3f ms (submitted %.3f ms before)", at,
+                         (double)(e->a - e->t) / 1e6, (double)(int64_t)(e->t - e->b) / 1e6); break;
+        default: break;
+        }
+    }
+}
+
+void gfx_tl_present(void) {
+    if (tl_on < 0) {
+        const char *e = cfg_get("NX2NAVI_GPU_TIMELINE");
+        tl_from = e && *e ? strtoull(e, NULL, 0) : 0;
+        tl_on = tl_from && (tl_ev = calloc(TL_CAP, sizeof *tl_ev)) != NULL;
+    }
+    if (!tl_on) return;
+    uint64_t f = ++tl_frames;
+    if (f == tl_from) __atomic_store_n(&tl_rec, 1, __ATOMIC_RELEASE);
+    gfx_tl_note('P', 0, f, 0);
+    if (f == tl_from + TL_FRAMES + 3) {   // the parts of the last frame have been read back by now
+        __atomic_store_n(&tl_rec, 0, __ATOMIC_SEQ_CST);
+        tl_dump();
+        tl_on = 0;
+    }
 }
 
 // At the start of a command buffer (sub_lock held): the pair it times, -1 untimed.
@@ -694,6 +777,77 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     return cb;
 }
 
+// The command buffers of the part that ends now, in queue order, into cbi: the prologue (when there is one), the
+// part's earlier pieces (vk_sync_append) and, with `with_last`, its last command buffer. Empties the list.
+static uint32_t part_list(VkCommandBufferSubmitInfo *cbi, VkCommandBuffer pro, VkCommandBuffer last, int with_last) {
+    uint32_t n = 0;
+    VkCommandBufferSubmitInfo one = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    if (pro) one.commandBuffer = pro, cbi[n++] = one;
+    for (int i = 0; i < npart_cbs; i++) one.commandBuffer = part_cbs[i], cbi[n++] = one;
+    if (with_last) one.commandBuffer = last, cbi[n++] = one;
+    npart_cbs = 0;
+    return n;
+}
+
+// The replay workers (vk_exec.c "replay workers"): the replay's command buffer being recorded ends and joins the
+// part's list, then the n command buffers the workers recorded, in that order, and a new command buffer of the same
+// part is begun and returned: the same timeline value, timed and submitted with the rest, so the workers' commands run
+// between the replay's commands before and after. vk_sync_append_room: whether the list has room for n more.
+int vk_sync_append_room(int n) { return npart_cbs + n + 1 <= PART_CBS; }
+
+VkCommandBuffer vk_sync_append(const VkCommandBuffer *cbs, int n) {
+    if (!vk_sync_append_room(n)) rt_fatal("vk: a submission part of more than %d command buffers", PART_CBS);
+    VkCtx *c = vk_ctx();
+    VkCommandBuffer cb = slots[cur_slot].cb;
+    if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of it is in cb, ended by its recorder
+    part_cbs[npart_cbs++] = cb;
+    for (int i = 0; i < n; i++) part_cbs[npart_cbs++] = cbs[i];
+    CmdSlot *s = take_slot(c, cur_fence);   // the ended one keeps its slot until the value is reached
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(s->cb, &bi);
+    rec_begin(s->cb, cur_fence);
+    return s->cb;
+}
+
+// The replay workers' command buffers: each worker has a command pool of its own (a pool belongs to one thread at a
+// time) and claims command buffers from it for the submission being recorded, as the replay claims its slots. Called
+// on the worker while the submitting thread holds sub_lock and waits for it, so cur_fence stays put.
+#define SYNC_WORKERS 16
+static struct { VkCommandPool pool; CmdSlot *slots; int n; } WP[SYNC_WORKERS];
+
+VkCommandBuffer vk_sync_worker_begin(int w) {
+    VkCtx *c = vk_ctx();
+    if (w < 0 || w >= SYNC_WORKERS) rt_fatal("vk: replay worker %d of %d", w, SYNC_WORKERS);
+    typeof(WP[0]) *p = &WP[w];
+    if (!p->pool) {
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                      .queueFamilyIndex = c->gfx_family};
+        if (vkCreateCommandPool(c->device, &pi, NULL, &p->pool) != VK_SUCCESS) rt_fatal("vk: replay worker command pool");
+    }
+    uint64_t gpu = 0;
+    vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+    CmdSlot *s = NULL;
+    for (int i = 0; i < p->n && !s; i++)
+        if (p->slots[i].fence <= gpu) s = &p->slots[i];
+    if (!s) {
+        CmdSlot *m = realloc(p->slots, sizeof *m * (size_t)(p->n + 1));
+        if (!m) rt_fatal("vk: out of memory (command buffers)");
+        p->slots = m, s = &m[p->n++];
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = p->pool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        if (vkAllocateCommandBuffers(c->device, &ai, &s->cb) != VK_SUCCESS) rt_fatal("vk: command buffer allocation");
+    }
+    s->fence = cur_fence;
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(s->cb, &bi);
+    return s->cb;
+}
+
+void vk_sync_worker_end(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }
+
 static VkCommandBuffer split_part(int exec);
 VkCommandBuffer vk_sync_split(void) { return split_part(0); }
 // The part that ends here is the last with the submission's own commands: it signals the executed timeline.
@@ -707,10 +861,9 @@ static VkCommandBuffer split_part(int exec) {
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     VkCommandBuffer pro = prologue(c, cur_fence);
-    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
-                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
-                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
+    VkCommandBufferSubmitInfo cbi[PART_CBS + 2];
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = part_list(cbi, pro, cb, 1),
+                        .pCommandBufferInfos = cbi};
     VkSemaphoreSubmitInfo esig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = exec_tl,
                                   .value = cur_fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     if (exec && exec_tl && exec_sig < cur_fence)
@@ -785,8 +938,8 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, fence);
     s = &slots[cur_slot];
-    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
-                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
+    VkCommandBufferSubmitInfo cbi[PART_CBS + 2];
+    uint32_t ncbi = part_list(cbi, pro, s->cb, recorded);
     // the timeline, and the executed timeline unless a part of this submission signalled it already (split_part)
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
                                      .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -794,9 +947,8 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
                                      .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
     int both = exec_tl && exec_sig < fence;
     if (both) exec_sig = fence;
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-                        .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
-                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = both ? 2u : 1u,
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = ncbi,
+                        .pCommandBufferInfos = cbi, .signalSemaphoreInfoCount = both ? 2u : 1u,
                         .pSignalSemaphoreInfos = sig};
     ts_submitted();
     queue_submit(c, &si, fence);   // held or handed to the queue (submit batching)
@@ -980,6 +1132,11 @@ void vk_sync_shutdown(void) {
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
+        for (int w = 0; w < SYNC_WORKERS; w++) {
+            if (c && WP[w].pool) vkDestroyCommandPool(c->device, WP[w].pool, NULL);
+            free(WP[w].slots);
+            memset(&WP[w], 0, sizeof WP[w]);
+        }
         if (c && exec_tl) vkDestroySemaphore(c->device, exec_tl, NULL);
         exec_tl = VK_NULL_HANDLE;
         perf_gpu_stats = NULL;
